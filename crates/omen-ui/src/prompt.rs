@@ -71,7 +71,9 @@ impl PromptRenderer {
         // Header line: path branch status
         // Prompt line: >
         let prompt_sym = colors.prompt_symbol.paint(">");
+        let p_start = crate::blocks::SemanticBlock::osc133_prompt_start(caps);
+        let c_start = crate::blocks::SemanticBlock::osc133_command_start(caps);
 
-        format!("{path_part}{branch_part}{status_part}\n{prompt_sym} ")
+        format!("{p_start}{path_part}{branch_part}{status_part}\n{prompt_sym} {c_start}")
     }
 }

@@ -167,6 +167,11 @@ impl InteractiveSession {
                     required_assurance: RequiredAssurance::default(),
                 };
 
+                print!(
+                    "{}",
+                    omen_ui::SemanticBlock::osc133_command_executed(&self.caps)
+                );
+
                 let output = tokio::runtime::Handle::try_current()
                     .map_err(|_| CoreError::Internal("No tokio runtime found".into()))
                     .and_then(|handle| {
@@ -174,6 +179,14 @@ impl InteractiveSession {
                             handle.block_on(self.supervisor.execute(req))
                         })
                     })?;
+
+                print!(
+                    "{}",
+                    omen_ui::SemanticBlock::osc133_command_finished(
+                        output.process_exit.code.unwrap_or(0),
+                        &self.caps
+                    )
+                );
 
                 let exec_id = omen_core::ExecutionId::new(format!(
                     "exec-{}",
@@ -252,6 +265,10 @@ impl InteractiveSession {
     }
 
     fn update_prompt_state(&mut self) {
+        print!(
+            "{}",
+            omen_ui::SemanticBlock::osc7_cwd(&self.cwd, &self.caps)
+        );
         let has_failure = self
             .last_exit
             .as_ref()
