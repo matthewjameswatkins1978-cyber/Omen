@@ -128,9 +128,15 @@ impl InteractiveSession {
 
         match lane {
             crate::grammar::InputLane::AiReasoning { query } => {
-                println!(
-                    "AI reasoning is not configured.\nDeterministic options:\n  :show @failed\n  :why @last\n  :open @failed\nQuery was: {query}"
-                );
+                let out = crate::ai_lane::AiLaneDispatcher::dispatch(
+                    &query,
+                    &self.session_id,
+                    self.db.as_ref(),
+                )?;
+                println!("{}", out.response_text);
+                for cmd in &out.suggested_commands {
+                    println!("  {cmd}");
+                }
                 Ok(ProcessExit {
                     code: Some(0),
                     signal: None,
