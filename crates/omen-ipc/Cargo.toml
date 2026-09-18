@@ -1,0 +1,20 @@
+[package]
+name = "omen-ipc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+omen-core.workspace = true
+omen-schema.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+tokio = { workspace = true, features = ["io-util", "sync"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
