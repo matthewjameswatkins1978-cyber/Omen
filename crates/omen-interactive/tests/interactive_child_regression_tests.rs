@@ -119,11 +119,13 @@ fn test_interactive_children_record_execution_history() {
     )
     .unwrap();
 
-    // Spawn an invocation that classifies as interactive handoff using a command available on Windows / cross-platform
-    // Using explicit `--interactive` override with a fast-exiting binary
-    let exit = session
-        .dispatch_input("--interactive cmd /c exit 0")
-        .unwrap();
+    let (test_cmd, expected_sub) = if cfg!(windows) {
+        ("--interactive cmd /c exit 0", "cmd /c exit 0")
+    } else {
+        ("--interactive sh -c 'exit 0'", "sh -c 'exit 0'")
+    };
+
+    let exit = session.dispatch_input(test_cmd).unwrap();
     assert_eq!(exit.code, Some(0));
 
     // Check that execution history in SQLite recorded this interactive execution
@@ -135,7 +137,7 @@ fn test_interactive_children_record_execution_history() {
         "Interactive execution must produce subordinate execution history"
     );
     assert!(
-        hist[0].command.contains("cmd /c exit 0"),
+        hist[0].command.contains(expected_sub),
         "Execution history must preserve interactive command: {}",
         hist[0].command
     );
