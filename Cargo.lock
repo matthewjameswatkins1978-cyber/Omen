@@ -552,6 +552,7 @@ version = "0.2.0"
 dependencies = [
  "omen-core",
  "omen-schema",
+ "omen-test-fixtures",
  "rustix",
  "serde",
  "serde_json",
