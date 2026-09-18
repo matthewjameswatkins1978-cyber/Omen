@@ -11,6 +11,7 @@ impl SemanticDispatcher {
         action: &str,
         args: &[String],
         cwd: &Path,
+        session_id: &omen_core::InteractiveSessionId,
         db: Option<&mut Database>,
     ) -> Result<ProcessExit, CoreError> {
         match action {
@@ -114,6 +115,65 @@ impl SemanticDispatcher {
                     code: Some(0),
                     signal: None,
                 })
+            }
+            "history" => {
+                if let Some(db_ref) = db
+                    && let Ok(execs) = omen_knowledge::ExecutionHistory::list_session_executions(
+                        db_ref, session_id, 20,
+                    )
+                {
+                    println!("Execution History for session {}:", session_id.as_str());
+                    for (i, exec) in execs.iter().enumerate() {
+                        let status_str = match exec.exit_code {
+                            Some(0) => "OK".to_string(),
+                            Some(c) => format!("FAILED({c})"),
+                            None => "RUNNING".to_string(),
+                        };
+                        println!(
+                            "  [{}] {} (exit: {}, {} ms)",
+                            i + 1,
+                            exec.command,
+                            status_str,
+                            exec.duration_ms.unwrap_or(0)
+                        );
+                    }
+                    return Ok(ProcessExit {
+                        code: Some(0),
+                        signal: None,
+                    });
+                }
+                println!("No execution history recorded for this session");
+                Ok(ProcessExit {
+                    code: Some(0),
+                    signal: None,
+                })
+            }
+            "rerun" => {
+                let target = args.first().map(|s| s.as_str()).unwrap_or("@last");
+                if let Some(db_ref) = db {
+                    match crate::resolver::ReferenceResolver::resolve(target, session_id, db_ref) {
+                        Ok(cmd) => {
+                            println!("Reconstructing command: {cmd}");
+                            Ok(ProcessExit {
+                                code: Some(0),
+                                signal: None,
+                            })
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to rerun: {e}");
+                            Ok(ProcessExit {
+                                code: Some(1),
+                                signal: None,
+                            })
+                        }
+                    }
+                } else {
+                    println!("Database not available for :rerun");
+                    Ok(ProcessExit {
+                        code: Some(1),
+                        signal: None,
+                    })
+                }
             }
             other => {
                 println!(

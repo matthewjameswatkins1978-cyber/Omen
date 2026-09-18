@@ -2,11 +2,13 @@
 
 pub mod cas;
 pub mod db;
+pub mod history;
 pub mod registry;
 pub mod workspace;
 
 pub use cas::{ArtifactMetadata, ContentAddressedStore, GcReport};
 pub use db::Database;
+pub use history::{ExecutionHistory, ExecutionRecord, InteractiveSessionRecord};
 pub use registry::{
     DependencyRecord, FactProvenance, FactRecord, FactRegistry, PublishFactRequest,
 };

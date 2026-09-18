@@ -5,6 +5,7 @@ pub mod child;
 pub mod completion;
 pub mod grammar;
 pub mod prompt_adapter;
+pub mod resolver;
 pub mod session;
 
 pub use actions::SemanticDispatcher;
@@ -12,6 +13,7 @@ pub use child::ChildHandoff;
 pub use completion::{CompletionContext, OmenCompleter, OmenHinter};
 pub use grammar::{GrammarScanner, InputLane, TypedReference};
 pub use prompt_adapter::OmenPrompt;
+pub use resolver::ReferenceResolver;
 pub use session::InteractiveSession;
 
 pub fn version() -> &'static str {

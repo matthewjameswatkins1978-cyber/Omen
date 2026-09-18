@@ -98,6 +98,51 @@ impl Database {
                 PRIMARY KEY (fact_id, artifact_uri),
                 FOREIGN KEY (fact_id) REFERENCES facts(fact_id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS interactive_sessions (
+                session_id TEXT PRIMARY KEY,
+                actor TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                last_active TEXT NOT NULL,
+                cwd TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS execution_history (
+                execution_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                command TEXT NOT NULL,
+                exit_code INTEGER,
+                duration_ms INTEGER,
+                stdout_artifact TEXT,
+                stderr_artifact TEXT,
+                envelope_json TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES interactive_sessions(session_id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_execution_session ON execution_history(session_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS execution_resources (
+                execution_id TEXT NOT NULL,
+                resource_uri TEXT NOT NULL,
+                role TEXT NOT NULL,
+                PRIMARY KEY (execution_id, resource_uri, role),
+                FOREIGN KEY (execution_id) REFERENCES execution_history(execution_id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS execution_facts (
+                execution_id TEXT NOT NULL,
+                fact_id TEXT NOT NULL,
+                PRIMARY KEY (execution_id, fact_id),
+                FOREIGN KEY (execution_id) REFERENCES execution_history(execution_id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS execution_artifacts (
+                execution_id TEXT NOT NULL,
+                artifact_uri TEXT NOT NULL,
+                PRIMARY KEY (execution_id, artifact_uri),
+                FOREIGN KEY (execution_id) REFERENCES execution_history(execution_id) ON DELETE CASCADE
+            );
             "#,
             )
             .map_err(|e| CoreError::Internal(format!("Database migration failed: {e}")))?;

@@ -126,6 +126,7 @@ impl InteractiveSession {
                     &action,
                     &args,
                     &self.cwd,
+                    &self.session_id,
                     self.db.as_mut(),
                 )
             }
@@ -137,11 +138,18 @@ impl InteractiveSession {
                     });
                 }
 
-                let cmd_name = &argv[0];
+                // Resolve any typed references in argv (@last, @last.artifact, etc.)
+                let resolved_argv = crate::resolver::ReferenceResolver::resolve_argv(
+                    &argv,
+                    &self.session_id,
+                    self.db.as_ref(),
+                );
+
+                let cmd_name = &resolved_argv[0];
 
                 // 1. Interactive child handoff if command is interactive
                 if ChildHandoff::is_interactive_command(cmd_name) {
-                    let exit = ChildHandoff::spawn_interactive(&argv, &self.cwd)?;
+                    let exit = ChildHandoff::spawn_interactive(&resolved_argv, &self.cwd)?;
                     self.last_exit = Some(exit.clone());
                     self.update_prompt_state();
                     return Ok(exit);
@@ -149,7 +157,7 @@ impl InteractiveSession {
 
                 // 2. Ordinary executable invocation via ProcessSupervisor
                 let req = ExecutionRequest {
-                    argv,
+                    argv: resolved_argv.clone(),
                     cwd: self.cwd.clone(),
                     env: vec![],
                     stdin_mode: StdioMode::Closed,
@@ -166,6 +174,70 @@ impl InteractiveSession {
                             handle.block_on(self.supervisor.execute(req))
                         })
                     })?;
+
+                let exec_id = omen_core::ExecutionId::new(format!(
+                    "exec-{}",
+                    &hex::encode(sha2::Sha256::digest(
+                        format!(
+                            "{}-{:?}",
+                            resolved_argv.join(" "),
+                            std::time::SystemTime::now()
+                        )
+                        .as_bytes()
+                    ))[..12]
+                ))?;
+
+                // Record execution in subordinate physical history
+                if let Some(db_ref) = &mut self.db {
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let cas_dir = omen_knowledge::resolve_workspace_dir(&self.cwd).join("cas");
+                    let cas = omen_knowledge::ContentAddressedStore::new(cas_dir);
+                    let stdout_art = if !output.stdout_all.is_empty() {
+                        cas.store(
+                            db_ref,
+                            &output.stdout_all,
+                            "text/plain",
+                            "human",
+                            omen_core::RetentionClass::Referenced,
+                        )
+                        .ok()
+                        .map(|m| m.uri.as_str().to_string())
+                    } else {
+                        None
+                    };
+                    let stderr_art = if !output.stderr_all.is_empty() {
+                        cas.store(
+                            db_ref,
+                            &output.stderr_all,
+                            "text/plain",
+                            "human",
+                            omen_core::RetentionClass::Referenced,
+                        )
+                        .ok()
+                        .map(|m| m.uri.as_str().to_string())
+                    } else {
+                        None
+                    };
+
+                    let exec_rec = omen_knowledge::ExecutionRecord {
+                        execution_id: exec_id,
+                        session_id: self.session_id.clone(),
+                        command: resolved_argv.join(" "),
+                        exit_code: output.process_exit.code,
+                        duration_ms: Some(output.duration_ms as i64),
+                        stdout_artifact: stdout_art,
+                        stderr_artifact: stderr_art,
+                        envelope_json: None,
+                        created_at: now,
+                    };
+                    let _ = omen_knowledge::ExecutionHistory::record_execution(
+                        db_ref,
+                        &exec_rec,
+                        &[],
+                        &[],
+                        &[],
+                    );
+                }
 
                 // Print stdout / stderr to user
                 print!("{}", String::from_utf8_lossy(&output.stdout_all));
