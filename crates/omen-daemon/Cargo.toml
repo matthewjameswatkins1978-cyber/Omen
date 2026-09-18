@@ -35,3 +35,4 @@ clap = { workspace = true, features = ["derive"] }
 [dev-dependencies]
 tempfile.workspace = true
 omen-client.workspace = true
+omen-interactive.workspace = true

@@ -459,7 +459,59 @@ impl DaemonServer {
                 }
             }
 
-            RequestPayload::RecordHistory { .. } => Ok(ResponsePayload::HistoryRecorded),
+            RequestPayload::RecordHistory {
+                session_id,
+                command,
+                exit_code,
+                duration_ms,
+                stdout_artifact,
+                stderr_artifact,
+            } => {
+                let current = attached_workspace.read().await;
+                match &*current {
+                    Some(ws) => {
+                        match ws
+                            .record_history(
+                                &session_id,
+                                &command,
+                                exit_code,
+                                duration_ms,
+                                stdout_artifact,
+                                stderr_artifact,
+                            )
+                            .await
+                        {
+                            Ok(_) => Ok(ResponsePayload::HistoryRecorded),
+                            Err(e) => Err(LocalIpcError::InternalRuntimeError(e.to_string())),
+                        }
+                    }
+                    None => Err(LocalIpcError::WorkspaceNotAttached(
+                        "No workspace attached for this session".into(),
+                    )),
+                }
+            }
+
+            RequestPayload::QueryLastExecution { session_id } => {
+                let current = attached_workspace.read().await;
+                match &*current {
+                    Some(ws) => match ws.get_last_execution(&session_id).await {
+                        Ok(Some(rec)) => Ok(ResponsePayload::LastExecutionResponse {
+                            command: Some(rec.command),
+                            exit_code: rec.exit_code,
+                            execution_id: Some(rec.execution_id.to_string()),
+                        }),
+                        Ok(None) => Ok(ResponsePayload::LastExecutionResponse {
+                            command: None,
+                            exit_code: None,
+                            execution_id: None,
+                        }),
+                        Err(e) => Err(LocalIpcError::InternalRuntimeError(e.to_string())),
+                    },
+                    None => Err(LocalIpcError::WorkspaceNotAttached(
+                        "No workspace attached for this session".into(),
+                    )),
+                }
+            }
 
             RequestPayload::ReportOfflineGap { .. } => Ok(ResponsePayload::OfflineGapAcknowledged),
 

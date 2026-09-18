@@ -72,6 +72,9 @@ pub enum RequestPayload {
         stdout_artifact: Option<String>,
         stderr_artifact: Option<String>,
     },
+    QueryLastExecution {
+        session_id: String,
+    },
     ReportOfflineGap {
         modified_paths: Vec<String>,
     },
@@ -133,6 +136,11 @@ pub enum ResponsePayload {
         fact: Option<FactInfo>,
     },
     HistoryRecorded,
+    LastExecutionResponse {
+        command: Option<String>,
+        exit_code: Option<i32>,
+        execution_id: Option<String>,
+    },
     OfflineGapAcknowledged,
     Success,
 }

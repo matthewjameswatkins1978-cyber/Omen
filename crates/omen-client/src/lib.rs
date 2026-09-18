@@ -472,6 +472,22 @@ impl OmenClient {
         }
     }
 
+    pub async fn query_last_execution(
+        &self,
+        session_id: Option<&str>,
+    ) -> Result<Option<String>, LocalIpcError> {
+        let sid = session_id.unwrap_or(&self.session_id).to_string();
+        let resp = self
+            .send_request(RequestPayload::QueryLastExecution { session_id: sid })
+            .await?;
+        match resp {
+            ResponsePayload::LastExecutionResponse { command, .. } => Ok(command),
+            other => Err(LocalIpcError::MalformedRequest(format!(
+                "Expected LastExecutionResponse, got {other:?}"
+            ))),
+        }
+    }
+
     pub async fn report_offline_gap(
         &self,
         modified_paths: Vec<String>,

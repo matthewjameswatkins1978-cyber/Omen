@@ -110,7 +110,8 @@ async fn test_fs_mutation_invalidates_current_facts() {
     let _ = event_rx.recv().await.unwrap();
 
     // Trigger external file mutation directly via helper or filesystem write
-    ws.invalidate_all_current_facts("fs:external mutation").await;
+    ws.invalidate_all_current_facts("fs:external mutation")
+        .await;
 
     // Client must receive FactInvalidated event
     let event = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
@@ -144,8 +145,10 @@ async fn test_event_sequence_gap_triggers_resync_required() {
 
     // Spawn handshake on server side
     tokio::spawn(async move {
-        let _hello: omen_ipc::ClientHello =
-            omen_ipc::read_json_frame(&mut server_stream).await.unwrap().unwrap();
+        let _hello: omen_ipc::ClientHello = omen_ipc::read_json_frame(&mut server_stream)
+            .await
+            .unwrap()
+            .unwrap();
         let daemon_hello = omen_ipc::DaemonHello {
             selected_protocol_version: 1,
             daemon_instance_id: "dmn_test".into(),
@@ -153,7 +156,9 @@ async fn test_event_sequence_gap_triggers_resync_required() {
             supported_features: vec!["events".into()],
             max_frame_size: 1024 * 1024,
         };
-        omen_ipc::write_json_frame(&mut server_stream, &daemon_hello).await.unwrap();
+        omen_ipc::write_json_frame(&mut server_stream, &daemon_hello)
+            .await
+            .unwrap();
 
         // Send sequence 1 event
         let ev1 = IpcEvent::new(

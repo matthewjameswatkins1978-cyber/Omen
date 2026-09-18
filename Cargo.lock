@@ -780,6 +780,7 @@ dependencies = [
  "omen-client",
  "omen-core",
  "omen-engine",
+ "omen-interactive",
  "omen-ipc",
  "omen-knowledge",
  "omen-schema",

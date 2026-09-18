@@ -6,10 +6,11 @@ use tokio::sync::{Mutex, RwLock, broadcast};
 
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 
+use omen_core::{CoreError, ExecutionId, InteractiveSessionId};
 use omen_ipc::{EventPayload, FactInfo, IpcEvent, ManagedServiceInfo, SharedIndexSnapshot};
 use omen_knowledge::{
-    Database, FactRegistry, RequestReceiptRecord, ServiceRecord, WorkspacePersistence,
-    deterministic_workspace_id, resolve_workspace_dir,
+    Database, ExecutionHistory, ExecutionRecord, FactRegistry, RequestReceiptRecord, ServiceRecord,
+    WorkspacePersistence, deterministic_workspace_id, resolve_workspace_dir,
 };
 
 pub struct WorkspaceState {
@@ -159,15 +160,12 @@ impl WorkspaceState {
         let mut watcher = RecommendedWatcher::new(
             move |res: Result<Event, notify::Error>| {
                 if let Ok(event) = res {
-                    let has_relevant_change =
-                        event.paths.iter().any(|p| !Self::is_ignored_path(p));
-                    if has_relevant_change {
-                        if let Some(ws) = this.upgrade() {
-                            let cause = format!("fs:mutation:{:?}", event.kind);
-                            rt_clone.spawn(async move {
-                                ws.invalidate_all_current_facts(&cause).await;
-                            });
-                        }
+                    let has_relevant_change = event.paths.iter().any(|p| !Self::is_ignored_path(p));
+                    if has_relevant_change && let Some(ws) = this.upgrade() {
+                        let cause = format!("fs:mutation:{:?}", event.kind);
+                        rt_clone.spawn(async move {
+                            ws.invalidate_all_current_facts(&cause).await;
+                        });
                     }
                 }
             },
@@ -378,5 +376,58 @@ impl WorkspaceState {
         WorkspacePersistence::get_request_receipt(&db, req_id)
             .ok()
             .flatten()
+    }
+
+    pub fn db(&self) -> Arc<Mutex<Database>> {
+        self.db.clone()
+    }
+
+    pub async fn record_history(
+        &self,
+        session_id: &str,
+        command: &str,
+        exit_code: Option<i32>,
+        duration_ms: u64,
+        stdout_artifact: Option<String>,
+        stderr_artifact: Option<String>,
+    ) -> Result<String, CoreError> {
+        let exec_id_str = format!("exec_{}", uuid::Uuid::new_v4());
+        let execution_id = ExecutionId::new(&exec_id_str)?;
+        let session_id_typed = InteractiveSessionId::new(session_id)?;
+
+        let record = ExecutionRecord {
+            execution_id: execution_id.clone(),
+            session_id: session_id_typed,
+            command: command.to_string(),
+            exit_code,
+            duration_ms: Some(duration_ms as i64),
+            stdout_artifact,
+            stderr_artifact,
+            envelope_json: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+
+        {
+            let mut db = self.db.lock().await;
+            ExecutionHistory::record_execution(&mut db, &record, &[], &[], &[])?;
+        }
+
+        self.broadcast_event(EventPayload::ExecutionRecorded {
+            execution_id: exec_id_str.clone(),
+            session_id: session_id.to_string(),
+            command: command.to_string(),
+            exit_code,
+        });
+
+        Ok(exec_id_str)
+    }
+
+    pub async fn get_last_execution(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<ExecutionRecord>, CoreError> {
+        let sid = InteractiveSessionId::new(session_id)?;
+        let db = self.db.lock().await;
+        ExecutionHistory::get_last_execution(&db, &sid)
     }
 }
