@@ -1,0 +1,21 @@
+[package]
+name = "omen-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+omen-core = { workspace = true }
+omen-knowledge = { workspace = true }
+crossterm = { workspace = true }
+nu-ansi-term = { workspace = true }
+unicode-width = "0.2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

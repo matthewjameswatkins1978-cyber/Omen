@@ -7,6 +7,8 @@ members = [
     "crates/omen-knowledge",
     "crates/omen-atlas",
     "crates/omen-adapters",
+    "crates/omen-ui",
+    "crates/omen-interactive",
     "crates/omen-cli",
     "crates/omen-test-fixtures",
     "crates/xtask",
@@ -30,6 +32,8 @@ omen-engine = { path = "crates/omen-engine", version = "0.2.0" }
 omen-knowledge = { path = "crates/omen-knowledge", version = "0.2.0" }
 omen-atlas = { path = "crates/omen-atlas", version = "0.2.0" }
 omen-adapters = { path = "crates/omen-adapters", version = "0.2.0" }
+omen-ui = { path = "crates/omen-ui", version = "0.2.0" }
+omen-interactive = { path = "crates/omen-interactive", version = "0.2.0" }
 omen-test-fixtures = { path = "crates/omen-test-fixtures", version = "0.2.0" }
 
 serde = { version = "1.0", features = ["derive"] }
@@ -47,3 +51,7 @@ toml = "0.8"
 tempfile = "3.17"
 notify = "8.0"
 chrono = { version = "0.4", features = ["serde"] }
+reedline = "0.51.0"
+crossterm = "0.29.0"
+nu-ansi-term = "0.50.3"
+fuzzy-matcher = "0.3.7"

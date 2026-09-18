@@ -20,7 +20,7 @@ async fn git_adapter_status_and_fact_publishing() {
     let root = repo_root();
 
     let status = GitAdapter::query_status(&supervisor, &root).await.unwrap();
-    assert_eq!(status.branch, "feature/omen-0.2-runtime-proof");
+    assert!(!status.branch.is_empty());
 
     let dir = tempdir().unwrap();
     let mut db = Database::open(&dir.path().join("state.sqlite")).unwrap();
@@ -29,14 +29,14 @@ async fn git_adapter_status_and_fact_publishing() {
         .await
         .unwrap();
 
-    assert_eq!(branch_fact.value, "feature/omen-0.2-runtime-proof");
+    assert_eq!(branch_fact.value, status.branch);
     assert_eq!(branch_fact.validity, ValidityState::Current);
 
     assert_eq!(clean_fact.validity, ValidityState::Current);
 
     // Verify registry can retrieve branch fact
     let retrieved = FactRegistry::get_fact(&db, &branch_fact.resource_uri, true).unwrap();
-    assert_eq!(retrieved.value, "feature/omen-0.2-runtime-proof");
+    assert_eq!(retrieved.value, status.branch);
 }
 
 #[tokio::test]
