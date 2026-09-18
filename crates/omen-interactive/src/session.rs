@@ -109,6 +109,21 @@ impl InteractiveSession {
 
     /// Dispatches entered input: ordinary executable, semantic action (:), or AI lane (?).
     pub fn dispatch_input(&mut self, input: &str) -> Result<ProcessExit, CoreError> {
+        // Intercept multiline paste buffer before execution
+        if let Some(review) = crate::preflight::PasteGuard::inspect(input) {
+            println!(
+                "[Paste Guard] {} lines detected in paste buffer. Review before execution:",
+                review.line_count
+            );
+            for (i, line) in review.lines.iter().enumerate() {
+                println!("  [{}] {}", i + 1, line);
+            }
+            return Ok(ProcessExit {
+                code: Some(0),
+                signal: None,
+            });
+        }
+
         let lane = crate::grammar::GrammarScanner::scan(input)?;
 
         match lane {
@@ -144,6 +159,14 @@ impl InteractiveSession {
                     &self.session_id,
                     self.db.as_ref(),
                 );
+
+                // Blast-Radius Preflight assessment
+                if let Some(blast) = crate::preflight::BlastPreflight::assess(&resolved_argv) {
+                    println!(
+                        "[Preflight Warning: {:?}] Command '{}' will affect: {}",
+                        blast.severity, blast.command, blast.summary
+                    );
+                }
 
                 let cmd_name = &resolved_argv[0];
 
