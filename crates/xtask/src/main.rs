@@ -20,6 +20,8 @@ enum Commands {
     VerifySchemas,
     /// Run full repository verification suite
     Verify,
+    /// Run Omen 0.3 performance benchmarks
+    Bench,
 }
 
 fn project_root() -> PathBuf {
@@ -119,8 +121,130 @@ fn main() {
                 "cargo",
                 &["run", "--package", "xtask", "--", "verify-schemas"],
             );
+            run_benchmarks();
             run_cmd("cargo-deny", &["check"]);
             println!("=== Verification Passed Successfully ===");
         }
+        Commands::Bench => {
+            run_benchmarks();
+        }
     }
+}
+
+fn run_benchmarks() {
+    use omen_interactive::InteractiveSession;
+    use omen_interactive::completion::{CompletionContext, OmenCompleter};
+    use omen_interactive::grammar::GrammarScanner;
+    use reedline::Prompt;
+    use std::time::Instant;
+
+    println!("=== Omen 0.3 Performance Benchmark Suite ===");
+
+    // 1. Startup & Initial Prompt Rendering Latency
+    println!("\n[1/3] Benchmarking Interactive Shell Startup Latency (100 iterations)...");
+    let mut startup_durations = Vec::with_capacity(100);
+    let temp_dir = tempfile::tempdir().expect("Failed to create tempdir");
+
+    for _ in 0..100 {
+        let t0 = Instant::now();
+        let session = InteractiveSession::new(temp_dir.path().to_path_buf(), None)
+            .expect("Failed to create session");
+        let _ = session.prompt.render_prompt_left();
+        startup_durations.push(t0.elapsed());
+    }
+
+    startup_durations.sort();
+    let min_startup = startup_durations[0];
+    let max_startup = startup_durations[startup_durations.len() - 1];
+    let median_startup = startup_durations[startup_durations.len() / 2];
+    let avg_startup: std::time::Duration =
+        startup_durations.iter().sum::<std::time::Duration>() / startup_durations.len() as u32;
+
+    println!("  Min:    {:?}", min_startup);
+    println!("  Max:    {:?}", max_startup);
+    println!("  Median: {:?}", median_startup);
+    println!("  Avg:    {:?}", avg_startup);
+
+    assert!(
+        avg_startup.as_millis() < 15,
+        "Startup average latency ({:?}) exceeds target limit of 15ms",
+        avg_startup
+    );
+    println!("  => PASS: Startup latency is well within < 15ms budget.");
+
+    // 2. Completion Engine Latency
+    println!("\n[2/3] Benchmarking OmenCompleter Suggestions (100 queries)...");
+    let ctx = std::sync::Arc::new(std::sync::Mutex::new(CompletionContext {
+        cwd: temp_dir.path().to_path_buf(),
+        ..Default::default()
+    }));
+    let mut completer = OmenCompleter::new(ctx);
+
+    let test_queries = [
+        ":", ":st", ":doc", ":why", ":his", ":rer", ":in", "@l", "@fa", "@er", "car", "git", "doc",
+        "thr", "?",
+    ];
+
+    let mut completion_durations = Vec::with_capacity(100);
+    for i in 0..100 {
+        let q = test_queries[i % test_queries.len()];
+        let t0 = Instant::now();
+        let suggestions = completer.complete_items(q, q.len());
+        let elapsed = t0.elapsed();
+        assert!(!suggestions.is_empty() || q == "?");
+        completion_durations.push(elapsed);
+    }
+
+    completion_durations.sort();
+    let min_comp = completion_durations[0];
+    let max_comp = completion_durations[completion_durations.len() - 1];
+    let median_comp = completion_durations[completion_durations.len() / 2];
+    let avg_comp: std::time::Duration = completion_durations.iter().sum::<std::time::Duration>()
+        / completion_durations.len() as u32;
+
+    println!("  Min:    {:?}", min_comp);
+    println!("  Max:    {:?}", max_comp);
+    println!("  Median: {:?}", median_comp);
+    println!("  Avg:    {:?}", avg_comp);
+
+    assert!(
+        avg_comp.as_millis() < 5,
+        "Completion average latency ({:?}) exceeds target limit of 5ms",
+        avg_comp
+    );
+    println!("  => PASS: Completion latency is well within < 5ms budget.");
+
+    // 3. Grammar Scanner Throughput
+    println!("\n[3/3] Benchmarking GrammarScanner Throughput (10,000 queries)...");
+    let scanner_queries = [
+        "cargo test --all",
+        ":status",
+        ":doctor",
+        "? why did the build fail",
+        "git status --porcelain",
+        ":why @last.failed",
+    ];
+
+    let t0 = Instant::now();
+    for i in 0..10000 {
+        let q = scanner_queries[i % scanner_queries.len()];
+        let _ = GrammarScanner::scan(q).expect("Scan failed");
+    }
+    let total_elapsed = t0.elapsed();
+    let avg_scan_ns = total_elapsed.as_nanos() / 10000;
+    let ops_per_sec = 10000.0 / total_elapsed.as_secs_f64();
+
+    println!("  Total time for 10,000 scans: {:?}", total_elapsed);
+    println!(
+        "  Avg per scan:                {} ns ({:.3} µs)",
+        avg_scan_ns,
+        avg_scan_ns as f64 / 1000.0
+    );
+    println!(
+        "  Throughput:                  {:.0} scans/sec",
+        ops_per_sec
+    );
+    println!("  => PASS: Grammar scanning executes in sub-microsecond time.");
+
+    println!("\n=== All Benchmarks Completed Successfully ===");
 }

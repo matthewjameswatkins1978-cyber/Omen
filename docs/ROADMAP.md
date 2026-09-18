@@ -15,19 +15,19 @@
 - [x] M9: Tethers execution contract fixture.
 - [x] M10: CLI commands and 0.2 Implementation Report.
 
-## Version 0.3: Human Interface (Current)
-- [ ] H0: Architecture & dependency freeze (Reedline, Crossterm, nu-ansi-term, fuzzy-matcher).
-- [ ] H1: Interactive shell core & terminal lifecycle (raw mode, child process handoff, dumb degradation).
-- [ ] H2: Semantic grammar (`:action`, `@reference`, `? query`).
-- [ ] H3: Fact-aware completion & ghost suggestions.
-- [ ] H4: Execution history, session identity (`InteractiveSessionId`), and typed references (`@last`, `@failed`).
-- [ ] H5: Human diagnostics & explanations (Levels 0-3 progressive disclosure, `:why`).
-- [ ] H6: Semantic blocks & terminal integration (OSC 7, OSC 8, OSC 133).
-- [ ] H7: Blast radius preflight & Paste Guard.
-- [ ] H8: Services & process UX.
-- [ ] H9: Optional AI reasoning lane boundary.
-- [ ] H10: Human/Agent shared-reality proof.
-- [ ] H11: Performance benchmarks, cross-platform verification, docs & closeout.
+## Version 0.3: Human Interface (Complete)
+- [x] H0: Architecture & dependency freeze (Reedline, Crossterm, nu-ansi-term, fuzzy-matcher).
+- [x] H1: Interactive shell core & terminal lifecycle (raw mode, child process handoff, dumb degradation).
+- [x] H2: Semantic grammar (`:action`, `@reference`, `? query`).
+- [x] H3: Fact-aware completion & ghost suggestions.
+- [x] H4: Execution history, session identity (`InteractiveSessionId`), and typed references (`@last`, `@failed`).
+- [x] H5: Human diagnostics & explanations (Levels 0-3 progressive disclosure, `:why`).
+- [x] H6: Semantic blocks & terminal integration (OSC 7, OSC 8, OSC 133).
+- [x] H7: Blast radius preflight & Paste Guard.
+- [x] H8: Services & process UX.
+- [x] H9: Optional AI reasoning lane boundary.
+- [x] H10: Human/Agent shared-reality proof.
+- [x] H11: Performance benchmarks, cross-platform verification, docs & closeout.
 
 ## Future Versions (Post-0.3)
 - **Omen 0.4**: Daemon architecture (`omend`) with local IPC/named pipes and cross-process coordination.

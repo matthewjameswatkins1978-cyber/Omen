@@ -1621,9 +1621,15 @@ name = "xtask"
 version = "0.2.0"
 dependencies = [
  "clap",
+ "omen-core",
+ "omen-interactive",
+ "omen-knowledge",
  "omen-schema",
+ "omen-ui",
+ "reedline",
  "schemars",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
