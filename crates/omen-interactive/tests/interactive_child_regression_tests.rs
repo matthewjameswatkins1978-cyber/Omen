@@ -122,7 +122,7 @@ fn test_interactive_children_record_execution_history() {
     let (test_cmd, expected_sub) = if cfg!(windows) {
         ("--interactive cmd /c exit 0", "cmd /c exit 0")
     } else {
-        ("--interactive sh -c 'exit 0'", "sh -c 'exit 0'")
+        ("--interactive true", "true")
     };
 
     let exit = session.dispatch_input(test_cmd).unwrap();
