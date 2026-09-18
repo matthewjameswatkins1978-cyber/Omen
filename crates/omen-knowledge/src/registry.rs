@@ -443,4 +443,99 @@ impl FactRegistry {
             history,
         })
     }
+
+    pub fn list_active_facts(
+        db: &crate::db::Database,
+        limit: usize,
+    ) -> Result<Vec<FactRecord>, CoreError> {
+        let mut stmt = db
+            .conn()
+            .prepare(
+                r#"
+                SELECT fact_id, resource_uri, value, validity, assurance, producer, witness, superseded_by, created_at
+                FROM facts
+                WHERE validity = 'CURRENT' OR validity = 'DIRTY'
+                ORDER BY created_at DESC
+                LIMIT ?1
+                "#,
+            )
+            .map_err(|e| CoreError::Internal(format!("Failed to prepare list_active_facts: {e}")))?;
+
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
+                let fid: String = row.get(0)?;
+                let ruri: String = row.get(1)?;
+                let val: String = row.get(2)?;
+                let val_state: String = row.get(3)?;
+                let ass: String = row.get(4)?;
+                let prod: String = row.get(5)?;
+                let wit: Option<String> = row.get(6)?;
+                let sby: Option<String> = row.get(7)?;
+                let cr: String = row.get(8)?;
+
+                let validity = match val_state.as_str() {
+                    "CURRENT" => ValidityState::Current,
+                    "DIRTY" => ValidityState::Dirty,
+                    "STALE" => ValidityState::Stale,
+                    "SUPERSEDED" => ValidityState::Superseded,
+                    _ => ValidityState::Historical,
+                };
+
+                let assurance = match ass.as_str() {
+                    "DETERMINISTIC" => Assurance::Deterministic,
+                    "VERIFIED" => Assurance::Verified,
+                    "ENFORCED" => Assurance::Enforced,
+                    "OBSERVED" => Assurance::Observed,
+                    "CLAIMED" => Assurance::Claimed,
+                    "INFERRED" => Assurance::Inferred,
+                    _ => Assurance::Unknown,
+                };
+
+                let fact_id = FactId::new(fid).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
+
+                let resource_uri = ResourceUri::parse(&ruri).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
+
+                let superseded_by = match sby {
+                    Some(s) => Some(FactId::new(s).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            7,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?),
+                    None => None,
+                };
+
+                Ok(FactRecord {
+                    fact_id,
+                    resource_uri,
+                    value: val,
+                    validity,
+                    assurance,
+                    producer: prod,
+                    witness: wit,
+                    superseded_by,
+                    created_at: cr,
+                })
+            })
+            .map_err(|e| CoreError::Internal(format!("Failed to query active facts: {e}")))?;
+
+        let mut facts = Vec::new();
+        for item in rows {
+            facts.push(item.map_err(|e| CoreError::Internal(e.to_string()))?);
+        }
+        Ok(facts)
+    }
 }

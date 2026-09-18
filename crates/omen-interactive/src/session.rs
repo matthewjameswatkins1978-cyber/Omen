@@ -4,7 +4,7 @@ use omen_core::{CoreError, InteractiveSessionId, ProcessExit, RequiredAssurance,
 use omen_engine::{ExecutionRequest, ProcessSupervisor};
 use omen_knowledge::Database;
 use omen_ui::TerminalCapabilities;
-use reedline::{DefaultValidator, Reedline, Signal};
+use reedline::{DefaultValidator, MenuBuilder, Reedline, Signal};
 use sha2::Digest;
 use std::path::PathBuf;
 
@@ -41,7 +41,36 @@ impl InteractiveSession {
 
     /// Runs the interactive REPL loop.
     pub fn run_loop(&mut self) -> Result<(), CoreError> {
-        let mut line_editor = Reedline::create().with_validator(Box::new(DefaultValidator));
+        let comp_ctx = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::completion::CompletionContext {
+                cwd: self.cwd.clone(),
+                db: None,
+                ..Default::default()
+            },
+        ));
+        let completer = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::completion::OmenCompleter::new(comp_ctx),
+        ));
+        let hinter = Box::new(crate::completion::OmenHinter::new(completer.clone()));
+        let completion_menu =
+            Box::new(reedline::ColumnarMenu::default().with_name("completion_menu"));
+
+        struct CompleterAdapter(std::sync::Arc<std::sync::Mutex<crate::completion::OmenCompleter>>);
+        impl reedline::Completer for CompleterAdapter {
+            fn complete(&mut self, line: &str, pos: usize) -> reedline::CompletionResult {
+                if let Ok(mut c) = self.0.lock() {
+                    c.complete(line, pos)
+                } else {
+                    reedline::CompletionResult::fresh(Vec::new())
+                }
+            }
+        }
+
+        let mut line_editor = Reedline::create()
+            .with_validator(Box::new(DefaultValidator))
+            .with_completer(Box::new(CompleterAdapter(completer)))
+            .with_hinter(hinter)
+            .with_menu(reedline::ReedlineMenu::EngineCompleter(completion_menu));
 
         loop {
             let sig = line_editor.read_line(&self.prompt);
