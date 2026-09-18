@@ -1,0 +1,17 @@
+tool_id = "tool://threadmoth"
+binary_name = "threadmoth"
+description = "Deterministic bounded structural mutation tool with pre/post hashes and refusal semantics"
+understanding = "ADAPTED"
+stdin_mode = "closed"
+
+[probes]
+version_args = ["--version"]
+health_args = ["doctor", "--json"]
+capabilities_args = ["capabilities", "--json"]
+
+[structured_output]
+supported = true
+canonical_interface = "mutate --request"
+preview_interface = "preview --request"
+doctor_json = true
+capabilities_json = true

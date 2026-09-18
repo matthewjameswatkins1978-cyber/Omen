@@ -1,0 +1,14 @@
+tool_id = "tool://git"
+binary_name = "git"
+description = "Distributed version control system with machine-readable porcelain v2 output"
+understanding = "ADAPTED"
+stdin_mode = "closed"
+
+[probes]
+version_args = ["--version"]
+
+[structured_output]
+supported = true
+status_format = "--porcelain=v2 -z"
+branch_format = "--show-current"
+rev_parse = true

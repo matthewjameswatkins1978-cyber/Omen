@@ -1,0 +1,13 @@
+tool_id = "tool://rg"
+binary_name = "rg"
+description = "Fast line-oriented structured search tool with streaming JSON output"
+understanding = "ADAPTED"
+stdin_mode = "closed"
+
+[probes]
+version_args = ["--version"]
+
+[structured_output]
+supported = true
+json_flag = "--json"
+bounded_preview = true

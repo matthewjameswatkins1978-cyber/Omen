@@ -1,0 +1,15 @@
+tool_id = "tool://cargo"
+binary_name = "cargo"
+description = "Rust package manager and build system with machine-readable diagnostics"
+understanding = "ADAPTED"
+stdin_mode = "closed"
+
+[probes]
+version_args = ["--version"]
+metadata_args = ["metadata", "--format-version", "1", "--no-deps"]
+
+[structured_output]
+supported = true
+build_message_format = "json"
+metadata_format_version = 1
+nextest_optional = true

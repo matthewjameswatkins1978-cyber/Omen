@@ -511,10 +511,17 @@ dependencies = [
 name = "omen-atlas"
 version = "0.2.0"
 dependencies = [
+ "chrono",
+ "hex",
  "omen-core",
+ "omen-engine",
  "omen-schema",
  "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
  "thiserror",
+ "tokio",
  "toml",
  "tracing",
 ]
