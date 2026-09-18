@@ -121,13 +121,17 @@ pub enum ResponsePayload {
         name: String,
     },
     ServiceRestarted(ManagedServiceInfo),
-    ServicesList(Vec<ManagedServiceInfo>),
+    ServicesList {
+        services: Vec<ManagedServiceInfo>,
+    },
     ServiceLogsResponse {
         name: String,
         lines: Vec<String>,
         cas_uri: Option<String>,
     },
-    FactResponse(Option<FactInfo>),
+    FactResponse {
+        fact: Option<FactInfo>,
+    },
     HistoryRecorded,
     OfflineGapAcknowledged,
     Success,
@@ -245,4 +249,47 @@ pub struct ExecutionStatusRecord {
     pub consequential_request_id: String,
     pub execution_id: Option<String>,
     pub status: ExecutionStatusCode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum DaemonMessage {
+    Response(IpcResponse),
+    Event(IpcEvent),
+}
+
+impl DaemonMessage {
+    pub fn is_response(&self) -> bool {
+        matches!(self, DaemonMessage::Response(_))
+    }
+
+    pub fn is_event(&self) -> bool {
+        matches!(self, DaemonMessage::Event(_))
+    }
+
+    pub fn as_response(&self) -> Option<&IpcResponse> {
+        match self {
+            DaemonMessage::Response(r) => Some(r),
+            _ => None,
+        }
+    }
+
+    pub fn as_event(&self) -> Option<&IpcEvent> {
+        match self {
+            DaemonMessage::Event(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<IpcResponse> for DaemonMessage {
+    fn from(r: IpcResponse) -> Self {
+        DaemonMessage::Response(r)
+    }
+}
+
+impl From<IpcEvent> for DaemonMessage {
+    fn from(e: IpcEvent) -> Self {
+        DaemonMessage::Event(e)
+    }
 }

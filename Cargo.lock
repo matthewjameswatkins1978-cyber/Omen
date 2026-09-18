@@ -744,7 +744,9 @@ dependencies = [
 name = "omen-client"
 version = "0.2.0"
 dependencies = [
+ "chrono",
  "omen-core",
+ "omen-daemon",
  "omen-ipc",
  "omen-schema",
  "serde",
@@ -772,6 +774,7 @@ version = "0.2.0"
 dependencies = [
  "chrono",
  "clap",
+ "hex",
  "notify",
  "omen-atlas",
  "omen-client",
@@ -783,6 +786,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",

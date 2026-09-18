@@ -1,6 +1,6 @@
 use crate::error::LocalIpcError;
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024; // 1 MiB hard ceiling
@@ -28,10 +28,9 @@ where
 
     let mut payload = vec![0u8; len];
     if len > 0 {
-        reader
-            .read_exact(&mut payload)
-            .await
-            .map_err(|e| LocalIpcError::MalformedRequest(format!("Truncated frame payload: {e}")))?;
+        reader.read_exact(&mut payload).await.map_err(|e| {
+            LocalIpcError::MalformedRequest(format!("Truncated frame payload: {e}"))
+        })?;
     }
 
     Ok(Some(payload))
@@ -78,8 +77,9 @@ where
 {
     match read_frame(reader).await? {
         Some(bytes) => {
-            let msg = serde_json::from_slice::<T>(&bytes)
-                .map_err(|e| LocalIpcError::MalformedRequest(format!("Failed to parse JSON: {e}")))?;
+            let msg = serde_json::from_slice::<T>(&bytes).map_err(|e| {
+                LocalIpcError::MalformedRequest(format!("Failed to parse JSON: {e}"))
+            })?;
             Ok(Some(msg))
         }
         None => Ok(None),

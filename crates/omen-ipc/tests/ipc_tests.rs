@@ -161,3 +161,44 @@ async fn test_event_envelope_roundtrip() {
     let received: Option<IpcEvent> = read_json_frame(&mut receiver).await.unwrap();
     assert_eq!(received, Some(event));
 }
+
+#[tokio::test]
+async fn test_daemon_message_untagged_deserialization() {
+    let (mut sender, mut receiver) = omen_ipc::PlatformStream::duplex_pair(2048);
+
+    // 1. Send IpcResponse as DaemonMessage
+    let response = IpcResponse::ok(
+        "req-1",
+        ResponsePayload::Pong {
+            timestamp_ms: 1234567,
+        },
+    );
+    write_json_frame(&mut sender, &DaemonMessage::Response(response.clone()))
+        .await
+        .unwrap();
+
+    let msg1: Option<DaemonMessage> = read_json_frame(&mut receiver).await.unwrap();
+    match msg1 {
+        Some(DaemonMessage::Response(r)) => assert_eq!(r, response),
+        other => panic!("Expected DaemonMessage::Response, got {other:?}"),
+    }
+
+    // 2. Send IpcEvent as DaemonMessage
+    let event = IpcEvent::new(
+        "ws-1",
+        2,
+        100,
+        EventPayload::ResyncRequired {
+            reason: "gap".into(),
+        },
+    );
+    write_json_frame(&mut sender, &DaemonMessage::Event(event.clone()))
+        .await
+        .unwrap();
+
+    let msg2: Option<DaemonMessage> = read_json_frame(&mut receiver).await.unwrap();
+    match msg2 {
+        Some(DaemonMessage::Event(e)) => assert_eq!(e, event),
+        other => panic!("Expected DaemonMessage::Event, got {other:?}"),
+    }
+}
