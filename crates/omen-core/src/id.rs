@@ -1,5 +1,7 @@
+use crate::error::CoreError;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::str::FromStr;
 
 macro_rules! define_id {
     ($name:ident, $prefix:literal) => {
@@ -8,8 +10,23 @@ macro_rules! define_id {
         pub struct $name(pub String);
 
         impl $name {
-            pub fn new(id: impl Into<String>) -> Self {
-                Self(id.into())
+            pub fn new(id: impl Into<String>) -> Result<Self, CoreError> {
+                let s = id.into();
+                if s.trim().is_empty() {
+                    return Err(CoreError::InvalidId(format!(
+                        "{} identifier cannot be empty",
+                        stringify!($name)
+                    )));
+                }
+                // Disallow newlines, control characters, or non-printable ASCII
+                if s.chars().any(|c| c.is_control()) {
+                    return Err(CoreError::InvalidId(format!(
+                        "{} identifier contains control characters: {:?}",
+                        stringify!($name),
+                        s
+                    )));
+                }
+                Ok(Self(s))
             }
 
             pub fn as_str(&self) -> &str {
@@ -29,15 +46,10 @@ macro_rules! define_id {
             }
         }
 
-        impl From<&str> for $name {
-            fn from(s: &str) -> Self {
-                Self(s.to_string())
-            }
-        }
-
-        impl From<String> for $name {
-            fn from(s: String) -> Self {
-                Self(s)
+        impl FromStr for $name {
+            type Err = CoreError;
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                Self::new(s)
             }
         }
     };
