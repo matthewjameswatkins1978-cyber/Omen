@@ -3,22 +3,37 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use omen_core::ValidityState;
 use omen_knowledge::{Database, FactRegistry};
 use reedline::{Completer, CompletionResult, Hinter, Span, Suggestion};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-pub struct CompletionContext {
-    pub cwd: PathBuf,
-    pub db: Option<Arc<Mutex<Database>>>,
+/// Cached active fact entry in the hot semantic index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedFact {
+    pub resource_uri: String,
+    pub validity: ValidityState,
+}
+
+/// Bounded hot semantic cache owned per-session in Omen 0.3.
+/// This guarantees zero SQLite queries and zero filesystem scans on the keystroke-critical path.
+#[derive(Debug, Clone)]
+pub struct HotSemanticIndex {
+    /// Bounded active facts from the Fact Registry (up to 100).
+    pub active_facts: Vec<CachedFact>,
+    /// Bounded immediate filesystem entries in current working directory (up to 200).
+    pub workspace_entries: Vec<String>,
+    /// Atlas-registered tools.
     pub known_tools: Vec<String>,
+    /// Registered semantic actions.
     pub known_actions: Vec<String>,
+    /// Dynamic typed references.
     pub static_refs: Vec<String>,
 }
 
-impl Default for CompletionContext {
+impl Default for HotSemanticIndex {
     fn default() -> Self {
         Self {
-            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            db: None,
+            active_facts: Vec::new(),
+            workspace_entries: Vec::new(),
             known_tools: vec![
                 "threadmoth".into(),
                 "cargo".into(),
@@ -44,6 +59,49 @@ impl Default for CompletionContext {
                 "@failed".into(),
                 "@errors".into(),
             ],
+        }
+    }
+}
+
+impl HotSemanticIndex {
+    /// Refreshes the hot index from the SQLite database and current working directory.
+    /// Executed strictly out-of-band (e.g. before prompt display or after execution),
+    /// never on keystrokes.
+    pub fn refresh(&mut self, cwd: &Path, db: Option<&Database>) {
+        if let Some(db_conn) = db {
+            if let Ok(facts) = FactRegistry::list_active_facts(db_conn, 100) {
+                self.active_facts = facts
+                    .into_iter()
+                    .map(|f| CachedFact {
+                        resource_uri: f.resource_uri.to_string(),
+                        validity: f.validity,
+                    })
+                    .collect();
+            }
+        } else {
+            self.active_facts.clear();
+        }
+
+        self.workspace_entries.clear();
+        if let Ok(entries) = std::fs::read_dir(cwd) {
+            for entry in entries.flatten().take(200) {
+                self.workspace_entries
+                    .push(entry.file_name().to_string_lossy().to_string());
+            }
+        }
+    }
+}
+
+pub struct CompletionContext {
+    pub cwd: PathBuf,
+    pub hot_index: HotSemanticIndex,
+}
+
+impl Default for CompletionContext {
+    fn default() -> Self {
+        Self {
+            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            hot_index: HotSemanticIndex::default(),
         }
     }
 }
@@ -84,13 +142,13 @@ impl OmenCompleter {
         let mut candidates: Vec<(String, Option<String>, i64)> = Vec::new();
 
         if word.starts_with(':') {
-            for action in &ctx.known_actions {
+            for action in &ctx.hot_index.known_actions {
                 if let Some(score) = self.matcher.fuzzy_match(action, word) {
                     candidates.push((action.clone(), Some("semantic action".into()), score));
                 }
             }
         } else if word.starts_with('@') {
-            for r in &ctx.static_refs {
+            for r in &ctx.hot_index.static_refs {
                 if let Some(score) = self.matcher.fuzzy_match(r, word) {
                     let mut score_adj = score;
                     if r == "@failed" || r == "@errors" {
@@ -99,34 +157,34 @@ impl OmenCompleter {
                     candidates.push((r.clone(), Some("typed reference".into()), score_adj));
                 }
             }
-            if let Some(db_arc) = &ctx.db
-                && let Ok(db) = db_arc.lock()
-                && let Ok(facts) = FactRegistry::list_active_facts(&db, 50)
-            {
-                for f in facts {
-                    let ref_str = format!("@{}", f.resource_uri);
-                    if let Some(score) = self.matcher.fuzzy_match(&ref_str, word) {
-                        let mut final_score = score;
-                        if f.validity == ValidityState::Dirty {
-                            final_score += 50; // elevate dirty facts
-                        }
-                        candidates.push((
-                            ref_str,
-                            Some(format!("fact ({:?})", f.validity)),
-                            final_score,
-                        ));
+            for f in &ctx.hot_index.active_facts {
+                let ref_str = format!("@{}", f.resource_uri);
+                if let Some(score) = self.matcher.fuzzy_match(&ref_str, word) {
+                    let mut final_score = score;
+                    if f.validity == ValidityState::Dirty {
+                        final_score += 50; // elevate dirty facts
                     }
+                    candidates.push((
+                        ref_str,
+                        Some(format!("fact ({:?})", f.validity)),
+                        final_score,
+                    ));
                 }
             }
         } else if start == 0 {
-            for tool in &ctx.known_tools {
+            for tool in &ctx.hot_index.known_tools {
                 if let Some(score) = self.matcher.fuzzy_match(tool, word) {
                     candidates.push((tool.clone(), Some("known tool".into()), score));
                 }
             }
-            for action in &ctx.known_actions {
+            for action in &ctx.hot_index.known_actions {
                 if let Some(score) = self.matcher.fuzzy_match(action, word) {
                     candidates.push((action.clone(), Some("semantic action".into()), score));
+                }
+            }
+            for name in &ctx.hot_index.workspace_entries {
+                if let Some(score) = self.matcher.fuzzy_match(name, word) {
+                    candidates.push((name.clone(), Some("workspace entry".into()), score));
                 }
             }
         } else {
@@ -166,18 +224,15 @@ impl OmenCompleter {
                 _ => {}
             }
 
-            for r in &ctx.static_refs {
+            for r in &ctx.hot_index.static_refs {
                 if let Some(score) = self.matcher.fuzzy_match(r, word) {
                     candidates.push((r.clone(), Some("typed reference".into()), score));
                 }
             }
 
-            if let Ok(entries) = std::fs::read_dir(&ctx.cwd) {
-                for entry in entries.flatten() {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if let Some(score) = self.matcher.fuzzy_match(&name, word) {
-                        candidates.push((name, Some("path".into()), score));
-                    }
+            for name in &ctx.hot_index.workspace_entries {
+                if let Some(score) = self.matcher.fuzzy_match(name, word) {
+                    candidates.push((name.clone(), Some("path".into()), score));
                 }
             }
         }

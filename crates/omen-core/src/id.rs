@@ -64,3 +64,10 @@ define_id!(ArtifactId, "artifact");
 define_id!(ProcessId, "proc");
 define_id!(InteractiveSessionId, "sess");
 define_id!(OperationId, "op");
+
+impl InteractiveSessionId {
+    /// Generates a genuinely unique opaque session ID using UUID v4.
+    pub fn generate() -> Self {
+        Self(format!("sess-{}", uuid::Uuid::new_v4()))
+    }
+}

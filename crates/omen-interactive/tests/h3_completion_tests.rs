@@ -109,10 +109,11 @@ fn test_fact_aware_ranking_elevates_dirty_facts() {
     let fact_b = FactRegistry::get_fact(&db, &res_b, false).unwrap();
     assert_eq!(fact_b.validity, ValidityState::Dirty);
 
+    let mut hot_index = omen_interactive::completion::HotSemanticIndex::default();
+    hot_index.refresh(dir.path(), Some(&db));
     let ctx = Arc::new(Mutex::new(CompletionContext {
         cwd: dir.path().to_path_buf(),
-        db: Some(Arc::new(Mutex::new(db))),
-        ..Default::default()
+        hot_index,
     }));
     let mut completer = OmenCompleter::new(ctx);
 

@@ -16,14 +16,12 @@ pub struct InteractiveSession {
     pub prompt: OmenPrompt,
     pub last_exit: Option<ProcessExit>,
     pub db: Option<Database>,
+    pub comp_ctx: std::sync::Arc<std::sync::Mutex<crate::completion::CompletionContext>>,
 }
 
 impl InteractiveSession {
     pub fn new(cwd: PathBuf, db: Option<Database>) -> Result<Self, CoreError> {
-        let session_id = InteractiveSessionId::new(format!(
-            "sess-{}",
-            &hex::encode(sha2::Sha256::digest(cwd.to_string_lossy().as_bytes()))[..12]
-        ))?;
+        let session_id = InteractiveSessionId::generate();
         Self::new_with_session_id(session_id, cwd, db)
     }
 
@@ -36,6 +34,15 @@ impl InteractiveSession {
         let caps = TerminalCapabilities::detect();
         let prompt = OmenPrompt::new(cwd.clone(), None, 0, false, caps.clone());
 
+        let mut hot_index = crate::completion::HotSemanticIndex::default();
+        hot_index.refresh(&cwd, db.as_ref());
+        let comp_ctx = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::completion::CompletionContext {
+                cwd: cwd.clone(),
+                hot_index,
+            },
+        ));
+
         let mut sess = Self {
             session_id,
             cwd,
@@ -44,6 +51,7 @@ impl InteractiveSession {
             prompt,
             last_exit: None,
             db,
+            comp_ctx,
         };
         sess.update_prompt_state();
         Ok(sess)
@@ -51,15 +59,8 @@ impl InteractiveSession {
 
     /// Runs the interactive REPL loop.
     pub fn run_loop(&mut self) -> Result<(), CoreError> {
-        let comp_ctx = std::sync::Arc::new(std::sync::Mutex::new(
-            crate::completion::CompletionContext {
-                cwd: self.cwd.clone(),
-                db: None,
-                ..Default::default()
-            },
-        ));
         let completer = std::sync::Arc::new(std::sync::Mutex::new(
-            crate::completion::OmenCompleter::new(comp_ctx),
+            crate::completion::OmenCompleter::new(self.comp_ctx.clone()),
         ));
         let hinter = Box::new(crate::completion::OmenHinter::new(completer.clone()));
         let completion_menu =
@@ -193,12 +194,49 @@ impl InteractiveSession {
                     );
                 }
 
-                let cmd_name = &resolved_argv[0];
-
-                // 1. Interactive child handoff if command is interactive
-                if ChildHandoff::is_interactive_command(cmd_name) {
+                // 1. Interactive child handoff if invocation requires terminal ownership
+                if ChildHandoff::classify(&resolved_argv)
+                    == crate::child::ChildClassification::InteractiveHandoff
+                {
+                    let start_t = std::time::Instant::now();
                     let exit = ChildHandoff::spawn_interactive(&resolved_argv, &self.cwd)?;
+                    let duration_ms = start_t.elapsed().as_millis() as i64;
                     self.last_exit = Some(exit.clone());
+
+                    // Record interactive execution in subordinate physical history
+                    if let Some(db_ref) = &mut self.db {
+                        let now = chrono::Utc::now().to_rfc3339();
+                        let exec_id = omen_core::ExecutionId::new(format!(
+                            "exec-{}",
+                            &hex::encode(sha2::Sha256::digest(
+                                format!(
+                                    "{}-{:?}",
+                                    resolved_argv.join(" "),
+                                    std::time::SystemTime::now()
+                                )
+                                .as_bytes()
+                            ))[..12]
+                        ))?;
+                        let exec_rec = omen_knowledge::ExecutionRecord {
+                            execution_id: exec_id,
+                            session_id: self.session_id.clone(),
+                            command: resolved_argv.join(" "),
+                            exit_code: exit.code,
+                            duration_ms: Some(duration_ms),
+                            stdout_artifact: None,
+                            stderr_artifact: None,
+                            envelope_json: None,
+                            created_at: now,
+                        };
+                        let _ = omen_knowledge::ExecutionHistory::record_execution(
+                            db_ref,
+                            &exec_rec,
+                            &[],
+                            &[],
+                            &[],
+                        );
+                    }
+
                     self.update_prompt_state();
                     return Ok(exit);
                 }
@@ -338,5 +376,11 @@ impl InteractiveSession {
 
         self.prompt
             .update_state(self.cwd.clone(), None, dirty_count, has_failure);
+
+        // Refresh bounded hot semantic index out-of-band for completion
+        if let Ok(mut ctx) = self.comp_ctx.lock() {
+            ctx.cwd = self.cwd.clone();
+            ctx.hot_index.refresh(&self.cwd, self.db.as_ref());
+        }
     }
 }

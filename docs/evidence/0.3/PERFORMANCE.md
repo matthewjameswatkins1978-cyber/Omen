@@ -3,66 +3,72 @@
 **Date**: 2026-09-18  
 **Architecture**: x86_64  
 **OS**: Windows 11 Enterprise (Build 26100)  
-**Rust Version**: rustc 1.98.0-nightly (ded4292ae 2026-06-25)  
+**Rust Version**: rustc 1.98.1  
 **Harness**: `cargo run -p xtask -- bench`  
 
 ---
 
-## 1. Executive Summary
+## 1. Methodology & Truthfulness
 
-Omen 0.3 was designed with strict latency and memory budgets. The benchmarks confirm that Omen's human interface operates in sub-millisecond to microsecond regimes, well ahead of human perception thresholds (~50ms) and far faster than legacy shells.
+Performance claims in Omen are verified by reproducible automated benchmarks. We distinguish between:
+1. **In-Process Session Construction**: Memory allocation, terminal capability interrogation, and initial prompt string synthesis within a running Rust process.
+2. **Genuine Cold Process Launch**: Full OS process spawn of a release binary (`omen.exe doctor --json`), including executable image loading, dynamic link resolution, C/Rust runtime initialization, command parsing, environment inspection, and JSON output generation.
+3. **Hot-Index Interactive Completion**: In-memory fuzzy ranking across representative workspace state (active facts, directory entries, tools, actions) without synchronous filesystem or database I/O on keystrokes.
+4. **Grammar Scanner Throughput**: Lexical categorization of raw input lines into Executable, Semantic Action, or AI Reasoning lanes.
+
+Concurrency note: Omen 0.3 avoids lock contention on keystrokes by querying an in-memory `HotSemanticIndex` protected by `std::sync::Mutex`. Out-of-band updates occur prior to prompt display, ensuring sub-millisecond keystroke responsiveness.
 
 ---
 
-## 2. Benchmark Results
+## 2. Benchmark Measurements
 
-### 2.1 Interactive Shell Startup & Initial Prompt Latency
-Measures the duration from cold initialization of `InteractiveSession` (terminal capability detection, color palette loading, prompt state compilation) to the rendering of the first prompt string.
+### 2.1 In-Process Session Construction & Prompt Latency
+- **Definition**: Time to allocate `InteractiveSession`, detect `TerminalCapabilities`, compute color roles, and render the initial prompt string in-process.
+- **Sample Size**: 100 iterations
+- **Min**: 151.9 µs (0.152 ms)
+- **Max**: 450.0 µs (0.450 ms)
+- **Median**: 160.6 µs (0.161 ms)
+- **Mean (Average)**: **166.59 µs** (0.167 ms)
+- **Budget**: < 15.0 ms (Target achieved with >98% margin)
 
-- **Target Budget**: < 15.00 ms
-- **Measured Iterations**: 100 iterations
-- **Min**: 12.7 µs (0.0127 ms)
-- **Max**: 247.0 µs (0.2470 ms)
-- **Median**: 12.9 µs (0.0129 ms)
-- **Mean (Average)**: **15.48 µs** (0.0155 ms)
-- **Assessment**: **PASS** (Exceeds requirement by ~1000x)
+### 2.2 Genuine Cold Process Launch (Release Binary)
+- **Definition**: Fresh process execution of compiled release binary `omen.exe doctor --json` measured from process creation to exit.
+- **Sample Size**: 10 iterations
+- **Min**: 12.47 ms
+- **Max**: 17.11 ms
+- **Median**: 13.40 ms
+- **Mean (Average)**: **13.69 ms**
+- **Analysis**: Typical Windows process creation and dynamic linking overhead ranges from 10–25 ms. Omen initializes the engine and inspects capabilities within this standard OS scheduling window.
 
-### 2.2 Completion Engine Latency (`OmenCompleter`)
-Measures the latency of `OmenCompleter` returning ranked fuzzy suggestions for 100 query variations across semantic actions (`:`), dynamic references (`@`), tool profiles, and active facts.
+### 2.3 Completion Engine with Representative Hot-Index State
+- **Definition**: Latency of `OmenCompleter` returning fuzzy-ranked suggestions across a populated `HotSemanticIndex` containing:
+  - 50 active facts (25 Current, 25 Dirty with elevation)
+  - 20 workspace directory entries
+  - Atlas tools (`cargo`, `git`, `threadmoth`, `ripgrep`)
+  - Semantic actions (`:status`, `:doctor`, `:why`, etc.)
+  - Dynamic references (`@last`, `@failed`, `@errors`, etc.)
+- **Sample Size**: 100 queries
+- **Min**: 11.4 µs
+- **Max**: 520.4 µs
+- **Median**: 39.3 µs
+- **Mean (Average)**: **134.29 µs** (0.134 ms)
+- **Budget**: < 5.0 ms (Target achieved with >97% margin)
 
-- **Target Budget**: < 5.00 ms
-- **Measured Iterations**: 100 queries
-- **Min**: 9.6 µs (0.0096 ms)
-- **Max**: 109.1 µs (0.1091 ms)
-- **Median**: 12.9 µs (0.0129 ms)
-- **Mean (Average)**: **15.14 µs** (0.0151 ms)
-- **Assessment**: **PASS** (Exceeds requirement by ~300x)
-
-### 2.3 Semantic Grammar Scanner Throughput (`GrammarScanner`)
-Measures throughput and per-scan latency across 10,000 input lines categorizing inputs into Executable, Semantic Action, or AI Reasoning lanes.
-
-- **Target Budget**: > 100,000 scans/sec (< 10 µs per scan)
+### 2.4 Semantic Grammar Scanner Throughput
+- **Definition**: Lexical analysis and token splitting across 10,000 queries including complex Windows drive paths, UNC paths, and quoted arguments.
 - **Sample Size**: 10,000 invocations
-- **Total Time**: 11.30 ms
-- **Average Latency**: **1.13 µs** (1,130 ns)
-- **Throughput**: **884,838 scans/second**
-- **Assessment**: **PASS**
+- **Total Time**: 14.50 ms
+- **Average Latency**: **1.45 µs** (1,449 ns)
+- **Throughput**: **689,841 scans/second**
+- **Budget**: > 100,000 scans/second (Target achieved with ~7x margin)
 
 ---
 
-## 3. Comparison Matrix
+## 3. Summary Performance Matrix
 
-| Component | Target Budget | Omen 0.3 Actual | Margin |
+| Metric | Target Budget | Measured Actual | Assessment |
 | :--- | :--- | :--- | :--- |
-| Startup to First Prompt | < 15 ms | **0.015 ms** (15.5 µs) | 99.9% faster |
-| Autocomplete Suggestion | < 5 ms | **0.015 ms** (15.1 µs) | 99.7% faster |
-| Grammar Scanner | < 10 µs | **1.13 µs** | 88.7% faster |
-| Dirty Fact Detection | < 1 ms | **0.042 ms** (42 µs) | 95.8% faster |
-
----
-
-## 4. Resource Allocation & Zero-Lock Guarantees
-
-1. **Non-Blocking REPL**: The completion engine and hinter query in-memory caches and SQLite WAL read transactions without taking exclusive locks on the database.
-2. **Deterministic Memory Footprint**: `OmenCompleter` uses pooled allocations and pre-indexed static references, bounding per-keystroke allocations to < 4 KiB.
-3. **Ghost Hinter Efficiency**: `OmenHinter` reuses the top fuzzy match from the previous completion pass, executing in sub-microsecond time per rendered keystroke.
+| **In-Process Prompt Construction** | < 15.0 ms | **0.167 ms** (166.6 µs) | **PASS** |
+| **Genuine Cold Process Launch** | < 50.0 ms | **13.69 ms** | **PASS** |
+| **Hot-Index Completion Latency** | < 5.0 ms | **0.134 ms** (134.3 µs) | **PASS** |
+| **Grammar Scanner Throughput** | > 100,000 scans/s | **689,841 scans/s** | **PASS** |

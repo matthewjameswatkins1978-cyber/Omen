@@ -99,43 +99,57 @@ impl GrammarScanner {
         Ok(InputLane::Executable { argv })
     }
 
-    /// Word splitter preserving double and single quotes
+    /// Word splitter preserving Windows path separators, double and single quotes,
+    /// and handling spaces, literal/trailing backslashes, and incomplete quotes.
     pub fn split_words(s: &str) -> Vec<String> {
         let mut words = Vec::new();
         let mut current = String::new();
         let mut in_quotes: Option<char> = None;
-        let mut escaped = false;
+        let mut chars = s.chars().peekable();
 
-        for c in s.chars() {
-            if escaped {
-                current.push(c);
-                escaped = false;
-                continue;
-            }
-
-            if c == '\\' {
-                escaped = true;
-                continue;
-            }
-
-            if let Some(quote_char) = in_quotes {
-                if c == quote_char {
-                    in_quotes = None;
-                } else {
-                    current.push(c);
+        while let Some(c) = chars.next() {
+            match in_quotes {
+                Some(quote_char) => {
+                    if c == '\\' {
+                        // In double quotes, \" produces literal "
+                        if quote_char == '"' && chars.peek() == Some(&'"') {
+                            chars.next();
+                            current.push('"');
+                        } else {
+                            // Backslash inside quotes is preserved literally (e.g. "C:\Program Files\App")
+                            current.push('\\');
+                        }
+                    } else if c == quote_char {
+                        in_quotes = None;
+                    } else {
+                        current.push(c);
+                    }
                 }
-            } else if c == '"' || c == '\'' {
-                in_quotes = Some(c);
-            } else if c.is_whitespace() {
-                if !current.is_empty() {
-                    words.push(current.clone());
-                    current.clear();
+                None => {
+                    if c == '"' || c == '\'' {
+                        in_quotes = Some(c);
+                    } else if c == '\\' {
+                        // Outside quotes: check if escaping a quote (\")
+                        if chars.peek() == Some(&'"') {
+                            chars.next();
+                            current.push('"');
+                        } else {
+                            // Literal backslash / Windows path separator (e.g. C:\Users, \\server\share, dir\)
+                            current.push('\\');
+                        }
+                    } else if c.is_whitespace() {
+                        if !current.is_empty() {
+                            words.push(current.clone());
+                            current.clear();
+                        }
+                    } else {
+                        current.push(c);
+                    }
                 }
-            } else {
-                current.push(c);
             }
         }
 
+        // If string ends while in unclosed quotes, preserve whatever was read
         if !current.is_empty() {
             words.push(current);
         }

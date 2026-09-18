@@ -100,10 +100,8 @@ impl ProcessSupervisor {
             CoreError::ExecutionFailed(format!("Process spawn failed for '{}': {e}", req.argv[0]))
         })?;
 
-        let child_pid = child.id();
-
         #[cfg(windows)]
-        if let Some(pid) = child_pid {
+        if let Some(pid) = child.id() {
             let _ = job_guard.assign_pid(pid);
         }
 

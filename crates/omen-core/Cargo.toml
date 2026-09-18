@@ -11,3 +11,4 @@ publish = false
 serde = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
+uuid = { workspace = true }
