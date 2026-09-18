@@ -47,5 +47,9 @@ jobs:
           rustup show active-toolchain || rustup toolchain install 1.98.1 --profile minimal
           rustup default 1.98.1
 
+      - name: Install ripgrep (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
       - name: Run Workspace Tests
         run: cargo test --workspace --all-targets

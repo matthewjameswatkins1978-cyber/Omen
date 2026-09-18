@@ -47,7 +47,7 @@ async fn ripgrep_adapter_json_and_cas_spooling() {
     let mut db = Database::open(&dir.path().join("state.sqlite")).unwrap();
     let cas = ContentAddressedStore::new(dir.path().join("cas"));
 
-    let result = RipgrepAdapter::search(
+    let result = match RipgrepAdapter::search(
         &supervisor,
         &cas,
         &mut db,
@@ -55,7 +55,20 @@ async fn ripgrep_adapter_json_and_cas_spooling() {
         "substrate, not sovereign",
     )
     .await
-    .unwrap();
+    {
+        Ok(res) => res,
+        Err(omen_core::CoreError::ExecutionFailed(err))
+            if err.contains("No such file or directory")
+                || err.contains("program not found")
+                || err.contains("os error 2") =>
+        {
+            eprintln!(
+                "Skipping ripgrep_adapter_json_and_cas_spooling: 'rg' binary not found on host"
+            );
+            return;
+        }
+        Err(e) => panic!("Ripgrep search failed: {e}"),
+    };
 
     assert!(
         result.match_count > 0,

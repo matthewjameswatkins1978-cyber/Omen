@@ -6,23 +6,39 @@ use tempfile::tempdir;
 #[tokio::test]
 async fn test_threadmoth_doctor() {
     let supervisor = ProcessSupervisor::new();
-    let doc = ThreadMothAdapter::doctor(&supervisor).await;
-    assert!(doc.is_ok(), "ThreadMoth doctor failed: {:?}", doc.err());
-    let doc_json = doc.unwrap();
-    assert!(doc_json.get("status").is_some() || doc_json.get("version").is_some());
+    let doc = match ThreadMothAdapter::doctor(&supervisor).await {
+        Ok(doc) => doc,
+        Err(omen_core::CoreError::ExecutionFailed(err))
+            if err.contains("No such file or directory")
+                || err.contains("program not found")
+                || err.contains("os error 2") =>
+        {
+            eprintln!("Skipping test_threadmoth_doctor: 'threadmoth' binary not found on host");
+            return;
+        }
+        Err(e) => panic!("ThreadMoth doctor failed: {e}"),
+    };
+    assert!(doc.get("status").is_some() || doc.get("version").is_some());
 }
 
 #[tokio::test]
 async fn test_threadmoth_capabilities() {
     let supervisor = ProcessSupervisor::new();
-    let caps = ThreadMothAdapter::capabilities(&supervisor).await;
-    assert!(
-        caps.is_ok(),
-        "ThreadMoth capabilities failed: {:?}",
-        caps.err()
-    );
-    let caps_json = caps.unwrap();
-    assert!(caps_json.get("threadmoth_version").is_some() || caps_json.get("targets").is_some());
+    let caps = match ThreadMothAdapter::capabilities(&supervisor).await {
+        Ok(caps) => caps,
+        Err(omen_core::CoreError::ExecutionFailed(err))
+            if err.contains("No such file or directory")
+                || err.contains("program not found")
+                || err.contains("os error 2") =>
+        {
+            eprintln!(
+                "Skipping test_threadmoth_capabilities: 'threadmoth' binary not found on host"
+            );
+            return;
+        }
+        Err(e) => panic!("ThreadMoth capabilities failed: {e}"),
+    };
+    assert!(caps.get("threadmoth_version").is_some() || caps.get("targets").is_some());
 }
 
 #[tokio::test]
@@ -34,7 +50,7 @@ async fn test_threadmoth_mutation_and_refusal() {
     let supervisor = ProcessSupervisor::new();
 
     // 1. Successful exact replacement
-    let cert = ThreadMothAdapter::replace_exact(
+    let cert = match ThreadMothAdapter::replace_exact(
         &supervisor,
         dir.path(),
         "sample.txt",
@@ -42,14 +58,21 @@ async fn test_threadmoth_mutation_and_refusal() {
         "Omen",
         None,
     )
-    .await;
-
-    assert!(
-        cert.is_ok(),
-        "ThreadMoth replace_exact failed: {:?}",
-        cert.err()
-    );
-    let cert = cert.unwrap();
+    .await
+    {
+        Ok(cert) => cert,
+        Err(omen_core::CoreError::ExecutionFailed(err))
+            if err.contains("No such file or directory")
+                || err.contains("program not found")
+                || err.contains("os error 2") =>
+        {
+            eprintln!(
+                "Skipping test_threadmoth_mutation_and_refusal: 'threadmoth' binary not found on host"
+            );
+            return;
+        }
+        Err(e) => panic!("ThreadMoth replace_exact failed: {e}"),
+    };
     assert_eq!(cert.outcome, "APPLIED");
     assert!(cert.is_applied());
     assert!(cert.pre_hash.is_some());
