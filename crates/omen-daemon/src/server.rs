@@ -61,6 +61,10 @@ impl DaemonServer {
         let _ = self.shutdown_tx.send(true);
     }
 
+    pub fn subscribe_shutdown(&self) -> watch::Receiver<bool> {
+        self.shutdown_rx.clone()
+    }
+
     pub async fn run(&self) -> Result<(), LocalIpcError> {
         let mut listener = PlatformListener::bind(&self.endpoint)
             .await

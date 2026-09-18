@@ -217,6 +217,9 @@ async fn test_daemon_services_lifecycle() {
     let restarted = client.restart_service("web").await.unwrap();
     assert_eq!(restarted.name, "web");
     assert_eq!(restarted.state, "running");
+
+    // Clean up service
+    client.stop_service("web").await.unwrap();
 }
 
 #[tokio::test]
