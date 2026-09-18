@@ -24,11 +24,19 @@ impl InteractiveSession {
             "sess-{}",
             &hex::encode(sha2::Sha256::digest(cwd.to_string_lossy().as_bytes()))[..12]
         ))?;
+        Self::new_with_session_id(session_id, cwd, db)
+    }
+
+    pub fn new_with_session_id(
+        session_id: InteractiveSessionId,
+        cwd: PathBuf,
+        db: Option<Database>,
+    ) -> Result<Self, CoreError> {
         let supervisor = ProcessSupervisor::new();
         let caps = TerminalCapabilities::detect();
         let prompt = OmenPrompt::new(cwd.clone(), None, 0, false, caps.clone());
 
-        Ok(Self {
+        let mut sess = Self {
             session_id,
             cwd,
             supervisor,
@@ -36,7 +44,9 @@ impl InteractiveSession {
             prompt,
             last_exit: None,
             db,
-        })
+        };
+        sess.update_prompt_state();
+        Ok(sess)
     }
 
     /// Runs the interactive REPL loop.
@@ -73,6 +83,7 @@ impl InteractiveSession {
             .with_menu(reedline::ReedlineMenu::EngineCompleter(completion_menu));
 
         loop {
+            self.update_prompt_state();
             let sig = line_editor.read_line(&self.prompt);
             match sig {
                 Ok(Signal::Success(buffer)) => {
@@ -137,19 +148,27 @@ impl InteractiveSession {
                 for cmd in &out.suggested_commands {
                     println!("  {cmd}");
                 }
-                Ok(ProcessExit {
+                let exit = ProcessExit {
                     code: Some(0),
                     signal: None,
-                })
+                };
+                self.last_exit = Some(exit.clone());
+                self.update_prompt_state();
+                Ok(exit)
             }
             crate::grammar::InputLane::SemanticAction { action, args } => {
-                crate::actions::SemanticDispatcher::dispatch(
+                let res = crate::actions::SemanticDispatcher::dispatch(
                     &action,
                     &args,
                     &self.cwd,
                     &self.session_id,
                     self.db.as_mut(),
-                )
+                );
+                if let Ok(exit) = &res {
+                    self.last_exit = Some(exit.clone());
+                }
+                self.update_prompt_state();
+                res
             }
             crate::grammar::InputLane::Executable { argv } => {
                 if argv.is_empty() {
@@ -293,7 +312,7 @@ impl InteractiveSession {
         }
     }
 
-    fn update_prompt_state(&mut self) {
+    pub fn update_prompt_state(&mut self) {
         print!(
             "{}",
             omen_ui::SemanticBlock::osc7_cwd(&self.cwd, &self.caps)
@@ -303,7 +322,21 @@ impl InteractiveSession {
             .as_ref()
             .map(|e| !e.is_zero())
             .unwrap_or(false);
+
+        let dirty_count = if let Some(db) = &self.db {
+            omen_knowledge::FactRegistry::list_active_facts(db, 200)
+                .map(|facts| {
+                    facts
+                        .iter()
+                        .filter(|f| f.validity == omen_core::ValidityState::Dirty)
+                        .count()
+                })
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
         self.prompt
-            .update_state(self.cwd.clone(), None, 0, has_failure);
+            .update_state(self.cwd.clone(), None, dirty_count, has_failure);
     }
 }
