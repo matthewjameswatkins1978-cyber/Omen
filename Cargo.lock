@@ -570,7 +570,9 @@ dependencies = [
  "hex",
  "omen-core",
  "rusqlite",
+ "serde",
  "sha2",
+ "tempfile",
  "thiserror",
  "tracing",
 ]
