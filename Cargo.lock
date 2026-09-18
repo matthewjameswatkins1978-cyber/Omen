@@ -496,6 +496,7 @@ dependencies = [
 name = "omen-adapters"
 version = "0.2.0"
 dependencies = [
+ "hex",
  "omen-atlas",
  "omen-core",
  "omen-engine",
@@ -503,7 +504,10 @@ dependencies = [
  "omen-schema",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "thiserror",
+ "tokio",
  "tracing",
 ]
 
