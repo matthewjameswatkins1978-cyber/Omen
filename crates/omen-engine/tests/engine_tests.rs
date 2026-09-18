@@ -16,18 +16,31 @@ fn gremlin_exe() -> PathBuf {
         "omen-gremlin"
     };
     let exe = path.join(name);
-    if !exe.exists() {
-        let fallback = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("target")
-            .join("debug")
-            .join(name);
+    if exe.exists() {
+        return exe;
+    }
+
+    let fallback = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("target")
+        .join("debug")
+        .join(name);
+    if fallback.exists() {
         return fallback;
     }
-    exe
+
+    // If binary not found, build it on-demand
+    let _ = std::process::Command::new("cargo")
+        .args(["build", "--bin", "omen-gremlin"])
+        .status();
+
+    if exe.exists() {
+        return exe;
+    }
+    fallback
 }
 
 #[tokio::test]

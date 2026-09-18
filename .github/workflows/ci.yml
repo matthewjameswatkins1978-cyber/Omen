@@ -51,5 +51,8 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y ripgrep
 
+      - name: Build Test Fixtures
+        run: cargo build --bin omen-gremlin
+
       - name: Run Workspace Tests
         run: cargo test --workspace --all-targets
