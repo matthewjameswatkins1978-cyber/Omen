@@ -1,0 +1,110 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ExecutionResultWire",
+  "type": "object",
+  "required": [
+    "action_id",
+    "adapter_classification",
+    "artifacts",
+    "enforcement",
+    "execution_id",
+    "fact_updates",
+    "observations",
+    "process_exit",
+    "reduced_summary",
+    "runtime_status",
+    "schema_version"
+  ],
+  "properties": {
+    "action_id": {
+      "type": "string"
+    },
+    "adapter_classification": {
+      "type": "string"
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "enforcement": {
+      "$ref": "#/definitions/EnforcementReportWire"
+    },
+    "execution_id": {
+      "type": "string"
+    },
+    "fact_updates": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "observations": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "process_exit": {
+      "$ref": "#/definitions/ProcessExitWire"
+    },
+    "reduced_summary": {
+      "type": "string"
+    },
+    "runtime_status": {
+      "type": "string"
+    },
+    "schema_version": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "EnforcementReportWire": {
+      "type": "object",
+      "required": [
+        "descendant_processes",
+        "filesystem",
+        "network",
+        "symlink_escape"
+      ],
+      "properties": {
+        "descendant_processes": {
+          "type": "string"
+        },
+        "filesystem": {
+          "type": "string"
+        },
+        "network": {
+          "type": "string"
+        },
+        "symlink_escape": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ProcessExitWire": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        },
+        "signal": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

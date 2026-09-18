@@ -1,0 +1,1 @@
+//! ThreadMoth adapter placeholder.

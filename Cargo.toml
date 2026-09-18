@@ -1,0 +1,46 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/omen-core",
+    "crates/omen-schema",
+    "crates/omen-engine",
+    "crates/omen-knowledge",
+    "crates/omen-atlas",
+    "crates/omen-adapters",
+    "crates/omen-cli",
+    "crates/omen-test-fixtures",
+    "crates/xtask",
+]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.98.1"
+publish = false
+authors = ["Matthew James Watkins <matthewjameswatkins1978@cyber.net>"]
+repository = "https://github.com/matthewjameswatkins1978-cyber/Omen"
+
+[workspace.dependencies]
+omen-core = { path = "crates/omen-core", version = "0.2.0" }
+omen-schema = { path = "crates/omen-schema", version = "0.2.0" }
+omen-engine = { path = "crates/omen-engine", version = "0.2.0" }
+omen-knowledge = { path = "crates/omen-knowledge", version = "0.2.0" }
+omen-atlas = { path = "crates/omen-atlas", version = "0.2.0" }
+omen-adapters = { path = "crates/omen-adapters", version = "0.2.0" }
+omen-test-fixtures = { path = "crates/omen-test-fixtures", version = "0.2.0" }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+schemars = { version = "0.8", features = ["derive"] }
+thiserror = "2.0"
+sha2 = "0.10"
+hex = "0.4"
+tokio = { version = "1.43", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rusqlite = { version = "0.33", features = ["bundled"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+toml = "0.8"
+tempfile = "3.17"
+notify = "8.0"
+chrono = { version = "0.4", features = ["serde"] }

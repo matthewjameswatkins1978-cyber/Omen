@@ -1,0 +1,161 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ExecutionContractWire",
+  "type": "object",
+  "required": [
+    "actor",
+    "constraints",
+    "execution_id",
+    "intent",
+    "leases",
+    "required_assurance",
+    "schema_version",
+    "stdio"
+  ],
+  "properties": {
+    "actor": {
+      "type": "string"
+    },
+    "constraints": {
+      "$ref": "#/definitions/ExecutionConstraintsWire"
+    },
+    "execution_id": {
+      "type": "string"
+    },
+    "intent": {
+      "$ref": "#/definitions/IntentWire"
+    },
+    "leases": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/LeaseRequestWire"
+      }
+    },
+    "required_assurance": {
+      "$ref": "#/definitions/RequiredAssuranceWire"
+    },
+    "schema_version": {
+      "type": "string"
+    },
+    "stdio": {
+      "$ref": "#/definitions/StdioConfigWire"
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "ExecutionConstraintsWire": {
+      "type": "object",
+      "required": [
+        "timeout_ms"
+      ],
+      "properties": {
+        "network": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "IntentWire": {
+      "type": "object",
+      "required": [
+        "args",
+        "operation",
+        "tool"
+      ],
+      "properties": {
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "operation": {
+          "type": "string"
+        },
+        "tool": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "LeaseRequestWire": {
+      "type": "object",
+      "required": [
+        "native_access",
+        "resource",
+        "rights"
+      ],
+      "properties": {
+        "native_access": {
+          "type": "boolean"
+        },
+        "resource": {
+          "type": "string"
+        },
+        "rights": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "RequiredAssuranceWire": {
+      "type": "object",
+      "properties": {
+        "descendants": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "filesystem": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "network": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "StdioConfigWire": {
+      "type": "object",
+      "required": [
+        "stderr",
+        "stdin",
+        "stdout"
+      ],
+      "properties": {
+        "stderr": {
+          "type": "string"
+        },
+        "stdin": {
+          "type": "string"
+        },
+        "stdout": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
