@@ -37,6 +37,7 @@ impl WorkspaceRegistry {
         }
 
         let state = Arc::new(WorkspaceState::new(canonical.clone(), self.epoch));
+        let _ = state.start_fs_watcher();
         by_id.insert(state.workspace_id().to_string(), state.clone());
         by_path.insert(canonical, state.clone());
         state

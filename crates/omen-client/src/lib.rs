@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot};
 use uuid::Uuid;
 
@@ -27,6 +27,8 @@ pub struct OmenClient {
     request_tx: mpsc::Sender<QueuedRequest>,
     event_tx: broadcast::Sender<IpcEvent>,
     is_connected: Arc<AtomicBool>,
+    last_sequence: Arc<AtomicU64>,
+    last_epoch: Arc<AtomicU64>,
 }
 
 impl OmenClient {
@@ -82,10 +84,16 @@ impl OmenClient {
             }
         });
 
+        let last_sequence = Arc::new(AtomicU64::new(0));
+        let last_epoch = Arc::new(AtomicU64::new(0));
+
         // Background reader
         let pending_reader = pending_requests.clone();
         let event_tx_reader = event_tx.clone();
         let is_connected_reader = is_connected.clone();
+        let last_sequence_reader = last_sequence.clone();
+        let last_epoch_reader = last_epoch.clone();
+
         tokio::spawn(async move {
             loop {
                 let msg: Result<Option<DaemonMessage>, LocalIpcError> =
@@ -98,6 +106,33 @@ impl OmenClient {
                         }
                     }
                     Ok(Some(DaemonMessage::Event(event))) => {
+                        let prev_seq = last_sequence_reader.swap(event.sequence, Ordering::SeqCst);
+                        let prev_epoch = last_epoch_reader.swap(event.epoch, Ordering::SeqCst);
+
+                        if prev_epoch != 0 && prev_epoch != event.epoch {
+                            let _ = event_tx_reader.send(IpcEvent::new(
+                                &event.workspace_id,
+                                event.epoch,
+                                event.sequence,
+                                omen_ipc::EventPayload::ResyncRequired {
+                                    reason: "Epoch changed; daemon restarted".to_string(),
+                                },
+                            ));
+                        } else if prev_seq != 0 && event.sequence > prev_seq + 1 {
+                            let _ = event_tx_reader.send(IpcEvent::new(
+                                &event.workspace_id,
+                                event.epoch,
+                                event.sequence,
+                                omen_ipc::EventPayload::ResyncRequired {
+                                    reason: format!(
+                                        "Event gap detected: expected {}, received {}",
+                                        prev_seq + 1,
+                                        event.sequence
+                                    ),
+                                },
+                            ));
+                        }
+
                         let _ = event_tx_reader.send(event);
                     }
                     Ok(None) => {
@@ -125,6 +160,8 @@ impl OmenClient {
             request_tx,
             event_tx,
             is_connected,
+            last_sequence,
+            last_epoch,
         })
     }
 
@@ -175,6 +212,14 @@ impl OmenClient {
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<IpcEvent> {
         self.event_tx.subscribe()
+    }
+
+    pub fn last_event_sequence(&self) -> u64 {
+        self.last_sequence.load(Ordering::SeqCst)
+    }
+
+    pub fn last_event_epoch(&self) -> u64 {
+        self.last_epoch.load(Ordering::SeqCst)
     }
 
     pub async fn send_request_with_id(

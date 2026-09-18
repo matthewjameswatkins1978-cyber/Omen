@@ -4,6 +4,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, RwLock, broadcast};
 
+use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
+
 use omen_ipc::{EventPayload, FactInfo, IpcEvent, ManagedServiceInfo, SharedIndexSnapshot};
 use omen_knowledge::{
     Database, FactRegistry, RequestReceiptRecord, ServiceRecord, WorkspacePersistence,
@@ -19,6 +21,7 @@ pub struct WorkspaceState {
     services: RwLock<HashMap<String, ManagedServiceInfo>>,
     db: Arc<Mutex<Database>>,
     event_tx: broadcast::Sender<IpcEvent>,
+    watcher: Arc<Mutex<Option<RecommendedWatcher>>>,
 }
 
 impl WorkspaceState {
@@ -100,7 +103,86 @@ impl WorkspaceState {
             services: RwLock::new(initial_services),
             db: Arc::new(Mutex::new(db)),
             event_tx,
+            watcher: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub fn is_ignored_path(path: &Path) -> bool {
+        for component in path.components() {
+            if let std::path::Component::Normal(c) = component {
+                let s = c.to_string_lossy();
+                if s == ".git"
+                    || s == "target"
+                    || s == "node_modules"
+                    || s == ".omen"
+                    || s == ".omen-state"
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub async fn invalidate_all_current_facts(&self, cause: &str) -> Vec<String> {
+        let mut invalidated = Vec::new();
+        let mut facts = self.facts.write().await;
+        for fact in facts.values_mut() {
+            if fact.validity == "CURRENT" {
+                fact.validity = "DIRTY".to_string();
+                invalidated.push((fact.fact_id.clone(), fact.resource_uri.clone()));
+            }
+        }
+        drop(facts);
+
+        for (fact_id, resource_uri) in &invalidated {
+            self.broadcast_event(EventPayload::FactInvalidated {
+                fact_id: fact_id.clone(),
+                resource_uri: resource_uri.clone(),
+                previous_validity: "CURRENT".into(),
+                new_validity: "DIRTY".into(),
+                cause: cause.to_string(),
+            });
+        }
+
+        invalidated.into_iter().map(|(_, uri)| uri).collect()
+    }
+
+    pub fn start_fs_watcher(self: &Arc<Self>) -> notify::Result<()> {
+        let this = Arc::downgrade(self);
+        let rt_handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => return Ok(()),
+        };
+        let rt_clone = rt_handle.clone();
+
+        let mut watcher = RecommendedWatcher::new(
+            move |res: Result<Event, notify::Error>| {
+                if let Ok(event) = res {
+                    let has_relevant_change =
+                        event.paths.iter().any(|p| !Self::is_ignored_path(p));
+                    if has_relevant_change {
+                        if let Some(ws) = this.upgrade() {
+                            let cause = format!("fs:mutation:{:?}", event.kind);
+                            rt_clone.spawn(async move {
+                                ws.invalidate_all_current_facts(&cause).await;
+                            });
+                        }
+                    }
+                }
+            },
+            Config::default(),
+        )?;
+
+        watcher.watch(&self.canonical_path, RecursiveMode::Recursive)?;
+
+        let watcher_mutex = self.watcher.clone();
+        rt_handle.spawn(async move {
+            let mut w = watcher_mutex.lock().await;
+            *w = Some(watcher);
+        });
+
+        Ok(())
     }
 
     pub fn workspace_id(&self) -> &str {
