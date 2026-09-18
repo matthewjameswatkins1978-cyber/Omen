@@ -1,13 +1,29 @@
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
+use omen_atlas::{RuntimeProfile, ToolValidator};
+use omen_core::{
+    ActionId, CoreError, ExecutionContract, RequiredAssurance, ResourceUri, StdioMode,
+};
+use omen_engine::{ExecutionRequest, ProcessSupervisor};
+use omen_knowledge::{ContentAddressedStore, Database, FactRegistry, resolve_workspace_dir};
+use omen_schema::{
+    ExecutionContractWire, ExecutionResultWire, ProcessExitWire, SCHEMA_VERSION_RESULT,
+};
+use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
 #[command(
     name = "omen",
     author,
     version,
-    about = "Agent-native developer runtime"
+    about = "Agent-native developer runtime. Substrate, not sovereign."
 )]
 struct Cli {
+    #[arg(long, global = true)]
+    json: bool,
+
+    #[arg(long, global = true)]
+    workspace: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -15,38 +31,425 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Inspect environment and health
-    Doctor {
-        #[arg(long)]
-        json: bool,
-    },
+    Doctor,
     /// Describe Omen runtime capabilities
-    Describe {
-        #[arg(long)]
-        json: bool,
-    },
+    Describe,
+    /// Tool atlas management and inspection
+    Tool(ToolArgs),
+    /// Fact query and provenance
+    Fact(FactArgs),
+    /// Execute an argv or contract
+    Exec(ExecArgs),
+    /// CAS artifact inspection and retrieval
+    Artifact(ArtifactArgs),
+    /// Ephemeral storage garbage collection
+    Gc(GcArgs),
 }
 
-fn main() {
+#[derive(Args, Debug)]
+struct ToolArgs {
+    #[command(subcommand)]
+    subcommand: ToolSubcommands,
+}
+
+#[derive(Subcommand, Debug)]
+enum ToolSubcommands {
+    /// List known tool profiles
+    List,
+    /// Inspect a specific tool profile
+    Inspect { tool_id: String },
+    /// Validate tool availability, version, and health
+    Validate { tool_id: String },
+}
+
+#[derive(Args, Debug)]
+struct FactArgs {
+    #[command(subcommand)]
+    subcommand: FactSubcommands,
+}
+
+#[derive(Subcommand, Debug)]
+enum FactSubcommands {
+    /// Get fact by logical URI
+    Get {
+        uri: String,
+        #[arg(long)]
+        require_current: bool,
+    },
+    /// Inspect fact provenance and dependency history
+    Why { uri: String },
+}
+
+#[derive(Args, Debug)]
+struct ExecArgs {
+    /// Logical tool URI or binary name
+    argv: Vec<String>,
+    /// Execution timeout in milliseconds
+    #[arg(long, default_value = "30000")]
+    timeout_ms: u64,
+    /// Inline output budget in bytes
+    #[arg(long, default_value = "8192")]
+    budget: usize,
+    /// Path to Tethers execution contract JSON
+    #[arg(long)]
+    contract: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+struct ArtifactArgs {
+    #[command(subcommand)]
+    subcommand: ArtifactSubcommands,
+}
+
+#[derive(Subcommand, Debug)]
+enum ArtifactSubcommands {
+    /// Read slice of artifact
+    Read {
+        hash: String,
+        #[arg(long, default_value = "0")]
+        offset: u64,
+        #[arg(long, default_value = "8192")]
+        length: usize,
+    },
+    /// Inspect artifact metadata
+    Inspect { hash: String },
+}
+
+#[derive(Args, Debug)]
+struct GcArgs {
+    /// Dry run without deleting artifacts
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    let json_mode = cli.json;
+
+    let current_dir = std::env::current_dir()?;
+    let ws_root = cli.workspace.unwrap_or(current_dir);
+    let state_dir = resolve_workspace_dir(&ws_root);
+    let db_path = state_dir.join("state.sqlite");
+    let cas_dir = state_dir.join("cas");
+
+    let supervisor = ProcessSupervisor::new();
+
     match cli.command {
-        Some(Commands::Doctor { json }) => {
-            if json {
-                println!(r#"{{"status":"ok","version":"0.2.0"}}"#);
+        Some(Commands::Doctor) => {
+            let backend_caps = supervisor.backend().capabilities();
+            if json_mode {
+                let doc = serde_json::json!({
+                    "status": "ok",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "doctrine": "substrate, not sovereign",
+                    "platform": std::env::consts::OS,
+                    "capabilities": {
+                        "filesystem": format!("{:?}", backend_caps.filesystem),
+                        "network": format!("{:?}", backend_caps.network),
+                        "descendants": format!("{:?}", backend_caps.descendants),
+                    }
+                });
+                println!("{}", serde_json::to_string_pretty(&doc)?);
             } else {
-                println!("Omen 0.2.0: OK");
+                println!("Omen {}: OK", env!("CARGO_PKG_VERSION"));
+                println!("Doctrine: substrate, not sovereign");
+                println!("Platform Backend: {}", std::env::consts::OS);
+                println!("Descendant Containment: {:?}", backend_caps.descendants);
             }
         }
-        Some(Commands::Describe { json }) => {
-            if json {
-                println!(
-                    r#"{{"name":"omen","doctrine":"substrate, not sovereign","version":"0.2.0"}}"#
-                );
+        Some(Commands::Describe) => {
+            let backend_caps = supervisor.backend().capabilities();
+            let desc = serde_json::json!({
+                "name": "omen",
+                "version": env!("CARGO_PKG_VERSION"),
+                "doctrine": "substrate, not sovereign",
+                "boundaries": {
+                    "lantern": "memory and provenance",
+                    "resolve": "live guards and locks",
+                    "tethers": "permissions, policy, approval, durable intent, and outcome truth",
+                    "omen": "physical execution, containment, facts, and CAS artifacts",
+                    "threadmoth": "deterministic bounded structural mutation",
+                },
+                "containment": {
+                    "filesystem": format!("{:?}", backend_caps.filesystem),
+                    "network": format!("{:?}", backend_caps.network),
+                    "descendants": format!("{:?}", backend_caps.descendants),
+                }
+            });
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&desc)?);
             } else {
-                println!("Omen: substrate, not sovereign (v0.2.0)");
+                println!(
+                    "Omen {}: Substrate, not sovereign",
+                    env!("CARGO_PKG_VERSION")
+                );
+                println!("Enforcement: Descendants: {:?}", backend_caps.descendants);
+            }
+        }
+        Some(Commands::Tool(tool_args)) => match tool_args.subcommand {
+            ToolSubcommands::List => {
+                let profiles = vec!["threadmoth", "cargo", "git", "ripgrep"];
+                if json_mode {
+                    println!("{}", serde_json::to_string_pretty(&profiles)?);
+                } else {
+                    for p in profiles {
+                        println!("- {p}");
+                    }
+                }
+            }
+            ToolSubcommands::Inspect { tool_id } => {
+                let profile_path = Path::new("profiles").join(format!("{tool_id}.toml"));
+                let prof = RuntimeProfile::from_file(&profile_path);
+                match prof {
+                    Ok(p) => {
+                        if json_mode {
+                            println!("{}", serde_json::to_string_pretty(&p)?);
+                        } else {
+                            println!("Tool: {}", p.tool_id);
+                            println!("Binary: {}", p.binary_name);
+                            println!("Description: {}", p.description);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error inspecting tool {tool_id}: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            ToolSubcommands::Validate { tool_id } => {
+                let profile_path = Path::new("profiles").join(format!("{tool_id}.toml"));
+                let prof = RuntimeProfile::from_file(&profile_path)?;
+                let binary_path =
+                    omen_atlas::find_binary_on_path(&prof.binary_name).ok_or_else(|| {
+                        CoreError::NotFound(format!(
+                            "Binary '{}' not found on PATH",
+                            prof.binary_name
+                        ))
+                    })?;
+                let fingerprint = omen_atlas::compute_binary_fingerprint(&binary_path)?;
+                let mut instance = omen_atlas::ToolInstance {
+                    tool_id: omen_core::ToolId::new(&prof.tool_id)?,
+                    binary_path,
+                    binary_fingerprint: fingerprint,
+                    version: None,
+                    platform: std::env::consts::OS.into(),
+                    validation_state: omen_atlas::ValidationState::Unvalidated,
+                    understanding: omen_atlas::ToolUnderstanding::Adapted,
+                    profile: Some(prof),
+                    last_validated_at: None,
+                };
+
+                let validator = ToolValidator::new();
+                validator.validate(&mut instance).await?;
+                if json_mode {
+                    println!("{}", serde_json::to_string_pretty(&instance)?);
+                } else {
+                    println!("Tool: {}", instance.tool_id);
+                    println!("Status: {:?}", instance.validation_state);
+                    println!("Fingerprint: {}", instance.binary_fingerprint);
+                }
+            }
+        },
+        Some(Commands::Fact(fact_args)) => match fact_args.subcommand {
+            FactSubcommands::Get {
+                uri,
+                require_current,
+            } => {
+                let res_uri = ResourceUri::parse(&uri)?;
+                let db = Database::open(&db_path)?;
+                let fact = FactRegistry::get_fact(&db, &res_uri, require_current);
+                match fact {
+                    Ok(f) => {
+                        if json_mode {
+                            println!("{}", serde_json::to_string_pretty(&f)?);
+                        } else {
+                            println!("Fact: {}", f.fact_id);
+                            println!("Resource: {}", f.resource_uri);
+                            println!("Value: {}", f.value);
+                            println!("Validity: {:?}", f.validity);
+                        }
+                    }
+                    Err(e) => {
+                        if json_mode {
+                            let err_json = serde_json::json!({
+                                "error": e.to_string(),
+                                "code": format!("{:?}", e.code()),
+                            });
+                            println!("{}", serde_json::to_string_pretty(&err_json)?);
+                        } else {
+                            eprintln!("Refusal: {e}");
+                        }
+                        std::process::exit(1);
+                    }
+                }
+            }
+            FactSubcommands::Why { uri } => {
+                let res_uri = ResourceUri::parse(&uri)?;
+                let db = Database::open(&db_path)?;
+                let prov = FactRegistry::why_fact(&db, &res_uri)?;
+                if json_mode {
+                    println!("{}", serde_json::to_string_pretty(&prov)?);
+                } else {
+                    println!("Provenance for: {}", prov.fact.resource_uri);
+                    println!("Current Value: {}", prov.fact.value);
+                    println!("Validity: {:?}", prov.fact.validity);
+                    println!("Dependencies: {}", prov.dependencies.len());
+                    for dep in &prov.dependencies {
+                        println!(
+                            "  - {}: recorded={}, current={}",
+                            dep.generation_name, dep.recorded_generation, dep.current_generation
+                        );
+                    }
+                    println!("History Count: {}", prov.history.len());
+                }
+            }
+        },
+        Some(Commands::Exec(exec_args)) => {
+            let mut db = Database::open(&db_path)?;
+            let cas = ContentAddressedStore::new(cas_dir);
+
+            if let Some(contract_file) = exec_args.contract {
+                let content = std::fs::read_to_string(contract_file)?;
+                let wire: ExecutionContractWire = serde_json::from_str(&content)?;
+                let contract = ExecutionContract::try_from(wire)?;
+
+                let req = ExecutionRequest {
+                    argv: contract.intent.args,
+                    cwd: ws_root,
+                    env: vec![],
+                    stdin_mode: contract.stdio.stdin,
+                    stdin_payload: None,
+                    timeout_ms: contract.constraints.timeout_ms,
+                    inline_budget: exec_args.budget,
+                    required_assurance: contract.required_assurance,
+                };
+
+                let output = supervisor.execute(req).await?;
+                let artifact = cas.store(
+                    &mut db,
+                    &output.stdout_all,
+                    "text/plain",
+                    "omen://execution/contract",
+                    omen_core::RetentionClass::Referenced,
+                )?;
+
+                let backend_caps = supervisor.backend().capabilities();
+                let res_wire = ExecutionResultWire {
+                    schema_version: SCHEMA_VERSION_RESULT.to_string(),
+                    execution_id: contract.execution_id.to_string(),
+                    action_id: ActionId::new("act-execution-result").unwrap().to_string(),
+                    runtime_status: format!("{:?}", output.runtime_status).to_uppercase(),
+                    process_exit: ProcessExitWire {
+                        code: output.process_exit.code,
+                        signal: None,
+                    },
+                    adapter_classification: "EXECUTION_COMPLETE".to_string(),
+                    enforcement: omen_schema::EnforcementReportWire {
+                        filesystem: format!("{:?}", backend_caps.filesystem).to_uppercase(),
+                        network: format!("{:?}", backend_caps.network).to_uppercase(),
+                        descendant_processes: format!("{:?}", backend_caps.descendants)
+                            .to_uppercase(),
+                        symlink_escape: "OBSERVED".to_string(),
+                    },
+                    observations: vec![],
+                    fact_updates: vec![],
+                    artifacts: vec![artifact.uri.to_string()],
+                    reduced_summary: String::from_utf8_lossy(&output.stdout_bounded).to_string(),
+                };
+
+                println!("{}", serde_json::to_string_pretty(&res_wire)?);
+            } else {
+                if exec_args.argv.is_empty() {
+                    eprintln!("Error: argv cannot be empty");
+                    std::process::exit(1);
+                }
+
+                let req = ExecutionRequest {
+                    argv: exec_args.argv,
+                    cwd: ws_root,
+                    env: vec![],
+                    stdin_mode: StdioMode::Closed,
+                    stdin_payload: None,
+                    timeout_ms: exec_args.timeout_ms,
+                    inline_budget: exec_args.budget,
+                    required_assurance: RequiredAssurance::default(),
+                };
+
+                let output = supervisor.execute(req).await?;
+                let artifact = cas.store(
+                    &mut db,
+                    &output.stdout_all,
+                    "text/plain",
+                    "omen://execution/direct",
+                    omen_core::RetentionClass::Referenced,
+                )?;
+
+                if json_mode {
+                    let out_json = serde_json::json!({
+                        "runtime_status": format!("{:?}", output.runtime_status),
+                        "exit_code": output.process_exit.code,
+                        "artifact_uri": artifact.uri.to_string(),
+                        "stdout_bounded": String::from_utf8_lossy(&output.stdout_bounded),
+                        "stderr_bounded": String::from_utf8_lossy(&output.stderr_bounded),
+                    });
+                    println!("{}", serde_json::to_string_pretty(&out_json)?);
+                } else {
+                    print!("{}", String::from_utf8_lossy(&output.stdout_bounded));
+                }
+            }
+        }
+        Some(Commands::Artifact(art_args)) => match art_args.subcommand {
+            ArtifactSubcommands::Read {
+                hash,
+                offset,
+                length,
+            } => {
+                let mut db = Database::open(&db_path)?;
+                let cas = ContentAddressedStore::new(cas_dir);
+                let slice = cas.read_slice(&mut db, &hash, offset, length as u64)?;
+                if json_mode {
+                    let out_json = serde_json::json!({
+                        "hash": hash,
+                        "offset": offset,
+                        "length": slice.len(),
+                        "content": String::from_utf8_lossy(&slice),
+                    });
+                    println!("{}", serde_json::to_string_pretty(&out_json)?);
+                } else {
+                    print!("{}", String::from_utf8_lossy(&slice));
+                }
+            }
+            ArtifactSubcommands::Inspect { hash } => {
+                let db = Database::open(&db_path)?;
+                let cas = ContentAddressedStore::new(cas_dir);
+                let meta = cas.inspect(&db, &hash)?;
+                if json_mode {
+                    println!("{}", serde_json::to_string_pretty(&meta)?);
+                } else {
+                    println!("Artifact: {}", meta.digest);
+                    println!("Size: {} bytes", meta.size);
+                    println!("MIME: {}", meta.media_type);
+                    println!("Created: {}", meta.created_at);
+                }
+            }
+        },
+        Some(Commands::Gc(gc_args)) => {
+            let mut db = Database::open(&db_path)?;
+            let cas = ContentAddressedStore::new(cas_dir);
+            let report = cas.gc(&mut db, gc_args.dry_run)?;
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("GC Report (dry_run={}):", report.dry_run);
+                println!("  Reclaimed count: {}", report.reclaimed_count);
+                println!("  Reclaimed bytes: {}", report.reclaimed_bytes);
             }
         }
         None => {
             println!("Omen: substrate, not sovereign. Run 'omen --help' for usage.");
         }
     }
+
+    Ok(())
 }
