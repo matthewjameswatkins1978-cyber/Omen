@@ -11,6 +11,9 @@ members = [
     "crates/omen-test-fixtures",
     "crates/xtask",
 ]
+exclude = [
+    "tests/fixtures/auth_project",
+]
 
 [workspace.package]
 version = "0.2.0"

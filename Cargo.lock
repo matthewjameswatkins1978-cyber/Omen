@@ -543,6 +543,7 @@ dependencies = [
  "omen-schema",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
