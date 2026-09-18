@@ -78,53 +78,76 @@ impl InteractiveSession {
         Ok(())
     }
 
-    /// Dispatches entered input: ordinary executable or internal commands.
+    /// Dispatches entered input: ordinary executable, semantic action (:), or AI lane (?).
     pub fn dispatch_input(&mut self, input: &str) -> Result<ProcessExit, CoreError> {
-        let parts: Vec<String> = input.split_whitespace().map(|s| s.to_string()).collect();
+        let lane = crate::grammar::GrammarScanner::scan(input)?;
 
-        if parts.is_empty() {
-            return Ok(ProcessExit {
-                code: Some(0),
-                signal: None,
-            });
+        match lane {
+            crate::grammar::InputLane::AiReasoning { query } => {
+                println!(
+                    "AI reasoning is not configured.\nDeterministic options:\n  :show @failed\n  :why @last\n  :open @failed\nQuery was: {query}"
+                );
+                Ok(ProcessExit {
+                    code: Some(0),
+                    signal: None,
+                })
+            }
+            crate::grammar::InputLane::SemanticAction { action, args } => {
+                crate::actions::SemanticDispatcher::dispatch(
+                    &action,
+                    &args,
+                    &self.cwd,
+                    self.db.as_mut(),
+                )
+            }
+            crate::grammar::InputLane::Executable { argv } => {
+                if argv.is_empty() {
+                    return Ok(ProcessExit {
+                        code: Some(0),
+                        signal: None,
+                    });
+                }
+
+                let cmd_name = &argv[0];
+
+                // 1. Interactive child handoff if command is interactive
+                if ChildHandoff::is_interactive_command(cmd_name) {
+                    let exit = ChildHandoff::spawn_interactive(&argv, &self.cwd)?;
+                    self.last_exit = Some(exit.clone());
+                    self.update_prompt_state();
+                    return Ok(exit);
+                }
+
+                // 2. Ordinary executable invocation via ProcessSupervisor
+                let req = ExecutionRequest {
+                    argv,
+                    cwd: self.cwd.clone(),
+                    env: vec![],
+                    stdin_mode: StdioMode::Closed,
+                    stdin_payload: None,
+                    timeout_ms: 60000,
+                    inline_budget: 65536,
+                    required_assurance: RequiredAssurance::default(),
+                };
+
+                let output = tokio::runtime::Handle::try_current()
+                    .map_err(|_| CoreError::Internal("No tokio runtime found".into()))
+                    .and_then(|handle| {
+                        tokio::task::block_in_place(|| {
+                            handle.block_on(self.supervisor.execute(req))
+                        })
+                    })?;
+
+                // Print stdout / stderr to user
+                print!("{}", String::from_utf8_lossy(&output.stdout_all));
+                eprint!("{}", String::from_utf8_lossy(&output.stderr_all));
+
+                self.last_exit = Some(output.process_exit.clone());
+                self.update_prompt_state();
+
+                Ok(output.process_exit)
+            }
         }
-
-        let cmd_name = &parts[0];
-
-        // 1. Interactive child handoff if command is interactive
-        if ChildHandoff::is_interactive_command(cmd_name) {
-            let exit = ChildHandoff::spawn_interactive(&parts, &self.cwd)?;
-            self.last_exit = Some(exit.clone());
-            self.update_prompt_state();
-            return Ok(exit);
-        }
-
-        // 2. Ordinary executable invocation via ProcessSupervisor
-        let req = ExecutionRequest {
-            argv: parts,
-            cwd: self.cwd.clone(),
-            env: vec![],
-            stdin_mode: StdioMode::Closed,
-            stdin_payload: None,
-            timeout_ms: 60000,
-            inline_budget: 65536,
-            required_assurance: RequiredAssurance::default(),
-        };
-
-        let output = tokio::runtime::Handle::try_current()
-            .map_err(|_| CoreError::Internal("No tokio runtime found".into()))
-            .and_then(|handle| {
-                tokio::task::block_in_place(|| handle.block_on(self.supervisor.execute(req)))
-            })?;
-
-        // Print stdout / stderr to user
-        print!("{}", String::from_utf8_lossy(&output.stdout_all));
-        eprint!("{}", String::from_utf8_lossy(&output.stderr_all));
-
-        self.last_exit = Some(output.process_exit.clone());
-        self.update_prompt_state();
-
-        Ok(output.process_exit)
     }
 
     fn update_prompt_state(&mut self) {
