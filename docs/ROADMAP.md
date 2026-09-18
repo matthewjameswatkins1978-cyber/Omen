@@ -55,7 +55,7 @@
 
 ### Omen 0.4: Shared Runtime
 - **Daemon Architecture (`omend`)**: Background daemon managing shared physical execution and monitoring.
-- **Cross-Process Coordination**: Named pipes (Windows) and Unix domain sockets (Linux/macOS).
+- **Cross-Process Coordination**: Named pipes (Windows) and Unix domain sockets (Linux/macOS) for shared physical runtime/session coordination only. Resolve remains sovereign for live guards, scope locks, fencing, and conflict admission.
 - **Shared Hot Semantic Index**: Promotes 0.3 per-session hot index to a high-throughput, lock-free cross-session cache.
 - **Cross-Session Subordinate History**: Multi-agent / multi-human concurrency over single repository substrate.
 - **Terminal Lifecycle Refinements**: Kitty keyboard protocol support, cursor position reporting.
@@ -80,7 +80,7 @@
 ### Omen 0.8: Composition
 - **Multi-Tool Pipeline Composition**: Typed pipelining between Tool Atlas profiles.
 - **Transactional Workspace Snapshots**: Ephemeral Git worktrees and CAS change sets.
-- **Deterministic Workflows**: Replayable execution envelopes.
+- **Deterministic Composition & Reconstruction**: Omen may reconstruct typed execution requests and compositions from recorded subordinate evidence, but execution is always re-admitted under current Tethers authority. Omen does not own authoritative replay.
 
 ### Omen 0.9: Stabilisation
 - **API & Wire Schema Freeze**: Long-term compatibility guarantees for `v1.0`.
