@@ -7,6 +7,7 @@ pub mod grammar;
 pub mod preflight;
 pub mod prompt_adapter;
 pub mod resolver;
+pub mod services;
 pub mod session;
 
 pub use actions::SemanticDispatcher;
@@ -16,6 +17,7 @@ pub use grammar::{GrammarScanner, InputLane, TypedReference};
 pub use preflight::{BlastPreflight, BlastRadiusReport, BlastSeverity, PasteGuard, PasteReview};
 pub use prompt_adapter::OmenPrompt;
 pub use resolver::ReferenceResolver;
+pub use services::{ManagedService, ServiceRegistry, ServiceState};
 pub use session::InteractiveSession;
 
 pub fn version() -> &'static str {

@@ -16,6 +16,24 @@ impl SemanticDispatcher {
     ) -> Result<ProcessExit, CoreError> {
         match action {
             "status" => {
+                if let Some(target) = args.first() {
+                    let svc_name = target
+                        .strip_prefix("@service.")
+                        .or_else(|| target.strip_prefix("service."))
+                        .unwrap_or(target);
+                    if let Some(svc) = crate::services::ServiceRegistry::global().get(svc_name) {
+                        println!("Service Status: {}", svc.name);
+                        println!("URI:    {}", svc.resource_uri);
+                        println!("State:  {:?}", svc.state);
+                        println!("PID:    {:?}", svc.pid);
+                        println!("Uptime: {}s", svc.uptime_secs);
+                        println!("Cmd:    {}", svc.command);
+                        return Ok(ProcessExit {
+                            code: Some(0),
+                            signal: None,
+                        });
+                    }
+                }
                 println!("Omen 0.3 Human Interface: Status Healthy");
                 println!("Active Workspace: {}", cwd.display());
                 if let Some(db_ref) = db
@@ -224,9 +242,64 @@ impl SemanticDispatcher {
                     })
                 }
             }
+            "services" => {
+                let services = crate::services::ServiceRegistry::global().list();
+                if services.is_empty() {
+                    println!("No managed background services running.");
+                } else {
+                    println!("Managed Services (proc://):");
+                    for svc in &services {
+                        println!(
+                            "  - {} [{:?}] pid: {:?}, uptime: {}s, uri: {}",
+                            svc.name, svc.state, svc.pid, svc.uptime_secs, svc.resource_uri
+                        );
+                    }
+                }
+                Ok(ProcessExit {
+                    code: Some(0),
+                    signal: None,
+                })
+            }
+            "stop" => {
+                if let Some(target) = args.first() {
+                    let svc_name = target
+                        .strip_prefix("@service.")
+                        .or_else(|| target.strip_prefix("service."))
+                        .unwrap_or(target);
+                    match crate::services::ServiceRegistry::global().stop(svc_name) {
+                        Ok(true) => {
+                            println!("Service '{svc_name}' stopped.");
+                            Ok(ProcessExit {
+                                code: Some(0),
+                                signal: None,
+                            })
+                        }
+                        Ok(false) => {
+                            println!("Service '{svc_name}' not found.");
+                            Ok(ProcessExit {
+                                code: Some(1),
+                                signal: None,
+                            })
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to stop service: {e}");
+                            Ok(ProcessExit {
+                                code: Some(1),
+                                signal: None,
+                            })
+                        }
+                    }
+                } else {
+                    println!("Usage: :stop <@service.<name> | name>");
+                    Ok(ProcessExit {
+                        code: Some(1),
+                        signal: None,
+                    })
+                }
+            }
             other => {
                 println!(
-                    "Unknown Omen semantic action ':{other}'. Available: :status, :doctor, :tools, :inspect, :why, :history, :show, :open, :rerun"
+                    "Unknown Omen semantic action ':{other}'. Available: :status, :doctor, :tools, :inspect, :why, :history, :show, :open, :rerun, :services, :stop"
                 );
                 Ok(ProcessExit {
                     code: Some(1),
