@@ -62,3 +62,5 @@ define_id!(ActionId, "action");
 define_id!(FactId, "fact");
 define_id!(ArtifactId, "artifact");
 define_id!(ProcessId, "proc");
+define_id!(InteractiveSessionId, "sess");
+define_id!(OperationId, "op");

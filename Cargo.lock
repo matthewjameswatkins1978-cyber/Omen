@@ -652,8 +652,10 @@ dependencies = [
  "omen-atlas",
  "omen-core",
  "omen-engine",
+ "omen-interactive",
  "omen-knowledge",
  "omen-schema",
+ "omen-ui",
  "serde",
  "serde_json",
  "tempfile",
@@ -693,6 +695,7 @@ name = "omen-interactive"
 version = "0.2.0"
 dependencies = [
  "fuzzy-matcher",
+ "hex",
  "nu-ansi-term",
  "omen-adapters",
  "omen-atlas",
@@ -704,6 +707,7 @@ dependencies = [
  "reedline",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",

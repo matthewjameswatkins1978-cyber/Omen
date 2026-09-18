@@ -447,7 +447,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         None => {
-            println!("Omen: substrate, not sovereign. Run 'omen --help' for usage.");
+            if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                let db = Database::open(&db_path).ok();
+                let mut session = omen_interactive::InteractiveSession::new(ws_root, db)?;
+                session.run_loop()?;
+            } else {
+                println!("Omen: substrate, not sovereign. Run 'omen --help' for usage.");
+            }
         }
     }
 

@@ -7,7 +7,10 @@ pub mod resource;
 pub mod types;
 
 pub use error::{CoreError, ErrorCode};
-pub use id::{ActionId, ArtifactId, ExecutionId, FactId, ProcessId, ResourceId, ToolId};
+pub use id::{
+    ActionId, ArtifactId, ExecutionId, FactId, InteractiveSessionId, OperationId, ProcessId,
+    ResourceId, ToolId,
+};
 pub use model::{
     AdapterClassification, EnforcementReport, ExecutionConstraints, ExecutionContract,
     ExecutionResult, Intent, LeaseRequest, ProcessExit, RequiredAssurance, RuntimeStatus,
