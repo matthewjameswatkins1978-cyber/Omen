@@ -56,7 +56,27 @@ impl SemanticDispatcher {
                     });
                 }
                 let target = &args[0];
-                if let Some(typed_ref) = TypedReference::parse(target) {
+                let roles = omen_ui::ColorRoles::plain();
+                if target == "@last" {
+                    if let Some(db_ref) = db
+                        && let Ok(Some(exec)) =
+                            omen_knowledge::ExecutionHistory::get_last_execution(db_ref, session_id)
+                    {
+                        println!(
+                            "{}",
+                            omen_ui::DiagnosticRenderer::render_execution(
+                                &exec,
+                                omen_ui::DiagnosticLevel::Level2,
+                                &roles
+                            )
+                        );
+                        return Ok(ProcessExit {
+                            code: Some(0),
+                            signal: None,
+                        });
+                    }
+                    println!("No previous execution to inspect");
+                } else if let Some(typed_ref) = TypedReference::parse(target) {
                     println!("Inspecting typed reference: {:?}", typed_ref);
                 } else {
                     let prof_path = Path::new("profiles").join(format!("{target}.toml"));
@@ -68,6 +88,38 @@ impl SemanticDispatcher {
                         println!("Target '{}' not found for inspection", target);
                     }
                 }
+                Ok(ProcessExit {
+                    code: Some(0),
+                    signal: None,
+                })
+            }
+            "show" => {
+                let target = args.first().map(|s| s.as_str()).unwrap_or("@last");
+                let roles = omen_ui::ColorRoles::plain();
+                if let Some(db_ref) = db {
+                    let exec_opt = if target == "@failed" {
+                        omen_knowledge::ExecutionHistory::get_last_failed_execution(
+                            db_ref, session_id,
+                        )
+                    } else {
+                        omen_knowledge::ExecutionHistory::get_last_execution(db_ref, session_id)
+                    };
+                    if let Ok(Some(exec)) = exec_opt {
+                        println!(
+                            "{}",
+                            omen_ui::DiagnosticRenderer::render_execution(
+                                &exec,
+                                omen_ui::DiagnosticLevel::Level1,
+                                &roles
+                            )
+                        );
+                        return Ok(ProcessExit {
+                            code: Some(0),
+                            signal: None,
+                        });
+                    }
+                }
+                println!("No execution found for :show {target}");
                 Ok(ProcessExit {
                     code: Some(0),
                     signal: None,
@@ -92,18 +144,15 @@ impl SemanticDispatcher {
                     if let Ok(res_uri) = ResourceUri::parse(&uri_str)
                         && let Ok(prov) = FactRegistry::why_fact(db_ref, &res_uri)
                     {
-                        println!("Provenance for: {}", prov.fact.resource_uri);
-                        println!("Value: {}", prov.fact.value);
-                        println!("Validity: {:?}", prov.fact.validity);
-                        println!("Dependencies:");
-                        for dep in &prov.dependencies {
-                            println!(
-                                "  - {}: recorded={}, current={}",
-                                dep.generation_name,
-                                dep.recorded_generation,
-                                dep.current_generation
-                            );
-                        }
+                        let roles = omen_ui::ColorRoles::plain();
+                        println!(
+                            "{}",
+                            omen_ui::DiagnosticRenderer::render_fact_provenance(
+                                &prov,
+                                omen_ui::DiagnosticLevel::Level2,
+                                &roles
+                            )
+                        );
                         return Ok(ProcessExit {
                             code: Some(0),
                             signal: None,
