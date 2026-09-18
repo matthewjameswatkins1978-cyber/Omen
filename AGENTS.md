@@ -17,7 +17,10 @@ The surrounding division of responsibility is absolute:
 - **Omen** makes the machine legible and enforceable (physical execution, containment, typed resources, machine-readable facts, and artifact CAS evidence).
 - **ThreadMoth** deterministically mutates (bounded structural edits with cryptographic pre/post hashes and refusal).
 
-Do not blur these boundaries. Never create competing policy, replay, approval, or journaling systems inside Omen.
+Compact system statement:
+> **Lantern knows. Resolve coordinates. Tethers controls. Omen makes the machine legible and enforceable. ThreadMoth mutates deterministically.**
+
+Do not blur these boundaries. Never create competing policy, replay, approval, or journaling systems inside Omen. Resolve admission cannot grant Tethers permission. Tethers controls authority; Omen reports enforceability.
 
 ## 2. Rules for Machine Reasoning
 
@@ -28,3 +31,4 @@ Do not blur these boundaries. Never create competing policy, replay, approval, o
 5. **Lazy pessimism for Facts**: When an underlying resource dependency changes, the associated Fact transitions from `CURRENT` to `DIRTY`. Omen **refuses** to silently revalidate or rerun commands when `CURRENT` is required. The caller must explicitly dispatch revalidation.
 6. **Strongly typed identities**: All resources, tools, executions, actions, facts, and artifacts have dedicated types (e.g. `ResourceId`, `FactId`, `ArtifactId`), not interchangeable strings.
 7. **Platform truthfulness**: If a platform cannot enforce a constraint (such as sandboxing), it reports `OBSERVED` or `UNSUPPORTED`. It never fakes `ENFORCED`.
+8. **Cross-platform by default**: Unless explicitly designated as platform-specific (such as Windows Job Objects or Linux Landlock), all ordinary Omen code, grammar parsing, and tests are portable across Windows, Linux, and macOS. Do not hard-code PowerShell, Bash, shell quoting, or Windows drive assumptions into portable code.

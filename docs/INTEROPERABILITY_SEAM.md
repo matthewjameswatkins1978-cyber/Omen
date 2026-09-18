@@ -53,9 +53,23 @@ To avoid conflating packages, configurations, and running processes, Omen define
 
 | Entity | Description | Mutability | Location |
 | :--- | :--- | :--- | :--- |
-| **Adapter Package** | The portable distribution bundle (manifest, binary/script, wire schema, checksums). | Immutable | Registry / Tarball |
-| **Installed Adapter** | An unpacked, verified adapter in the workspace or system catalog. | Read-Only | Workspace Store (`.omen/adapters`) |
-| **Exact Binding** | An active runtime instance bound to a specific session ID, transport handle, and capability scope. | Ephemeral | Runtime Memory / `omend` |
+| **Adapter Package** | The portable distribution bundle (manifest, binary/script, wire schema, checksums, conformance fixtures). | Immutable | Registry / Tarball |
+| **Installed Adapter** | An unpacked, verified adapter in the workspace or system catalog with exact version/digest. | Read-Only | Workspace Store (`.omen/adapters`) |
+| **Exact Binding** | An active runtime instance bound to a specific session ID, transport channel, and capability scope. | Ephemeral | Runtime Memory / `omend` |
+
+### Adapter Lifecycle States
+```text
+inspect ──> validate ──> conform ──> install ──> bind ──> active
+```
+Possible non-active states:
+- `stale` (dependency or binary updated; requires re-conformance)
+- `incompatible` (fails baseline protocol or schema expectations)
+- `degraded` (partial protocol support; unsupported optional capabilities refused)
+- `unavailable` (transport unreachable or process crashed)
+- `disabled` (administratively turned off)
+- `quarantined` (failed security/conformance check or erratic behavior detected)
+
+Conformance proves protocol and translation behavior. It does not establish authority.
 
 ---
 
@@ -65,11 +79,14 @@ External consumers declare their exact protocol expectations using **Compatibili
 
 ```toml
 [interop]
-profile = "agent.v1"
+profile = "agent-interop-2026"
 requires_capabilities = [
-    "omen.tools.execute.v1",
-    "omen.facts.read.v2",
-    "omen.artifacts.read.v1",
+    "mcp.tools.2026-07-28",
+    "mcp.resources.2026-07-28",
+    "a2a.tasks.1.0",
+]
+optional_capabilities = [
+    "agentsmd.instructions.1.x",
 ]
 conformance_test = "strict"
 ```
@@ -78,15 +95,34 @@ conformance_test = "strict"
 1. **Zero Authority Grant**: Declaring an Interop Set validates protocol compatibility; it **never** grants permission, authority, or elevated trust.
 2. **Strict Authority Division**: Permission, approval, capability identity, durable intent, and provider outcome truth remain sovereign to **Tethers**.
 3. **Pre-Activation Conformance**: Omen executes a dry-run capability handshake against the adapter before activation. If the adapter fails the interop set contract, activation is refused.
-4. **Independent Version Axes**:
+4. **Independent Version Axes**: Never collapse versioning into "latest". Track each axis independently:
    - Substrate Version: `omen 0.3.0`
-   - Canonical Schema Version: `schema 0.2`
-   - Protocol Adapter Version: `mcp-edge 0.1.0`
-   Each axis evolves and versions independently.
+   - Canonical Schema/SPI Version: `schema 0.2`
+   - Adapter Package Format: `pkg 1.0`
+   - Adapter Implementation Version: `mcp-edge 0.1.0`
+   - External Protocol Version: `mcp 2026-07-28`
+   - Protocol Extension Version: `ext.roots 1.0`
+   - Transport-Binding Version: `stdio.v1`
 
 ---
 
-## 5. Summary of Seam Boundaries
+## 5. The 10-Step Adapter Conformance Crucible
+
+Before claiming support for an external standard, an adapter must pass the 10-step crucible:
+1. **Inspect** package without executing it (static manifest and hash verification).
+2. **Validate** schema and version claims against canonical wire definitions.
+3. **Run** controlled conformance fixtures in an isolated test harness.
+4. **Prove** deterministic translation into canonical Omen types.
+5. **Prove** unsupported semantics refuse explicitly rather than silently faking support.
+6. **Preserve** identity and provenance across translation boundaries.
+7. **Prove** unknown extension data cannot grant authority or bypass constraints.
+8. **Test** output projection into external protocol formats.
+9. **Test** round-trip serialization where bidirectional mapping is promised.
+10. **Record** exact package, protocol, and version evidence in the Tool Atlas.
+
+---
+
+## 6. Summary of Seam Boundaries
 
 ```
 ┌─────────────────────────────────────────────────────────────┐

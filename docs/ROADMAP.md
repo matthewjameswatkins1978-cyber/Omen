@@ -3,6 +3,8 @@
 > **Doctrine**: *Omen is substrate, not sovereign.*  
 > **Standards Doctrine**: *Stable canonical Omen semantics internally; protocol adapters at the edges; zero protocol-specific coupling inside the core substrate.*
 
+> For the complete architectural rationale, standards doctrine, research findings, and detailed release charters, see **[Road to 1.0](ROAD_TO_1_0.md)**.
+
 ---
 
 ## 1. Sequence of Releases
@@ -54,41 +56,55 @@
 - [x] H11: Performance benchmarks (genuine cold-start + hot completion), golden snapshots, evidence package.
 
 ### Omen 0.4: Shared Runtime
-- **Daemon Architecture (`omend`)**: Background daemon managing shared physical execution and monitoring.
+- **Theme**: *One Omen reality across processes.*
+- **Daemon Architecture (`omend`)**: Small local runtime daemon managing shared physical execution, monitoring, and state.
 - **Cross-Process Coordination**: Named pipes (Windows) and Unix domain sockets (Linux/macOS) for shared physical runtime/session coordination only. Resolve remains sovereign for live guards, scope locks, fencing, and conflict admission.
-- **Shared Hot Semantic Index**: Promotes 0.3 per-session hot index to a high-throughput, lock-free cross-session cache.
-- **Cross-Session Subordinate History**: Multi-agent / multi-human concurrency over single repository substrate.
-- **Terminal Lifecycle Refinements**: Kitty keyboard protocol support, cursor position reporting.
+- **Shared State**: Shared Facts with live invalidation, shared subordinate physical history, and a shared hot semantic index cache across concurrent shells.
+- **Process & Services**: Process registry, named service lifecycle (`proc://`), session recovery, and daemon disconnect/recovery semantics.
+- **Success Criteria**: *Two Omen shells and an agent can look at the same workspace and see the same underlying machine truth.*
 
 ### Omen 0.5: Agent Interoperability
-- **Standards-Based Edge Projections**: Protocol adapters projecting Omen to external agents (e.g. Model Context Protocol / MCP, Language Server Protocol / LSP, Agent-to-Agent / A2A).
+- **Theme**: *Stop agents using terminals as eyes.*
+- **General Interoperability Boundary**: Edge protocol adapters (MCP, A2A, LSP, repo instructions). MCP is an edge adapter, not Omen's internal architecture.
 - **Zero Core Protocol Coupling**: Core Omen substrate remains pure and unpolluted by external protocol quirks.
-- **Compatibility Profiles & Interop Sets**: Declarative manifests validating protocol conformance before activation.
-- **Transport Independence**: Stdio, IPC, WebSocket, and HTTP/SSE transports for edge adapters.
+- **Capabilities**: Tool/resource discovery, execution requests, Fact queries/subscriptions, process inspection, CAS context pagination, structured errors, explicit standards version negotiation.
+- **Compatibility Profiles & Interop Sets**: Declarative manifests validating protocol conformance before activation (no authority grant).
+- **Success Criteria**: *A capable coding agent using Omen should need raw terminal scraping dramatically less often.*
 
 ### Omen 0.6: Physical Maturity
-- **Hardened Containment**: Linux Landlock v3/v4 fine-tuning, cgroups v2 resource controllers.
-- **Windows Sandboxing**: AppContainer profiles, restricted tokens, Job Object nested limits.
-- **macOS Sandboxing**: Endpoint Security framework integration, sandbox-exec profiles.
-- **Truthful Platform Matrix**: Unforgeable platform enforcement reporting (`ENFORCED` vs `OBSERVED`).
+- **Theme**: *Make physical execution genuinely mature.*
+- **Pluggable Execution Backends**: Native host, WSL, container, microVM sandbox, remote runtime.
+- **Interactive & Process Capabilities**: First-class PTY execution, attachable/resumable sessions, process-tree ownership, service leases.
+- **Hardened Containment**: Linux Landlock/pidfd/cgroups v2/namespaces; Windows Job Objects/restricted tokens/AppContainer; macOS Endpoint Security.
+- **Truthful Platform Assurance**: Unforgeable reporting (`ENFORCED`, `MEDIATED`, `OBSERVED`, `BEST_EFFORT`, `UNSUPPORTED`).
+- **Secrets Handles**: Strict separation of `secret.use` from `secret.expose`.
+- **Success Criteria**: *Omen can supervise normal developer workloads, hostile fixtures, services and interactive programs while truthfully describing what the platform actually enforced.*
 
 ### Omen 0.7: Semantic Environment
-- **Ast-Grep Adapter**: Structural code search and pattern matching.
-- **Carapace Grammar Ingestion**: Dynamic argument completion ingestion for thousands of CLI tools.
-- **Rich Semantic Schemas**: Workspace-wide AST and symbol fact generation.
+- **Theme**: *Understand more than commands.*
+- **Structural Analysis & Metadata**: Ast-grep adapter for AST search/rewrites, compiler metadata extraction.
+- **Language Intelligence**: LSP and SCIP integration for symbol and reference navigation (`symbol://crate/auth/refresh_token`).
+- **Tool Ecosystem**: Richer domain understanding of Cargo/Rust, npm/pnpm, Python/uv, Go, Docker, GitHub CLI. Descriptive grammar ingestion (Carapace/Fig) without authority grant.
+- **Success Criteria**: *Omen increasingly understands what developer actions mean, not merely which executables launched.*
 
 ### Omen 0.8: Composition
-- **Multi-Tool Pipeline Composition**: Typed pipelining between Tool Atlas profiles.
-- **Transactional Workspace Snapshots**: Ephemeral Git worktrees and CAS change sets.
-- **Deterministic Composition & Reconstruction**: Omen may reconstruct typed execution requests and compositions from recorded subordinate evidence, but execution is always re-admitted under current Tethers authority. Omen does not own authoritative replay.
+- **Theme**: *Make repeated work concise without inventing another programming language.*
+- **Project Configuration (`Omen.toml`)**: Optional declarative workspace configuration (identity, known services, named checks, common actions, adapter config). No policy; does not replace package manifests.
+- **Composition Engine**: Named actions combining checks, typed value routing, large output handling via CAS artifacts and bounded previews.
+- **Authority Invariant**: Omen may reconstruct typed execution requests/compositions from recorded subordinate evidence, but all execution is re-admitted under current Tethers authority. Omen does not own authoritative replay.
+- **Success Criteria**: *Most everyday developer command chains become clearer and safer without Omen growing loops, classes, modules and another package manager.*
 
 ### Omen 0.9: Stabilisation
-- **API & Wire Schema Freeze**: Long-term compatibility guarantees for `v1.0`.
-- **Fuzzing & Torture Testing**: High-concurrency Gremlin stress testing across multi-platform matrix.
-- **Security Audit**: Memory safety, secret redaction, and symlink escape proofs.
+- **Theme**: *Stop adding clever things and make everything boringly dependable.*
+- **Hardening & Verification**: Protocol and wire schema freeze, database migrations, crash recovery, corruption handling, CAS integrity.
+- **Security & Torture**: Fuzzing, path traversal, symlink/junction/mount escape, secret leakage, terminal escape injection, malicious workspace metadata, adapter trust, local IPC authentication.
+- **Success Criteria**: *We deliberately struggle to break it before allowing it to call itself 1.0.*
 
 ### Omen 1.0: Stable Human + Agent Developer Runtime
-- **Production Standard**: The unified substrate for human developers and autonomous AI coding agents.
+- **Theme**: *A stable, production-grade commitment.*
+- **Production Standard**: Unified substrate for human developers and autonomous AI coding agents across Windows, Linux, and macOS.
+- **Qualities**: Human quality (low-friction daily driver), agent quality (semantic operation without scraping), shared reality (identical machine truth without history contamination), cross-platform, AI-optional, and backed by reproducible evidence.
+
 
 ---
 
