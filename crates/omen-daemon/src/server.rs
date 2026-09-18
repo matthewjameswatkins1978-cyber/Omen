@@ -210,6 +210,10 @@ impl DaemonServer {
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let req_id = request.request_id.clone();
+        let session_id = request
+            .session_id
+            .clone()
+            .unwrap_or_else(|| "sess_anonymous".to_string());
         let outcome = match request.payload {
             RequestPayload::Ping { timestamp_ms } => Ok(ResponsePayload::Pong { timestamp_ms }),
 
@@ -391,29 +395,25 @@ impl DaemonServer {
                 tool,
                 operation,
                 args,
-                cwd: _,
-                timeout_ms: _,
+                cwd,
+                timeout_ms,
+                consequential_request_id,
             } => {
                 let current = attached_workspace.read().await;
                 match &*current {
                     Some(ws) => {
-                        let exec_id = format!("exec_{}", Uuid::new_v4());
-                        ws.record_request_receipt(&req_id, Some(&exec_id), "Completed")
-                            .await;
-                        Ok(ResponsePayload::ExecutionFinished(
-                            omen_ipc::ExecutionResultSummary {
-                                execution_id: exec_id,
-                                exit_code: Some(0),
-                                duration_ms: 10,
-                                stdout_preview: format!(
-                                    "Executed {} {} with {:?}",
-                                    tool, operation, args
-                                ),
-                                stderr_preview: String::new(),
-                                stdout_artifact: None,
-                                stderr_artifact: None,
-                            },
-                        ))
+                        let dedup_id = consequential_request_id.unwrap_or_else(|| req_id.clone());
+                        let params = crate::workspace::BrokerExecutionParams {
+                            dedup_id: &dedup_id,
+                            session_id: &session_id,
+                            tool: &tool,
+                            operation: &operation,
+                            args: &args,
+                            cwd: &cwd,
+                            timeout_ms,
+                        };
+                        let res = ws.execute_broker(params).await;
+                        res.map(ResponsePayload::ExecutionFinished)
                     }
                     None => Err(LocalIpcError::WorkspaceNotAttached(
                         "No workspace attached for this session".into(),

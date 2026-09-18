@@ -15,6 +15,9 @@ struct GremlinArgs {
     stdout: Option<String>,
 
     #[arg(long)]
+    stdout_bytes: Option<usize>,
+
+    #[arg(long)]
     stderr: Option<String>,
 
     #[arg(long)]
@@ -42,6 +45,11 @@ fn main() {
 
     if let Some(msg) = args.stdout {
         println!("{msg}");
+    }
+
+    if let Some(count) = args.stdout_bytes {
+        let chunk = "A".repeat(count);
+        print!("{chunk}");
     }
 
     if let Some(err) = args.stderr {

@@ -7,11 +7,30 @@ use tokio::sync::{Mutex, RwLock, broadcast};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 
 use omen_core::{CoreError, ExecutionId, InteractiveSessionId};
-use omen_ipc::{EventPayload, FactInfo, IpcEvent, ManagedServiceInfo, SharedIndexSnapshot};
+use omen_engine::{ExecutionRequest, ProcessSupervisor};
+use omen_ipc::{
+    EventPayload, ExecutionResultSummary, FactInfo, IpcEvent, LocalIpcError, ManagedServiceInfo,
+    SharedIndexSnapshot,
+};
 use omen_knowledge::{
     Database, ExecutionHistory, ExecutionRecord, FactRegistry, RequestReceiptRecord, ServiceRecord,
-    WorkspacePersistence, deterministic_workspace_id, resolve_workspace_dir,
+    WorkspacePersistence, cas::ContentAddressedStore, deterministic_workspace_id,
+    resolve_workspace_dir,
 };
+
+pub type InFlightMap =
+    Arc<Mutex<HashMap<String, broadcast::Sender<Result<ExecutionResultSummary, LocalIpcError>>>>>;
+
+#[derive(Debug, Clone)]
+pub struct BrokerExecutionParams<'a> {
+    pub dedup_id: &'a str,
+    pub session_id: &'a str,
+    pub tool: &'a str,
+    pub operation: &'a str,
+    pub args: &'a [String],
+    pub cwd: &'a str,
+    pub timeout_ms: u64,
+}
 
 pub struct WorkspaceState {
     workspace_id: String,
@@ -21,6 +40,10 @@ pub struct WorkspaceState {
     facts: RwLock<HashMap<String, FactInfo>>,
     services: RwLock<HashMap<String, ManagedServiceInfo>>,
     db: Arc<Mutex<Database>>,
+    cas: Arc<ContentAddressedStore>,
+    supervisor: Arc<ProcessSupervisor>,
+    execution_cache: RwLock<HashMap<String, ExecutionResultSummary>>,
+    in_flight_executions: InFlightMap,
     event_tx: broadcast::Sender<IpcEvent>,
     watcher: Arc<Mutex<Option<RecommendedWatcher>>>,
 }
@@ -94,6 +117,10 @@ impl WorkspaceState {
         }
 
         let (event_tx, _) = broadcast::channel(512);
+        let cas = Arc::new(ContentAddressedStore::new(state_dir.join("cas")));
+        let supervisor = Arc::new(ProcessSupervisor::new());
+        let execution_cache = RwLock::new(HashMap::new());
+        let in_flight_executions = Arc::new(Mutex::new(HashMap::new()));
 
         Self {
             workspace_id,
@@ -103,6 +130,10 @@ impl WorkspaceState {
             facts: RwLock::new(initial_facts),
             services: RwLock::new(initial_services),
             db: Arc::new(Mutex::new(db)),
+            cas,
+            supervisor,
+            execution_cache,
+            in_flight_executions,
             event_tx,
             watcher: Arc::new(Mutex::new(None)),
         }
@@ -429,5 +460,234 @@ impl WorkspaceState {
         let sid = InteractiveSessionId::new(session_id)?;
         let db = self.db.lock().await;
         ExecutionHistory::get_last_execution(&db, &sid)
+    }
+
+    pub fn cas(&self) -> Arc<ContentAddressedStore> {
+        self.cas.clone()
+    }
+
+    pub fn supervisor(&self) -> Arc<ProcessSupervisor> {
+        self.supervisor.clone()
+    }
+
+    pub async fn execute_broker(
+        self: &Arc<Self>,
+        params: BrokerExecutionParams<'_>,
+    ) -> Result<ExecutionResultSummary, LocalIpcError> {
+        let dedup_id = params.dedup_id;
+        let session_id = params.session_id;
+        let tool = params.tool;
+        let operation = params.operation;
+        let args = params.args;
+        let cwd = params.cwd;
+        let timeout_ms = params.timeout_ms;
+
+        // 1. Check if already completed in memory cache
+        if let Some(cached) = self.execution_cache.read().await.get(dedup_id) {
+            return Ok(cached.clone());
+        }
+
+        // 2. Check if already recorded in request_receipts in SQLite
+        if let Some(receipt) = self.query_request_receipt(dedup_id).await
+            && receipt.status == "Completed"
+            && let Some(exec_id) = receipt.execution_id
+        {
+            let db = self.db.lock().await;
+            if let Ok(Some(rec)) = ExecutionHistory::get_last_execution(
+                &db,
+                &InteractiveSessionId::new(session_id)
+                    .map_err(|e| LocalIpcError::InternalRuntimeError(e.to_string()))?,
+            ) && rec.execution_id.as_str() == exec_id
+            {
+                let summary = ExecutionResultSummary {
+                    execution_id: exec_id,
+                    exit_code: rec.exit_code,
+                    duration_ms: rec.duration_ms.unwrap_or(0) as u64,
+                    stdout_preview: rec.command.clone(),
+                    stderr_preview: String::new(),
+                    stdout_artifact: rec.stdout_artifact,
+                    stderr_artifact: rec.stderr_artifact,
+                };
+                self.execution_cache
+                    .write()
+                    .await
+                    .insert(dedup_id.to_string(), summary.clone());
+                return Ok(summary);
+            }
+        }
+
+        // 3. Check if currently in-flight
+        let maybe_sub = {
+            let mut in_flight = self.in_flight_executions.lock().await;
+            if let Some(tx) = in_flight.get(dedup_id) {
+                Some(tx.subscribe())
+            } else {
+                let (tx, _) = broadcast::channel(4);
+                in_flight.insert(dedup_id.to_string(), tx);
+                None
+            }
+        };
+
+        if let Some(mut subscriber) = maybe_sub {
+            return match subscriber.recv().await {
+                Ok(res) => res,
+                Err(e) => Err(LocalIpcError::InternalRuntimeError(format!(
+                    "In-flight execution subscription error: {e}"
+                ))),
+            };
+        }
+
+        // 4. Mark Running in SQLite receipt
+        self.record_request_receipt(dedup_id, None, "Running").await;
+
+        // 5. Construct argv
+        let mut argv = Vec::new();
+        if !tool.is_empty() && tool != "exec" {
+            argv.push(tool.to_string());
+        }
+        if !operation.is_empty() {
+            argv.push(operation.to_string());
+        }
+        argv.extend(args.iter().cloned());
+        if argv.is_empty() && tool == "exec" && !args.is_empty() {
+            argv = args.to_vec();
+        }
+        if argv.is_empty() {
+            let mut in_flight = self.in_flight_executions.lock().await;
+            in_flight.remove(dedup_id);
+            self.record_request_receipt(dedup_id, None, "Failed").await;
+            return Err(LocalIpcError::MalformedRequest(
+                "Command argv cannot be empty".into(),
+            ));
+        }
+
+        let this = Arc::clone(self);
+        let dedup_id_str = dedup_id.to_string();
+        let session_id_str = session_id.to_string();
+        let tool_str = tool.to_string();
+        let exec_cwd = if cwd.is_empty() {
+            self.canonical_path.clone()
+        } else {
+            PathBuf::from(cwd)
+        };
+
+        let join_handle = tokio::spawn(async move {
+            let req = ExecutionRequest {
+                argv: argv.clone(),
+                cwd: exec_cwd,
+                env: vec![],
+                stdin_mode: omen_core::StdioMode::Closed,
+                stdin_payload: None,
+                timeout_ms: if timeout_ms == 0 { 60000 } else { timeout_ms },
+                inline_budget: 8192,
+                required_assurance: omen_core::RequiredAssurance::default(),
+            };
+
+            let exec_result = this.supervisor.execute(req).await;
+            match exec_result {
+                Ok(output) => {
+                    let exec_id_str = format!("exec_{}", uuid::Uuid::new_v4());
+                    let cmd_str = argv.join(" ");
+
+                    // Check CAS offload for large output
+                    let (stdout_art, stderr_art) = {
+                        let mut db = this.db.lock().await;
+                        let so_art = if output.stdout_all.len() > 8192 {
+                            this.cas
+                                .store(
+                                    &mut db,
+                                    &output.stdout_all,
+                                    "text/plain",
+                                    &tool_str,
+                                    omen_core::RetentionClass::Ephemeral,
+                                )
+                                .ok()
+                                .map(|m| m.uri.to_string())
+                        } else {
+                            None
+                        };
+                        let se_art = if output.stderr_all.len() > 8192 {
+                            this.cas
+                                .store(
+                                    &mut db,
+                                    &output.stderr_all,
+                                    "text/plain",
+                                    &tool_str,
+                                    omen_core::RetentionClass::Ephemeral,
+                                )
+                                .ok()
+                                .map(|m| m.uri.to_string())
+                        } else {
+                            None
+                        };
+                        (so_art, se_art)
+                    };
+
+                    let exit_code = output.process_exit.code;
+                    let duration_ms = output.duration_ms;
+                    let stdout_preview =
+                        String::from_utf8_lossy(&output.stdout_bounded).to_string();
+                    let stderr_preview =
+                        String::from_utf8_lossy(&output.stderr_bounded).to_string();
+
+                    // Record history
+                    let _ = this
+                        .record_history(
+                            &session_id_str,
+                            &cmd_str,
+                            exit_code,
+                            duration_ms,
+                            stdout_art.clone(),
+                            stderr_art.clone(),
+                        )
+                        .await;
+
+                    // Update request receipt
+                    this.record_request_receipt(&dedup_id_str, Some(&exec_id_str), "Completed")
+                        .await;
+
+                    let summary = ExecutionResultSummary {
+                        execution_id: exec_id_str,
+                        exit_code,
+                        duration_ms,
+                        stdout_preview,
+                        stderr_preview,
+                        stdout_artifact: stdout_art,
+                        stderr_artifact: stderr_art,
+                    };
+
+                    // Cache in memory
+                    this.execution_cache
+                        .write()
+                        .await
+                        .insert(dedup_id_str.clone(), summary.clone());
+
+                    // Notify in-flight subscribers
+                    let mut in_flight = this.in_flight_executions.lock().await;
+                    if let Some(tx) = in_flight.remove(&dedup_id_str) {
+                        let _ = tx.send(Ok(summary.clone()));
+                    }
+
+                    Ok(summary)
+                }
+                Err(e) => {
+                    this.record_request_receipt(&dedup_id_str, None, "Failed")
+                        .await;
+                    let err = LocalIpcError::InternalRuntimeError(format!("Execution failed: {e}"));
+                    let mut in_flight = this.in_flight_executions.lock().await;
+                    if let Some(tx) = in_flight.remove(&dedup_id_str) {
+                        let _ = tx.send(Err(err.clone()));
+                    }
+                    Err(err)
+                }
+            }
+        });
+
+        match join_handle.await {
+            Ok(res) => res,
+            Err(e) => Err(LocalIpcError::InternalRuntimeError(format!(
+                "Execution task panicked: {e}"
+            ))),
+        }
     }
 }

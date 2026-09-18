@@ -325,7 +325,39 @@ impl OmenClient {
                 args,
                 cwd: cwd.into(),
                 timeout_ms,
+                consequential_request_id: None,
             })
+            .await?;
+        match resp {
+            ResponsePayload::ExecutionFinished(summary) => Ok(summary),
+            other => Err(LocalIpcError::MalformedRequest(format!(
+                "Expected ExecutionFinished, got {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn submit_consequential_execution(
+        &self,
+        consequential_request_id: impl Into<String>,
+        tool: impl Into<String>,
+        operation: impl Into<String>,
+        args: Vec<String>,
+        cwd: impl Into<String>,
+        timeout_ms: u64,
+    ) -> Result<ExecutionResultSummary, LocalIpcError> {
+        let cid = consequential_request_id.into();
+        let resp = self
+            .send_request_with_id(
+                cid.clone(),
+                RequestPayload::SubmitExecution {
+                    tool: tool.into(),
+                    operation: operation.into(),
+                    args,
+                    cwd: cwd.into(),
+                    timeout_ms,
+                    consequential_request_id: Some(cid),
+                },
+            )
             .await?;
         match resp {
             ResponsePayload::ExecutionFinished(summary) => Ok(summary),

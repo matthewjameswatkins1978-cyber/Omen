@@ -41,6 +41,8 @@ pub enum RequestPayload {
         args: Vec<String>,
         cwd: String,
         timeout_ms: u64,
+        #[serde(default)]
+        consequential_request_id: Option<String>,
     },
     QueryRequestStatus {
         consequential_request_id: String,

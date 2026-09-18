@@ -130,11 +130,12 @@ async fn test_request_receipt_tracking_and_status() {
         .send_request_with_id(
             &test_req_id,
             omen_ipc::RequestPayload::SubmitExecution {
-                tool: "git".into(),
-                operation: "status".into(),
+                tool: "cargo".into(),
+                operation: "--version".into(),
                 args: vec![],
                 cwd: tmp.path().to_str().unwrap().into(),
-                timeout_ms: 1000,
+                timeout_ms: 5000,
+                consequential_request_id: Some(test_req_id.clone()),
             },
         )
         .await
