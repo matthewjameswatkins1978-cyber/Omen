@@ -170,9 +170,24 @@ async fn test_daemon_services_lifecycle() {
         .await
         .unwrap();
 
+    let mut gremlin_path = std::env::current_exe().expect("current exe");
+    gremlin_path.pop();
+    if gremlin_path.ends_with("deps") {
+        gremlin_path.pop();
+    }
+    let gremlin_name = if cfg!(windows) {
+        "omen-gremlin.exe"
+    } else {
+        "omen-gremlin"
+    };
+    let gremlin = gremlin_path
+        .join(gremlin_name)
+        .to_string_lossy()
+        .to_string();
+
     // Start service
     let svc = client
-        .start_service("web", "npm", vec!["run".into(), "dev".into()])
+        .start_service("web", &gremlin, vec!["--sleep-ms".into(), "10000".into()])
         .await
         .unwrap();
     assert_eq!(svc.name, "web");
@@ -180,7 +195,7 @@ async fn test_daemon_services_lifecycle() {
 
     // Starting already running service must fail with ServiceAlreadyRunning
     let duplicate_res = client
-        .start_service("web", "npm", vec!["run".into(), "dev".into()])
+        .start_service("web", &gremlin, vec!["--sleep-ms".into(), "10000".into()])
         .await;
     match duplicate_res {
         Err(LocalIpcError::ServiceAlreadyRunning(msg)) => {

@@ -21,6 +21,18 @@ use omen_knowledge::{
 pub type InFlightMap =
     Arc<Mutex<HashMap<String, broadcast::Sender<Result<ExecutionResultSummary, LocalIpcError>>>>>;
 
+pub struct ManagedChildService {
+    pub name: String,
+    pub command: String,
+    pub argv: Vec<String>,
+    pub pid: u32,
+    pub started_at: std::time::Instant,
+    pub log_lines: Arc<RwLock<Vec<String>>>,
+    pub stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+pub type ManagedProcessMap = Arc<Mutex<HashMap<String, ManagedChildService>>>;
+
 #[derive(Debug, Clone)]
 pub struct BrokerExecutionParams<'a> {
     pub dedup_id: &'a str,
@@ -39,6 +51,8 @@ pub struct WorkspaceState {
     sequence: Arc<AtomicU64>,
     facts: RwLock<HashMap<String, FactInfo>>,
     services: RwLock<HashMap<String, ManagedServiceInfo>>,
+    service_configs: RwLock<HashMap<String, (String, Vec<String>)>>,
+    managed_processes: ManagedProcessMap,
     db: Arc<Mutex<Database>>,
     cas: Arc<ContentAddressedStore>,
     supervisor: Arc<ProcessSupervisor>,
@@ -102,14 +116,36 @@ impl WorkspaceState {
         let mut initial_services = HashMap::new();
         if let Ok(records) = WorkspacePersistence::list_services(&db, &workspace_id) {
             for s in records {
+                let mut state = s.state.clone();
+                let mut pid = s.pid;
+                // Crash reconciliation: if recorded as running, verify process is actually alive
+                if state == "running" {
+                    let is_alive = pid.map(omen_engine::is_process_alive).unwrap_or(false);
+                    if !is_alive {
+                        state = "crashed".to_string();
+                        pid = None;
+                        let _ = WorkspacePersistence::upsert_service(
+                            &db,
+                            &ServiceRecord {
+                                workspace_id: workspace_id.clone(),
+                                name: s.name.clone(),
+                                command: s.command.clone(),
+                                pid: None,
+                                state: state.clone(),
+                                started_at: s.started_at.clone(),
+                                updated_at: chrono::Utc::now().to_rfc3339(),
+                            },
+                        );
+                    }
+                }
                 initial_services.insert(
                     s.name.clone(),
                     ManagedServiceInfo {
                         name: s.name.clone(),
                         resource_uri: format!("proc://workspace/{}", s.name),
-                        pid: s.pid,
+                        pid,
                         command: s.command,
-                        state: s.state,
+                        state,
                         uptime_secs: 0,
                     },
                 );
@@ -121,6 +157,8 @@ impl WorkspaceState {
         let supervisor = Arc::new(ProcessSupervisor::new());
         let execution_cache = RwLock::new(HashMap::new());
         let in_flight_executions = Arc::new(Mutex::new(HashMap::new()));
+        let managed_processes = Arc::new(Mutex::new(HashMap::new()));
+        let service_configs = RwLock::new(HashMap::new());
 
         Self {
             workspace_id,
@@ -129,6 +167,8 @@ impl WorkspaceState {
             sequence: Arc::new(AtomicU64::new(1)),
             facts: RwLock::new(initial_facts),
             services: RwLock::new(initial_services),
+            service_configs,
+            managed_processes,
             db: Arc::new(Mutex::new(db)),
             cas,
             supervisor,
@@ -313,12 +353,237 @@ impl WorkspaceState {
 
     pub async fn list_services(&self) -> Vec<ManagedServiceInfo> {
         let services = self.services.read().await;
-        services.values().cloned().collect()
+        let managed = self.managed_processes.lock().await;
+        let mut list = Vec::new();
+        for svc in services.values() {
+            let mut info = svc.clone();
+            if let Some(child) = managed.get(&info.name) {
+                info.uptime_secs = child.started_at.elapsed().as_secs();
+            }
+            list.push(info);
+        }
+        list
     }
 
     pub async fn get_service(&self, name: &str) -> Option<ManagedServiceInfo> {
         let services = self.services.read().await;
-        services.get(name).cloned()
+        if let Some(svc) = services.get(name) {
+            let mut info = svc.clone();
+            let managed = self.managed_processes.lock().await;
+            if let Some(child) = managed.get(name) {
+                info.uptime_secs = child.started_at.elapsed().as_secs();
+            }
+            Some(info)
+        } else {
+            None
+        }
+    }
+
+    pub async fn start_managed_service(
+        self: &Arc<Self>,
+        name: &str,
+        command: &str,
+        argv: &[String],
+    ) -> Result<ManagedServiceInfo, LocalIpcError> {
+        {
+            let services = self.services.read().await;
+            if let Some(existing) = services.get(name)
+                && existing.state == "running"
+            {
+                return Err(LocalIpcError::ServiceAlreadyRunning(format!(
+                    "Service '{name}' is already running with PID {:?}",
+                    existing.pid
+                )));
+            }
+        }
+
+        let mut cmd = tokio::process::Command::new(command);
+        cmd.args(argv);
+        cmd.current_dir(&self.canonical_path);
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        let mut child = cmd.spawn().map_err(|e| {
+            LocalIpcError::InternalRuntimeError(format!("Failed to spawn service '{name}': {e}"))
+        })?;
+
+        let pid = child.id().ok_or_else(|| {
+            LocalIpcError::InternalRuntimeError("Failed to obtain child process ID".into())
+        })?;
+
+        let log_lines = Arc::new(RwLock::new(Vec::new()));
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+
+        if let Some(out) = child.stdout.take() {
+            let logs = log_lines.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncBufReadExt;
+                let mut reader = tokio::io::BufReader::new(out).lines();
+                while let Ok(Some(line)) = reader.next_line().await {
+                    let mut buf = logs.write().await;
+                    if buf.len() >= 5000 {
+                        buf.remove(0);
+                    }
+                    buf.push(line);
+                }
+            });
+        }
+
+        if let Some(err) = child.stderr.take() {
+            let logs = log_lines.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncBufReadExt;
+                let mut reader = tokio::io::BufReader::new(err).lines();
+                while let Ok(Some(line)) = reader.next_line().await {
+                    let mut buf = logs.write().await;
+                    if buf.len() >= 5000 {
+                        buf.remove(0);
+                    }
+                    buf.push(line);
+                }
+            });
+        }
+
+        let this_ws = Arc::downgrade(self);
+        let name_clone = name.to_string();
+        tokio::spawn(async move {
+            tokio::select! {
+                exit_status = child.wait() => {
+                    if let Some(ws) = this_ws.upgrade() {
+                        let exit_clean = exit_status.map(|s| s.success()).unwrap_or(false);
+                        let final_state = if exit_clean { "stopped" } else { "crashed" };
+                        ws.update_service_state(&name_clone, final_state, None).await;
+                        let mut managed = ws.managed_processes.lock().await;
+                        managed.remove(&name_clone);
+                    }
+                }
+                _ = &mut stop_rx => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    if let Some(ws) = this_ws.upgrade() {
+                        ws.update_service_state(&name_clone, "stopped", None).await;
+                        let mut managed = ws.managed_processes.lock().await;
+                        managed.remove(&name_clone);
+                    }
+                }
+            }
+        });
+
+        let managed_service = ManagedChildService {
+            name: name.to_string(),
+            command: command.to_string(),
+            argv: argv.to_vec(),
+            pid,
+            started_at: std::time::Instant::now(),
+            log_lines: log_lines.clone(),
+            stop_tx: Some(stop_tx),
+        };
+        self.managed_processes
+            .lock()
+            .await
+            .insert(name.to_string(), managed_service);
+
+        self.service_configs
+            .write()
+            .await
+            .insert(name.to_string(), (command.to_string(), argv.to_vec()));
+
+        let info = ManagedServiceInfo {
+            name: name.to_string(),
+            resource_uri: format!("proc://workspace/{name}"),
+            pid: Some(pid),
+            command: format!("{} {}", command, argv.join(" ")),
+            state: "running".to_string(),
+            uptime_secs: 0,
+        };
+        self.register_service(info.clone()).await;
+        Ok(info)
+    }
+
+    pub async fn stop_managed_service(&self, name: &str) -> Result<String, LocalIpcError> {
+        let mut managed = self.managed_processes.lock().await;
+        if let Some(mut proc) = managed.remove(name) {
+            if let Some(stop_tx) = proc.stop_tx.take() {
+                let _ = stop_tx.send(());
+            }
+            drop(managed);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            self.update_service_state(name, "stopped", None).await;
+            Ok(name.to_string())
+        } else if self.update_service_state(name, "stopped", None).await {
+            Ok(name.to_string())
+        } else {
+            Err(LocalIpcError::ServiceNotFound(format!(
+                "Service '{name}' not found"
+            )))
+        }
+    }
+
+    pub async fn restart_managed_service(
+        self: &Arc<Self>,
+        name: &str,
+    ) -> Result<ManagedServiceInfo, LocalIpcError> {
+        let (cmd, argv) = {
+            let configs = self.service_configs.read().await;
+            if let Some((cmd, argv)) = configs.get(name) {
+                (cmd.clone(), argv.clone())
+            } else {
+                let managed = self.managed_processes.lock().await;
+                if let Some(proc) = managed.get(name) {
+                    (proc.command.clone(), proc.argv.clone())
+                } else {
+                    return Err(LocalIpcError::ServiceNotFound(format!(
+                        "Service '{name}' not found"
+                    )));
+                }
+            }
+        };
+
+        let _ = self.stop_managed_service(name).await;
+        self.start_managed_service(name, &cmd, &argv).await
+    }
+
+    pub async fn service_logs(
+        &self,
+        name: &str,
+        tail_lines: usize,
+    ) -> Result<(Vec<String>, Option<String>), LocalIpcError> {
+        let managed = self.managed_processes.lock().await;
+        if let Some(child) = managed.get(name) {
+            let logs = child.log_lines.read().await;
+            let total = logs.len();
+            let start = total.saturating_sub(tail_lines);
+            let lines = logs[start..].to_vec();
+
+            let full_text = logs.join("\n");
+            let cas_uri = if full_text.len() > 8192 {
+                let mut db = self.db.lock().await;
+                self.cas
+                    .store(
+                        &mut db,
+                        full_text.as_bytes(),
+                        "text/plain",
+                        name,
+                        omen_core::RetentionClass::Ephemeral,
+                    )
+                    .ok()
+                    .map(|m| m.uri.to_string())
+            } else {
+                None
+            };
+
+            Ok((lines, cas_uri))
+        } else if self.services.read().await.contains_key(name) {
+            Ok((
+                vec!["Service is stopped; no active process stream".to_string()],
+                None,
+            ))
+        } else {
+            Err(LocalIpcError::ServiceNotFound(format!(
+                "Service '{name}' not found"
+            )))
+        }
     }
 
     pub async fn register_service(&self, info: ManagedServiceInfo) {

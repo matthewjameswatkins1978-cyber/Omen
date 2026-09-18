@@ -7,8 +7,8 @@ use uuid::Uuid;
 
 use omen_ipc::{
     ClientHello, DaemonHello, DaemonMessage, IpcRequest, IpcResponse, LocalIpcError,
-    MAX_FRAME_SIZE, ManagedServiceInfo, PlatformListener, RequestPayload, ResponsePayload,
-    default_endpoint_address, negotiate_protocol_version, read_json_frame, write_json_frame,
+    MAX_FRAME_SIZE, PlatformListener, RequestPayload, ResponsePayload, default_endpoint_address,
+    negotiate_protocol_version, read_json_frame, write_json_frame,
 };
 
 use crate::registry::WorkspaceRegistry;
@@ -287,30 +287,10 @@ impl DaemonServer {
             } => {
                 let current = attached_workspace.read().await;
                 match &*current {
-                    Some(ws) => {
-                        if let Some(existing) = ws.get_service(&name).await
-                            && existing.state == "running"
-                        {
-                            return IpcResponse::err(
-                                req_id,
-                                LocalIpcError::ServiceAlreadyRunning(format!(
-                                    "Service '{name}' is already running with PID {:?}",
-                                    existing.pid
-                                )),
-                            );
-                        }
-
-                        let info = ManagedServiceInfo {
-                            name: name.clone(),
-                            resource_uri: format!("proc://workspace/{name}"),
-                            pid: Some(std::process::id()),
-                            command: format!("{} {}", command, argv.join(" ")),
-                            state: "running".into(),
-                            uptime_secs: 0,
-                        };
-                        ws.register_service(info.clone()).await;
-                        Ok(ResponsePayload::ServiceStarted(info))
-                    }
+                    Some(ws) => ws
+                        .start_managed_service(&name, &command, &argv)
+                        .await
+                        .map(ResponsePayload::ServiceStarted),
                     None => Err(LocalIpcError::WorkspaceNotAttached(
                         "No workspace attached for this session".into(),
                     )),
@@ -320,15 +300,10 @@ impl DaemonServer {
             RequestPayload::StopService { name } => {
                 let current = attached_workspace.read().await;
                 match &*current {
-                    Some(ws) => {
-                        if ws.update_service_state(&name, "stopped", None).await {
-                            Ok(ResponsePayload::ServiceStopped { name })
-                        } else {
-                            Err(LocalIpcError::ServiceNotFound(format!(
-                                "Service '{name}' not found"
-                            )))
-                        }
-                    }
+                    Some(ws) => ws
+                        .stop_managed_service(&name)
+                        .await
+                        .map(|name| ResponsePayload::ServiceStopped { name }),
                     None => Err(LocalIpcError::WorkspaceNotAttached(
                         "No workspace attached for this session".into(),
                     )),
@@ -338,18 +313,10 @@ impl DaemonServer {
             RequestPayload::RestartService { name } => {
                 let current = attached_workspace.read().await;
                 match &*current {
-                    Some(ws) => {
-                        if let Some(mut existing) = ws.get_service(&name).await {
-                            existing.state = "running".into();
-                            existing.uptime_secs = 0;
-                            ws.register_service(existing.clone()).await;
-                            Ok(ResponsePayload::ServiceRestarted(existing))
-                        } else {
-                            Err(LocalIpcError::ServiceNotFound(format!(
-                                "Service '{name}' not found"
-                            )))
-                        }
-                    }
+                    Some(ws) => ws
+                        .restart_managed_service(&name)
+                        .await
+                        .map(ResponsePayload::ServiceRestarted),
                     None => Err(LocalIpcError::WorkspaceNotAttached(
                         "No workspace attached for this session".into(),
                     )),
@@ -369,22 +336,17 @@ impl DaemonServer {
                 }
             }
 
-            RequestPayload::ServiceLogs { name, .. } => {
+            RequestPayload::ServiceLogs { name, tail_lines } => {
                 let current = attached_workspace.read().await;
                 match &*current {
-                    Some(ws) => {
-                        if ws.get_service(&name).await.is_some() {
-                            Ok(ResponsePayload::ServiceLogsResponse {
-                                name,
-                                lines: vec!["Service log initialized".to_string()],
-                                cas_uri: None,
-                            })
-                        } else {
-                            Err(LocalIpcError::ServiceNotFound(format!(
-                                "Service '{name}' not found"
-                            )))
-                        }
-                    }
+                    Some(ws) => ws
+                        .service_logs(&name, tail_lines)
+                        .await
+                        .map(|(lines, cas_uri)| ResponsePayload::ServiceLogsResponse {
+                            name,
+                            lines,
+                            cas_uri,
+                        }),
                     None => Err(LocalIpcError::WorkspaceNotAttached(
                         "No workspace attached for this session".into(),
                     )),
