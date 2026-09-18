@@ -12,4 +12,7 @@ pub use history::{ExecutionHistory, ExecutionRecord, InteractiveSessionRecord};
 pub use registry::{
     DependencyRecord, FactProvenance, FactRecord, FactRegistry, PublishFactRequest,
 };
-pub use workspace::{deterministic_workspace_id, resolve_workspace_dir};
+pub use workspace::{
+    RequestReceiptRecord, ServiceRecord, WorkspacePersistence, WorkspaceRecord,
+    deterministic_workspace_id, resolve_workspace_dir,
+};

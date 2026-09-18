@@ -396,8 +396,10 @@ impl DaemonServer {
             } => {
                 let current = attached_workspace.read().await;
                 match &*current {
-                    Some(_ws) => {
+                    Some(ws) => {
                         let exec_id = format!("exec_{}", Uuid::new_v4());
+                        ws.record_request_receipt(&req_id, Some(&exec_id), "Completed")
+                            .await;
                         Ok(ResponsePayload::ExecutionFinished(
                             omen_ipc::ExecutionResultSummary {
                                 execution_id: exec_id,
@@ -421,13 +423,41 @@ impl DaemonServer {
 
             RequestPayload::QueryRequestStatus {
                 consequential_request_id,
-            } => Ok(ResponsePayload::RequestStatus(
-                omen_ipc::ExecutionStatusRecord {
-                    consequential_request_id,
-                    execution_id: None,
-                    status: omen_ipc::ExecutionStatusCode::Completed,
-                },
-            )),
+            } => {
+                let current = attached_workspace.read().await;
+                match &*current {
+                    Some(ws) => {
+                        if let Some(rec) = ws.query_request_receipt(&consequential_request_id).await
+                        {
+                            let status = match rec.status.as_str() {
+                                "Completed" => omen_ipc::ExecutionStatusCode::Completed,
+                                "Running" => omen_ipc::ExecutionStatusCode::Running,
+                                "Accepted" => omen_ipc::ExecutionStatusCode::Accepted,
+                                "Failed" => omen_ipc::ExecutionStatusCode::Failed,
+                                _ => omen_ipc::ExecutionStatusCode::Unknown,
+                            };
+                            Ok(ResponsePayload::RequestStatus(
+                                omen_ipc::ExecutionStatusRecord {
+                                    consequential_request_id,
+                                    execution_id: rec.execution_id,
+                                    status,
+                                },
+                            ))
+                        } else {
+                            Ok(ResponsePayload::RequestStatus(
+                                omen_ipc::ExecutionStatusRecord {
+                                    consequential_request_id,
+                                    execution_id: None,
+                                    status: omen_ipc::ExecutionStatusCode::NotSeen,
+                                },
+                            ))
+                        }
+                    }
+                    None => Err(LocalIpcError::WorkspaceNotAttached(
+                        "No workspace attached for this session".into(),
+                    )),
+                }
+            }
 
             RequestPayload::RecordHistory { .. } => Ok(ResponsePayload::HistoryRecorded),
 

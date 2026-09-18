@@ -1,11 +1,14 @@
-use sha2::Digest;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{Mutex, RwLock, broadcast};
 
 use omen_ipc::{EventPayload, FactInfo, IpcEvent, ManagedServiceInfo, SharedIndexSnapshot};
+use omen_knowledge::{
+    Database, FactRegistry, RequestReceiptRecord, ServiceRecord, WorkspacePersistence,
+    deterministic_workspace_id, resolve_workspace_dir,
+};
 
 pub struct WorkspaceState {
     workspace_id: String,
@@ -14,14 +17,78 @@ pub struct WorkspaceState {
     sequence: Arc<AtomicU64>,
     facts: RwLock<HashMap<String, FactInfo>>,
     services: RwLock<HashMap<String, ManagedServiceInfo>>,
+    db: Arc<Mutex<Database>>,
     event_tx: broadcast::Sender<IpcEvent>,
 }
 
 impl WorkspaceState {
     pub fn new(canonical_path: PathBuf, epoch: u64) -> Self {
-        let path_str = canonical_path.to_string_lossy().to_string();
-        let digest = hex::encode(sha2::Sha256::digest(path_str.as_bytes()));
-        let workspace_id = format!("ws_{}", &digest[..16]);
+        let workspace_id = deterministic_workspace_id(&canonical_path);
+        let state_dir = resolve_workspace_dir(&canonical_path);
+        let db = Database::open(&state_dir.join("knowledge.db"))
+            .unwrap_or_else(|_| Database::open_in_memory().expect("In-memory database fallback"));
+
+        let _ = WorkspacePersistence::upsert_workspace(
+            &db,
+            &workspace_id,
+            &canonical_path.to_string_lossy(),
+            epoch,
+        );
+
+        let mut initial_facts = HashMap::new();
+        if let Ok(records) = FactRegistry::list_all_facts(&db) {
+            for r in records {
+                let resource_uri = r.resource_uri.to_string();
+                let fact_id = r.fact_id.to_string();
+                let validity = match r.validity {
+                    omen_core::ValidityState::Current => "CURRENT",
+                    omen_core::ValidityState::Dirty => "DIRTY",
+                    omen_core::ValidityState::Stale => "STALE",
+                    omen_core::ValidityState::Superseded => "SUPERSEDED",
+                    omen_core::ValidityState::Historical => "HISTORICAL",
+                }
+                .to_string();
+                let assurance = match r.assurance {
+                    omen_core::Assurance::Deterministic => "DETERMINISTIC",
+                    omen_core::Assurance::Verified => "VERIFIED",
+                    omen_core::Assurance::Enforced => "ENFORCED",
+                    omen_core::Assurance::Observed => "OBSERVED",
+                    omen_core::Assurance::Claimed => "CLAIMED",
+                    omen_core::Assurance::Inferred => "INFERRED",
+                    omen_core::Assurance::Unknown => "UNKNOWN",
+                }
+                .to_string();
+                let value = r.value;
+                initial_facts.insert(
+                    resource_uri.clone(),
+                    FactInfo {
+                        fact_id,
+                        resource_uri,
+                        value,
+                        validity,
+                        assurance,
+                    },
+                );
+            }
+        }
+
+        let mut initial_services = HashMap::new();
+        if let Ok(records) = WorkspacePersistence::list_services(&db, &workspace_id) {
+            for s in records {
+                initial_services.insert(
+                    s.name.clone(),
+                    ManagedServiceInfo {
+                        name: s.name.clone(),
+                        resource_uri: format!("proc://workspace/{}", s.name),
+                        pid: s.pid,
+                        command: s.command,
+                        state: s.state,
+                        uptime_secs: 0,
+                    },
+                );
+            }
+        }
+
         let (event_tx, _) = broadcast::channel(512);
 
         Self {
@@ -29,8 +96,9 @@ impl WorkspaceState {
             canonical_path,
             epoch,
             sequence: Arc::new(AtomicU64::new(1)),
-            facts: RwLock::new(HashMap::new()),
-            services: RwLock::new(HashMap::new()),
+            facts: RwLock::new(initial_facts),
+            services: RwLock::new(initial_services),
+            db: Arc::new(Mutex::new(db)),
             event_tx,
         }
     }
@@ -146,10 +214,27 @@ impl WorkspaceState {
         let name = info.name.clone();
         let state = info.state.clone();
         let pid = info.pid;
+        let command = info.command.clone();
 
         {
             let mut services = self.services.write().await;
             services.insert(name.clone(), info);
+        }
+
+        {
+            let db = self.db.lock().await;
+            let _ = WorkspacePersistence::upsert_service(
+                &db,
+                &ServiceRecord {
+                    workspace_id: self.workspace_id.clone(),
+                    name: name.clone(),
+                    command,
+                    pid,
+                    state: state.clone(),
+                    started_at: chrono::Utc::now().to_rfc3339(),
+                    updated_at: chrono::Utc::now().to_rfc3339(),
+                },
+            );
         }
 
         self.broadcast_event(EventPayload::ServiceStateChanged { name, state, pid });
@@ -162,8 +247,25 @@ impl WorkspaceState {
             svc.pid = pid;
             let svc_name = svc.name.clone();
             let svc_state = svc.state.clone();
+            let svc_cmd = svc.command.clone();
 
             drop(services);
+
+            {
+                let db = self.db.lock().await;
+                let _ = WorkspacePersistence::upsert_service(
+                    &db,
+                    &ServiceRecord {
+                        workspace_id: self.workspace_id.clone(),
+                        name: svc_name.clone(),
+                        command: svc_cmd,
+                        pid,
+                        state: svc_state.clone(),
+                        started_at: chrono::Utc::now().to_rfc3339(),
+                        updated_at: chrono::Utc::now().to_rfc3339(),
+                    },
+                );
+            }
 
             self.broadcast_event(EventPayload::ServiceStateChanged {
                 name: svc_name,
@@ -174,5 +276,25 @@ impl WorkspaceState {
         } else {
             false
         }
+    }
+
+    pub async fn record_request_receipt(&self, req_id: &str, exec_id: Option<&str>, status: &str) {
+        let db = self.db.lock().await;
+        let _ = WorkspacePersistence::record_request_receipt(
+            &db,
+            &RequestReceiptRecord {
+                consequential_request_id: req_id.to_string(),
+                execution_id: exec_id.map(Into::into),
+                status: status.to_string(),
+                recorded_at: chrono::Utc::now().to_rfc3339(),
+            },
+        );
+    }
+
+    pub async fn query_request_receipt(&self, req_id: &str) -> Option<RequestReceiptRecord> {
+        let db = self.db.lock().await;
+        WorkspacePersistence::get_request_receipt(&db, req_id)
+            .ok()
+            .flatten()
     }
 }

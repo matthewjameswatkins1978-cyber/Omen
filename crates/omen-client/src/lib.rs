@@ -177,8 +177,9 @@ impl OmenClient {
         self.event_tx.subscribe()
     }
 
-    pub async fn send_request(
+    pub async fn send_request_with_id(
         &self,
+        request_id: impl Into<String>,
         payload: RequestPayload,
     ) -> Result<ResponsePayload, LocalIpcError> {
         if !self.is_connected() {
@@ -186,7 +187,7 @@ impl OmenClient {
                 "Client is not connected to daemon".to_string(),
             ));
         }
-        let request_id = format!("req_{}", Uuid::new_v4());
+        let request_id = request_id.into();
         let ws_id = self.workspace_id.read().await.clone();
         let request = IpcRequest::new(
             request_id.clone(),
@@ -207,6 +208,14 @@ impl OmenClient {
                 "Daemon closed connection before responding".to_string(),
             )),
         }
+    }
+
+    pub async fn send_request(
+        &self,
+        payload: RequestPayload,
+    ) -> Result<ResponsePayload, LocalIpcError> {
+        let request_id = format!("req_{}", Uuid::new_v4());
+        self.send_request_with_id(request_id, payload).await
     }
 
     pub async fn ping(&self) -> Result<u64, LocalIpcError> {

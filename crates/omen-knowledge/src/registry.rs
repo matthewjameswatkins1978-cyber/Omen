@@ -297,6 +297,95 @@ impl FactRegistry {
         Ok(fact)
     }
 
+    pub fn list_all_facts(db: &crate::db::Database) -> Result<Vec<FactRecord>, CoreError> {
+        let mut stmt = db
+            .conn()
+            .prepare(
+                r#"
+                SELECT fact_id, resource_uri, value, validity, assurance, producer, witness, superseded_by, created_at
+                FROM facts
+                ORDER BY created_at DESC
+                "#,
+            )
+            .map_err(|e| CoreError::Internal(format!("Failed to prepare list_all_facts query: {e}")))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let fid: String = row.get(0)?;
+                let ruri: String = row.get(1)?;
+                let val: String = row.get(2)?;
+                let val_str: String = row.get(3)?;
+                let ass_str: String = row.get(4)?;
+                let prod: String = row.get(5)?;
+                let wit: Option<String> = row.get(6)?;
+                let sby: Option<String> = row.get(7)?;
+                let cr: String = row.get(8)?;
+
+                let validity = match val_str.as_str() {
+                    "CURRENT" => ValidityState::Current,
+                    "DIRTY" => ValidityState::Dirty,
+                    "HISTORICAL" => ValidityState::Historical,
+                    _ => ValidityState::Dirty,
+                };
+
+                let assurance = match ass_str.as_str() {
+                    "DETERMINISTIC" => Assurance::Deterministic,
+                    "VERIFIED" => Assurance::Verified,
+                    "ENFORCED" => Assurance::Enforced,
+                    "OBSERVED" => Assurance::Observed,
+                    "CLAIMED" => Assurance::Claimed,
+                    "INFERRED" => Assurance::Inferred,
+                    _ => Assurance::Unknown,
+                };
+
+                let fact_id = FactId::new(fid).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
+
+                let resource_uri = ResourceUri::parse(&ruri).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
+
+                let superseded_by = match sby {
+                    Some(s) => Some(FactId::new(s).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            7,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?),
+                    None => None,
+                };
+
+                Ok(FactRecord {
+                    fact_id,
+                    resource_uri,
+                    value: val,
+                    validity,
+                    assurance,
+                    producer: prod,
+                    witness: wit,
+                    superseded_by,
+                    created_at: cr,
+                })
+            })
+            .map_err(|e| CoreError::Internal(format!("Failed to query all facts: {e}")))?;
+
+        let mut results = Vec::new();
+        for r in rows {
+            results.push(r.map_err(|e| CoreError::Internal(format!("Error reading fact: {e}")))?);
+        }
+        Ok(results)
+    }
+
     pub fn why_fact(
         db: &crate::db::Database,
         resource: &ResourceUri,
