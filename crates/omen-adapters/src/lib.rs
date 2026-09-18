@@ -7,3 +7,7 @@ pub mod threadmoth;
 
 pub use git::{GitAdapter, GitStatusResult};
 pub use ripgrep::{RipgrepAdapter, RipgrepMatch, RipgrepSearchResult};
+pub use threadmoth::{
+    ThreadMothAdapter, ThreadMothBudget, ThreadMothByteRange, ThreadMothCardinality,
+    ThreadMothCertificate, ThreadMothNamespace, ThreadMothOperationWrapper, ThreadMothRequest,
+};
