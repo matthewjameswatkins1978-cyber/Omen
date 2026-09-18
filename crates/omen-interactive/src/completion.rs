@@ -90,6 +90,58 @@ impl HotSemanticIndex {
             }
         }
     }
+
+    pub fn update_fact(&mut self, info: &omen_ipc::FactInfo) {
+        let validity = match info.validity.as_str() {
+            "CURRENT" => ValidityState::Current,
+            "DIRTY" => ValidityState::Dirty,
+            "STALE" => ValidityState::Stale,
+            "SUPERSEDED" => ValidityState::Superseded,
+            "HISTORICAL" => ValidityState::Historical,
+            _ => ValidityState::Dirty,
+        };
+        if let Some(existing) = self
+            .active_facts
+            .iter_mut()
+            .find(|f| f.resource_uri == info.resource_uri)
+        {
+            existing.validity = validity;
+        } else {
+            self.active_facts.push(CachedFact {
+                resource_uri: info.resource_uri.clone(),
+                validity,
+            });
+            if self.active_facts.len() > 100 {
+                self.active_facts.remove(0);
+            }
+        }
+    }
+
+    pub fn mark_fact_dirty(&mut self, uri_or_id: &str) {
+        for fact in &mut self.active_facts {
+            if fact.resource_uri == uri_or_id {
+                fact.validity = ValidityState::Dirty;
+            }
+        }
+    }
+
+    pub fn apply_snapshot(&mut self, snapshot: &omen_ipc::SharedIndexSnapshot) {
+        self.active_facts = snapshot
+            .facts
+            .iter()
+            .map(|f| CachedFact {
+                resource_uri: f.resource_uri.clone(),
+                validity: match f.validity.as_str() {
+                    "CURRENT" => ValidityState::Current,
+                    "DIRTY" => ValidityState::Dirty,
+                    "STALE" => ValidityState::Stale,
+                    "SUPERSEDED" => ValidityState::Superseded,
+                    "HISTORICAL" => ValidityState::Historical,
+                    _ => ValidityState::Dirty,
+                },
+            })
+            .collect();
+    }
 }
 
 pub struct CompletionContext {

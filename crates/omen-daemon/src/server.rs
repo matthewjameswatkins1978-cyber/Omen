@@ -81,8 +81,9 @@ impl DaemonServer {
                             let instance_id = self.instance_id.clone();
                             let registry = self.registry.clone();
                             let shutdown_rx = self.shutdown_rx.clone();
+                            let shutdown_tx = self.shutdown_tx.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = Self::handle_connection(stream, instance_id, registry, shutdown_rx).await {
+                                if let Err(e) = Self::handle_connection_internal(stream, instance_id, registry, shutdown_rx, shutdown_tx).await {
                                     error!("Client connection handler finished with error: {e}");
                                 }
                             });
@@ -106,7 +107,28 @@ impl DaemonServer {
         stream: S,
         daemon_instance_id: String,
         registry: Arc<WorkspaceRegistry>,
+        shutdown_rx: watch::Receiver<bool>,
+    ) -> Result<(), LocalIpcError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (shutdown_tx, _) = watch::channel(false);
+        Self::handle_connection_internal(
+            stream,
+            daemon_instance_id,
+            registry,
+            shutdown_rx,
+            shutdown_tx,
+        )
+        .await
+    }
+
+    pub async fn handle_connection_internal<S>(
+        stream: S,
+        daemon_instance_id: String,
+        registry: Arc<WorkspaceRegistry>,
         mut shutdown_rx: watch::Receiver<bool>,
+        shutdown_tx: watch::Sender<bool>,
     ) -> Result<(), LocalIpcError>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -115,8 +137,8 @@ impl DaemonServer {
         let write_mutex = Arc::new(Mutex::new(write_half));
 
         // 1. Handshake
-        let client_hello: Option<ClientHello> = read_json_frame(&mut read_half).await?;
-        let client_hello = client_hello
+        let client_hello: ClientHello = read_json_frame(&mut read_half)
+            .await?
             .ok_or_else(|| LocalIpcError::Io("Client closed stream during handshake".into()))?;
 
         let selected_version = match negotiate_protocol_version(
@@ -155,13 +177,14 @@ impl DaemonServer {
                 req_res = read_json_frame::<IpcRequest, _>(&mut read_half) => {
                     match req_res {
                         Ok(Some(request)) => {
-                            let should_disconnect = matches!(request.payload, RequestPayload::Disconnect);
+                            let should_stop = matches!(request.payload, RequestPayload::Disconnect | RequestPayload::Shutdown);
                             let response = Self::process_request(
                                 request,
                                 registry.clone(),
                                 attached_workspace.clone(),
                                 write_mutex.clone(),
                                 event_pump_handle.clone(),
+                                shutdown_tx.clone(),
                             ).await;
 
                             let mut writer = write_mutex.lock().await;
@@ -171,7 +194,7 @@ impl DaemonServer {
                                 break;
                             }
 
-                            if should_disconnect {
+                            if should_stop {
                                 break;
                             }
                         }
@@ -205,6 +228,7 @@ impl DaemonServer {
         attached_workspace: Arc<RwLock<Option<Arc<WorkspaceState>>>>,
         write_mutex: Arc<Mutex<W>>,
         event_pump_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+        shutdown_tx: watch::Sender<bool>,
     ) -> IpcResponse
     where
         W: AsyncWrite + Unpin + Send + 'static,
@@ -476,6 +500,11 @@ impl DaemonServer {
             }
 
             RequestPayload::ReportOfflineGap { .. } => Ok(ResponsePayload::OfflineGapAcknowledged),
+
+            RequestPayload::Shutdown => {
+                let _ = shutdown_tx.send(true);
+                Ok(ResponsePayload::DaemonShuttingDown)
+            }
 
             RequestPayload::Disconnect => Ok(ResponsePayload::Success),
         };

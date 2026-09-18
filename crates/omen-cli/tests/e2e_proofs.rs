@@ -116,7 +116,7 @@ async fn proof_1_authoritative_lifecycle_and_refusal() {
     let failure_art_uri = &test_run_2.artifact_uri;
     let failure_hash = failure_art_uri.path().strip_prefix("sha256/").unwrap();
     let slice = cas
-        .read_slice(&mut db, failure_hash, 0, 500)
+        .read_slice(&mut db, failure_hash, 0, 2048)
         .expect("Should read CAS slice of test failure");
     let slice_text = String::from_utf8_lossy(&slice);
     assert!(

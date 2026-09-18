@@ -535,6 +535,19 @@ impl OmenClient {
         }
     }
 
+    pub async fn shutdown_daemon(&self) -> Result<(), LocalIpcError> {
+        let resp = self.send_request(RequestPayload::Shutdown).await?;
+        match resp {
+            ResponsePayload::DaemonShuttingDown => {
+                self.is_connected.store(false, Ordering::SeqCst);
+                Ok(())
+            }
+            other => Err(LocalIpcError::MalformedRequest(format!(
+                "Expected DaemonShuttingDown, got {other:?}"
+            ))),
+        }
+    }
+
     pub async fn disconnect(&self) -> Result<(), LocalIpcError> {
         let _ = self.send_request(RequestPayload::Disconnect).await;
         self.is_connected.store(false, Ordering::SeqCst);

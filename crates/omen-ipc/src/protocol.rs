@@ -80,6 +80,7 @@ pub enum RequestPayload {
     ReportOfflineGap {
         modified_paths: Vec<String>,
     },
+    Shutdown,
     Disconnect,
 }
 
@@ -111,6 +112,7 @@ pub enum ResponsePayload {
     Pong {
         timestamp_ms: u64,
     },
+    DaemonShuttingDown,
     WorkspaceAttached {
         workspace_id: String,
         epoch: u64,

@@ -9,6 +9,7 @@ pub struct PromptState {
     pub branch: Option<String>,
     pub dirty_facts_count: usize,
     pub has_failure: bool,
+    pub mode_indicator: Option<String>,
 }
 
 impl PromptState {
@@ -24,7 +25,13 @@ impl PromptState {
             branch,
             dirty_facts_count,
             has_failure,
+            mode_indicator: None,
         }
+    }
+
+    pub fn with_mode_indicator(mut self, indicator: impl Into<String>) -> Self {
+        self.mode_indicator = Some(indicator.into());
+        self
     }
 
     fn compact_path(path: &Path) -> String {
@@ -68,12 +75,17 @@ impl PromptRenderer {
             format!(" {}", colors.success.paint(sym))
         };
 
+        let mode_part = match &state.mode_indicator {
+            Some(ind) => format!("{} ", colors.subtle.paint(ind)),
+            None => String::new(),
+        };
+
         // Header line: path branch status
-        // Prompt line: >
+        // Prompt line: [mode] >
         let prompt_sym = colors.prompt_symbol.paint(">");
         let p_start = crate::blocks::SemanticBlock::osc133_prompt_start(caps);
         let c_start = crate::blocks::SemanticBlock::osc133_command_start(caps);
 
-        format!("{p_start}{path_part}{branch_part}{status_part}\n{prompt_sym} {c_start}")
+        format!("{p_start}{path_part}{branch_part}{status_part}\n{mode_part}{prompt_sym} {c_start}")
     }
 }
