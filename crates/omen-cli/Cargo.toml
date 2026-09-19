@@ -23,6 +23,7 @@ omen-interactive = { workspace = true }
 omen-ipc = { workspace = true }
 omen-client = { workspace = true }
 omen-daemon = { workspace = true }
+omen-mcp = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -42,9 +42,11 @@ Omen gives humans and AI the same workspace through different interfaces, while 
 - `crates/omen-knowledge`: SQLite Fact Registry, resource generations, CAS blob store.
 - `crates/omen-atlas`: Tool registry, TOML runtime profiles, probing validator harness.
 - `crates/omen-adapters`: Dedicated adapters for ThreadMoth, Cargo, Git, and ripgrep.
-- `crates/omen-interactive`: Interactive shell core, 3-lane grammar scanner, hot semantic index, fact-aware completer, session history, blast radius, paste guard.
+- `crates/omen-agent`: Canonical agent context extraction, bounded summaries, AgentProvider trait, deterministic reasoning engine.
+- `crates/omen-mcp`: Model Context Protocol (MCP) server adapter over stdio and streams (`omen mcp`).
+- `crates/omen-interactive`: Interactive shell core, 3-lane grammar scanner, hot semantic index, fact-aware completer, session history, blast radius, paste guard, AI lane.
 - `crates/omen-ui`: Terminal capability detection, prompt rendering, progressive diagnostics (Levels 0–3), semantic blocks (OSC 7/8/133).
-- `crates/omen-cli`: The unified `omen` CLI and interactive shell binary.
+- `crates/omen-cli`: The unified `omen` CLI, daemon manager, MCP runner, and interactive shell binary.
 - `crates/omen-test-fixtures`: Hostile testing fixtures (`omen-gremlin`).
 - `crates/xtask`: Portable repository automation tasks.
 
@@ -52,8 +54,8 @@ Omen gives humans and AI the same workspace through different interfaces, while 
 
 1. **Omen 0.2: Machine Truth** — *Complete*
 2. **Omen 0.3: Human Interface** — *Complete*
-3. **Omen 0.4: Shared Runtime** — Local daemon (`omend`), physical cross-process coordination, shared facts, shared hot semantic index.
-4. **Omen 0.5: Agent Interoperability** — General interoperability boundary, protocol adapters (MCP, A2A, LSP), compatibility profiles.
+3. **Omen 0.4: Shared Runtime** — *Complete*
+4. **Omen 0.5: Agent Interoperability** — *Complete*
 5. **Omen 0.6: Physical Maturity** — Pluggable execution backends, PTY persistence, hardened containment, truthful platform assurance.
 6. **Omen 0.7: Semantic Environment** — Structural search (ast-grep), compiler metadata, language servers, symbol references.
 7. **Omen 0.8: Composition** — Typed pipeline composition, `Omen.toml`, deterministic reconstruction re-admitted under Tethers.

@@ -957,7 +957,7 @@ impl WorkspaceState {
                     // Check CAS offload for large output
                     let (stdout_art, stderr_art) = {
                         let mut db = this.db.lock().await;
-                        let so_art = if output.stdout_all.len() > 8192 {
+                        let so_art = if !output.stdout_all.is_empty() {
                             this.cas
                                 .store(
                                     &mut db,
@@ -971,7 +971,7 @@ impl WorkspaceState {
                         } else {
                             None
                         };
-                        let se_art = if output.stderr_all.len() > 8192 {
+                        let se_art = if !output.stderr_all.is_empty() {
                             this.cas
                                 .store(
                                     &mut db,

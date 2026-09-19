@@ -1,0 +1,105 @@
+# Omen 0.5 — Agent Context Proof
+
+## 1. Principle & Requirements
+
+An AI agent assisting a human developer in Omen must never be starved of machine truth, nor should it be drowned in unbounded raw text dumps.
+
+Omen 0.5 establishes `AgentContext` in `crates/omen-agent`:
+1. **Zero Hot-Path Overhead**: As long as the user is typing, receiving completions, or inspecting the prompt, zero model calls, zero Git subprocess spawns, and zero SQLite database queries take place.
+2. **On-Demand Synthesis**: `build_agent_context` executes strictly when the user dispatches an AI query via the `?` grammar lane or when an MCP tool request arrives.
+3. **Bounded Context**: Transcripts and output blobs are never passed raw. Excerpts are bounded to 512 bytes (`AgentContext::bounded_excerpt`), with full unreduced evidence referenced by Content-Addressed Storage URI (`artifact://sha256/...`).
+4. **Structured Facts & History**: Dirty and current facts from the Fact Registry and hot semantic index are directly exposed as typed records.
+
+---
+
+## 2. Structure Definition
+
+```rust
+pub struct AgentContext {
+    pub cwd: PathBuf,
+    pub session_id: String,
+    pub git: Option<GitStatusInfo>,
+    pub recent_execution: Option<ExecutionSummary>,
+    pub recent_failed_execution: Option<ExecutionSummary>,
+    pub dirty_facts: Vec<FactInfo>,
+    pub current_facts: Vec<FactInfo>,
+    pub services: Vec<ManagedServiceInfo>,
+    pub env: EnvironmentInfo,
+}
+```
+
+---
+
+## 3. Verified Proofs
+
+### Proof 1: Git Status & Branch Awareness
+- `GitStatusInfo` inspects:
+  - Active branch (`git rev-parse --abbrev-ref HEAD`)
+  - Remote origin (`git config --get remote.origin.url`)
+  - Working tree status (`git status --porcelain`) bounded to 30 lines.
+- Verified in `agent_lane_tests::test_agent_lane_im_lost_proof_a`:
+  Active branch and modified count are observed and reported cleanly in human diagnosis.
+
+### Proof 2: Bounded Excerpts & CAS References
+- When commands fail, `build_agent_context` locates the execution's stderr CAS artifact via the canonical workspace directory.
+- Reads at most 512 bytes of stderr as an inline preview, leaving the full blob safely in CAS.
+- Verified in `agent_lane_tests::test_agent_lane_why_did_that_fail_proof_b`:
+  Failure diagnosis identifies the exact root cause (`error[E0308]: mismatched types`) without dumping megabytes of compiler output.
+
+### Proof 3: Dirty Fact Visibility
+- Facts invalidated by workspace mutations transition from `CURRENT` to `DIRTY`.
+- `build_agent_context` queries both SQLite persistent registry and in-memory hot cache.
+- Verified in `agent_lane_tests::test_agent_lane_im_lost_proof_a`:
+  When a workspace file changes, dirty facts (e.g. `fact://project/build_status`) are explicitly reported in Agent's situation assessment.
+
+### Proof 4: Bounded Git & Context Inspection Subprocesses
+- Rule: "Nothing is allowed to depend on eventually happening." All external Git probes and inspections run under `ProcessSupervisor` with closed stdin, explicit deadlines, Windows Job Object / POSIX process tree kill on timeout, and task reaping.
+- When an inspection probe times out (e.g. stalling Git lock or huge repository index), it never hangs the shell. It returns degraded `GitStatusInfo` with `probe_error` and `blocked_phase`.
+- Verified in `agent_regression_tests::agent_git_probe_times_out_cleanly`:
+  A 30-second stalling process is terminated within a 300ms deadline, reporting `probe_error: "git inspection timed out after 300ms"` and `blocked_phase: "rev-parse"`.
+
+### Proof 5: Zero-Model Token Economy for Deterministic Inquiries
+- Rule: Deterministic questions must never make generative model calls or burn tokens.
+- Queries such as "what folder am I in?", "where am I?", "what branch am I on?", "what was the last command?", "is anything dirty?", and "what file is this?" are intercepted and answered directly from machine state by `DeterministicClassifier`.
+- Model provider call count remains exactly 0.
+- Verified in `agent_regression_tests::deterministic_question_uses_zero_model_calls`.
+
+### Proof 6: Genuine Cheapness of Deterministic Routing
+- Order of execution:
+  ```text
+  classify query cheaply (0 I/O)
+          ↓
+  fetch only deterministic fields required
+          ↓
+  answer
+  ```
+  Only when general reasoning is actually needed:
+  ```text
+  build bounded AgentContext
+          ↓
+  invoke selected provider
+  ```
+- For trivial queries such as `? what folder am I in?`:
+  - `provider_calls`: **0**
+  - `git_probes`: **0**
+  - `db_context_queries`: **0**
+  - `service_scans`: **0**
+- Instrumenting the real `?` dispatcher (`AiLaneDispatcher::dispatch_with_workspace`), verified in:
+  - `agent_lane_tests::trivial_question_uses_zero_provider_calls`
+  - `agent_lane_tests::trivial_question_uses_zero_git_probes`
+  - `agent_lane_tests::trivial_question_uses_zero_db_context_queries`
+
+### Proof 7: Real Provider Switching
+- Provider selection is a real product seam, not simulated state:
+  ```text
+  :agent use <provider>
+          ↓
+  ProviderRegistry::set_active_provider(...)
+          ↓
+  InteractiveSession.agent_provider = registry.active_provider()
+  ```
+- Verified in `agent_lane_tests::test_provider_switching_real_interactive_proof`:
+  - Register provider A and provider B.
+  - `:agent use B`.
+  - Query non-deterministic question.
+  - Proves B received the request (calls = 1), A did not (calls = 0), and `:agent status` truthfully reports B.

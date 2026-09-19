@@ -13,6 +13,8 @@ members = [
     "crates/omen-daemon",
     "crates/omen-client",
     "crates/omen-cli",
+    "crates/omen-agent",
+    "crates/omen-mcp",
     "crates/omen-test-fixtures",
     "crates/xtask",
 ]
@@ -40,6 +42,8 @@ omen-interactive = { path = "crates/omen-interactive", version = "0.2.0" }
 omen-ipc = { path = "crates/omen-ipc", version = "0.2.0" }
 omen-daemon = { path = "crates/omen-daemon", version = "0.2.0" }
 omen-client = { path = "crates/omen-client", version = "0.2.0" }
+omen-agent = { path = "crates/omen-agent", version = "0.2.0" }
+omen-mcp = { path = "crates/omen-mcp", version = "0.2.0" }
 omen-test-fixtures = { path = "crates/omen-test-fixtures", version = "0.2.0" }
 
 serde = { version = "1.0", features = ["derive"] }

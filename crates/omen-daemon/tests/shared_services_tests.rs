@@ -136,11 +136,18 @@ async fn test_shared_services_supervision_and_two_clients() {
     assert_eq!(services[0].state, "running");
     assert_eq!(services[0].pid, Some(original_pid));
 
-    // Wait a brief moment for output line to be captured in ring buffer
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    // Client 2 reads logs from "api-server"
-    let (logs, _) = client2.service_logs("api-server", 10).await.unwrap();
+    // Poll bounded for child stdout to be captured in ring buffer
+    let poll_start = std::time::Instant::now();
+    let mut logs = Vec::new();
+    while poll_start.elapsed() < std::time::Duration::from_millis(3000) {
+        if let Ok((l, _)) = client2.service_logs("api-server", 10).await
+            && l.iter().any(|line| line.contains("api-server-ready"))
+        {
+            logs = l;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     assert!(
         logs.iter().any(|l| l.contains("api-server-ready")),
         "Logs should contain child stdout: {logs:?}"

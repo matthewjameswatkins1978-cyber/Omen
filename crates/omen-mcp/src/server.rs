@@ -1,0 +1,645 @@
+use crate::protocol::*;
+use omen_client::OmenClient;
+use omen_core::InteractiveSessionId;
+use omen_knowledge::{
+    ContentAddressedStore, Database, canonical_workspace_db_path, resolve_workspace_dir,
+};
+use serde_json::{Value, json};
+use std::path::PathBuf;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+pub struct McpServer {
+    workspace_path: PathBuf,
+    session_id: String,
+    client: Option<OmenClient>,
+}
+
+impl McpServer {
+    pub fn new(workspace_path: PathBuf, client: Option<OmenClient>) -> Self {
+        let session_id = format!("sess_mcp_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        Self {
+            workspace_path,
+            session_id,
+            client,
+        }
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub async fn handle_request(&self, req: JsonRpcRequest) -> JsonRpcResponse {
+        match req.method.as_str() {
+            "initialize" => self.handle_initialize(req.id, req.params).await,
+            "notifications/initialized" | "initialized" => {
+                JsonRpcResponse::success(req.id, json!({}))
+            }
+            "ping" => JsonRpcResponse::success(req.id, json!({})),
+            "tools/list" => self.handle_tools_list(req.id).await,
+            "tools/call" => self.handle_tools_call(req.id, req.params).await,
+            "resources/list" => self.handle_resources_list(req.id).await,
+            "resources/read" => self.handle_resources_read(req.id, req.params).await,
+            other => JsonRpcResponse::error(req.id, -32601, format!("Method not found: {other}")),
+        }
+    }
+
+    async fn handle_initialize(&self, id: Option<Value>, params: Option<Value>) -> JsonRpcResponse {
+        if let Some(p) = params
+            && let Some(ver) = p.get("protocolVersion").and_then(|v| v.as_str())
+        {
+            // Section 18: No silent reinterpretation of incompatible requests
+            if ver != LATEST_MCP_PROTOCOL_VERSION && ver != "2024-10-07" {
+                return JsonRpcResponse::error(
+                    id,
+                    -32002,
+                    format!(
+                        "Unsupported MCP protocol version: '{ver}', expected '{LATEST_MCP_PROTOCOL_VERSION}'"
+                    ),
+                );
+            }
+        }
+
+        let result = InitializeResult {
+            protocol_version: LATEST_MCP_PROTOCOL_VERSION.to_string(),
+            capabilities: ServerCapabilities {
+                tools: Some(ToolsCapability {
+                    list_changed: Some(false),
+                }),
+                resources: Some(ResourcesCapability {
+                    subscribe: Some(false),
+                    list_changed: Some(false),
+                }),
+            },
+            server_info: Implementation {
+                name: "omen-mcp".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            },
+        };
+
+        JsonRpcResponse::success(id, serde_json::to_value(result).unwrap())
+    }
+
+    async fn handle_tools_list(&self, id: Option<Value>) -> JsonRpcResponse {
+        let tools = vec![
+            ToolDefinition {
+                name: "omen_workspace_status".into(),
+                description: "Query Omen structured workspace status, active facts, dirty count, and services.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {},
+                }),
+            },
+            ToolDefinition {
+                name: "omen_facts_query".into(),
+                description: "Query current and dirty facts published in this workspace.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "filter": {
+                            "type": "string",
+                            "enum": ["all", "current", "dirty"],
+                            "description": "Filter facts by validity state (default: all)"
+                        }
+                    },
+                }),
+            },
+            ToolDefinition {
+                name: "omen_execute".into(),
+                description: "Submit execution through Omen shared daemon broker. Executes physical work and records structured evidence.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["argv"],
+                    "properties": {
+                        "tool": { "type": "string", "description": "Optional tool name (e.g. 'cargo', 'git')" },
+                        "operation": { "type": "string", "description": "Optional tool operation (e.g. 'check', 'test')" },
+                        "argv": { "type": "array", "items": { "type": "string" }, "description": "Command arguments" },
+                        "cwd": { "type": "string", "description": "Working directory override" },
+                        "timeout_ms": { "type": "integer", "description": "Timeout in milliseconds (default 60000)" }
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "omen_execution_status".into(),
+                description: "Query status of an execution by consequential request receipt ID or execution ID.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["request_id"],
+                    "properties": {
+                        "request_id": { "type": "string", "description": "Consequential request ID" }
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "omen_history_query".into(),
+                description: "Query subordinate physical execution history.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "all_sessions": { "type": "boolean", "description": "Whether to query all sessions or only current session" }
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "omen_services_list".into(),
+                description: "List managed background services running in the workspace.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {}
+                }),
+            },
+            ToolDefinition {
+                name: "omen_services_control".into(),
+                description: "Start, stop, or restart a managed background service.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["action", "name"],
+                    "properties": {
+                        "action": { "type": "string", "enum": ["start", "stop", "restart"] },
+                        "name": { "type": "string", "description": "Service name" },
+                        "command": { "type": "string", "description": "Command to run (for start)" }
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "omen_capabilities_discover".into(),
+                description: "Discover Omen runtime physical capabilities and constraints.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {}
+                }),
+            },
+        ];
+
+        JsonRpcResponse::success(id, json!({ "tools": tools }))
+    }
+
+    async fn handle_tools_call(&self, id: Option<Value>, params: Option<Value>) -> JsonRpcResponse {
+        let params = match params {
+            Some(p) => p,
+            None => return JsonRpcResponse::error(id, -32602, "Missing params for tools/call"),
+        };
+
+        let tool_name = match params.get("name").and_then(|v| v.as_str()) {
+            Some(n) => n,
+            None => {
+                return JsonRpcResponse::error(id, -32602, "Missing 'name' in tools/call params");
+            }
+        };
+
+        let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+
+        let result = match tool_name {
+            "omen_workspace_status" => self.tool_workspace_status().await,
+            "omen_facts_query" => self.tool_facts_query(&arguments).await,
+            "omen_execute" => self.tool_execute(&arguments).await,
+            "omen_execution_status" => self.tool_execution_status(&arguments).await,
+            "omen_history_query" => self.tool_history_query(&arguments).await,
+            "omen_services_list" => self.tool_services_list().await,
+            "omen_services_control" => self.tool_services_control(&arguments).await,
+            "omen_capabilities_discover" => self.tool_capabilities_discover().await,
+            other => CallToolResult::error(format!("Unknown tool: '{other}'")),
+        };
+
+        JsonRpcResponse::success(id, serde_json::to_value(result).unwrap())
+    }
+
+    async fn tool_workspace_status(&self) -> CallToolResult {
+        if let Some(ref c) = self.client
+            && let Ok(snap) = c.get_snapshot().await
+        {
+            return CallToolResult::text(
+                serde_json::to_string_pretty(&json!({
+                    "workspace_id": snap.workspace_id,
+                    "workspace_path": self.workspace_path.display().to_string(),
+                    "epoch": snap.epoch,
+                    "sequence": snap.sequence,
+                    "active_facts_count": snap.facts.len(),
+                    "dirty_facts_count": snap.dirty_facts_count,
+                    "services_count": snap.services.len(),
+                    "available_tools": snap.tools,
+                }))
+                .unwrap(),
+            );
+        }
+
+        CallToolResult::text(
+            serde_json::to_string_pretty(&json!({
+                "workspace_path": self.workspace_path.display().to_string(),
+                "workspace_root": self.workspace_path.display().to_string(),
+                "mode": "standalone",
+            }))
+            .unwrap(),
+        )
+    }
+
+    async fn tool_facts_query(&self, args: &Value) -> CallToolResult {
+        let filter = args.get("filter").and_then(|v| v.as_str()).unwrap_or("all");
+
+        if let Some(ref c) = self.client
+            && let Ok(snap) = c.get_snapshot().await
+        {
+            let filtered: Vec<_> = snap
+                .facts
+                .into_iter()
+                .filter(|f| match filter {
+                    "current" => f.validity == "CURRENT",
+                    "dirty" => f.validity == "DIRTY",
+                    _ => true,
+                })
+                .collect();
+
+            return CallToolResult::text(serde_json::to_string_pretty(&filtered).unwrap());
+        }
+
+        CallToolResult::text("[]")
+    }
+
+    async fn tool_execute(&self, args: &Value) -> CallToolResult {
+        let argv = match args.get("argv").and_then(|v| v.as_array()) {
+            Some(arr) => arr
+                .iter()
+                .filter_map(|item| item.as_str().map(|s| s.to_string()))
+                .collect::<Vec<String>>(),
+            None => return CallToolResult::error("Missing 'argv' array"),
+        };
+
+        if argv.is_empty() {
+            return CallToolResult::error("'argv' cannot be empty");
+        }
+
+        let tool = args.get("tool").and_then(|v| v.as_str()).unwrap_or("exec");
+        let operation = args.get("operation").and_then(|v| v.as_str()).unwrap_or("");
+        let cwd = args
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| self.workspace_path.to_str().unwrap_or("."));
+        let timeout_ms = args
+            .get("timeout_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(60000);
+
+        if let Some(ref c) = self.client {
+            match c
+                .submit_execution(tool, operation, argv, cwd, timeout_ms)
+                .await
+            {
+                Ok(summary) => {
+                    let out = json!({
+                        "execution_id": summary.execution_id,
+                        "exit_code": summary.exit_code,
+                        "duration_ms": summary.duration_ms,
+                        "stdout_preview": summary.stdout_preview,
+                        "stderr_preview": summary.stderr_preview,
+                        "stdout_artifact": summary.stdout_artifact,
+                        "stderr_artifact": summary.stderr_artifact,
+                    });
+                    CallToolResult::text(serde_json::to_string_pretty(&out).unwrap())
+                }
+                Err(e) => CallToolResult::error(format!("Execution broker error: {e}")),
+            }
+        } else {
+            let supervisor = omen_engine::ProcessSupervisor::new();
+            let req = omen_engine::ExecutionRequest {
+                argv: argv.clone(),
+                cwd: std::path::PathBuf::from(cwd),
+                env: vec![],
+                stdin_mode: omen_core::StdioMode::Closed,
+                stdin_payload: None,
+                timeout_ms,
+                inline_budget: 8192,
+                required_assurance: omen_core::RequiredAssurance::default(),
+            };
+            match supervisor.execute(req).await {
+                Ok(output) => {
+                    let state_dir = resolve_workspace_dir(&self.workspace_path);
+                    let db_path = canonical_workspace_db_path(&self.workspace_path);
+                    let cas_dir = state_dir.join("cas");
+                    let cas = ContentAddressedStore::new(cas_dir);
+
+                    let mut db = Database::open(&db_path).ok();
+                    let stdout_artifact = if !output.stdout_all.is_empty() {
+                        if let Some(ref mut d) = db {
+                            cas.store(
+                                d,
+                                &output.stdout_all,
+                                "text/plain",
+                                "agent",
+                                omen_core::RetentionClass::Referenced,
+                            )
+                            .ok()
+                            .map(|m| m.uri.to_string())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    let stderr_artifact = if !output.stderr_all.is_empty() {
+                        if let Some(ref mut d) = db {
+                            cas.store(
+                                d,
+                                &output.stderr_all,
+                                "text/plain",
+                                "agent",
+                                omen_core::RetentionClass::Referenced,
+                            )
+                            .ok()
+                            .map(|m| m.uri.to_string())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    let out = json!({
+                        "execution_id": format!("exec-local-{}", &uuid::Uuid::new_v4().to_string()[..8]),
+                        "exit_code": output.process_exit.code.unwrap_or(0),
+                        "duration_ms": 0,
+                        "stdout_preview": String::from_utf8_lossy(&output.stdout_bounded).to_string(),
+                        "stderr_preview": String::from_utf8_lossy(&output.stderr_bounded).to_string(),
+                        "stdout_artifact": stdout_artifact,
+                        "stderr_artifact": stderr_artifact,
+                    });
+                    CallToolResult::text(serde_json::to_string_pretty(&out).unwrap())
+                }
+                Err(e) => CallToolResult::error(format!("Local execution error: {e}")),
+            }
+        }
+    }
+
+    async fn tool_execution_status(&self, args: &Value) -> CallToolResult {
+        let req_id = match args.get("request_id").and_then(|v| v.as_str()) {
+            Some(id) => id,
+            None => return CallToolResult::error("Missing 'request_id'"),
+        };
+
+        if let Some(ref c) = self.client {
+            match c.query_request_status(req_id).await {
+                Ok(receipt) => {
+                    CallToolResult::text(serde_json::to_string_pretty(&receipt).unwrap())
+                }
+                Err(e) => CallToolResult::error(format!("Query status error: {e}")),
+            }
+        } else {
+            CallToolResult::error("Shared daemon client not connected")
+        }
+    }
+
+    async fn tool_history_query(&self, args: &Value) -> CallToolResult {
+        let all = args
+            .get("all_sessions")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let db_path = canonical_workspace_db_path(&self.workspace_path);
+
+        if let Ok(db) = Database::open(&db_path) {
+            if all {
+                let records = omen_knowledge::ExecutionHistory::list_all_executions(&db, 20)
+                    .unwrap_or_default();
+                CallToolResult::text(serde_json::to_string_pretty(&records).unwrap())
+            } else {
+                let sid = InteractiveSessionId::new(&self.session_id).unwrap();
+                let last = omen_knowledge::ExecutionHistory::get_last_execution(&db, &sid)
+                    .unwrap_or_default();
+                CallToolResult::text(serde_json::to_string_pretty(&last).unwrap())
+            }
+        } else {
+            CallToolResult::error("Failed to open canonical workspace database")
+        }
+    }
+
+    async fn tool_services_list(&self) -> CallToolResult {
+        if let Some(ref c) = self.client {
+            match c.list_services().await {
+                Ok(services) => {
+                    CallToolResult::text(serde_json::to_string_pretty(&services).unwrap())
+                }
+                Err(e) => CallToolResult::error(format!("List services error: {e}")),
+            }
+        } else {
+            CallToolResult::error("Shared daemon client not connected")
+        }
+    }
+
+    async fn tool_services_control(&self, args: &Value) -> CallToolResult {
+        let action = match args.get("action").and_then(|v| v.as_str()) {
+            Some(a) => a,
+            None => return CallToolResult::error("Missing 'action'"),
+        };
+        let name = match args.get("name").and_then(|v| v.as_str()) {
+            Some(n) => n,
+            None => return CallToolResult::error("Missing 'name'"),
+        };
+
+        if let Some(ref c) = self.client {
+            let res: Result<String, omen_ipc::LocalIpcError> = match action {
+                "start" => {
+                    let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+                    c.start_service(name, cmd, vec![])
+                        .await
+                        .map(|s| format!("Service '{}' started (PID {:?})", s.name, s.pid))
+                }
+                "stop" => c.stop_service(name).await,
+                "restart" => c
+                    .restart_service(name)
+                    .await
+                    .map(|s| format!("Service '{}' restarted (PID {:?})", s.name, s.pid)),
+                other => Err(omen_ipc::LocalIpcError::Io(format!(
+                    "Unknown service action: {other}"
+                ))),
+            };
+
+            match res {
+                Ok(msg) => CallToolResult::text(format!(
+                    "Service action '{action}' on '{name}' completed: {msg}"
+                )),
+                Err(e) => CallToolResult::error(format!("Service control error: {e}")),
+            }
+        } else {
+            CallToolResult::error("Shared daemon client not connected")
+        }
+    }
+
+    async fn tool_capabilities_discover(&self) -> CallToolResult {
+        let caps = json!({
+            "product": "Omen",
+            "version": env!("CARGO_PKG_VERSION"),
+            "doctrine": "substrate, not sovereign",
+            "boundaries": {
+                "lantern": "memory and provenance",
+                "resolve": "live guards and locks",
+                "tethers": "permissions, policy, approval, durable intent, and outcome truth",
+                "omen": "physical execution, containment, facts, and CAS artifacts",
+                "threadmoth": "deterministic bounded structural mutation"
+            },
+            "tools": [
+                "omen_workspace_status",
+                "omen_facts_query",
+                "omen_execute",
+                "omen_execution_status",
+                "omen_history_query",
+                "omen_services_list",
+                "omen_services_control",
+                "omen_capabilities_discover"
+            ],
+            "capabilities": {
+                "execution": {
+                    "broker": "shared_daemon",
+                    "containment": if cfg!(windows) { "JobObjects" } else { "ProcessGroup" },
+                    "closed_stdin_default": true,
+                    "bounded_context": true
+                },
+                "facts": {
+                    "registry": "lazy_pessimism",
+                    "states": ["CURRENT", "DIRTY", "SUPERSEDED"]
+                },
+                "cas": {
+                    "hasher": "sha256",
+                    "uri_scheme": "artifact://sha256/<hash>",
+                    "storage": "content_addressed"
+                },
+                "services": {
+                    "supervision": "managed",
+                    "ownership_states": ["RUNNING_OWNED", "OBSERVED", "STOPPED", "CRASHED"]
+                },
+                "authority": {
+                    "sovereign": false,
+                    "doctrine": "Omen is substrate, not sovereign. Authority belongs to Tethers."
+                }
+            }
+        });
+        CallToolResult::text(serde_json::to_string_pretty(&caps).unwrap())
+    }
+
+    async fn handle_resources_list(&self, id: Option<Value>) -> JsonRpcResponse {
+        let resources = vec![
+            ResourceDefinition {
+                uri: "fact://".into(),
+                name: "Omen Facts".into(),
+                description: Some("Facts published in the Fact Registry".into()),
+                mime_type: Some("application/json".into()),
+            },
+            ResourceDefinition {
+                uri: "artifact://".into(),
+                name: "CAS Artifacts".into(),
+                description: Some(
+                    "Content-addressed storage artifacts (stdout/stderr/evidence)".into(),
+                ),
+                mime_type: Some("text/plain".into()),
+            },
+            ResourceDefinition {
+                uri: "proc://".into(),
+                name: "Managed Services".into(),
+                description: Some("Managed process supervisor resources".into()),
+                mime_type: Some("application/json".into()),
+            },
+        ];
+
+        JsonRpcResponse::success(id, json!({ "resources": resources }))
+    }
+
+    async fn handle_resources_read(
+        &self,
+        id: Option<Value>,
+        params: Option<Value>,
+    ) -> JsonRpcResponse {
+        let uri = match params
+            .and_then(|p| p.get("uri").and_then(|u| u.as_str()).map(|s| s.to_string()))
+        {
+            Some(u) => u,
+            None => return JsonRpcResponse::error(id, -32602, "Missing 'uri' parameter"),
+        };
+
+        // Section 32: mcp_large_artifact_returns_reference_not_unbounded_payload
+        if uri.starts_with("artifact://sha256/") {
+            let digest = uri.trim_start_matches("artifact://sha256/");
+            let state_dir = resolve_workspace_dir(&self.workspace_path);
+            let cas = ContentAddressedStore::new(state_dir.join("cas"));
+            let blob_path = cas.blob_path(digest);
+
+            if !blob_path.exists() {
+                return JsonRpcResponse::error(
+                    id,
+                    -32004,
+                    format!("Artifact not found in CAS: {digest}"),
+                );
+            }
+
+            match std::fs::read(&blob_path) {
+                Ok(mut bytes) => {
+                    // Bound payload to at most 64 KiB
+                    if bytes.len() > 65536 {
+                        bytes.truncate(65536);
+                    }
+                    let text = String::from_utf8_lossy(&bytes).to_string();
+                    let contents = vec![ResourceContent {
+                        uri: uri.clone(),
+                        mime_type: Some("text/plain".into()),
+                        text,
+                    }];
+                    return JsonRpcResponse::success(id, json!({ "contents": contents }));
+                }
+                Err(e) => {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32004,
+                        format!("Failed to read artifact: {e}"),
+                    );
+                }
+            }
+        }
+
+        JsonRpcResponse::error(
+            id,
+            -32004,
+            format!("Resource not found or unsupported scheme: {uri}"),
+        )
+    }
+
+    /// Dispatches a single JSON-RPC message string to a response string.
+    pub async fn dispatch_message(&self, line: &str) -> Option<String> {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        match serde_json::from_str::<JsonRpcRequest>(trimmed) {
+            Ok(req) => {
+                let resp = self.handle_request(req).await;
+                serde_json::to_string(&resp).ok()
+            }
+            Err(e) => {
+                let resp = JsonRpcResponse::error(None, -32700, format!("Parse error: {e}"));
+                serde_json::to_string(&resp).ok()
+            }
+        }
+    }
+
+    /// Runs stream server loop over any async reader and writer.
+    pub async fn run_stream<R, W>(
+        &self,
+        reader: R,
+        mut writer: W,
+    ) -> Result<(), Box<dyn std::error::Error>>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        let mut lines = BufReader::new(reader).lines();
+        while let Some(line) = lines.next_line().await? {
+            if let Some(resp_str) = self.dispatch_message(&line).await {
+                writer.write_all(resp_str.as_bytes()).await?;
+                writer.write_all(b"\n").await?;
+                writer.flush().await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Runs stdio server loop for external agents.
+    pub async fn run_stdio(&self) -> Result<(), Box<dyn std::error::Error>> {
+        self.run_stream(tokio::io::stdin(), tokio::io::stdout())
+            .await
+    }
+}

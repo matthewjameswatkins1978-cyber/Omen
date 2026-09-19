@@ -49,6 +49,15 @@ enum Commands {
     Gc(GcArgs),
     /// Manage Omen shared runtime daemon
     Daemon(DaemonArgs),
+    /// Model Context Protocol (MCP) server over stdio
+    Mcp(McpArgs),
+}
+
+#[derive(Args, Debug)]
+struct McpArgs {
+    /// Workspace root directory to serve
+    #[arg(long)]
+    workspace: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -692,6 +701,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             },
         },
+        Some(Commands::Mcp(mcp_args)) => {
+            let ws = mcp_args.workspace.unwrap_or(ws_root);
+            let client = omen_client::OmenClient::connect_default(None).await.ok();
+            if let Some(ref c) = client {
+                let path_str = ws.canonicalize().unwrap_or_else(|_| ws.clone());
+                let _ = c
+                    .attach_workspace(path_str.to_string_lossy().to_string())
+                    .await;
+            }
+
+            let server = omen_mcp::McpServer::new(ws, client);
+            server.run_stdio().await?;
+        }
         None => {
             if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
                 let db = Database::open(&db_path).ok();

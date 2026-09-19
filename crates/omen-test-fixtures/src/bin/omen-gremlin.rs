@@ -1,5 +1,5 @@
 use clap::Parser;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
@@ -37,23 +37,35 @@ struct GremlinArgs {
 
     #[arg(long, default_value_t = 0)]
     exit: i32,
+
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    trailing_args: Vec<String>,
 }
 
 #[allow(clippy::zombie_processes)]
 fn main() {
     let args = GremlinArgs::parse();
 
+    if let Ok(stall_str) = std::env::var("OMEN_GREMLIN_STALL_MS")
+        && let Ok(ms) = stall_str.parse::<u64>()
+    {
+        thread::sleep(Duration::from_millis(ms));
+    }
+
     if let Some(msg) = args.stdout {
         println!("{msg}");
+        let _ = io::stdout().flush();
     }
 
     if let Some(count) = args.stdout_bytes {
         let chunk = "A".repeat(count);
         print!("{chunk}");
+        let _ = io::stdout().flush();
     }
 
     if let Some(err) = args.stderr {
         eprintln!("{err}");
+        let _ = io::stderr().flush();
     }
 
     if args.read_stdin {
