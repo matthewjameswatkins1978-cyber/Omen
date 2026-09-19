@@ -143,6 +143,32 @@ impl Database {
                 PRIMARY KEY (execution_id, artifact_uri),
                 FOREIGN KEY (execution_id) REFERENCES execution_history(execution_id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS daemon_workspaces (
+                workspace_id TEXT PRIMARY KEY,
+                canonical_path TEXT NOT NULL UNIQUE,
+                epoch INTEGER NOT NULL,
+                attached_at TEXT NOT NULL,
+                last_seen TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS service_records (
+                workspace_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                command TEXT NOT NULL,
+                pid INTEGER,
+                state TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (workspace_id, name)
+            );
+
+            CREATE TABLE IF NOT EXISTS request_receipts (
+                consequential_request_id TEXT PRIMARY KEY,
+                execution_id TEXT,
+                status TEXT NOT NULL,
+                recorded_at TEXT NOT NULL
+            );
             "#,
             )
             .map_err(|e| CoreError::Internal(format!("Database migration failed: {e}")))?;

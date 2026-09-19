@@ -200,6 +200,69 @@ impl ExecutionHistory {
         }
     }
 
+    pub fn get_execution(
+        db: &crate::db::Database,
+        execution_id: &ExecutionId,
+    ) -> Result<Option<ExecutionRecord>, CoreError> {
+        let mut stmt = db
+            .conn()
+            .prepare(
+                r#"
+                SELECT execution_id, session_id, command, exit_code, duration_ms,
+                       stdout_artifact, stderr_artifact, envelope_json, created_at
+                FROM execution_history
+                WHERE execution_id = ?1
+                LIMIT 1
+                "#,
+            )
+            .map_err(|e| CoreError::Internal(format!("Failed to prepare query: {e}")))?;
+
+        let mut rows = stmt
+            .query_map(params![execution_id.as_str()], |row| {
+                let eid: String = row.get(0)?;
+                let sid: String = row.get(1)?;
+                let cmd: String = row.get(2)?;
+                let code: Option<i32> = row.get(3)?;
+                let dur: Option<i64> = row.get(4)?;
+                let stdout_art: Option<String> = row.get(5)?;
+                let stderr_art: Option<String> = row.get(6)?;
+                let env_json: Option<String> = row.get(7)?;
+                let cr: String = row.get(8)?;
+
+                Ok(ExecutionRecord {
+                    execution_id: ExecutionId::new(eid).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?,
+                    session_id: InteractiveSessionId::new(sid).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?,
+                    command: cmd,
+                    exit_code: code,
+                    duration_ms: dur,
+                    stdout_artifact: stdout_art,
+                    stderr_artifact: stderr_art,
+                    envelope_json: env_json,
+                    created_at: cr,
+                })
+            })
+            .map_err(|e| CoreError::Internal(format!("Failed to query execution by id: {e}")))?;
+
+        if let Some(res) = rows.next() {
+            let rec = res.map_err(|e| CoreError::Internal(e.to_string()))?;
+            Ok(Some(rec))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub fn get_last_failed_execution(
         db: &crate::db::Database,
         session_id: &InteractiveSessionId,

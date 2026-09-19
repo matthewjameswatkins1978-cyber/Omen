@@ -9,6 +9,7 @@ pub struct OmenPrompt {
     dirty_count: usize,
     has_failure: bool,
     caps: TerminalCapabilities,
+    mode_indicator: Option<String>,
 }
 
 impl OmenPrompt {
@@ -25,7 +26,17 @@ impl OmenPrompt {
             dirty_count,
             has_failure,
             caps,
+            mode_indicator: None,
         }
+    }
+
+    pub fn with_mode_indicator(mut self, indicator: impl Into<String>) -> Self {
+        self.mode_indicator = Some(indicator.into());
+        self
+    }
+
+    pub fn set_mode_indicator(&mut self, indicator: Option<String>) {
+        self.mode_indicator = indicator;
     }
 
     pub fn update_state(
@@ -40,16 +51,27 @@ impl OmenPrompt {
         self.dirty_count = dirty_count;
         self.has_failure = has_failure;
     }
+
+    pub fn dirty_count(&self) -> usize {
+        self.dirty_count
+    }
+
+    pub fn mode_indicator(&self) -> Option<&str> {
+        self.mode_indicator.as_deref()
+    }
 }
 
 impl Prompt for OmenPrompt {
     fn render_prompt_left(&self) -> Cow<'_, str> {
-        let state = PromptState::new(
+        let mut state = PromptState::new(
             &self.cwd,
             self.branch.clone(),
             self.dirty_count,
             self.has_failure,
         );
+        if let Some(ref ind) = self.mode_indicator {
+            state = state.with_mode_indicator(ind.clone());
+        }
         let rendered = PromptRenderer::render(&state, &self.caps);
         Cow::Owned(rendered)
     }

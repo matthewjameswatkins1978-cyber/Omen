@@ -1,0 +1,40 @@
+[package]
+name = "omen-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "omend"
+path = "src/main.rs"
+
+[dependencies]
+omen-core.workspace = true
+omen-schema.workspace = true
+omen-engine.workspace = true
+omen-knowledge.workspace = true
+omen-atlas.workspace = true
+omen-ipc.workspace = true
+tokio = { workspace = true, features = ["full"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rusqlite.workspace = true
+notify.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+sha2.workspace = true
+hex.workspace = true
+clap = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+omen-client.workspace = true
+omen-interactive.workspace = true
+omen-test-fixtures.workspace = true
+

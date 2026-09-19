@@ -17,6 +17,38 @@ pub struct InteractiveSession {
     pub last_exit: Option<ProcessExit>,
     pub db: Option<Database>,
     pub comp_ctx: std::sync::Arc<std::sync::Mutex<crate::completion::CompletionContext>>,
+    pub client: Option<omen_client::OmenClient>,
+}
+
+pub fn block_on_async<F>(future: F) -> F::Output
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        match handle.runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| handle.block_on(future))
+            }
+            _ => std::thread::scope(|s| {
+                s.spawn(|| {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("Failed to build local tokio runtime")
+                        .block_on(future)
+                })
+                .join()
+                .expect("Tokio runtime thread panicked")
+            }),
+        }
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to build local tokio runtime")
+            .block_on(future)
+    }
 }
 
 impl InteractiveSession {
@@ -30,18 +62,94 @@ impl InteractiveSession {
         cwd: PathBuf,
         db: Option<Database>,
     ) -> Result<Self, CoreError> {
+        let client = block_on_async(async {
+            let sid = session_id.to_string();
+            let c_path = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
+            let path_str = c_path.to_string_lossy().to_string();
+            if let Ok(c) = omen_client::OmenClient::connect_default(Some(sid)).await {
+                let _ = c.attach_workspace(&path_str).await;
+                Some(c)
+            } else {
+                None
+            }
+        });
+
+        Self::new_with_client(session_id, cwd, db, client)
+    }
+
+    pub fn new_with_client(
+        session_id: InteractiveSessionId,
+        cwd: PathBuf,
+        db: Option<Database>,
+        client: Option<omen_client::OmenClient>,
+    ) -> Result<Self, CoreError> {
         let supervisor = ProcessSupervisor::new();
         let caps = TerminalCapabilities::detect();
-        let prompt = OmenPrompt::new(cwd.clone(), None, 0, false, caps.clone());
+        let mode_label = if client.is_some() {
+            "[shared]"
+        } else {
+            "[standalone]"
+        };
+        let prompt = OmenPrompt::new(cwd.clone(), None, 0, false, caps.clone())
+            .with_mode_indicator(mode_label);
 
         let mut hot_index = crate::completion::HotSemanticIndex::default();
         hot_index.refresh(&cwd, db.as_ref());
+
         let comp_ctx = std::sync::Arc::new(std::sync::Mutex::new(
             crate::completion::CompletionContext {
                 cwd: cwd.clone(),
                 hot_index,
             },
         ));
+
+        if let Some(ref c) = client {
+            let mut event_rx = c.subscribe_events();
+            let comp_ctx_bg = comp_ctx.clone();
+            let client_bg = c.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    if let (Ok(snap), Ok(mut ctx)) =
+                        (client_bg.get_snapshot().await, comp_ctx_bg.lock())
+                    {
+                        ctx.hot_index.apply_snapshot(&snap);
+                    }
+                    while let Ok(event) = event_rx.recv().await {
+                        match event.payload {
+                            omen_ipc::EventPayload::FactPublished {
+                                resource_uri,
+                                validity,
+                                ..
+                            } => {
+                                let info = omen_ipc::FactInfo {
+                                    resource_uri,
+                                    fact_id: String::new(),
+                                    value: String::new(),
+                                    validity,
+                                    assurance: String::new(),
+                                };
+                                if let Ok(mut ctx) = comp_ctx_bg.lock() {
+                                    ctx.hot_index.update_fact(&info);
+                                }
+                            }
+                            omen_ipc::EventPayload::FactInvalidated { resource_uri, .. } => {
+                                if let Ok(mut ctx) = comp_ctx_bg.lock() {
+                                    ctx.hot_index.mark_fact_dirty(&resource_uri);
+                                }
+                            }
+                            omen_ipc::EventPayload::ResyncRequired { .. } => {
+                                if let (Ok(snap), Ok(mut ctx)) =
+                                    (client_bg.get_snapshot().await, comp_ctx_bg.lock())
+                                {
+                                    ctx.hot_index.apply_snapshot(&snap);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+            }
+        }
 
         let mut sess = Self {
             session_id,
@@ -52,6 +160,7 @@ impl InteractiveSession {
             last_exit: None,
             db,
             comp_ctx,
+            client,
         };
         sess.update_prompt_state();
         Ok(sess)
@@ -203,8 +312,21 @@ impl InteractiveSession {
                     let duration_ms = start_t.elapsed().as_millis() as i64;
                     self.last_exit = Some(exit.clone());
 
-                    // Record interactive execution in subordinate physical history
-                    if let Some(db_ref) = &mut self.db {
+                    // Record interactive execution ONCE: via daemon client if connected, else local db
+                    if let Some(ref c) = self.client
+                        && c.is_connected()
+                    {
+                        let client_c = c.clone();
+                        let cmd = resolved_argv.join(" ");
+                        let exit_code = exit.code;
+                        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                            handle.spawn(async move {
+                                let _ = client_c
+                                    .record_history(cmd, exit_code, duration_ms as u64, None, None)
+                                    .await;
+                            });
+                        }
+                    } else if let Some(db_ref) = &mut self.db {
                         let now = chrono::Utc::now().to_rfc3339();
                         let exec_id = omen_core::ExecutionId::new(format!(
                             "exec-{}",
@@ -241,7 +363,59 @@ impl InteractiveSession {
                     return Ok(exit);
                 }
 
-                // 2. Ordinary executable invocation via ProcessSupervisor
+                // 2. If daemon client is connected, route execution through shared daemon broker
+                if let Some(ref c) = self.client
+                    && c.is_connected()
+                {
+                    let tool = "exec";
+                    let operation = "";
+                    let client_clone = c.clone();
+                    let argv_clone = resolved_argv.clone();
+                    let cwd_str = self.cwd.to_string_lossy().to_string();
+
+                    print!(
+                        "{}",
+                        omen_ui::SemanticBlock::osc133_command_executed(&self.caps)
+                    );
+
+                    let summary_res = block_on_async(
+                        client_clone.submit_execution(tool, operation, argv_clone, cwd_str, 60000),
+                    )
+                    .map_err(|e| CoreError::Internal(format!("Daemon execution error: {e}")));
+
+                    match summary_res {
+                        Ok(summary) => {
+                            print!(
+                                "{}",
+                                omen_ui::SemanticBlock::osc133_command_finished(
+                                    summary.exit_code.unwrap_or(0),
+                                    &self.caps
+                                )
+                            );
+
+                            if !summary.stdout_preview.is_empty() {
+                                print!("{}", summary.stdout_preview);
+                            }
+                            if !summary.stderr_preview.is_empty() {
+                                eprint!("{}", summary.stderr_preview);
+                            }
+
+                            let exit = ProcessExit {
+                                code: summary.exit_code,
+                                signal: None,
+                            };
+                            self.last_exit = Some(exit.clone());
+                            self.update_prompt_state();
+                            return Ok(exit);
+                        }
+                        Err(e) => {
+                            eprintln!("Execution error via shared daemon broker: {e}");
+                            // Fall through to standalone execution if daemon fails
+                        }
+                    }
+                }
+
+                // 3. Standalone execution via ProcessSupervisor
                 let req = ExecutionRequest {
                     argv: resolved_argv.clone(),
                     cwd: self.cwd.clone(),
@@ -258,13 +432,7 @@ impl InteractiveSession {
                     omen_ui::SemanticBlock::osc133_command_executed(&self.caps)
                 );
 
-                let output = tokio::runtime::Handle::try_current()
-                    .map_err(|_| CoreError::Internal("No tokio runtime found".into()))
-                    .and_then(|handle| {
-                        tokio::task::block_in_place(|| {
-                            handle.block_on(self.supervisor.execute(req))
-                        })
-                    })?;
+                let output = block_on_async(self.supervisor.execute(req))?;
 
                 print!(
                     "{}",
@@ -286,12 +454,11 @@ impl InteractiveSession {
                     ))[..12]
                 ))?;
 
-                // Record execution in subordinate physical history
+                // Compute CAS artifacts and record execution in subordinate physical history
+                let cas_dir = omen_knowledge::resolve_workspace_dir(&self.cwd).join("cas");
+                let cas = omen_knowledge::ContentAddressedStore::new(cas_dir);
                 if let Some(db_ref) = &mut self.db {
-                    let now = chrono::Utc::now().to_rfc3339();
-                    let cas_dir = omen_knowledge::resolve_workspace_dir(&self.cwd).join("cas");
-                    let cas = omen_knowledge::ContentAddressedStore::new(cas_dir);
-                    let stdout_art = if !output.stdout_all.is_empty() {
+                    let out_art = if !output.stdout_all.is_empty() {
                         cas.store(
                             db_ref,
                             &output.stdout_all,
@@ -304,7 +471,7 @@ impl InteractiveSession {
                     } else {
                         None
                     };
-                    let stderr_art = if !output.stderr_all.is_empty() {
+                    let err_art = if !output.stderr_all.is_empty() {
                         cas.store(
                             db_ref,
                             &output.stderr_all,
@@ -318,14 +485,15 @@ impl InteractiveSession {
                         None
                     };
 
+                    let now = chrono::Utc::now().to_rfc3339();
                     let exec_rec = omen_knowledge::ExecutionRecord {
                         execution_id: exec_id,
                         session_id: self.session_id.clone(),
                         command: resolved_argv.join(" "),
                         exit_code: output.process_exit.code,
                         duration_ms: Some(output.duration_ms as i64),
-                        stdout_artifact: stdout_art,
-                        stderr_artifact: stderr_art,
+                        stdout_artifact: out_art,
+                        stderr_artifact: err_art,
                         envelope_json: None,
                         created_at: now,
                     };
@@ -361,7 +529,22 @@ impl InteractiveSession {
             .map(|e| !e.is_zero())
             .unwrap_or(false);
 
-        let dirty_count = if let Some(db) = &self.db {
+        let dirty_count = if self
+            .client
+            .as_ref()
+            .map(|c| c.is_connected())
+            .unwrap_or(false)
+        {
+            if let Ok(ctx) = self.comp_ctx.lock() {
+                ctx.hot_index
+                    .active_facts
+                    .iter()
+                    .filter(|f| f.validity == omen_core::ValidityState::Dirty)
+                    .count()
+            } else {
+                0
+            }
+        } else if let Some(db) = &self.db {
             omen_knowledge::FactRegistry::list_active_facts(db, 200)
                 .map(|facts| {
                     facts
@@ -370,9 +553,27 @@ impl InteractiveSession {
                         .count()
                 })
                 .unwrap_or(0)
+        } else if let Ok(ctx) = self.comp_ctx.lock() {
+            ctx.hot_index
+                .active_facts
+                .iter()
+                .filter(|f| f.validity == omen_core::ValidityState::Dirty)
+                .count()
         } else {
             0
         };
+
+        let mode_label = if self
+            .client
+            .as_ref()
+            .map(|c| c.is_connected())
+            .unwrap_or(false)
+        {
+            "[shared]"
+        } else {
+            "[standalone]"
+        };
+        self.prompt.set_mode_indicator(Some(mode_label.to_string()));
 
         self.prompt
             .update_state(self.cwd.clone(), None, dirty_count, has_failure);
@@ -380,7 +581,9 @@ impl InteractiveSession {
         // Refresh bounded hot semantic index out-of-band for completion
         if let Ok(mut ctx) = self.comp_ctx.lock() {
             ctx.cwd = self.cwd.clone();
-            ctx.hot_index.refresh(&self.cwd, self.db.as_ref());
+            if self.client.is_none() {
+                ctx.hot_index.refresh(&self.cwd, self.db.as_ref());
+            }
         }
     }
 }

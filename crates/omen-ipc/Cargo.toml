@@ -1,0 +1,31 @@
+[package]
+name = "omen-ipc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+omen-core.workspace = true
+omen-schema.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+tokio = { workspace = true, features = ["io-util", "sync", "net", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_Security",
+] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.0", features = ["process", "fs"] }

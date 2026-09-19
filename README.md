@@ -60,6 +60,7 @@ Omen gives humans and AI the same workspace through different interfaces, while 
 8. **Omen 0.9: Stabilisation** — Protocol freeze, backwards compatibility, migrations, torture testing, fuzzing, security audit.
 9. **Omen 1.0: Stable Human + Agent Developer Runtime** — Production guarantees across human, agent, and shared reality.
 
+See [Using Omen](docs/USING_OMEN.md) for a walkthrough of daily shell workflows and what actually happens when you open it.
 See [Road to 1.0](docs/ROAD_TO_1_0.md) and [Roadmap](docs/ROADMAP.md) for full architectural specifications.
 
 ## Getting Started

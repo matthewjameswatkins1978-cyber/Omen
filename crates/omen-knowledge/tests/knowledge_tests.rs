@@ -128,3 +128,62 @@ fn cas_storage_bounded_slice_and_gc() {
     let read_err = cas.read_slice(&mut db, &meta.digest, 0, 5).unwrap_err();
     assert!(matches!(read_err, CoreError::NotFound(_)));
 }
+
+#[test]
+fn workspace_persistence_and_receipts() {
+    use omen_knowledge::{RequestReceiptRecord, ServiceRecord, WorkspacePersistence};
+
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("state.sqlite");
+    let db = Database::open(&db_path).unwrap();
+
+    // 1. Workspace persistence
+    WorkspacePersistence::upsert_workspace(&db, "ws_test_01", "/tmp/omen-test", 100).unwrap();
+    let ws = WorkspacePersistence::get_workspace(&db, "ws_test_01")
+        .unwrap()
+        .expect("Workspace should be found");
+    assert_eq!(ws.workspace_id, "ws_test_01");
+    assert_eq!(ws.epoch, 100);
+    assert_eq!(ws.canonical_path, "/tmp/omen-test");
+
+    let all_ws = WorkspacePersistence::list_workspaces(&db).unwrap();
+    assert_eq!(all_ws.len(), 1);
+
+    // 2. Service persistence
+    let srv = ServiceRecord {
+        workspace_id: "ws_test_01".into(),
+        name: "api_server".into(),
+        command: "cargo run --bin api".into(),
+        pid: Some(4567),
+        state: "running".into(),
+        started_at: "2026-09-18T20:00:00Z".into(),
+        updated_at: "2026-09-18T20:00:00Z".into(),
+    };
+    WorkspacePersistence::upsert_service(&db, &srv).unwrap();
+
+    let fetched_srv = WorkspacePersistence::get_service(&db, "ws_test_01", "api_server")
+        .unwrap()
+        .expect("Service should be found");
+    assert_eq!(fetched_srv.name, "api_server");
+    assert_eq!(fetched_srv.pid, Some(4567));
+    assert_eq!(fetched_srv.state, "running");
+
+    let srv_list = WorkspacePersistence::list_services(&db, "ws_test_01").unwrap();
+    assert_eq!(srv_list.len(), 1);
+
+    // 3. Request receipt persistence
+    let receipt = RequestReceiptRecord {
+        consequential_request_id: "req_idem_123".into(),
+        execution_id: Some("exec_456".into()),
+        status: "Completed".into(),
+        recorded_at: "2026-09-18T20:01:00Z".into(),
+    };
+    WorkspacePersistence::record_request_receipt(&db, &receipt).unwrap();
+
+    let fetched_receipt = WorkspacePersistence::get_request_receipt(&db, "req_idem_123")
+        .unwrap()
+        .expect("Receipt should be found");
+    assert_eq!(fetched_receipt.consequential_request_id, "req_idem_123");
+    assert_eq!(fetched_receipt.execution_id, Some("exec_456".into()));
+    assert_eq!(fetched_receipt.status, "Completed");
+}

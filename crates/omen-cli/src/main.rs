@@ -4,7 +4,10 @@ use omen_core::{
     ActionId, CoreError, ExecutionContract, RequiredAssurance, ResourceUri, StdioMode,
 };
 use omen_engine::{ExecutionRequest, ProcessSupervisor};
-use omen_knowledge::{ContentAddressedStore, Database, FactRegistry, resolve_workspace_dir};
+use omen_knowledge::{
+    ContentAddressedStore, Database, FactRegistry, canonical_workspace_db_path,
+    resolve_workspace_dir,
+};
 use omen_schema::{
     ExecutionContractWire, ExecutionResultWire, ProcessExitWire, SCHEMA_VERSION_RESULT,
 };
@@ -44,6 +47,30 @@ enum Commands {
     Artifact(ArtifactArgs),
     /// Ephemeral storage garbage collection
     Gc(GcArgs),
+    /// Manage Omen shared runtime daemon
+    Daemon(DaemonArgs),
+}
+
+#[derive(Args, Debug)]
+struct DaemonArgs {
+    #[command(subcommand)]
+    subcommand: DaemonSubcommands,
+}
+
+#[derive(Subcommand, Debug)]
+enum DaemonSubcommands {
+    /// Start the omend daemon
+    Start {
+        /// Run daemon in foreground
+        #[arg(long)]
+        foreground: bool,
+    },
+    /// Stop the running omend daemon
+    Stop,
+    /// Inspect omend daemon status
+    Status,
+    /// Ping the omend daemon
+    Ping,
 }
 
 #[derive(Args, Debug)]
@@ -130,7 +157,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let current_dir = std::env::current_dir()?;
     let ws_root = cli.workspace.unwrap_or(current_dir);
     let state_dir = resolve_workspace_dir(&ws_root);
-    let db_path = state_dir.join("state.sqlite");
+    let db_path = canonical_workspace_db_path(&ws_root);
     let cas_dir = state_dir.join("cas");
 
     let supervisor = ProcessSupervisor::new();
@@ -446,6 +473,225 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("  Reclaimed bytes: {}", report.reclaimed_bytes);
             }
         }
+        Some(Commands::Daemon(daemon_args)) => match daemon_args.subcommand {
+            DaemonSubcommands::Start { foreground } => {
+                if foreground {
+                    let server = omen_daemon::DaemonServer::new(None);
+                    if !json_mode {
+                        println!("Starting omend in foreground on {}...", server.endpoint());
+                    }
+                    tokio::select! {
+                        res = server.run() => {
+                            if let Err(e) = res {
+                                eprintln!("omend error: {e}");
+                                std::process::exit(1);
+                            }
+                        }
+                        _ = tokio::signal::ctrl_c() => {
+                            server.shutdown();
+                            if !json_mode {
+                                println!("omend shut down cleanly.");
+                            }
+                        }
+                    }
+                } else {
+                    if let Ok(client) = omen_client::OmenClient::connect_default(None).await
+                        && let Ok(ts) = client.ping().await
+                    {
+                        if json_mode {
+                            let doc = serde_json::json!({
+                                "status": "already_running",
+                                "endpoint": client.endpoint(),
+                                "timestamp_ms": ts
+                            });
+                            println!("{}", serde_json::to_string_pretty(&doc)?);
+                        } else {
+                            println!("Daemon is already running on {}", client.endpoint());
+                        }
+                        return Ok(());
+                    }
+
+                    let exe = std::env::current_exe()?;
+                    let omend_bin = exe
+                        .parent()
+                        .map(|d| d.join(if cfg!(windows) { "omend.exe" } else { "omend" }))
+                        .filter(|p| p.exists())
+                        .unwrap_or_else(|| {
+                            PathBuf::from(if cfg!(windows) { "omend.exe" } else { "omend" })
+                        });
+
+                    let mut cmd = std::process::Command::new(&omend_bin);
+                    cmd.arg("--foreground")
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null());
+
+                    #[cfg(windows)]
+                    {
+                        use std::os::windows::process::CommandExt;
+                        const CREATE_NO_WINDOW: u32 = 0x08000000;
+                        const DETACHED_PROCESS: u32 = 0x00000008;
+                        cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+                    }
+
+                    let _child = cmd.spawn()?;
+
+                    let start_poll = std::time::Instant::now();
+                    let mut running = false;
+                    while start_poll.elapsed().as_millis() < 3000 {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        if let Ok(client) = omen_client::OmenClient::connect_default(None).await
+                            && client.ping().await.is_ok()
+                        {
+                            running = true;
+                            break;
+                        }
+                    }
+
+                    if running {
+                        if json_mode {
+                            let doc = serde_json::json!({
+                                "status": "started",
+                                "endpoint": omen_ipc::default_endpoint_address()
+                            });
+                            println!("{}", serde_json::to_string_pretty(&doc)?);
+                        } else {
+                            println!(
+                                "Daemon started successfully on {}",
+                                omen_ipc::default_endpoint_address()
+                            );
+                        }
+                    } else {
+                        if json_mode {
+                            let doc = serde_json::json!({
+                                "status": "error",
+                                "message": "Timed out waiting for daemon to start"
+                            });
+                            println!("{}", serde_json::to_string_pretty(&doc)?);
+                        } else {
+                            eprintln!("Error: Timed out waiting for daemon to start");
+                        }
+                        std::process::exit(1);
+                    }
+                }
+            }
+            DaemonSubcommands::Stop => match omen_client::OmenClient::connect_default(None).await {
+                Ok(client) => match client.shutdown_daemon().await {
+                    Ok(_) => {
+                        if json_mode {
+                            let doc = serde_json::json!({ "status": "stopped" });
+                            println!("{}", serde_json::to_string_pretty(&doc)?);
+                        } else {
+                            println!("Daemon stopped successfully.");
+                        }
+                    }
+                    Err(e) => {
+                        if json_mode {
+                            let doc = serde_json::json!({
+                                "status": "error",
+                                "message": e.to_string()
+                            });
+                            println!("{}", serde_json::to_string_pretty(&doc)?);
+                        } else {
+                            eprintln!("Error stopping daemon: {e}");
+                        }
+                        std::process::exit(1);
+                    }
+                },
+                Err(_) => {
+                    if json_mode {
+                        let doc = serde_json::json!({ "status": "not_running" });
+                        println!("{}", serde_json::to_string_pretty(&doc)?);
+                    } else {
+                        println!("Daemon is not running.");
+                    }
+                }
+            },
+            DaemonSubcommands::Status => {
+                let endpoint = omen_ipc::default_endpoint_address();
+                match omen_client::OmenClient::connect_default(None).await {
+                    Ok(client) => match client.ping().await {
+                        Ok(ts) => {
+                            if json_mode {
+                                let doc = serde_json::json!({
+                                    "status": "running",
+                                    "endpoint": client.endpoint(),
+                                    "timestamp_ms": ts
+                                });
+                                println!("{}", serde_json::to_string_pretty(&doc)?);
+                            } else {
+                                println!("Daemon Status: running");
+                                println!("Endpoint: {}", client.endpoint());
+                                println!("Timestamp: {ts}ms");
+                            }
+                        }
+                        Err(e) => {
+                            if json_mode {
+                                let doc = serde_json::json!({
+                                    "status": "unresponsive",
+                                    "endpoint": endpoint,
+                                    "error": e.to_string()
+                                });
+                                println!("{}", serde_json::to_string_pretty(&doc)?);
+                            } else {
+                                println!("Daemon Status: unresponsive ({e})");
+                            }
+                        }
+                    },
+                    Err(_) => {
+                        if json_mode {
+                            let doc = serde_json::json!({
+                                "status": "offline",
+                                "endpoint": endpoint
+                            });
+                            println!("{}", serde_json::to_string_pretty(&doc)?);
+                        } else {
+                            println!("Daemon Status: offline");
+                            println!("Endpoint: {endpoint}");
+                        }
+                    }
+                }
+            }
+            DaemonSubcommands::Ping => match omen_client::OmenClient::connect_default(None).await {
+                Ok(client) => match client.ping().await {
+                    Ok(ts) => {
+                        if json_mode {
+                            let doc = serde_json::json!({
+                                "status": "pong",
+                                "timestamp_ms": ts
+                            });
+                            println!("{}", serde_json::to_string_pretty(&doc)?);
+                        } else {
+                            println!("pong ({ts}ms)");
+                        }
+                    }
+                    Err(e) => {
+                        if json_mode {
+                            let doc = serde_json::json!({
+                                "status": "offline",
+                                "error": e.to_string()
+                            });
+                            println!("{}", serde_json::to_string_pretty(&doc)?);
+                        } else {
+                            eprintln!("Daemon is offline: {e}");
+                        }
+                        std::process::exit(1);
+                    }
+                },
+                Err(e) => {
+                    if json_mode {
+                        let doc = serde_json::json!({
+                            "status": "offline",
+                            "error": e.to_string()
+                        });
+                        println!("{}", serde_json::to_string_pretty(&doc)?);
+                    } else {
+                        eprintln!("Daemon is offline: {e}");
+                    }
+                    std::process::exit(1);
+                }
+            },
+        },
         None => {
             if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
                 let db = Database::open(&db_path).ok();

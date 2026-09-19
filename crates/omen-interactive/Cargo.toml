@@ -15,6 +15,8 @@ omen-knowledge = { workspace = true }
 omen-atlas = { workspace = true }
 omen-adapters = { workspace = true }
 omen-ui = { workspace = true }
+omen-ipc = { workspace = true }
+omen-client = { workspace = true }
 reedline = { workspace = true }
 fuzzy-matcher = { workspace = true }
 nu-ansi-term = { workspace = true }
@@ -29,3 +31,6 @@ chrono = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+omen-daemon = { workspace = true }
+omen-test-fixtures = { workspace = true }
+

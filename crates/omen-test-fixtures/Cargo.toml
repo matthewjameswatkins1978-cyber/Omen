@@ -13,3 +13,5 @@ path = "src/bin/omen-gremlin.rs"
 
 [dependencies]
 clap = { workspace = true }
+tokio = { workspace = true }
+
