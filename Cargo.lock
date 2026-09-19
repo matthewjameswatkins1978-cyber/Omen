@@ -701,6 +701,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "omen-agent"
+version = "0.2.0"
+dependencies = [
+ "chrono",
+ "hex",
+ "omen-client",
+ "omen-core",
+ "omen-daemon",
+ "omen-engine",
+ "omen-ipc",
+ "omen-knowledge",
+ "omen-test-fixtures",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "omen-atlas"
 version = "0.2.0"
 dependencies = [
@@ -733,6 +755,7 @@ dependencies = [
  "omen-interactive",
  "omen-ipc",
  "omen-knowledge",
+ "omen-mcp",
  "omen-schema",
  "omen-ui",
  "serde",
@@ -826,6 +849,7 @@ dependencies = [
  "hex",
  "nu-ansi-term",
  "omen-adapters",
+ "omen-agent",
  "omen-atlas",
  "omen-client",
  "omen-core",
@@ -874,6 +898,29 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tracing",
+]
+
+[[package]]
+name = "omen-mcp"
+version = "0.2.0"
+dependencies = [
+ "clap",
+ "omen-agent",
+ "omen-client",
+ "omen-core",
+ "omen-daemon",
+ "omen-engine",
+ "omen-ipc",
+ "omen-knowledge",
+ "omen-test-fixtures",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

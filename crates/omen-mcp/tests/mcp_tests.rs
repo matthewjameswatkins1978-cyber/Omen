@@ -1,0 +1,364 @@
+use omen_mcp::McpServer;
+use omen_mcp::protocol::*;
+use omen_test_fixtures::{INTEGRATION_TIMEOUT, UNIT_TIMEOUT, run_with_test_timeout};
+use serde_json::{Value, json};
+use std::fs;
+use tempfile::tempdir;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mcp_initialize_and_protocol_version() {
+    run_with_test_timeout(
+        "test_mcp_initialize_and_protocol_version",
+        UNIT_TIMEOUT,
+        |_ctx| async move {
+            let temp = tempdir().unwrap();
+            let server = McpServer::new(temp.path().to_path_buf(), None);
+
+            // 1. Valid initialization
+            let req = JsonRpcRequest {
+                jsonrpc: "2.0".into(),
+                id: Some(json!(1)),
+                method: "initialize".into(),
+                params: Some(json!({
+                    "protocolVersion": "2024-11-05",
+                    "clientInfo": { "name": "test-agent", "version": "1.0.0" }
+                })),
+            };
+
+            let resp = server.handle_request(req).await;
+            assert!(resp.error.is_none(), "Valid initialize must succeed");
+            let result: InitializeResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+            assert_eq!(result.protocol_version, "2024-11-05");
+            assert_eq!(result.server_info.name, "omen-mcp");
+
+            // 2. Incompatible protocol version rejection
+            let bad_req = JsonRpcRequest {
+                jsonrpc: "2.0".into(),
+                id: Some(json!(2)),
+                method: "initialize".into(),
+                params: Some(json!({
+                    "protocolVersion": "9999-99-99"
+                })),
+            };
+            let bad_resp = server.handle_request(bad_req).await;
+            assert!(
+                bad_resp.error.is_some(),
+                "Incompatible version must be rejected"
+            );
+            let err = bad_resp.error.unwrap();
+            assert_eq!(err.code, -32002);
+            assert!(err.message.contains("Unsupported MCP protocol version"));
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mcp_tools_list() {
+    run_with_test_timeout("test_mcp_tools_list", UNIT_TIMEOUT, |_ctx| async move {
+        let temp = tempdir().unwrap();
+        let server = McpServer::new(temp.path().to_path_buf(), None);
+
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(1)),
+            method: "tools/list".into(),
+            params: None,
+        };
+
+        let resp = server.handle_request(req).await;
+        assert!(resp.error.is_none());
+        let val = resp.result.unwrap();
+        let tools = val["tools"].as_array().unwrap();
+
+        let tool_names: Vec<String> = tools
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(tool_names.contains(&"omen_workspace_status".to_string()));
+        assert!(tool_names.contains(&"omen_facts_query".to_string()));
+        assert!(tool_names.contains(&"omen_execute".to_string()));
+        assert!(tool_names.contains(&"omen_execution_status".to_string()));
+        assert!(tool_names.contains(&"omen_history_query".to_string()));
+        assert!(tool_names.contains(&"omen_services_list".to_string()));
+        assert!(tool_names.contains(&"omen_services_control".to_string()));
+        assert!(tool_names.contains(&"omen_capabilities_discover".to_string()));
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mcp_capabilities_discover() {
+    run_with_test_timeout(
+        "test_mcp_capabilities_discover",
+        UNIT_TIMEOUT,
+        |_ctx| async move {
+            let temp = tempdir().unwrap();
+            let server = McpServer::new(temp.path().to_path_buf(), None);
+
+            let req = JsonRpcRequest {
+                jsonrpc: "2.0".into(),
+                id: Some(json!(10)),
+                method: "tools/call".into(),
+                params: Some(json!({
+                    "name": "omen_capabilities_discover",
+                    "arguments": {}
+                })),
+            };
+
+            let resp = server.handle_request(req).await;
+            assert!(resp.error.is_none());
+            let result: CallToolResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+            assert_ne!(result.is_error, Some(true));
+
+            let content_text = &result.content[0].text;
+            let val: Value = serde_json::from_str(content_text).unwrap();
+            assert_eq!(val["doctrine"], "substrate, not sovereign");
+            assert!(val["boundaries"]["lantern"].is_string());
+            assert!(val["boundaries"]["resolve"].is_string());
+            assert!(val["boundaries"]["tethers"].is_string());
+            assert!(val["boundaries"]["omen"].is_string());
+            assert!(val["boundaries"]["threadmoth"].is_string());
+            assert!(val["tools"].as_array().unwrap().len() >= 8);
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mcp_workspace_status() {
+    run_with_test_timeout(
+        "test_mcp_workspace_status",
+        UNIT_TIMEOUT,
+        |_ctx| async move {
+            let temp = tempdir().unwrap();
+            let ws_path = temp.path().to_path_buf();
+            fs::write(ws_path.join("Cargo.toml"), "[package]\nname = \"mcp_ws\"\n").unwrap();
+
+            let server = McpServer::new(ws_path.clone(), None);
+
+            let req = JsonRpcRequest {
+                jsonrpc: "2.0".into(),
+                id: Some(json!(20)),
+                method: "tools/call".into(),
+                params: Some(json!({
+                    "name": "omen_workspace_status",
+                    "arguments": {}
+                })),
+            };
+
+            let resp = server.handle_request(req).await;
+            assert!(resp.error.is_none());
+            let result: CallToolResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+            assert_ne!(result.is_error, Some(true));
+
+            let text = &result.content[0].text;
+            let status: Value = serde_json::from_str(text).unwrap();
+            assert!(status["workspace_root"].is_string());
+            assert_eq!(status["mode"], "standalone");
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mcp_execute_and_read_cas_artifact_proof_d() {
+    run_with_test_timeout(
+        "test_mcp_execute_and_read_cas_artifact_proof_d",
+        INTEGRATION_TIMEOUT,
+        |ctx| async move {
+            ctx.phase("SETUP_WORKSPACE");
+            let temp = tempdir().unwrap();
+            let ws_path = temp.path().to_path_buf();
+
+            let daemon = std::sync::Arc::new(omen_daemon::DaemonServer::new(Some(
+                "duplex://proof_d_daemon".into(),
+            )));
+            let (client_stream, daemon_stream) = omen_ipc::PlatformStream::duplex_pair(65536);
+            let instance_id = daemon.instance_id().to_string();
+            let registry = daemon.registry();
+            let shutdown_rx = daemon.subscribe_shutdown();
+
+            tokio::spawn(async move {
+                let _ = omen_daemon::DaemonServer::handle_connection(
+                    daemon_stream,
+                    instance_id,
+                    registry,
+                    shutdown_rx,
+                )
+                .await;
+            });
+
+            let client = omen_client::OmenClient::from_stream(
+                client_stream,
+                Some("memory://proof_d".into()),
+                Some("sess-proof-d".into()),
+            )
+            .await
+            .unwrap();
+
+            client
+                .attach_workspace(ws_path.to_str().unwrap())
+                .await
+                .unwrap();
+
+            let server = McpServer::new(ws_path.clone(), Some(client));
+
+            ctx.phase("EXECUTE_COMMAND");
+            #[cfg(windows)]
+            let argv = vec![
+                "cmd".to_string(),
+                "/C".to_string(),
+                "echo proof_d_token_hello".to_string(),
+            ];
+            #[cfg(not(windows))]
+            let argv = vec!["echo".to_string(), "proof_d_token_hello".to_string()];
+
+            let exec_req = JsonRpcRequest {
+                jsonrpc: "2.0".into(),
+                id: Some(json!(30)),
+                method: "tools/call".into(),
+                params: Some(json!({
+                    "name": "omen_execute",
+                    "arguments": {
+                        "argv": argv,
+                        "cwd": ws_path.to_string_lossy().to_string()
+                    }
+                })),
+            };
+
+            let exec_resp = server.handle_request(exec_req).await;
+            assert!(exec_resp.error.is_none(), "omen_execute call must succeed");
+
+            let exec_call_res: CallToolResult =
+                serde_json::from_value(exec_resp.result.unwrap()).unwrap();
+            assert_ne!(exec_call_res.is_error, Some(true));
+
+            let exec_val: Value = serde_json::from_str(&exec_call_res.content[0].text).unwrap();
+            assert_eq!(exec_val["exit_code"], 0);
+
+            let stdout_art = exec_val["stdout_artifact"].as_str();
+            assert!(
+                stdout_art.is_some(),
+                "Execution must produce a stdout CAS artifact"
+            );
+            let art_uri = stdout_art.unwrap();
+            assert!(
+                art_uri.starts_with("artifact://sha256/"),
+                "Artifact URI must be artifact://sha256/..."
+            );
+
+            ctx.phase("READ_CAS_ARTIFACT_RESOURCE");
+            let read_req = JsonRpcRequest {
+                jsonrpc: "2.0".into(),
+                id: Some(json!(31)),
+                method: "resources/read".into(),
+                params: Some(json!({
+                    "uri": art_uri,
+                    "offset": 0,
+                    "length": 1024
+                })),
+            };
+
+            let read_resp = server.handle_request(read_req).await;
+            assert!(read_resp.error.is_none(), "resources/read must succeed");
+
+            let read_val = read_resp.result.unwrap();
+            let contents = read_val["contents"].as_array().unwrap();
+            assert_eq!(contents.len(), 1);
+            assert_eq!(contents[0]["uri"], art_uri);
+
+            let content_text = contents[0]["text"].as_str().unwrap();
+            assert!(
+                content_text.contains("proof_d_token_hello"),
+                "Artifact resource read must contain the executed command output"
+            );
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mcp_malformed_json_rpc_handling() {
+    run_with_test_timeout(
+        "test_mcp_malformed_json_rpc_handling",
+        UNIT_TIMEOUT,
+        |_ctx| async move {
+            let temp = tempdir().unwrap();
+            let server = McpServer::new(temp.path().to_path_buf(), None);
+
+            // 1. Invalid JSON string
+            let resp_str = server.dispatch_message("{malformed json").await;
+            assert!(resp_str.is_some());
+            let val: Value = serde_json::from_str(&resp_str.unwrap()).unwrap();
+            assert_eq!(val["error"]["code"], -32700);
+
+            // 2. Unknown method
+            let unknown_req = JsonRpcRequest {
+                jsonrpc: "2.0".into(),
+                id: Some(json!(99)),
+                method: "nonexistent/action".into(),
+                params: None,
+            };
+            let unknown_resp = server.handle_request(unknown_req).await;
+            assert!(unknown_resp.error.is_some());
+            assert_eq!(unknown_resp.error.unwrap().code, -32601);
+
+            // 3. Unknown tool
+            let bad_tool = JsonRpcRequest {
+                jsonrpc: "2.0".into(),
+                id: Some(json!(100)),
+                method: "tools/call".into(),
+                params: Some(json!({
+                    "name": "ghost_tool",
+                    "arguments": {}
+                })),
+            };
+            let bad_tool_resp = server.handle_request(bad_tool).await;
+            let call_res: CallToolResult =
+                serde_json::from_value(bad_tool_resp.result.unwrap()).unwrap();
+            assert_eq!(call_res.is_error, Some(true));
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mcp_duplex_stream_transport() {
+    run_with_test_timeout(
+        "test_mcp_duplex_stream_transport",
+        UNIT_TIMEOUT,
+        |_ctx| async move {
+            let temp = tempdir().unwrap();
+            let server = McpServer::new(temp.path().to_path_buf(), None);
+
+            let (client_read, server_write) = tokio::io::duplex(65536);
+            let (server_read, mut client_write) = tokio::io::duplex(65536);
+
+            tokio::spawn(async move {
+                let _ = server.run_stream(server_read, server_write).await;
+            });
+
+            let mut client_lines = BufReader::new(client_read).lines();
+
+            // Send ping
+            let ping_json = serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "ping"
+            }))
+            .unwrap();
+
+            client_write.write_all(ping_json.as_bytes()).await.unwrap();
+            client_write.write_all(b"\n").await.unwrap();
+            client_write.flush().await.unwrap();
+
+            let line = client_lines.next_line().await.unwrap().unwrap();
+            let resp_val: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(resp_val["id"], 1);
+            assert!(resp_val["result"].is_object());
+        },
+    )
+    .await;
+}

@@ -30,7 +30,7 @@ impl ContentAddressedStore {
         Self { root }
     }
 
-    fn blob_path(&self, digest: &str) -> PathBuf {
+    pub fn blob_path(&self, digest: &str) -> PathBuf {
         let prefix = &digest[..2];
         self.root.join("sha256").join(prefix).join(digest)
     }

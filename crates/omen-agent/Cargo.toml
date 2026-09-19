@@ -1,5 +1,5 @@
 [package]
-name = "omen-interactive"
+name = "omen-agent"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,29 +9,20 @@ publish = false
 
 [dependencies]
 omen-core = { workspace = true }
-omen-schema = { workspace = true }
-omen-engine = { workspace = true }
 omen-knowledge = { workspace = true }
-omen-atlas = { workspace = true }
-omen-adapters = { workspace = true }
-omen-ui = { workspace = true }
+omen-engine = { workspace = true }
 omen-ipc = { workspace = true }
 omen-client = { workspace = true }
-omen-agent = { workspace = true }
-reedline = { workspace = true }
-fuzzy-matcher = { workspace = true }
-nu-ansi-term = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }
 tokio = { workspace = true }
+chrono = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
-chrono = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
+omen-test-fixtures = { workspace = true }
 tempfile = { workspace = true }
 omen-daemon = { workspace = true }
-omen-test-fixtures = { workspace = true }
-

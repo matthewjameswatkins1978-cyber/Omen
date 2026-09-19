@@ -26,41 +26,81 @@ Omen is an agent-native developer runtime substrate, not an autonomous agent or 
    - `:why @last`
    - `:open @errors`
    - `:rerun @failed`
-5. **Bounded Context**: Rather than scraping megabytes of raw terminal ANSI text, the AI lane supplies bounded structured context:
-   - Command line and exit code.
-   - Bounded stdout/stderr previews from CAS.
-   - Active dirty/current Facts and dependencies from SQLite.
+5. **Bounded Context**: Rather than scraping megabytes of raw terminal ANSI text, the AI lane supplies bounded structured context (`AgentContext`):
+   - Working directory, environment info, Git status (branch, modified/staged files).
+   - Command line, exit code, execution IDs.
+   - Bounded excerpts (<= 512 bytes) from CAS stderr/stdout artifacts.
+   - Active dirty/current Facts and dependencies from SQLite and hot cache.
+6. **Strict Session Isolation**: Agent reasoning or background tasks never mutate the human session state or human `@last` reference.
+7. **Timeout Protection**: Universal 30-second execution ceiling. If an agent model provider does not return within 30 seconds, execution cleanly aborts with state intact.
 
 ---
 
-## 3. Deterministic Local Fallback
+## 3. Canonical Presentation Format
 
-If no LLM provider is configured (e.g. `ai = "ask"`, or when offline), `AiLaneDispatcher` provides high-utility deterministic assistance based purely on local runtime truth:
+Agent responses follow a standardized, clean markdown structure:
 
 ```text
-? why did the build fail?
+Agent
 
-[Omen Substrate Diagnostic (Deterministic Fallback)]
-Last command: cargo test --test auth (Exit code: 101, Duration: 420ms)
-Stderr artifact: artifact://sha256/7b2e...
-Known dirty facts: fact://test/status [DIRTY]
+<agent markdown explanation>
 
-Suggested actions:
-  :show @failed     - Display error transcript from CAS
-  :why @fact.test   - View causal dependency invalidation tree
-  :rerun @last      - Re-execute the failed test suite
+Proposed action:
+  <action description or command>
+```
+
+- **Displayed Identity**: Strictly `Agent`.
+- **Proposed Actions**: Either deterministic actions (`:why @last`, `:show @failed`), safe mutations executed automatically with user notification (`ChangeDirectory`), or proposed commands (`:cargo check`) presented for execution.
+
+---
+
+## 4. Deterministic Local Fallback (`DiagnosticAgentProvider`)
+
+If no external LLM provider is connected, Omen's built-in `DiagnosticAgentProvider` provides deterministic assistance based on structured machine truth:
+
+```text
+? I'm lost
+
+Agent
+
+You are in:
+  crates/omen-interactive
+
+Recent change:
+  2 modified file(s)
+
+Git:
+  2 modified file(s)
+  0 commit(s) ahead
+
+Tests:
+  recent execution 'cargo test' exited with code 101
+
+Likely current problem:
+  error[E0432]: unresolved import `foo::bar`
+
+Dirty facts:
+  1 fact(s) currently DIRTY (fact://project/build_status)
+
+Suggested next step:
+  inspect 'cargo test' and repair the failing test assertion
+
+Proposed action:
+  :show @failed
+  :cargo test
 ```
 
 ---
 
-## 4. Configuration
+## 5. Configuration & Pluggability
 
-The AI lane is governed by a simple user configuration toggle:
+The AI lane is backed by the `AgentProvider` trait (`crates/omen-agent`). Any external model service or agent framework can plug in by implementing:
 
-```toml
-# ai = "off" | "ask"
-ai = "ask"
+```rust
+pub trait AgentProvider: Send + Sync {
+    fn respond<'a>(
+        &'a self,
+        request: AgentRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<AgentResponse, AgentError>> + Send + 'a>>;
+}
 ```
-
-- `"off"`: Suppresses external model queries entirely; `?` always resolves using the local deterministic fallback engine.
-- `"ask"`: Queries an external model provider when configured, with seamless fallback on failure or network absence.

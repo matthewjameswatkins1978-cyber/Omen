@@ -18,6 +18,7 @@ pub struct InteractiveSession {
     pub db: Option<Database>,
     pub comp_ctx: std::sync::Arc<std::sync::Mutex<crate::completion::CompletionContext>>,
     pub client: Option<omen_client::OmenClient>,
+    pub agent_provider: Option<std::sync::Arc<dyn omen_agent::AgentProvider>>,
 }
 
 pub fn block_on_async<F>(future: F) -> F::Output
@@ -151,6 +152,12 @@ impl InteractiveSession {
             }
         }
 
+        let agent_provider: Option<std::sync::Arc<dyn omen_agent::AgentProvider>> =
+            Some(std::sync::Arc::new(omen_agent::TimeoutProvider::new(
+                std::sync::Arc::new(omen_agent::DiagnosticAgentProvider::new()),
+                omen_agent::DEFAULT_AGENT_TIMEOUT,
+            )));
+
         let mut sess = Self {
             session_id,
             cwd,
@@ -161,9 +168,18 @@ impl InteractiveSession {
             db,
             comp_ctx,
             client,
+            agent_provider,
         };
         sess.update_prompt_state();
         Ok(sess)
+    }
+
+    pub fn with_agent_provider(
+        mut self,
+        agent_provider: Option<std::sync::Arc<dyn omen_agent::AgentProvider>>,
+    ) -> Self {
+        self.agent_provider = agent_provider;
+        self
     }
 
     /// Runs the interactive REPL loop.
@@ -249,14 +265,62 @@ impl InteractiveSession {
 
         match lane {
             crate::grammar::InputLane::AiReasoning { query } => {
-                let out = crate::ai_lane::AiLaneDispatcher::dispatch(
+                let out = crate::ai_lane::AiLaneDispatcher::dispatch_with_session(
                     &query,
                     &self.session_id,
+                    &self.cwd,
                     self.db.as_ref(),
+                    self.agent_provider.as_deref(),
+                    Some(&self.comp_ctx),
                 )?;
                 println!("{}", out.response_text);
                 for cmd in &out.suggested_commands {
                     println!("  {cmd}");
+                }
+                for action in &out.proposed_actions {
+                    match action {
+                        omen_agent::ProposedAction::ChangeDirectory { path } => {
+                            let target = std::path::PathBuf::from(path);
+                            let resolved = if target.is_absolute() {
+                                target
+                            } else {
+                                self.cwd.join(target)
+                            };
+                            if resolved.is_dir() {
+                                self.cwd = resolved.canonicalize().unwrap_or(resolved);
+                                if let Ok(mut ctx) = self.comp_ctx.lock() {
+                                    ctx.cwd = self.cwd.clone();
+                                    ctx.hot_index.refresh(&self.cwd, self.db.as_ref());
+                                }
+                                println!("Changed directory to {}", self.cwd.display());
+                            }
+                        }
+                        omen_agent::ProposedAction::ExecuteCommand { argv, cwd } => {
+                            let in_cwd = cwd
+                                .as_ref()
+                                .map(|c| format!(" (in {c})"))
+                                .unwrap_or_default();
+                            println!("Proposed command{in_cwd}: {}", argv.join(" "));
+                        }
+                        omen_agent::ProposedAction::ExecuteTool {
+                            tool,
+                            operation,
+                            args,
+                            cwd,
+                        } => {
+                            let in_cwd = cwd
+                                .as_ref()
+                                .map(|c| format!(" (in {c})"))
+                                .unwrap_or_default();
+                            println!(
+                                "Proposed tool{in_cwd}: {tool} {operation} {}",
+                                args.join(" ")
+                            );
+                        }
+                        omen_agent::ProposedAction::SemanticAction { action, args } => {
+                            println!("Proposed action: :{action} {}", args.join(" "));
+                        }
+                    }
                 }
                 let exit = ProcessExit {
                     code: Some(0),

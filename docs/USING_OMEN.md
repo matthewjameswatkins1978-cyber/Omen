@@ -717,25 +717,57 @@ Suggested:
 
 No AI required.
 
-But perhaps you have three strange failures and genuinely want judgement:
+But perhaps you have three strange failures, are stuck, or genuinely want guidance:
 
 ```text
-? could these three failures have the same cause?
+? why did that fail?
 ```
 
 Now you have explicitly entered the AI lane.
 
-The answer may use Omen's structured context, but it remains advice.
+Omen does not dump your terminal scrollback into a prompt or ask you to copy-paste error messages. It gathers a strongly typed, bounded `AgentContext` (current directory, git status, last command execution summary, bounded stderr excerpt, and active facts) and queries the configured `AgentProvider`.
 
-It may suggest:
+The presentation format is always clean, structured, and distinct:
 
 ```text
-:show @failed
-:open @errors
-:test auth
+Agent
+
+The last command `cargo test auth` failed because `src/auth.rs` failed an assertion on line 88.
+The error was: `expected 200 OK, got 401 Unauthorized`.
+
+Proposed action:
+  cargo test auth -- --nocapture
 ```
 
-It does not quietly start hammering the machine.
+Other natural queries include:
+
+```text
+? I'm lost
+? what folder am I in?
+? what is interesting in here?
+```
+
+If an action is proposed (such as navigating to a submodule directory or re-running a targeted build check), Omen can present it cleanly for execution. Ambiguous requests (such as wanting to jump to a directory name matching multiple candidates) ask for clarification rather than guessing.
+
+### Connecting External Agents via MCP
+
+Omen also serves as a substrate for external AI agents (such as Claude Desktop, Cursor, or autonomous coding agents) via the Model Context Protocol (MCP):
+
+```text
+omen mcp --workspace /path/to/project
+```
+
+External agents gain structured access to:
+- `omen_workspace_status`
+- `omen_facts_query`
+- `omen_execute`
+- `omen_execution_status`
+- `omen_history_query`
+- `omen_services_list`
+- `omen_services_control`
+- `omen_capabilities_discover`
+
+Output from commands run by agents is captured into content-addressed storage (`artifact://sha256/...`), ensuring transcripts remain bounded while complete execution evidence is preserved.
 
 ### What Omen adds
 

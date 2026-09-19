@@ -1,5 +1,5 @@
 [package]
-name = "omen-interactive"
+name = "omen-mcp"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,31 +7,28 @@ authors.workspace = true
 repository.workspace = true
 publish = false
 
+[[bin]]
+name = "omen-mcp"
+path = "src/main.rs"
+
 [dependencies]
 omen-core = { workspace = true }
-omen-schema = { workspace = true }
 omen-engine = { workspace = true }
 omen-knowledge = { workspace = true }
-omen-atlas = { workspace = true }
-omen-adapters = { workspace = true }
-omen-ui = { workspace = true }
 omen-ipc = { workspace = true }
 omen-client = { workspace = true }
 omen-agent = { workspace = true }
-reedline = { workspace = true }
-fuzzy-matcher = { workspace = true }
-nu-ansi-term = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }
 tokio = { workspace = true }
-sha2 = { workspace = true }
-hex = { workspace = true }
-chrono = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+uuid = { workspace = true }
+
 
 [dev-dependencies]
-tempfile = { workspace = true }
-omen-daemon = { workspace = true }
 omen-test-fixtures = { workspace = true }
-
+omen-daemon = { workspace = true }
+tempfile = { workspace = true }
