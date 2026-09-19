@@ -36,6 +36,18 @@ impl AiLaneDispatcher {
         provider: Option<&dyn AgentProvider>,
         comp_ctx: Option<&Arc<Mutex<crate::completion::CompletionContext>>>,
     ) -> Result<AiLaneOutput, CoreError> {
+        Self::dispatch_with_workspace(query, session_id, cwd, cwd, db, provider, comp_ctx)
+    }
+
+    pub fn dispatch_with_workspace(
+        query: &str,
+        session_id: &InteractiveSessionId,
+        workspace_root: &Path,
+        cwd: &Path,
+        db: Option<&Database>,
+        provider: Option<&dyn AgentProvider>,
+        comp_ctx: Option<&Arc<Mutex<crate::completion::CompletionContext>>>,
+    ) -> Result<AiLaneOutput, CoreError> {
         let mut suggestions = vec![":status".to_string()];
 
         let has_failed = if let Some(db_ref) = db {
@@ -56,9 +68,25 @@ impl AiLaneDispatcher {
             suggestions.insert(1, ":history".to_string());
         }
 
+        let context =
+            build_agent_context_with_workspace(session_id, workspace_root, cwd, db, comp_ctx);
+
+        // 1. Check deterministic routing ladder FIRST:
+        // Orientation, location, branch, and status queries are answered from machine truth with zero model calls.
+        if let Some(resp) = omen_agent::DeterministicClassifier::try_answer(query, &context) {
+            let formatted = format!("Agent\n\n{}", resp.message);
+            return Ok(AiLaneOutput {
+                configured: true,
+                query: query.to_string(),
+                response_text: formatted,
+                suggested_commands: suggestions,
+                proposed_actions: resp.proposed_actions,
+                references: resp.references,
+            });
+        }
+
         // If an AgentProvider is available, evaluate the query using structured AgentContext
         if let Some(p) = provider {
-            let context = build_agent_context(session_id, cwd, db, comp_ctx);
             let request = AgentRequest {
                 prompt: query.to_string(),
                 context,
@@ -155,7 +183,7 @@ impl AiLaneDispatcher {
                         configured: false,
                         query: query.to_string(),
                         response_text: format!(
-                            "Agent unavailable: request exceeded {d:?}. Omen state is unchanged."
+                            "Agent\n\nAgent request exceeded {d:?}. Omen state is unchanged."
                         ),
                         suggested_commands: suggestions,
                         proposed_actions: Vec::new(),
@@ -166,7 +194,7 @@ impl AiLaneDispatcher {
                     return Ok(AiLaneOutput {
                         configured: false,
                         query: query.to_string(),
-                        response_text: format!("Agent provider error: {e}"),
+                        response_text: format!("Agent\n\nReasoning unavailable: {e}"),
                         suggested_commands: suggestions,
                         proposed_actions: Vec::new(),
                         references: Vec::new(),
@@ -192,22 +220,33 @@ impl AiLaneDispatcher {
     }
 }
 
-/// Builds bounded AgentContext from live session state.
+/// Builds bounded AgentContext from live session state with explicit workspace root.
 pub fn build_agent_context(
     session_id: &InteractiveSessionId,
     cwd: &Path,
     db: Option<&Database>,
     comp_ctx: Option<&Arc<Mutex<crate::completion::CompletionContext>>>,
 ) -> AgentContext {
-    let ws_id = omen_knowledge::deterministic_workspace_id(cwd);
+    build_agent_context_with_workspace(session_id, cwd, cwd, db, comp_ctx)
+}
+
+/// Builds bounded AgentContext from live session state with distinct workspace_root and cwd.
+pub fn build_agent_context_with_workspace(
+    session_id: &InteractiveSessionId,
+    workspace_root: &Path,
+    cwd: &Path,
+    db: Option<&Database>,
+    comp_ctx: Option<&Arc<Mutex<crate::completion::CompletionContext>>>,
+) -> AgentContext {
+    let ws_id = omen_knowledge::deterministic_workspace_id(workspace_root);
     let mut ctx = AgentContext::new(
-        ws_id,
-        cwd.to_path_buf(),
+        &ws_id,
+        workspace_root.to_path_buf(),
         session_id.clone(),
         cwd.to_path_buf(),
     );
 
-    // 1. Detect Git status in background CWD
+    // 1. Detect Git status in background CWD (bounded with timeout)
     ctx.git = AgentContext::detect_git_status(cwd);
 
     // 2. Query execution history from SQLite
@@ -232,7 +271,7 @@ pub fn build_agent_context(
         {
             let stderr_excerpt = failed.stderr_artifact.as_ref().and_then(|uri| {
                 let digest = uri.trim_start_matches("artifact://sha256/");
-                let state_dir = omen_knowledge::resolve_workspace_dir(cwd);
+                let state_dir = omen_knowledge::resolve_workspace_dir(workspace_root);
                 let cas = omen_knowledge::ContentAddressedStore::new(state_dir.join("cas"));
                 let blob = cas.blob_path(digest);
                 if let Ok(bytes) = std::fs::read(&blob) {
@@ -319,6 +358,40 @@ pub fn build_agent_context(
                 }
             }
         }
+    }
+
+    // Populate services from SQLite workspace persistence if available
+    if let Some(db_conn) = db
+        && let Ok(records) = omen_knowledge::WorkspacePersistence::list_services(db_conn, &ws_id)
+    {
+        for s in records {
+            ctx.services.push(omen_ipc::protocol::ManagedServiceInfo {
+                name: s.name.clone(),
+                resource_uri: format!("proc://workspace/{}", s.name),
+                pid: s.pid,
+                command: s.command,
+                state: s.state,
+                uptime_secs: 0,
+            });
+        }
+    }
+
+    // Populate tools from shared completion context hot index
+    if let Some(comp_lock) = comp_ctx
+        && let Ok(c) = comp_lock.lock()
+    {
+        ctx.available_tools = c.hot_index.known_tools.clone();
+    }
+
+    // Ensure canonical tools list is never decorative
+    if ctx.available_tools.is_empty() {
+        ctx.available_tools = vec![
+            "cargo".into(),
+            "git".into(),
+            "exec".into(),
+            "test".into(),
+            "fs".into(),
+        ];
     }
 
     ctx

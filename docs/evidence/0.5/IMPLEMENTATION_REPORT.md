@@ -107,11 +107,23 @@ Omen 0.5 introduces zero competing policy, permission, lock, or approval systems
 |---|---|---|---|
 | **Proof A** | Human "I'm lost" recovery | `agent_lane_tests::test_agent_lane_im_lost_proof_a` | **PASSED** |
 | **Proof B** | Human "why did that fail?" diagnosis | `agent_lane_tests::test_agent_lane_why_did_that_fail_proof_b` | **PASSED** |
-| **Proof C** | Human-Agent build check delegation | `agent_lane_tests::test_agent_lane_human_agent_build_proposal_proof_c` | **PASSED** |
+| **Proof C** | Real Human-Agent execution through shared broker | `agent_lane_tests::test_agent_lane_human_agent_build_proposal_proof_c` | **PASSED** |
+| **Proof C (Exec)** | Real action executes through daemon once | `agent_lane_tests::real_human_agent_action_executes_through_daemon_once` | **PASSED** |
+| **Proof C (Match)** | Execution ID matches history and receipt | `agent_lane_tests::agent_execution_id_matches_history_and_receipt` | **PASSED** |
 | **Proof D** | MCP external agent tool & CAS artifact read | `mcp_tests::test_mcp_execute_and_read_cas_artifact_proof_d` | **PASSED** |
 | **Isolation** | Subordinate session `@last` preservation | `agent_lane_tests::test_agent_lane_session_isolation_at_last` | **PASSED** |
+| **Background**| Background agent work preserves human `@last` | `agent_lane_tests::agent_background_work_preserves_human_last` | **PASSED** |
 | **Ambiguity** | Multi-candidate directory disambiguation | `agent_lane_tests::test_agent_lane_ambiguous_directory_navigation` | **PASSED** |
 | **Navigation** | Unambiguous directory navigation | `agent_lane_tests::test_agent_lane_unambiguous_directory_navigation_executes` | **PASSED** |
+| **Root/CWD** | Preserve workspace root separately from CWD | `agent_lane_tests::agent_context_preserves_workspace_root_after_cd` | **PASSED** |
+| **Workspace ID**| Workspace ID remains stable across cd | `agent_lane_tests::agent_context_workspace_id_stable_after_cd` | **PASSED** |
+| **CAS Root** | CAS directory resolves from workspace root | `agent_lane_tests::agent_context_cas_uses_workspace_root` | **PASSED** |
+| **Bounded Git**| Stalling Git probe terminates at deadline | `agent_regression_tests::agent_git_probe_times_out_cleanly` | **PASSED** |
+| **Timeout** | Agent context timeout does not hang shell | `agent_regression_tests::agent_context_timeout_does_not_hang_shell` | **PASSED** |
+| **Zero Model** | Deterministic inquiries consume zero model calls | `agent_regression_tests::deterministic_question_uses_zero_model_calls` | **PASSED** |
+| **Registry** | Provider registry selection & status | `agent_regression_tests::provider_registry_selects_configured_provider` | **PASSED** |
+| **Errors** | Provider failures translate to stable Omen errors | `agent_regression_tests::provider_failure_is_translated_to_omen_error` | **PASSED** |
+| **Diagnostics**| Raw provider traces never leak into normal UX | `agent_regression_tests::provider_diagnostics_do_not_leak_into_normal_agent_output` | **PASSED** |
 | **Protocol** | Incompatible MCP protocol version rejection | `mcp_tests::test_mcp_initialize_and_protocol_version` | **PASSED** |
 | **Robustness**| Malformed JSON-RPC handling | `mcp_tests::test_mcp_malformed_json_rpc_handling` | **PASSED** |
 | **Workspace** | Entire workspace verification & tests | `cargo test --workspace` & `cargo run -p xtask -- verify` | **PASSED** |

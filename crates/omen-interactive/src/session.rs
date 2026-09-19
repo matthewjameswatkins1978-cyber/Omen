@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 pub struct InteractiveSession {
     pub session_id: InteractiveSessionId,
+    pub workspace_root: PathBuf,
     pub cwd: PathBuf,
     pub supervisor: ProcessSupervisor,
     pub caps: TerminalCapabilities,
@@ -19,6 +20,7 @@ pub struct InteractiveSession {
     pub comp_ctx: std::sync::Arc<std::sync::Mutex<crate::completion::CompletionContext>>,
     pub client: Option<omen_client::OmenClient>,
     pub agent_provider: Option<std::sync::Arc<dyn omen_agent::AgentProvider>>,
+    pub agent_registry: std::sync::Arc<omen_agent::ProviderRegistry>,
 }
 
 pub fn block_on_async<F>(future: F) -> F::Output
@@ -80,6 +82,16 @@ impl InteractiveSession {
 
     pub fn new_with_client(
         session_id: InteractiveSessionId,
+        cwd: PathBuf,
+        db: Option<Database>,
+        client: Option<omen_client::OmenClient>,
+    ) -> Result<Self, CoreError> {
+        Self::new_with_workspace_and_client(session_id, cwd.clone(), cwd, db, client)
+    }
+
+    pub fn new_with_workspace_and_client(
+        session_id: InteractiveSessionId,
+        workspace_root: PathBuf,
         cwd: PathBuf,
         db: Option<Database>,
         client: Option<omen_client::OmenClient>,
@@ -152,14 +164,13 @@ impl InteractiveSession {
             }
         }
 
+        let agent_registry = std::sync::Arc::new(omen_agent::ProviderRegistry::new());
         let agent_provider: Option<std::sync::Arc<dyn omen_agent::AgentProvider>> =
-            Some(std::sync::Arc::new(omen_agent::TimeoutProvider::new(
-                std::sync::Arc::new(omen_agent::DiagnosticAgentProvider::new()),
-                omen_agent::DEFAULT_AGENT_TIMEOUT,
-            )));
+            Some(agent_registry.active_provider());
 
         let mut sess = Self {
             session_id,
+            workspace_root,
             cwd,
             supervisor,
             caps,
@@ -169,6 +180,7 @@ impl InteractiveSession {
             comp_ctx,
             client,
             agent_provider,
+            agent_registry,
         };
         sess.update_prompt_state();
         Ok(sess)
@@ -265,9 +277,10 @@ impl InteractiveSession {
 
         match lane {
             crate::grammar::InputLane::AiReasoning { query } => {
-                let out = crate::ai_lane::AiLaneDispatcher::dispatch_with_session(
+                let out = crate::ai_lane::AiLaneDispatcher::dispatch_with_workspace(
                     &query,
                     &self.session_id,
+                    &self.workspace_root,
                     &self.cwd,
                     self.db.as_ref(),
                     self.agent_provider.as_deref(),
@@ -295,27 +308,52 @@ impl InteractiveSession {
                                 println!("Changed directory to {}", self.cwd.display());
                             }
                         }
-                        omen_agent::ProposedAction::ExecuteCommand { argv, cwd } => {
-                            let in_cwd = cwd
-                                .as_ref()
-                                .map(|c| format!(" (in {c})"))
-                                .unwrap_or_default();
-                            println!("Proposed command{in_cwd}: {}", argv.join(" "));
-                        }
                         omen_agent::ProposedAction::ExecuteTool {
                             tool,
                             operation,
                             args,
                             cwd,
                         } => {
-                            let in_cwd = cwd
-                                .as_ref()
-                                .map(|c| format!(" (in {c})"))
-                                .unwrap_or_default();
-                            println!(
-                                "Proposed tool{in_cwd}: {tool} {operation} {}",
-                                args.join(" ")
-                            );
+                            if Self::is_permitted_agent_action(action) {
+                                let display = if operation.is_empty() {
+                                    format!("{tool} {}", args.join(" "))
+                                } else {
+                                    format!("{tool} {operation} {}", args.join(" "))
+                                };
+                                println!("Executing permitted action: {display}");
+                                let exec_cwd = cwd.as_ref().map(PathBuf::from);
+                                let exit = self.execute_via_broker(
+                                    tool,
+                                    operation,
+                                    args.clone(),
+                                    exec_cwd,
+                                )?;
+                                return Ok(exit);
+                            } else {
+                                let in_cwd = cwd
+                                    .as_ref()
+                                    .map(|c| format!(" (in {c})"))
+                                    .unwrap_or_default();
+                                println!(
+                                    "Proposed tool{in_cwd}: {tool} {operation} {}",
+                                    args.join(" ")
+                                );
+                            }
+                        }
+                        omen_agent::ProposedAction::ExecuteCommand { argv, cwd } => {
+                            if Self::is_permitted_agent_action(action) {
+                                println!("Executing permitted command: {}", argv.join(" "));
+                                let exec_cwd = cwd.as_ref().map(PathBuf::from);
+                                let exit =
+                                    self.execute_via_broker("exec", "", argv.clone(), exec_cwd)?;
+                                return Ok(exit);
+                            } else {
+                                let in_cwd = cwd
+                                    .as_ref()
+                                    .map(|c| format!(" (in {c})"))
+                                    .unwrap_or_default();
+                                println!("Proposed command{in_cwd}: {}", argv.join(" "));
+                            }
                         }
                         omen_agent::ProposedAction::SemanticAction { action, args } => {
                             println!("Proposed action: :{action} {}", args.join(" "));
@@ -358,6 +396,40 @@ impl InteractiveSession {
                     &self.session_id,
                     self.db.as_ref(),
                 );
+
+                // Built-in shell navigation: cd modifies session.cwd while preserving workspace_root
+                if resolved_argv.first().map(|s| s.as_str()) == Some("cd") {
+                    let target_path = if let Some(target) = resolved_argv.get(1) {
+                        let p = std::path::PathBuf::from(target);
+                        if p.is_absolute() { p } else { self.cwd.join(p) }
+                    } else {
+                        self.workspace_root.clone()
+                    };
+
+                    if target_path.is_dir() {
+                        self.cwd = target_path.canonicalize().unwrap_or(target_path);
+                        if let Ok(mut ctx) = self.comp_ctx.lock() {
+                            ctx.cwd = self.cwd.clone();
+                            ctx.hot_index.refresh(&self.cwd, self.db.as_ref());
+                        }
+                        let exit = ProcessExit {
+                            code: Some(0),
+                            signal: None,
+                        };
+                        self.last_exit = Some(exit.clone());
+                        self.update_prompt_state();
+                        return Ok(exit);
+                    } else {
+                        eprintln!("cd: {}: No such file or directory", target_path.display());
+                        let exit = ProcessExit {
+                            code: Some(1),
+                            signal: None,
+                        };
+                        self.last_exit = Some(exit.clone());
+                        self.update_prompt_state();
+                        return Ok(exit);
+                    }
+                }
 
                 // Blast-Radius Preflight assessment
                 if let Some(blast) = crate::preflight::BlastPreflight::assess(&resolved_argv) {
@@ -519,7 +591,8 @@ impl InteractiveSession {
                 ))?;
 
                 // Compute CAS artifacts and record execution in subordinate physical history
-                let cas_dir = omen_knowledge::resolve_workspace_dir(&self.cwd).join("cas");
+                let cas_dir =
+                    omen_knowledge::resolve_workspace_dir(&self.workspace_root).join("cas");
                 let cas = omen_knowledge::ContentAddressedStore::new(cas_dir);
                 if let Some(db_ref) = &mut self.db {
                     let out_art = if !output.stdout_all.is_empty() {
@@ -649,5 +722,206 @@ impl InteractiveSession {
                 ctx.hot_index.refresh(&self.cwd, self.db.as_ref());
             }
         }
+    }
+
+    /// Evaluates whether an agent action is permitted without secondary approval ceremony.
+    pub fn is_permitted_agent_action(action: &omen_agent::ProposedAction) -> bool {
+        match action {
+            omen_agent::ProposedAction::ChangeDirectory { .. } => true,
+            omen_agent::ProposedAction::ExecuteTool {
+                tool, operation, ..
+            } => {
+                let t = tool.as_str();
+                let op = operation.as_str();
+                t == "cargo"
+                    || t == "test"
+                    || t == "git"
+                    || t == "exec"
+                    || t == "fs"
+                    || op == "check"
+                    || op == "test"
+                    || op == "status"
+                    || op == "build"
+            }
+            omen_agent::ProposedAction::ExecuteCommand { argv, .. } => {
+                if let Some(cmd) = argv.first() {
+                    let c = cmd.as_str();
+                    c == "cargo"
+                        || c == "git"
+                        || c.ends_with("cargo")
+                        || c.ends_with("cargo.exe")
+                        || c.ends_with("git")
+                        || c.ends_with("git.exe")
+                } else {
+                    false
+                }
+            }
+            omen_agent::ProposedAction::SemanticAction { action, .. } => {
+                action == "status"
+                    || action == "why"
+                    || action == "show"
+                    || action == "inspect"
+                    || action == "history"
+                    || action == "agent"
+            }
+        }
+    }
+
+    /// Executes an operation through the shared daemon broker when connected, or local supervisor if standalone.
+    pub fn execute_via_broker(
+        &mut self,
+        tool: &str,
+        operation: &str,
+        argv: Vec<String>,
+        cwd: Option<PathBuf>,
+    ) -> Result<ProcessExit, CoreError> {
+        let exec_cwd = cwd.unwrap_or_else(|| self.cwd.clone());
+
+        if let Some(ref c) = self.client
+            && c.is_connected()
+        {
+            let client_clone = c.clone();
+            let cwd_str = exec_cwd.to_string_lossy().to_string();
+
+            print!(
+                "{}",
+                omen_ui::SemanticBlock::osc133_command_executed(&self.caps)
+            );
+
+            let summary_res = block_on_async(
+                client_clone.submit_execution(tool, operation, argv, cwd_str, 60000),
+            )
+            .map_err(|e| CoreError::Internal(format!("Daemon execution error: {e}")))?;
+
+            print!(
+                "{}",
+                omen_ui::SemanticBlock::osc133_command_finished(
+                    summary_res.exit_code.unwrap_or(0),
+                    &self.caps
+                )
+            );
+
+            if !summary_res.stdout_preview.is_empty() {
+                print!("{}", summary_res.stdout_preview);
+            }
+            if !summary_res.stderr_preview.is_empty() {
+                eprint!("{}", summary_res.stderr_preview);
+            }
+
+            let exit = ProcessExit {
+                code: summary_res.exit_code,
+                signal: None,
+            };
+            self.last_exit = Some(exit.clone());
+            self.update_prompt_state();
+            return Ok(exit);
+        }
+
+        // Standalone execution: run via supervisor and record into self.db with CAS
+        let mut full_argv = Vec::new();
+        if !tool.is_empty() && tool != "exec" {
+            full_argv.push(tool.to_string());
+        }
+        if !operation.is_empty() {
+            full_argv.push(operation.to_string());
+        }
+        full_argv.extend(argv);
+        if full_argv.is_empty() {
+            return Ok(ProcessExit {
+                code: Some(0),
+                signal: None,
+            });
+        }
+
+        let req = ExecutionRequest {
+            argv: full_argv.clone(),
+            cwd: exec_cwd,
+            env: vec![],
+            stdin_mode: StdioMode::Closed,
+            stdin_payload: None,
+            timeout_ms: 60000,
+            inline_budget: 65536,
+            required_assurance: RequiredAssurance::default(),
+        };
+
+        print!(
+            "{}",
+            omen_ui::SemanticBlock::osc133_command_executed(&self.caps)
+        );
+
+        let output = block_on_async(self.supervisor.execute(req))?;
+
+        print!(
+            "{}",
+            omen_ui::SemanticBlock::osc133_command_finished(
+                output.process_exit.code.unwrap_or(0),
+                &self.caps
+            )
+        );
+
+        let exec_id = omen_core::ExecutionId::new(format!(
+            "exec-{}",
+            &hex::encode(sha2::Sha256::digest(
+                format!("{}-{:?}", full_argv.join(" "), std::time::SystemTime::now()).as_bytes()
+            ))[..12]
+        ))?;
+
+        let cas_dir = omen_knowledge::resolve_workspace_dir(&self.workspace_root).join("cas");
+        let cas = omen_knowledge::ContentAddressedStore::new(cas_dir);
+        if let Some(db_ref) = &mut self.db {
+            let out_art = if !output.stdout_all.is_empty() {
+                cas.store(
+                    db_ref,
+                    &output.stdout_all,
+                    "text/plain",
+                    "agent",
+                    omen_core::RetentionClass::Referenced,
+                )
+                .ok()
+                .map(|m| m.uri.as_str().to_string())
+            } else {
+                None
+            };
+            let err_art = if !output.stderr_all.is_empty() {
+                cas.store(
+                    db_ref,
+                    &output.stderr_all,
+                    "text/plain",
+                    "agent",
+                    omen_core::RetentionClass::Referenced,
+                )
+                .ok()
+                .map(|m| m.uri.as_str().to_string())
+            } else {
+                None
+            };
+
+            let now = chrono::Utc::now().to_rfc3339();
+            let exec_rec = omen_knowledge::ExecutionRecord {
+                execution_id: exec_id,
+                session_id: self.session_id.clone(),
+                command: full_argv.join(" "),
+                exit_code: output.process_exit.code,
+                duration_ms: Some(output.duration_ms as i64),
+                stdout_artifact: out_art,
+                stderr_artifact: err_art,
+                envelope_json: None,
+                created_at: now,
+            };
+            let _ = omen_knowledge::ExecutionHistory::record_execution(
+                db_ref,
+                &exec_rec,
+                &[],
+                &[],
+                &[],
+            );
+        }
+
+        print!("{}", String::from_utf8_lossy(&output.stdout_all));
+        eprint!("{}", String::from_utf8_lossy(&output.stderr_all));
+
+        self.last_exit = Some(output.process_exit.clone());
+        self.update_prompt_state();
+        Ok(output.process_exit)
     }
 }

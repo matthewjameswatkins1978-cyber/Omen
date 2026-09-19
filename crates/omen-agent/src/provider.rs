@@ -110,13 +110,33 @@ impl AgentResponse {
     }
 }
 
-/// Errors occurring during Agent invocation.
-#[derive(Debug, thiserror::Error)]
+/// Errors occurring during Agent invocation, translated to stable Omen concepts.
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum AgentError {
-    #[error("Agent unavailable: request exceeded {0:?}. Omen state is unchanged.")]
+    #[error("Authentication required for agent provider '{provider}': {message}")]
+    AuthenticationRequired { provider: String, message: String },
+
+    #[error("Agent provider '{provider}' unavailable: {message}")]
+    ProviderUnavailable { provider: String, message: String },
+
+    #[error("Agent provider '{provider}' rate limited. Retry after {retry_after_secs:?} seconds.")]
+    RateLimited {
+        provider: String,
+        retry_after_secs: Option<u64>,
+    },
+
+    #[error("Agent request exceeded {0:?}. Omen state is unchanged.")]
     Timeout(Duration),
+
+    #[error("Unsupported capability '{capability}' for agent provider '{provider}'.")]
+    UnsupportedCapability {
+        provider: String,
+        capability: String,
+    },
+
     #[error("Agent provider error: {0}")]
     Provider(String),
+
     #[error("Agent request rejected: {0}")]
     Rejected(String),
 }

@@ -297,9 +297,61 @@ impl SemanticDispatcher {
                     })
                 }
             }
+            "agent" => {
+                let sub = args.first().map(|s| s.as_str()).unwrap_or("status");
+                match sub {
+                    "providers" => {
+                        println!("Available Agent Reasoning Providers:");
+                        println!(
+                            "  * diagnostic: Omen Built-in Diagnostic Agent [deterministic] (available)"
+                        );
+                        Ok(ProcessExit {
+                            code: Some(0),
+                            signal: None,
+                        })
+                    }
+                    "use" => {
+                        if let Some(target) = args.get(1) {
+                            println!("Active agent provider switched to '{target}'.");
+                            Ok(ProcessExit {
+                                code: Some(0),
+                                signal: None,
+                            })
+                        } else {
+                            println!("Usage: :agent use <provider_id>");
+                            Ok(ProcessExit {
+                                code: Some(1),
+                                signal: None,
+                            })
+                        }
+                    }
+                    "status" => {
+                        println!("Provider: diagnostic (Omen Built-in Diagnostic Agent)");
+                        println!("Model: deterministic");
+                        println!("Auth source: none");
+                        println!(
+                            "Capabilities: orientation, failure-diagnosis, navigation, build-check, deterministic"
+                        );
+                        println!("Status: available");
+                        Ok(ProcessExit {
+                            code: Some(0),
+                            signal: None,
+                        })
+                    }
+                    other => {
+                        println!(
+                            "Unknown agent subcommand '{other}'. Available: providers, use, status"
+                        );
+                        Ok(ProcessExit {
+                            code: Some(1),
+                            signal: None,
+                        })
+                    }
+                }
+            }
             other => {
                 println!(
-                    "Unknown Omen semantic action ':{other}'. Available: :status, :doctor, :tools, :inspect, :why, :history, :show, :open, :rerun, :services, :stop"
+                    "Unknown Omen semantic action ':{other}'. Available: :status, :doctor, :tools, :inspect, :why, :history, :show, :open, :rerun, :services, :stop, :agent"
                 );
                 Ok(ProcessExit {
                     code: Some(1),

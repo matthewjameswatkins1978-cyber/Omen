@@ -171,9 +171,6 @@ async fn test_execution_broker_disconnect_and_reconnect_status() {
     // Wait a brief moment for task to be spawned, then drop client1 (simulating disconnect)
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    // Wait for the background execution to finish on the daemon
-    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-
     // 2. Client 2 connects to the same workspace
     let (c2_stream, s2_stream) = PlatformStream::duplex_pair(4096);
     let reg2 = registry.clone();
@@ -188,8 +185,15 @@ async fn test_execution_broker_disconnect_and_reconnect_status() {
         .unwrap();
     client2.attach_workspace(path).await.unwrap();
 
-    // Query status of the execution initiated by client 1
-    let status = client2.query_request_status(dedup_key).await.unwrap();
+    // Poll for the background execution to finish on the daemon (bounded deadline)
+    let poll_start = std::time::Instant::now();
+    let mut status = client2.query_request_status(dedup_key).await.unwrap();
+    while status.status != ExecutionStatusCode::Completed
+        && poll_start.elapsed() < std::time::Duration::from_millis(5000)
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        status = client2.query_request_status(dedup_key).await.unwrap();
+    }
     assert_eq!(status.status, ExecutionStatusCode::Completed);
     assert!(status.execution_id.is_some());
 

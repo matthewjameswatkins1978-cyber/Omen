@@ -31,22 +31,38 @@ The primary user experience milestone of Omen 0.5 is:
   4. Suggests diagnostic actions: `:why @last` and `:show @failed`.
 - **Automated Test**: `agent_lane_tests::test_agent_lane_why_did_that_fail_proof_b` (PASSED).
 
-### Proof C: Human-Agent Build Check Delegation
+### Proof C: Real Human-Agent Execution Proof
 - **Scenario**: The human asks Agent to verify whether the project builds.
 - **Input**: `? check whether this project still builds`
-- **Agent Assessment**:
-  1. Examines workspace directory for build manifest (`Cargo.toml`).
-  2. Formulates a proposed tool execution (`cargo check`).
-  3. Returns proposal with canonical format:
-     ```text
-     Agent
+- **Execution Path**:
+  1. Human inputs query in the interactive shell.
+  2. Agent diagnoses workspace manifest (`Cargo.toml`) and produces proposed action `ExecuteTool { tool: "cargo", operation: "check", args: [] }`.
+  3. `InteractiveSession::is_permitted_agent_action` evaluates the proposed action as permitted without secondary ceremony.
+  4. `InteractiveSession::execute_via_broker` routes execution through Omen's real shared daemon broker (`client.submit_execution(...)`).
+  5. Exactly one physical execution occurs via the shared daemon `ProcessSupervisor`.
+  6. Exactly one `ExecutionId` is minted.
+  7. Exactly one `ExecutionRecord` is written to canonical SQLite.
+  8. Output is spooled to Content-Addressed Storage (`CAS`).
+  9. Command exit status (0) is reported to the human.
+  10. Session-scoped `@last` in that human session resolves directly to `cargo check`.
+  11. Zero duplicate executions are performed.
+- **Automated Tests**:
+  - `agent_lane_tests::test_agent_lane_human_agent_build_proposal_proof_c` (PASSED).
+  - `agent_lane_tests::real_human_agent_action_executes_through_daemon_once` (PASSED).
+  - `agent_lane_tests::agent_execution_id_matches_history_and_receipt` (PASSED).
 
-     I propose running `cargo check` using Omen's canonical cargo tool adapter.
-
-     Proposed action:
-       :cargo check
-     ```
-- **Automated Test**: `agent_lane_tests::test_agent_lane_human_agent_build_proposal_proof_c` (PASSED).
+### Proof D: Preserved Workspace Root Across Directory Navigation
+- **Rule**: Navigating the filesystem (`cd`) alters session `cwd` but never mutates `workspace_root`, `workspace_id`, or CAS store location.
+- **Verification**:
+  - Session starts at workspace root.
+  - User executes `cd crates/test-sub`.
+  - `session.cwd` points to `crates/test-sub`, while `session.workspace_root` remains strictly preserved at the top-level repository.
+  - Subsequent agent queries construct `AgentContext` reflecting both locations cleanly.
+  - CAS storage resolves to `<workspace_root>/.omen/workspaces/<ws_id>/cas`.
+- **Automated Tests**:
+  - `agent_lane_tests::agent_context_preserves_workspace_root_after_cd` (PASSED).
+  - `agent_lane_tests::agent_context_workspace_id_stable_after_cd` (PASSED).
+  - `agent_lane_tests::agent_context_cas_uses_workspace_root` (PASSED).
 
 ### Proof E1: Strict Subordinate Session Isolation
 - **Rule**: Background agent work or agent queries must never mutate human session state or human `@last`.
@@ -56,7 +72,9 @@ The primary user experience milestone of Omen 0.5 is:
   3. Human asks `? what folder am I in?`.
 - **Verification**:
   `ReferenceResolver::resolve("@last", &human_session, &db)` continues to return `git status`. Background agent commands and agent reasoning calls leave human session context strictly isolated.
-- **Automated Test**: `agent_lane_tests::test_agent_lane_session_isolation_at_last` (PASSED).
+- **Automated Tests**:
+  - `agent_lane_tests::test_agent_lane_session_isolation_at_last` (PASSED).
+  - `agent_lane_tests::agent_background_work_preserves_human_last` (PASSED).
 
 ### Proof E2: Directory Disambiguation Without Guessing
 - **Rule**: When an instruction has multiple legitimate interpretations, Agent must not guess silently. It must ask a clarifying question listing the concise alternatives.

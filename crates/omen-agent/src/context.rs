@@ -13,6 +13,8 @@ pub struct GitStatusInfo {
     pub untracked_files: Vec<String>,
     pub commits_ahead: usize,
     pub commits_behind: usize,
+    pub probe_error: Option<String>,
+    pub blocked_phase: Option<String>,
 }
 
 /// Bounded summary of a recent process execution.
@@ -57,6 +59,7 @@ pub struct AgentContext {
     pub session_id: InteractiveSessionId,
     pub cwd: PathBuf,
     pub git: Option<GitStatusInfo>,
+    pub git_diagnostic: Option<String>,
     pub recent_execution: Option<ExecutionSummary>,
     pub recent_failed_execution: Option<ExecutionSummary>,
     pub dirty_facts: Vec<FactInfo>,
@@ -64,6 +67,78 @@ pub struct AgentContext {
     pub services: Vec<ManagedServiceInfo>,
     pub available_tools: Vec<String>,
     pub environment: EnvironmentInfo,
+}
+
+/// Synchronously blocks on an async future across multithread and single-thread Tokio contexts.
+pub fn block_on_async<F>(future: F) -> F::Output
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        match handle.runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| handle.block_on(future))
+            }
+            _ => std::thread::scope(|s| {
+                s.spawn(|| {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("Failed to build local tokio runtime")
+                        .block_on(future)
+                })
+                .join()
+                .expect("Tokio runtime thread panicked")
+            }),
+        }
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to build local tokio runtime")
+            .block_on(future)
+    }
+}
+
+fn run_bounded_probe(
+    supervisor: &omen_engine::ProcessSupervisor,
+    bin: &str,
+    args: &[&str],
+    cwd: &Path,
+    timeout_ms: u64,
+) -> Result<Vec<u8>, (String, String)> {
+    let mut argv = vec![bin.to_string()];
+    argv.extend(args.iter().map(|s| s.to_string()));
+    let req = omen_engine::ExecutionRequest {
+        argv: argv.clone(),
+        cwd: cwd.to_path_buf(),
+        env: vec![],
+        stdin_mode: omen_core::StdioMode::Closed,
+        stdin_payload: None,
+        timeout_ms,
+        inline_budget: 8192,
+        required_assurance: omen_core::RequiredAssurance::default(),
+    };
+
+    let out = block_on_async(supervisor.execute(req))
+        .map_err(|e| (argv.join(" "), format!("Supervisor execution failed: {e}")))?;
+
+    if out.runtime_status == omen_core::RuntimeStatus::TimedOut {
+        return Err((
+            argv.join(" "),
+            format!("Probe timed out after {timeout_ms}ms"),
+        ));
+    }
+
+    if !out.process_exit.is_zero() {
+        return Err((
+            argv.join(" "),
+            format!("Process exited with status {:?}", out.process_exit.code),
+        ));
+    }
+
+    Ok(out.stdout_all)
 }
 
 impl AgentContext {
@@ -79,6 +154,7 @@ impl AgentContext {
             session_id,
             cwd,
             git: None,
+            git_diagnostic: None,
             recent_execution: None,
             recent_failed_execution: None,
             dirty_facts: Vec::new(),
@@ -101,8 +177,17 @@ impl AgentContext {
         format!("{}... [truncated]", &raw[..idx])
     }
 
-    /// Inspects the local Git state in the given directory with a bounded duration.
+    /// Inspects the local Git state in the given directory with a bounded duration (default 1500ms).
     pub fn detect_git_status(path: &Path) -> Option<GitStatusInfo> {
+        Self::detect_git_status_with_opts(path, "git", 1500)
+    }
+
+    /// Inspects Git state using a specified executable binary and bounded timeout in milliseconds.
+    pub fn detect_git_status_with_opts(
+        path: &Path,
+        git_bin: &str,
+        timeout_ms: u64,
+    ) -> Option<GitStatusInfo> {
         let git_dir = path.join(".git");
         if !git_dir.exists() {
             // Check parent directories up to 4 levels
@@ -124,54 +209,76 @@ impl AgentContext {
             }
         }
 
+        let supervisor = omen_engine::ProcessSupervisor::new();
         let mut status = GitStatusInfo::default();
 
         // 1. Get branch name
-        if let Ok(out) = std::process::Command::new("git")
-            .args(["rev-parse", "--abbrev-ref", "HEAD"])
-            .current_dir(path)
-            .output()
-            && out.status.success()
-        {
-            let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !name.is_empty() {
-                status.branch = Some(name);
+        match run_bounded_probe(
+            &supervisor,
+            git_bin,
+            &["rev-parse", "--abbrev-ref", "HEAD"],
+            path,
+            timeout_ms,
+        ) {
+            Ok(bytes) => {
+                let name = String::from_utf8_lossy(&bytes).trim().to_string();
+                if !name.is_empty() {
+                    status.branch = Some(name);
+                }
+            }
+            Err((phase, err)) => {
+                status.blocked_phase = Some(phase);
+                status.probe_error = Some(err);
+                return Some(status);
             }
         }
 
         // 2. Get remote origin URL
-        if let Ok(out) = std::process::Command::new("git")
-            .args(["config", "--get", "remote.origin.url"])
-            .current_dir(path)
-            .output()
-            && out.status.success()
-        {
-            let remote = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if let Ok(bytes) = run_bounded_probe(
+            &supervisor,
+            git_bin,
+            &["config", "--get", "remote.origin.url"],
+            path,
+            timeout_ms,
+        ) {
+            let remote = String::from_utf8_lossy(&bytes).trim().to_string();
             if !remote.is_empty() {
                 status.remote_origin = Some(remote);
             }
         }
 
         // 3. Get status --porcelain (bounded to first 30 entries)
-        if let Ok(out) = std::process::Command::new("git")
-            .args(["status", "--porcelain"])
-            .current_dir(path)
-            .output()
-            && out.status.success()
-        {
-            let text = String::from_utf8_lossy(&out.stdout);
-            for line in text.lines().take(30) {
-                if line.len() < 3 {
-                    continue;
+        match run_bounded_probe(
+            &supervisor,
+            git_bin,
+            &["status", "--porcelain"],
+            path,
+            timeout_ms,
+        ) {
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes);
+                for line in text.lines().take(30) {
+                    if line.len() < 3 {
+                        continue;
+                    }
+                    let code = &line[..2];
+                    let file = line[3..].trim().to_string();
+                    if code.starts_with('?') {
+                        status.untracked_files.push(file);
+                    } else if code.starts_with('M')
+                        || code.starts_with('A')
+                        || code.starts_with('D')
+                    {
+                        status.staged_files.push(file);
+                    } else if code.ends_with('M') || code.ends_with('D') {
+                        status.modified_files.push(file);
+                    }
                 }
-                let code = &line[..2];
-                let file = line[3..].trim().to_string();
-                if code.starts_with('?') {
-                    status.untracked_files.push(file);
-                } else if code.starts_with('M') || code.starts_with('A') || code.starts_with('D') {
-                    status.staged_files.push(file);
-                } else if code.ends_with('M') || code.ends_with('D') {
-                    status.modified_files.push(file);
+            }
+            Err((phase, err)) => {
+                if status.probe_error.is_none() {
+                    status.blocked_phase = Some(phase);
+                    status.probe_error = Some(err);
                 }
             }
         }

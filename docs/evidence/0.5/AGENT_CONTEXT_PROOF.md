@@ -51,3 +51,15 @@ pub struct AgentContext {
 - `build_agent_context` queries both SQLite persistent registry and in-memory hot cache.
 - Verified in `agent_lane_tests::test_agent_lane_im_lost_proof_a`:
   When a workspace file changes, dirty facts (e.g. `fact://project/build_status`) are explicitly reported in Agent's situation assessment.
+
+### Proof 4: Bounded Git & Context Inspection Subprocesses
+- Rule: "Nothing is allowed to depend on eventually happening." All external Git probes and inspections run under `ProcessSupervisor` with closed stdin, explicit deadlines, Windows Job Object / POSIX process tree kill on timeout, and task reaping.
+- When an inspection probe times out (e.g. stalling Git lock or huge repository index), it never hangs the shell. It returns degraded `GitStatusInfo` with `probe_error` and `blocked_phase`.
+- Verified in `agent_regression_tests::agent_git_probe_times_out_cleanly`:
+  A 30-second stalling process is terminated within a 300ms deadline, reporting `probe_error: "git inspection timed out after 300ms"` and `blocked_phase: "rev-parse"`.
+
+### Proof 5: Zero-Model Token Economy for Deterministic Inquiries
+- Rule: Deterministic questions must never make generative model calls or burn tokens.
+- Queries such as "what folder am I in?", "where am I?", "what branch am I on?", "what was the last command?", "is anything dirty?", and "what file is this?" are intercepted and answered directly from machine state by `DeterministicClassifier`.
+- Model provider call count remains exactly 0.
+- Verified in `agent_regression_tests::deterministic_question_uses_zero_model_calls`.

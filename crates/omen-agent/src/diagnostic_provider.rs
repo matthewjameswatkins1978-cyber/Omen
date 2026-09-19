@@ -81,7 +81,7 @@ impl DiagnosticAgentProvider {
                 vec![ProposedAction::ExecuteTool {
                     tool: "cargo".into(),
                     operation: "check".into(),
-                    args: vec!["cargo".into(), "check".into()],
+                    args: vec![],
                     cwd: Some(ctx.cwd.to_string_lossy().to_string()),
                 }],
             );
@@ -194,24 +194,11 @@ impl DiagnosticAgentProvider {
         }
 
         let mut actions = Vec::new();
-        if let Some(f) = failed_exec {
+        if let Some(_f) = failed_exec {
             actions.push(ProposedAction::SemanticAction {
                 action: "show".into(),
                 args: vec!["@failed".into()],
             });
-            if f.command.starts_with("cargo test") {
-                let parts: Vec<String> = f
-                    .command
-                    .split_whitespace()
-                    .map(|s| s.to_string())
-                    .collect();
-                actions.push(ProposedAction::ExecuteTool {
-                    tool: "cargo".into(),
-                    operation: "test".into(),
-                    args: parts,
-                    cwd: Some(ctx.cwd.to_string_lossy().to_string()),
-                });
-            }
         }
 
         AgentResponse::proposal(lines.join("\n"), actions)
