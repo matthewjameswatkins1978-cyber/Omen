@@ -14,8 +14,8 @@ use omen_ipc::{
 };
 use omen_knowledge::{
     Database, ExecutionHistory, ExecutionRecord, FactRegistry, RequestReceiptRecord, ServiceRecord,
-    WorkspacePersistence, cas::ContentAddressedStore, deterministic_workspace_id,
-    resolve_workspace_dir,
+    WorkspacePersistence, canonical_workspace_db_path, cas::ContentAddressedStore,
+    deterministic_workspace_id, resolve_workspace_dir,
 };
 
 pub type InFlightMap =
@@ -63,11 +63,16 @@ pub struct WorkspaceState {
 }
 
 impl WorkspaceState {
-    pub fn new(canonical_path: PathBuf, epoch: u64) -> Self {
+    pub fn new(canonical_path: PathBuf, epoch: u64) -> Result<Self, LocalIpcError> {
         let workspace_id = deterministic_workspace_id(&canonical_path);
         let state_dir = resolve_workspace_dir(&canonical_path);
-        let db = Database::open(&state_dir.join("knowledge.db"))
-            .unwrap_or_else(|_| Database::open_in_memory().expect("In-memory database fallback"));
+        let db_path = canonical_workspace_db_path(&canonical_path);
+        let db = Database::open(&db_path).map_err(|e| {
+            LocalIpcError::DaemonDegraded(format!(
+                "Failed to open canonical database at {}: {e}",
+                db_path.display()
+            ))
+        })?;
 
         let _ = WorkspacePersistence::upsert_workspace(
             &db,
@@ -75,6 +80,9 @@ impl WorkspaceState {
             &canonical_path.to_string_lossy(),
             epoch,
         );
+
+        // Crash reconciliation: Running request receipts become Unknown
+        let _ = WorkspacePersistence::reconcile_running_receipts(&db);
 
         let mut initial_facts = HashMap::new();
         if let Ok(records) = FactRegistry::list_all_facts(&db) {
@@ -118,10 +126,25 @@ impl WorkspaceState {
             for s in records {
                 let mut state = s.state.clone();
                 let mut pid = s.pid;
-                // Crash reconciliation: if recorded as running, verify process is actually alive
-                if state == "running" {
+                // Crash reconciliation: if recorded as running or observed
+                if state == "running" || state == "observed" {
                     let is_alive = pid.map(omen_engine::is_process_alive).unwrap_or(false);
-                    if !is_alive {
+                    if is_alive {
+                        // Alive in OS, but not managed/owned by this new daemon process
+                        state = "observed".to_string();
+                        let _ = WorkspacePersistence::upsert_service(
+                            &db,
+                            &ServiceRecord {
+                                workspace_id: workspace_id.clone(),
+                                name: s.name.clone(),
+                                command: s.command.clone(),
+                                pid,
+                                state: state.clone(),
+                                started_at: s.started_at.clone(),
+                                updated_at: chrono::Utc::now().to_rfc3339(),
+                            },
+                        );
+                    } else {
                         state = "crashed".to_string();
                         pid = None;
                         let _ = WorkspacePersistence::upsert_service(
@@ -160,7 +183,7 @@ impl WorkspaceState {
         let managed_processes = Arc::new(Mutex::new(HashMap::new()));
         let service_configs = RwLock::new(HashMap::new());
 
-        Self {
+        Ok(Self {
             workspace_id,
             canonical_path,
             epoch,
@@ -176,7 +199,7 @@ impl WorkspaceState {
             in_flight_executions,
             event_tx,
             watcher: Arc::new(Mutex::new(None)),
-        }
+        })
     }
 
     pub fn is_ignored_path(path: &Path) -> bool {
@@ -281,6 +304,11 @@ impl WorkspaceState {
     pub fn broadcast_event(&self, payload: EventPayload) -> IpcEvent {
         let seq = self.next_sequence();
         let event = IpcEvent::new(&self.workspace_id, self.epoch, seq, payload);
+        let _ = self.event_tx.send(event.clone());
+        event
+    }
+
+    pub fn broadcast_raw_event(&self, event: IpcEvent) -> IpcEvent {
         let _ = self.event_tx.send(event.clone());
         event
     }
@@ -511,12 +539,36 @@ impl WorkspaceState {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             self.update_service_state(name, "stopped", None).await;
             Ok(name.to_string())
-        } else if self.update_service_state(name, "stopped", None).await {
-            Ok(name.to_string())
         } else {
-            Err(LocalIpcError::ServiceNotFound(format!(
-                "Service '{name}' not found"
-            )))
+            drop(managed);
+            let services = self.services.read().await;
+            if let Some(svc) = services.get(name) {
+                let pid = svc.pid;
+                let state = svc.state.clone();
+                drop(services);
+
+                if state == "observed" {
+                    if let Some(p) = pid
+                        && omen_engine::is_process_alive(p)
+                    {
+                        Err(LocalIpcError::LocalPeerDenied(format!(
+                            "Service '{name}' is observed with active PID {p}; daemon lacks process ownership to stop it safely",
+                        )))
+                    } else {
+                        self.update_service_state(name, "stopped", None).await;
+                        Ok(name.to_string())
+                    }
+                } else if state == "stopped" {
+                    Ok(name.to_string())
+                } else {
+                    self.update_service_state(name, "stopped", None).await;
+                    Ok(name.to_string())
+                }
+            } else {
+                Err(LocalIpcError::ServiceNotFound(format!(
+                    "Service '{name}' not found"
+                )))
+            }
         }
     }
 
@@ -524,6 +576,19 @@ impl WorkspaceState {
         self: &Arc<Self>,
         name: &str,
     ) -> Result<ManagedServiceInfo, LocalIpcError> {
+        {
+            let services = self.services.read().await;
+            if let Some(svc) = services.get(name)
+                && svc.state == "observed"
+                && let Some(p) = svc.pid
+                && omen_engine::is_process_alive(p)
+            {
+                return Err(LocalIpcError::LocalPeerDenied(format!(
+                    "Service '{name}' is observed with active PID {p}; daemon cannot restart unowned process",
+                )));
+            }
+        }
+
         let (cmd, argv) = {
             let configs = self.service_configs.read().await;
             if let Some((cmd, argv)) = configs.get(name) {
@@ -687,8 +752,37 @@ impl WorkspaceState {
         stdout_artifact: Option<String>,
         stderr_artifact: Option<String>,
     ) -> Result<String, CoreError> {
-        let exec_id_str = format!("exec_{}", uuid::Uuid::new_v4());
-        let execution_id = ExecutionId::new(&exec_id_str)?;
+        self.record_history_with_id(
+            None,
+            session_id,
+            command,
+            exit_code,
+            duration_ms,
+            stdout_artifact,
+            stderr_artifact,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_history_with_id(
+        &self,
+        custom_execution_id: Option<ExecutionId>,
+        session_id: &str,
+        command: &str,
+        exit_code: Option<i32>,
+        duration_ms: u64,
+        stdout_artifact: Option<String>,
+        stderr_artifact: Option<String>,
+    ) -> Result<String, CoreError> {
+        let (execution_id, exec_id_str) = if let Some(id) = custom_execution_id {
+            let s = id.to_string();
+            (id, s)
+        } else {
+            let s = format!("exec_{}", uuid::Uuid::new_v4());
+            let id = ExecutionId::new(&s)?;
+            (id, s)
+        };
         let session_id_typed = InteractiveSessionId::new(session_id)?;
 
         let record = ExecutionRecord {
@@ -753,31 +847,32 @@ impl WorkspaceState {
         }
 
         // 2. Check if already recorded in request_receipts in SQLite
-        if let Some(receipt) = self.query_request_receipt(dedup_id).await
-            && receipt.status == "Completed"
-            && let Some(exec_id) = receipt.execution_id
-        {
-            let db = self.db.lock().await;
-            if let Ok(Some(rec)) = ExecutionHistory::get_last_execution(
-                &db,
-                &InteractiveSessionId::new(session_id)
-                    .map_err(|e| LocalIpcError::InternalRuntimeError(e.to_string()))?,
-            ) && rec.execution_id.as_str() == exec_id
+        if let Some(receipt) = self.query_request_receipt(dedup_id).await {
+            if receipt.status == "Unknown" {
+                return Err(LocalIpcError::ExecutionStatusUnknown(dedup_id.to_string()));
+            }
+            if receipt.status == "Completed"
+                && let Some(exec_id) = receipt.execution_id
             {
-                let summary = ExecutionResultSummary {
-                    execution_id: exec_id,
-                    exit_code: rec.exit_code,
-                    duration_ms: rec.duration_ms.unwrap_or(0) as u64,
-                    stdout_preview: rec.command.clone(),
-                    stderr_preview: String::new(),
-                    stdout_artifact: rec.stdout_artifact,
-                    stderr_artifact: rec.stderr_artifact,
-                };
-                self.execution_cache
-                    .write()
-                    .await
-                    .insert(dedup_id.to_string(), summary.clone());
-                return Ok(summary);
+                let db = self.db.lock().await;
+                if let Ok(eid) = ExecutionId::new(&exec_id)
+                    && let Ok(Some(rec)) = ExecutionHistory::get_execution(&db, &eid)
+                {
+                    let summary = ExecutionResultSummary {
+                        execution_id: exec_id,
+                        exit_code: rec.exit_code,
+                        duration_ms: rec.duration_ms.unwrap_or(0) as u64,
+                        stdout_preview: rec.command.clone(),
+                        stderr_preview: String::new(),
+                        stdout_artifact: rec.stdout_artifact,
+                        stderr_artifact: rec.stderr_artifact,
+                    };
+                    self.execution_cache
+                        .write()
+                        .await
+                        .insert(dedup_id.to_string(), summary.clone());
+                    return Ok(summary);
+                }
             }
         }
 
@@ -802,8 +897,13 @@ impl WorkspaceState {
             };
         }
 
-        // 4. Mark Running in SQLite receipt
-        self.record_request_receipt(dedup_id, None, "Running").await;
+        let exec_id_str = format!("exec_{}", uuid::Uuid::new_v4());
+        let execution_id = ExecutionId::new(&exec_id_str)
+            .map_err(|e| LocalIpcError::InternalRuntimeError(e.to_string()))?;
+
+        // 4. Mark Running in SQLite receipt with the canonical execution_id
+        self.record_request_receipt(dedup_id, Some(&exec_id_str), "Running")
+            .await;
 
         // 5. Construct argv
         let mut argv = Vec::new();
@@ -820,7 +920,8 @@ impl WorkspaceState {
         if argv.is_empty() {
             let mut in_flight = self.in_flight_executions.lock().await;
             in_flight.remove(dedup_id);
-            self.record_request_receipt(dedup_id, None, "Failed").await;
+            self.record_request_receipt(dedup_id, Some(&exec_id_str), "Failed")
+                .await;
             return Err(LocalIpcError::MalformedRequest(
                 "Command argv cannot be empty".into(),
             ));
@@ -851,7 +952,6 @@ impl WorkspaceState {
             let exec_result = this.supervisor.execute(req).await;
             match exec_result {
                 Ok(output) => {
-                    let exec_id_str = format!("exec_{}", uuid::Uuid::new_v4());
                     let cmd_str = argv.join(" ");
 
                     // Check CAS offload for large output
@@ -895,9 +995,10 @@ impl WorkspaceState {
                     let stderr_preview =
                         String::from_utf8_lossy(&output.stderr_bounded).to_string();
 
-                    // Record history
+                    // Record history with the same canonical execution_id
                     let _ = this
-                        .record_history(
+                        .record_history_with_id(
+                            Some(execution_id),
                             &session_id_str,
                             &cmd_str,
                             exit_code,

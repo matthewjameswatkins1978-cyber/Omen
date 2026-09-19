@@ -32,3 +32,5 @@ chrono = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 omen-daemon = { workspace = true }
+omen-test-fixtures = { workspace = true }
+

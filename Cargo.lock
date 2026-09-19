@@ -787,6 +787,7 @@ dependencies = [
  "omen-ipc",
  "omen-knowledge",
  "omen-schema",
+ "omen-test-fixtures",
  "rusqlite",
  "serde",
  "serde_json",
@@ -833,6 +834,7 @@ dependencies = [
  "omen-ipc",
  "omen-knowledge",
  "omen-schema",
+ "omen-test-fixtures",
  "omen-ui",
  "reedline",
  "serde",
@@ -850,11 +852,13 @@ version = "0.2.0"
 dependencies = [
  "omen-core",
  "omen-schema",
+ "rustix",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -888,6 +892,7 @@ name = "omen-test-fixtures"
 version = "0.2.0"
 dependencies = [
  "clap",
+ "tokio",
 ]
 
 [[package]]

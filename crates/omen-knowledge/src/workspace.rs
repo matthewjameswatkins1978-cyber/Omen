@@ -39,6 +39,14 @@ pub fn resolve_workspace_dir(root: &Path) -> PathBuf {
     ws_dir
 }
 
+/// Canonical database file name used by all Omen runtimes for a workspace.
+pub const CANONICAL_DB_FILE_NAME: &str = "state.sqlite";
+
+/// Resolves the canonical database file path for a workspace.
+pub fn canonical_workspace_db_path(root: &Path) -> PathBuf {
+    resolve_workspace_dir(root).join(CANONICAL_DB_FILE_NAME)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceRecord {
     pub workspace_id: String,
@@ -331,5 +339,18 @@ impl WorkspacePersistence {
         } else {
             Ok(None)
         }
+    }
+
+    pub fn reconcile_running_receipts(db: &Database) -> Result<usize, CoreError> {
+        db.conn()
+            .execute(
+                r#"
+                UPDATE request_receipts
+                SET status = 'Unknown'
+                WHERE status = 'Running'
+                "#,
+                [],
+            )
+            .map_err(|e| CoreError::Internal(format!("Failed to reconcile running receipts: {e}")))
     }
 }

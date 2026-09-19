@@ -111,7 +111,7 @@ async fn test_shell_ux_shared_mode_with_connected_daemon() {
     );
 
     // Simulate daemon publishing a fact event to all subscribers
-    let ws_state = daemon.registry().get_or_attach(temp.path()).await;
+    let ws_state = daemon.registry().get_or_attach(temp.path()).await.unwrap();
     let _ = ws_state.broadcast_event(EventPayload::FactPublished {
         fact_id: "fact-test-01".into(),
         resource_uri: "file://shared_config.toml".into(),

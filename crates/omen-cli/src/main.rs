@@ -4,7 +4,10 @@ use omen_core::{
     ActionId, CoreError, ExecutionContract, RequiredAssurance, ResourceUri, StdioMode,
 };
 use omen_engine::{ExecutionRequest, ProcessSupervisor};
-use omen_knowledge::{ContentAddressedStore, Database, FactRegistry, resolve_workspace_dir};
+use omen_knowledge::{
+    ContentAddressedStore, Database, FactRegistry, canonical_workspace_db_path,
+    resolve_workspace_dir,
+};
 use omen_schema::{
     ExecutionContractWire, ExecutionResultWire, ProcessExitWire, SCHEMA_VERSION_RESULT,
 };
@@ -154,7 +157,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let current_dir = std::env::current_dir()?;
     let ws_root = cli.workspace.unwrap_or(current_dir);
     let state_dir = resolve_workspace_dir(&ws_root);
-    let db_path = state_dir.join("state.sqlite");
+    let db_path = canonical_workspace_db_path(&ws_root);
     let cas_dir = state_dir.join("cas");
 
     let supervisor = ProcessSupervisor::new();

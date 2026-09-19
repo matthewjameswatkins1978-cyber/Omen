@@ -118,10 +118,18 @@ impl HotSemanticIndex {
     }
 
     pub fn mark_fact_dirty(&mut self, uri_or_id: &str) {
+        let mut found = false;
         for fact in &mut self.active_facts {
             if fact.resource_uri == uri_or_id {
                 fact.validity = ValidityState::Dirty;
+                found = true;
             }
+        }
+        if !found {
+            self.active_facts.push(CachedFact {
+                resource_uri: uri_or_id.to_string(),
+                validity: ValidityState::Dirty,
+            });
         }
     }
 

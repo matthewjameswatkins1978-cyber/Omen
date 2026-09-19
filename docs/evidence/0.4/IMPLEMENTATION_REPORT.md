@@ -35,15 +35,16 @@ Omen 0.4 does **not** create competing policy, replay, approval, or journaling s
 
 ### R1: Versioned Local IPC Protocol (`omen-ipc`)
 - Crate: `crates/omen-ipc`
-- Defines versioned framing with 4-byte length prefix and 16 MiB payload limit.
+- Defines versioned framing with 4-byte length prefix and 1 MiB payload limit (`MAX_FRAME_SIZE = 1024 * 1024`).
 - Handshake protocol: `ClientHello` and `DaemonHello` with protocol family `"omen.local-ipc"`, semver compatibility negotiation, and clear refusal on mismatch.
 - Request/Response payloads: `Ping`, `AttachWorkspace`, `GetSnapshot`, `SubmitExecution`, `QueryRequestStatus`, `StartService`, `StopService`, `RestartService`, `ListServices`, `RecordHistory`, `QueryLastExecution`, `Disconnect`.
 - Push event broadcast envelopes: `FactPublished`, `FactInvalidated`, `ServiceStateChanged`, `ExecutionCompleted`, `ResyncRequired`.
-- Cross-platform streaming abstraction (`PlatformStream`) supporting Windows Named Pipes (`\\.\pipe\omen-<instance_id>`), Unix Domain Sockets (`/tmp/omen-<instance_id>.sock`), and in-memory duplex streams for deterministic testing.
+- Cross-platform streaming abstraction (`PlatformStream`) supporting stable user endpoints: Windows Named Pipes (`\\.\pipe\omen-<username>-1`), Unix Domain Sockets (`$XDG_RUNTIME_DIR/omen/1/omend.sock` or `~/.omen/run/1/omend.sock`), and in-memory duplex streams for deterministic testing.
+- Local peer admission: verified peer credentials enforcing same-user access (Unix UID match with 0700 permissions; Windows user token SID comparison).
 
 ### R2–R3: Daemon Lifecycle (`omend`) & Client (`omen-client`)
 - Binaries/Crates: `crates/omen-daemon` (`omend`), `crates/omen-client`
-- Lifecycle management: single-instance enforcement via OS file locking (`omend.lock`), clean shutdown coordination via watch channel, and deterministic daemon instance naming.
+- Lifecycle management: single-instance enforcement via user-scoped stable endpoint listener binding (`PlatformListener::bind`), clean shutdown coordination via watch channel, and deterministic daemon instance naming.
 - Client connection engine: automatic reconnect with exponential backoff, background event reader pump, pending request correlation map, and graceful disconnection.
 
 ### R4: Workspace Registry Scoping & SQLite State Migrations

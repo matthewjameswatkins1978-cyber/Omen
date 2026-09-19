@@ -36,3 +36,5 @@ clap = { workspace = true, features = ["derive"] }
 tempfile.workspace = true
 omen-client.workspace = true
 omen-interactive.workspace = true
+omen-test-fixtures.workspace = true
+

@@ -103,7 +103,7 @@ async fn proof_a_two_shells_one_fact() {
         let mut rx1 = shell1.subscribe_events();
         let mut rx2 = shell2.subscribe_events();
 
-        let ws = daemon.registry().get_or_attach(temp.path()).await;
+        let ws = daemon.registry().get_or_attach(temp.path()).await.unwrap();
 
         // Publish fact
         ws.broadcast_event(EventPayload::FactPublished {
@@ -189,7 +189,7 @@ async fn proof_b_background_mutation_marks_dirty() {
         human_shell.attach_workspace(ws_path).await.unwrap();
 
         let mut human_events = human_shell.subscribe_events();
-        let ws = daemon.registry().get_or_attach(temp.path()).await;
+        let ws = daemon.registry().get_or_attach(temp.path()).await.unwrap();
 
         // Publish fact into shared workspace
         ws.put_fact(FactInfo {
@@ -237,7 +237,7 @@ async fn proof_c_external_watcher_invalidates_facts() {
         client.attach_workspace(ws_path).await.unwrap();
 
         let mut event_rx = client.subscribe_events();
-        let ws = daemon.registry().get_or_attach(temp.path()).await;
+        let ws = daemon.registry().get_or_attach(temp.path()).await.unwrap();
 
         // Publish fact
         ws.put_fact(FactInfo {
@@ -259,10 +259,12 @@ async fn proof_c_external_watcher_invalidates_facts() {
             EventPayload::FactInvalidated {
                 resource_uri,
                 new_validity,
+                cause,
                 ..
             } => {
                 assert_eq!(resource_uri, "fact:external_target");
                 assert_eq!(new_validity, "DIRTY");
+                assert_eq!(cause, "fs:external_change");
             }
             other => panic!("Expected FactInvalidated from watcher, got {other:?}"),
         }
@@ -271,10 +273,10 @@ async fn proof_c_external_watcher_invalidates_facts() {
 }
 
 // -----------------------------------------------------------------------------------------
-// PROOF D: Event gap handling (ResyncRequired triggers GetSnapshot and recovery)
+// PROOF D: Event gap detection & state resync catchup
 // -----------------------------------------------------------------------------------------
 #[tokio::test]
-async fn proof_d_event_gap_handling_and_resync() {
+async fn proof_d_reconnect_resync_catchup() {
     with_timeout(async {
         let temp = tempdir().unwrap();
         let daemon = Arc::new(DaemonServer::new(Some("duplex://proof_d".into())));
@@ -284,7 +286,7 @@ async fn proof_d_event_gap_handling_and_resync() {
         client.attach_workspace(ws_path).await.unwrap();
 
         let mut event_rx = client.subscribe_events();
-        let ws = daemon.registry().get_or_attach(temp.path()).await;
+        let ws = daemon.registry().get_or_attach(temp.path()).await.unwrap();
 
         // Emit ResyncRequired
         ws.broadcast_event(EventPayload::ResyncRequired {
@@ -575,7 +577,11 @@ async fn proof_j_strict_workspace_isolation() {
         );
 
         // Publish fact in Workspace A
-        let ws_a = daemon.registry().get_or_attach(temp_a.path()).await;
+        let ws_a = daemon
+            .registry()
+            .get_or_attach(temp_a.path())
+            .await
+            .unwrap();
         ws_a.put_fact(FactInfo {
             fact_id: "fact-ws-a".into(),
             resource_uri: "secret://a-fact".into(),

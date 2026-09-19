@@ -246,40 +246,44 @@ impl DaemonServer {
             RequestPayload::Ping { timestamp_ms } => Ok(ResponsePayload::Pong { timestamp_ms }),
 
             RequestPayload::AttachWorkspace { canonical_path } => {
-                let ws = registry.get_or_attach(Path::new(&canonical_path)).await;
-                let ws_id = ws.workspace_id().to_string();
-                let epoch = ws.epoch();
+                match registry.get_or_attach(Path::new(&canonical_path)).await {
+                    Ok(ws) => {
+                        let ws_id = ws.workspace_id().to_string();
+                        let epoch = ws.epoch();
 
-                // Save attached workspace
-                {
-                    let mut current = attached_workspace.write().await;
-                    *current = Some(ws.clone());
-                }
-
-                // Setup event forwarding pump for this workspace
-                let mut rx = ws.subscribe_events();
-                let writer_clone = write_mutex.clone();
-
-                let mut pump = event_pump_handle.lock().await;
-                if let Some(old) = pump.take() {
-                    old.abort();
-                }
-
-                let new_handle = tokio::spawn(async move {
-                    while let Ok(event) = rx.recv().await {
-                        let msg = DaemonMessage::Event(event);
-                        let mut writer = writer_clone.lock().await;
-                        if write_json_frame(&mut *writer, &msg).await.is_err() {
-                            break;
+                        // Save attached workspace
+                        {
+                            let mut current = attached_workspace.write().await;
+                            *current = Some(ws.clone());
                         }
-                    }
-                });
-                *pump = Some(new_handle);
 
-                Ok(ResponsePayload::WorkspaceAttached {
-                    workspace_id: ws_id,
-                    epoch,
-                })
+                        // Setup event forwarding pump for this workspace
+                        let mut rx = ws.subscribe_events();
+                        let writer_clone = write_mutex.clone();
+
+                        let mut pump = event_pump_handle.lock().await;
+                        if let Some(old) = pump.take() {
+                            old.abort();
+                        }
+
+                        let new_handle = tokio::spawn(async move {
+                            while let Ok(event) = rx.recv().await {
+                                let msg = DaemonMessage::Event(event);
+                                let mut writer = writer_clone.lock().await;
+                                if write_json_frame(&mut *writer, &msg).await.is_err() {
+                                    break;
+                                }
+                            }
+                        });
+                        *pump = Some(new_handle);
+
+                        Ok(ResponsePayload::WorkspaceAttached {
+                            workspace_id: ws_id,
+                            epoch,
+                        })
+                    }
+                    Err(e) => Err(e),
+                }
             }
 
             RequestPayload::GetSnapshot => {

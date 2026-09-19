@@ -43,7 +43,7 @@ async fn test_snapshot_consistency_across_clients() {
     client2.attach_workspace(path).await.unwrap();
 
     // Publish fact into shared workspace
-    let ws_state = registry.get_or_attach(tmp.path()).await;
+    let ws_state = registry.get_or_attach(tmp.path()).await.unwrap();
     ws_state
         .put_fact(FactInfo {
             fact_id: "fact://cargo/check".to_string(),
@@ -94,7 +94,7 @@ async fn test_fs_mutation_invalidates_current_facts() {
         .await
         .unwrap();
 
-    let ws = server.registry().get_or_attach(tmp.path()).await;
+    let ws = server.registry().get_or_attach(tmp.path()).await.unwrap();
 
     // Publish fact with CURRENT validity
     ws.put_fact(FactInfo {

@@ -2,8 +2,8 @@ use omen_client::OmenClient;
 use omen_daemon::DaemonServer;
 use omen_ipc::{EventPayload, LocalIpcError, PlatformStream};
 use omen_knowledge::{
-    Database, ServiceRecord, WorkspacePersistence, deterministic_workspace_id,
-    resolve_workspace_dir,
+    Database, ServiceRecord, WorkspacePersistence, canonical_workspace_db_path,
+    deterministic_workspace_id, resolve_workspace_dir,
 };
 use std::path::PathBuf;
 use tempfile::tempdir;
@@ -181,7 +181,7 @@ async fn test_service_crash_reconciliation_upon_daemon_start() {
     std::fs::create_dir_all(&state_dir).unwrap();
 
     // 1. Manually seed a stale "running" service with a dead PID (e.g. 999999) in SQLite
-    let db_path = state_dir.join("knowledge.db");
+    let db_path = canonical_workspace_db_path(tmp.path());
     let db = Database::open(&db_path).unwrap();
     WorkspacePersistence::upsert_service(
         &db,

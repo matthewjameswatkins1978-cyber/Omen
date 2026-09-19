@@ -262,7 +262,9 @@ async fn test_execution_broker_large_output_spools_to_cas() {
     let state_dir = resolve_workspace_dir(tmp.path());
     let cas = ContentAddressedStore::new(state_dir.join("cas"));
     let digest = artifact_uri.trim_start_matches("artifact://sha256/");
-    let db = omen_knowledge::Database::open(&state_dir.join("knowledge.db")).unwrap();
+    let db =
+        omen_knowledge::Database::open(&omen_knowledge::canonical_workspace_db_path(tmp.path()))
+            .unwrap();
     let meta = cas
         .inspect(&db, digest)
         .expect("Artifact must exist in CAS");

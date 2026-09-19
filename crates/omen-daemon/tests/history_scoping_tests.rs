@@ -3,7 +3,7 @@ use omen_core::InteractiveSessionId;
 use omen_daemon::DaemonServer;
 use omen_interactive::resolver::ReferenceResolver;
 use omen_ipc::{EventPayload, PlatformStream};
-use omen_knowledge::{Database, resolve_workspace_dir};
+use omen_knowledge::Database;
 use tempfile::tempdir;
 use tokio::sync::watch;
 
@@ -165,7 +165,7 @@ async fn test_shared_subordinate_history_and_session_scoped_last() {
     );
 
     // 6. Verify Subordinate Isolation in Database via ReferenceResolver
-    let db_path = resolve_workspace_dir(tmp.path()).join("knowledge.db");
+    let db_path = omen_knowledge::canonical_workspace_db_path(tmp.path());
     let db = Database::open(&db_path).expect("Should open workspace database");
 
     let human_sid = InteractiveSessionId::new("sess_human").unwrap();

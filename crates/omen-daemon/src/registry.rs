@@ -20,12 +20,15 @@ impl WorkspaceRegistry {
         }
     }
 
-    pub async fn get_or_attach(&self, path: &Path) -> Arc<WorkspaceState> {
+    pub async fn get_or_attach(
+        &self,
+        path: &Path,
+    ) -> Result<Arc<WorkspaceState>, omen_ipc::LocalIpcError> {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         {
             let by_path = self.by_path.read().await;
             if let Some(ws) = by_path.get(&canonical) {
-                return ws.clone();
+                return Ok(ws.clone());
             }
         }
 
@@ -33,14 +36,14 @@ impl WorkspaceRegistry {
         let mut by_id = self.by_id.write().await;
 
         if let Some(ws) = by_path.get(&canonical) {
-            return ws.clone();
+            return Ok(ws.clone());
         }
 
-        let state = Arc::new(WorkspaceState::new(canonical.clone(), self.epoch));
+        let state = Arc::new(WorkspaceState::new(canonical.clone(), self.epoch)?);
         let _ = state.start_fs_watcher();
         by_id.insert(state.workspace_id().to_string(), state.clone());
         by_path.insert(canonical, state.clone());
-        state
+        Ok(state)
     }
 
     pub async fn get_by_id(&self, id: &str) -> Option<Arc<WorkspaceState>> {

@@ -51,6 +51,14 @@ impl OmenPrompt {
         self.dirty_count = dirty_count;
         self.has_failure = has_failure;
     }
+
+    pub fn dirty_count(&self) -> usize {
+        self.dirty_count
+    }
+
+    pub fn mode_indicator(&self) -> Option<&str> {
+        self.mode_indicator.as_deref()
+    }
 }
 
 impl Prompt for OmenPrompt {

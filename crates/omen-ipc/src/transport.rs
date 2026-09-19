@@ -186,6 +186,8 @@ impl PlatformListener {
                 .create(&self.endpoint)?;
             self.pipe_server = Some(next);
 
+            Self::verify_windows_peer_admission(&current)?;
+
             Ok(PlatformStream::NamedPipeServer(current))
         }
 
@@ -195,8 +197,128 @@ impl PlatformListener {
                 io::Error::new(io::ErrorKind::BrokenPipe, "Unix listener missing")
             })?;
             let (stream, _) = listener.accept().await?;
+
+            #[cfg(unix)]
+            {
+                let peer_cred = stream.peer_cred()?;
+                let current_uid = rustix::process::getuid().as_raw();
+                if peer_cred.uid() != current_uid {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "Local peer admission denied: peer UID {} != daemon UID {}",
+                            peer_cred.uid(),
+                            current_uid
+                        ),
+                    ));
+                }
+            }
+
             Ok(PlatformStream::Unix(stream))
         }
+    }
+
+    #[cfg(windows)]
+    fn verify_windows_peer_admission(
+        server: &tokio::net::windows::named_pipe::NamedPipeServer,
+    ) -> io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use std::ptr;
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Security::{
+            EqualSid, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        };
+        use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentProcess, GetCurrentProcessId, OpenProcess, OpenProcessToken,
+            PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        let raw_handle = server.as_raw_handle() as HANDLE;
+        let mut client_pid: u32 = 0;
+        let res = unsafe { GetNamedPipeClientProcessId(raw_handle, &mut client_pid) };
+        if res == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let my_pid = unsafe { GetCurrentProcessId() };
+        if client_pid == my_pid {
+            return Ok(());
+        }
+
+        unsafe {
+            let proc_handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, client_pid);
+            if proc_handle.is_null() || proc_handle == INVALID_HANDLE_VALUE {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("Failed to inspect client process PID {client_pid}"),
+                ));
+            }
+
+            let mut client_token: HANDLE = ptr::null_mut();
+            let mut server_token: HANDLE = ptr::null_mut();
+
+            let ok_c = OpenProcessToken(proc_handle, TOKEN_QUERY, &mut client_token);
+            CloseHandle(proc_handle);
+
+            if ok_c == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("Failed to open client token for PID {client_pid}"),
+                ));
+            }
+
+            let ok_s = OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut server_token);
+            if ok_s == 0 {
+                CloseHandle(client_token);
+                return Err(io::Error::last_os_error());
+            }
+
+            let mut c_len: u32 = 0;
+            let mut s_len: u32 = 0;
+            let _ = GetTokenInformation(client_token, TokenUser, ptr::null_mut(), 0, &mut c_len);
+            let _ = GetTokenInformation(server_token, TokenUser, ptr::null_mut(), 0, &mut s_len);
+
+            let mut c_buf = vec![0u8; c_len as usize];
+            let mut s_buf = vec![0u8; s_len as usize];
+
+            let ok_c_info = GetTokenInformation(
+                client_token,
+                TokenUser,
+                c_buf.as_mut_ptr() as *mut _,
+                c_len,
+                &mut c_len,
+            );
+            let ok_s_info = GetTokenInformation(
+                server_token,
+                TokenUser,
+                s_buf.as_mut_ptr() as *mut _,
+                s_len,
+                &mut s_len,
+            );
+
+            CloseHandle(client_token);
+            CloseHandle(server_token);
+
+            if ok_c_info == 0 || ok_s_info == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Failed to retrieve user SID information from tokens",
+                ));
+            }
+
+            let c_user = &*(c_buf.as_ptr() as *const TOKEN_USER);
+            let s_user = &*(s_buf.as_ptr() as *const TOKEN_USER);
+
+            if EqualSid(c_user.User.Sid, s_user.User.Sid) == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Windows peer admission denied: client user SID does not match daemon user SID",
+                ));
+            }
+        }
+
+        Ok(())
     }
 }
 
