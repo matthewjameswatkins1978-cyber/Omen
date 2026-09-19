@@ -13,6 +13,7 @@ impl SemanticDispatcher {
         cwd: &Path,
         session_id: &omen_core::InteractiveSessionId,
         db: Option<&mut Database>,
+        agent_registry: Option<&omen_agent::ProviderRegistry>,
     ) -> Result<ProcessExit, CoreError> {
         match action {
             "status" => {
@@ -302,9 +303,29 @@ impl SemanticDispatcher {
                 match sub {
                     "providers" => {
                         println!("Available Agent Reasoning Providers:");
-                        println!(
-                            "  * diagnostic: Omen Built-in Diagnostic Agent [deterministic] (available)"
-                        );
+                        if let Some(reg) = agent_registry {
+                            let active_id = reg.active_descriptor().id;
+                            for p in reg.list_providers() {
+                                let star = if p.id == active_id { "*" } else { " " };
+                                let avail = if p.is_available {
+                                    "available"
+                                } else {
+                                    "unavailable"
+                                };
+                                println!(
+                                    "  {} {}: {} [{}] ({})",
+                                    star,
+                                    p.id,
+                                    p.name,
+                                    p.model.as_deref().unwrap_or("default"),
+                                    avail
+                                );
+                            }
+                        } else {
+                            println!(
+                                "  * diagnostic: Omen Built-in Diagnostic Agent [deterministic] (available)"
+                            );
+                        }
                         Ok(ProcessExit {
                             code: Some(0),
                             signal: None,
@@ -312,6 +333,15 @@ impl SemanticDispatcher {
                     }
                     "use" => {
                         if let Some(target) = args.get(1) {
+                            if let Some(reg) = agent_registry
+                                && let Err(e) = reg.set_active_provider(target)
+                            {
+                                println!("Error switching agent provider: {e}");
+                                return Ok(ProcessExit {
+                                    code: Some(1),
+                                    signal: None,
+                                });
+                            }
                             println!("Active agent provider switched to '{target}'.");
                             Ok(ProcessExit {
                                 code: Some(0),
@@ -326,13 +356,17 @@ impl SemanticDispatcher {
                         }
                     }
                     "status" => {
-                        println!("Provider: diagnostic (Omen Built-in Diagnostic Agent)");
-                        println!("Model: deterministic");
-                        println!("Auth source: none");
-                        println!(
-                            "Capabilities: orientation, failure-diagnosis, navigation, build-check, deterministic"
-                        );
-                        println!("Status: available");
+                        if let Some(reg) = agent_registry {
+                            println!("{}", reg.status_text());
+                        } else {
+                            println!("Provider: diagnostic (Omen Built-in Diagnostic Agent)");
+                            println!("Model: deterministic");
+                            println!("Auth source: none");
+                            println!(
+                                "Capabilities: orientation, failure-diagnosis, navigation, build-check, deterministic"
+                            );
+                            println!("Status: available");
+                        }
                         Ok(ProcessExit {
                             code: Some(0),
                             signal: None,

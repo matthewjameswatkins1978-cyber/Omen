@@ -906,3 +906,449 @@ async fn test_agent_lane_unambiguous_directory_navigation_executes() {
     )
     .await;
 }
+
+struct MockAgentProvider {
+    #[allow(dead_code)]
+    id: String,
+    call_count: std::sync::atomic::AtomicUsize,
+    response_msg: String,
+    proposals: Vec<omen_agent::ProposedAction>,
+}
+
+impl omen_agent::AgentProvider for MockAgentProvider {
+    fn respond<'a>(
+        &'a self,
+        _request: omen_agent::AgentRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<omen_agent::AgentResponse, omen_agent::AgentError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        self.call_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let resp = omen_agent::AgentResponse {
+            kind: omen_agent::AgentResponseKind::Proposal,
+            message: self.response_msg.clone(),
+            proposed_actions: self.proposals.clone(),
+            references: Vec::new(),
+            uncertainty: None,
+        };
+        Box::pin(async move { Ok(resp) })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_provider_switching_real_interactive_proof() {
+    run_with_test_timeout(
+        "test_provider_switching_real_interactive_proof",
+        UNIT_TIMEOUT,
+        |_ctx| async move {
+            let temp = tempdir().unwrap();
+            let ws_path = temp.path();
+
+            let session_id = InteractiveSessionId::new("sess-prov-switch").unwrap();
+            let mut session = InteractiveSession::new_with_client(
+                session_id.clone(),
+                ws_path.to_path_buf(),
+                None,
+                None,
+            )
+            .unwrap();
+
+            let prov_a = Arc::new(MockAgentProvider {
+                id: "prov-a".into(),
+                call_count: std::sync::atomic::AtomicUsize::new(0),
+                response_msg: "Response from provider A".into(),
+                proposals: vec![],
+            });
+            let desc_a = omen_agent::ProviderDescriptor {
+                id: "prov-a".into(),
+                name: "Test Provider A".into(),
+                model: Some("model-a".into()),
+                credential_source: Some("none".into()),
+                capabilities: vec!["test".into()],
+                is_available: true,
+            };
+
+            let prov_b = Arc::new(MockAgentProvider {
+                id: "prov-b".into(),
+                call_count: std::sync::atomic::AtomicUsize::new(0),
+                response_msg: "Response from provider B".into(),
+                proposals: vec![],
+            });
+            let desc_b = omen_agent::ProviderDescriptor {
+                id: "prov-b".into(),
+                name: "Test Provider B".into(),
+                model: Some("model-b".into()),
+                credential_source: Some("none".into()),
+                capabilities: vec!["test".into()],
+                is_available: true,
+            };
+
+            // Register provider A and provider B in the real registry
+            session.register_agent_provider(desc_a, prov_a.clone());
+            session.register_agent_provider(desc_b, prov_b.clone());
+
+            // Switch to B via real REPL semantic command
+            let exit_use = session.dispatch_input(":agent use prov-b").unwrap();
+            assert!(exit_use.is_zero(), ":agent use prov-b must succeed");
+
+            // Query non-deterministic question requiring provider reasoning
+            let exit_q = session
+                .dispatch_input("? please analyze why this pipeline failed")
+                .unwrap();
+            assert!(exit_q.is_zero());
+
+            // Prove B received the request
+            assert_eq!(
+                prov_b.call_count.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "Active provider B must receive the request"
+            );
+            // Prove A did not receive the request
+            assert_eq!(
+                prov_a.call_count.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "Inactive provider A must NOT receive the request"
+            );
+
+            // Prove :agent status reports B
+            assert_eq!(session.agent_registry.active_descriptor().id, "prov-b");
+            let status_text = session.agent_registry.status_text();
+            assert!(status_text.contains("Provider: prov-b (Test Provider B)"));
+            assert!(status_text.contains("Model: model-b"));
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_authority_bypass_hostile_proposals_refused() {
+    run_with_test_timeout(
+        "test_authority_bypass_hostile_proposals_refused",
+        UNIT_TIMEOUT,
+        |_ctx| async move {
+            // 1. git reset --hard
+            let hostile_reset = omen_agent::ProposedAction::ExecuteCommand {
+                argv: vec![
+                    "git".into(),
+                    "reset".into(),
+                    "--hard".into(),
+                    "HEAD~1".into(),
+                ],
+                cwd: None,
+            };
+            assert!(
+                !InteractiveSession::is_permitted_agent_action(&hostile_reset),
+                "git reset --hard must be refused by authority gate"
+            );
+
+            // 2. git clean -fd
+            let hostile_clean = omen_agent::ProposedAction::ExecuteCommand {
+                argv: vec!["git".into(), "clean".into(), "-fd".into()],
+                cwd: None,
+            };
+            assert!(
+                !InteractiveSession::is_permitted_agent_action(&hostile_clean),
+                "git clean -fd must be refused by authority gate"
+            );
+
+            // 3. git push --force
+            let hostile_push = omen_agent::ProposedAction::ExecuteCommand {
+                argv: vec![
+                    "git".into(),
+                    "push".into(),
+                    "--force".into(),
+                    "origin".into(),
+                    "main".into(),
+                ],
+                cwd: None,
+            };
+            assert!(
+                !InteractiveSession::is_permitted_agent_action(&hostile_push),
+                "git push --force must be refused by authority gate"
+            );
+
+            // 4. git branch -D
+            let hostile_branch = omen_agent::ProposedAction::ExecuteCommand {
+                argv: vec![
+                    "git".into(),
+                    "branch".into(),
+                    "-D".into(),
+                    "production".into(),
+                ],
+                cwd: None,
+            };
+            assert!(
+                !InteractiveSession::is_permitted_agent_action(&hostile_branch),
+                "git branch -D must be refused by authority gate"
+            );
+
+            // 5. arbitrary exec (rm -rf /)
+            let hostile_exec = omen_agent::ProposedAction::ExecuteCommand {
+                argv: vec!["rm".into(), "-rf".into(), "/".into()],
+                cwd: None,
+            };
+            assert!(
+                !InteractiveSession::is_permitted_agent_action(&hostile_exec),
+                "arbitrary exec must be refused by authority gate"
+            );
+
+            // 6. arbitrary filesystem mutation (fs delete / write)
+            let hostile_fs_del = omen_agent::ProposedAction::ExecuteTool {
+                tool: "fs".into(),
+                operation: "delete".into(),
+                args: vec!["important_file.rs".into()],
+                cwd: None,
+            };
+            assert!(
+                !InteractiveSession::is_permitted_agent_action(&hostile_fs_del),
+                "fs delete tool must be refused by authority gate"
+            );
+
+            let hostile_fs_write = omen_agent::ProposedAction::ExecuteTool {
+                tool: "fs".into(),
+                operation: "write".into(),
+                args: vec!["cargo.lock".into(), "corrupted".into()],
+                cwd: None,
+            };
+            assert!(
+                !InteractiveSession::is_permitted_agent_action(&hostile_fs_write),
+                "fs write tool must be refused by authority gate"
+            );
+
+            // 7. Safe read-only / verification operations MUST be permitted
+            let safe_check = omen_agent::ProposedAction::ExecuteCommand {
+                argv: vec!["cargo".into(), "check".into()],
+                cwd: None,
+            };
+            assert!(
+                InteractiveSession::is_permitted_agent_action(&safe_check),
+                "cargo check must be permitted"
+            );
+
+            let safe_test = omen_agent::ProposedAction::ExecuteCommand {
+                argv: vec!["cargo".into(), "test".into()],
+                cwd: None,
+            };
+            assert!(
+                InteractiveSession::is_permitted_agent_action(&safe_test),
+                "cargo test must be permitted"
+            );
+
+            let safe_git_status = omen_agent::ProposedAction::ExecuteCommand {
+                argv: vec!["git".into(), "status".into()],
+                cwd: None,
+            };
+            assert!(
+                InteractiveSession::is_permitted_agent_action(&safe_git_status),
+                "git status must be permitted"
+            );
+
+            let safe_git_diff = omen_agent::ProposedAction::ExecuteCommand {
+                argv: vec!["git".into(), "diff".into()],
+                cwd: None,
+            };
+            assert!(
+                InteractiveSession::is_permitted_agent_action(&safe_git_diff),
+                "git diff must be permitted"
+            );
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_hostile_agent_proposal_does_not_execute_in_session() {
+    run_with_test_timeout(
+        "test_hostile_agent_proposal_does_not_execute_in_session",
+        UNIT_TIMEOUT,
+        |_ctx| async move {
+            let temp = tempdir().unwrap();
+            let ws_path = temp.path();
+
+            let session_id = InteractiveSessionId::new("sess-hostile").unwrap();
+            let db_path = canonical_workspace_db_path(ws_path);
+            let mut db = Database::open(&db_path).unwrap();
+            ExecutionHistory::register_session(
+                &mut db,
+                &session_id,
+                "human",
+                ws_path.to_str().unwrap(),
+            )
+            .unwrap();
+
+            let mut session = InteractiveSession::new_with_client(
+                session_id.clone(),
+                ws_path.to_path_buf(),
+                Some(db),
+                None,
+            )
+            .unwrap();
+
+            // Setup a hostile provider that proposes git reset --hard
+            let hostile_prov = Arc::new(MockAgentProvider {
+                id: "hostile".into(),
+                call_count: std::sync::atomic::AtomicUsize::new(0),
+                response_msg: "I recommend resetting your repo".into(),
+                proposals: vec![omen_agent::ProposedAction::ExecuteCommand {
+                    argv: vec![
+                        "git".into(),
+                        "reset".into(),
+                        "--hard".into(),
+                        "HEAD~1".into(),
+                    ],
+                    cwd: None,
+                }],
+            });
+            let hostile_desc = omen_agent::ProviderDescriptor {
+                id: "hostile".into(),
+                name: "Hostile Agent".into(),
+                model: Some("evil-1".into()),
+                credential_source: None,
+                capabilities: vec!["destructive".into()],
+                is_available: true,
+            };
+            session.register_agent_provider(hostile_desc, hostile_prov.clone());
+            session.use_agent_provider("hostile").unwrap();
+
+            // Run query: session will print the refused proposal but MUST NOT execute it!
+            let exit = session
+                .dispatch_input("? fix my working directory")
+                .unwrap();
+            assert!(exit.is_zero());
+            assert_eq!(
+                hostile_prov
+                    .call_count
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            // Verify NO execution was recorded in knowledge DB (authority gate refused execution)
+            let last_exec =
+                ExecutionHistory::get_last_execution(session.db.as_ref().unwrap(), &session_id)
+                    .unwrap();
+            assert!(
+                last_exec.is_none(),
+                "Hostile action must NOT be executed or recorded"
+            );
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn trivial_question_uses_zero_provider_calls() {
+    run_with_test_timeout(
+        "trivial_question_uses_zero_provider_calls",
+        UNIT_TIMEOUT,
+        |_ctx| async move {
+            let temp = tempdir().unwrap();
+            let ws_path = temp.path();
+            let session_id = InteractiveSessionId::new("sess-det-1").unwrap();
+
+            let mock_prov = Arc::new(MockAgentProvider {
+                id: "mock".into(),
+                call_count: std::sync::atomic::AtomicUsize::new(0),
+                response_msg: "Should not be called".into(),
+                proposals: vec![],
+            });
+
+            let out = omen_interactive::ai_lane::AiLaneDispatcher::dispatch_with_workspace(
+                "? what folder am I in?",
+                &session_id,
+                ws_path,
+                ws_path,
+                None,
+                Some(mock_prov.as_ref()),
+                None,
+            )
+            .unwrap();
+
+            assert_eq!(
+                out.stats.provider_calls, 0,
+                "Trivial question must use 0 provider calls"
+            );
+            assert_eq!(
+                mock_prov
+                    .call_count
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "Provider must not be invoked"
+            );
+            assert!(out.response_text.contains("You are in folder"));
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn trivial_question_uses_zero_git_probes() {
+    run_with_test_timeout(
+        "trivial_question_uses_zero_git_probes",
+        UNIT_TIMEOUT,
+        |_ctx| async move {
+            let temp = tempdir().unwrap();
+            let ws_path = temp.path();
+            let session_id = InteractiveSessionId::new("sess-det-2").unwrap();
+
+            let out = omen_interactive::ai_lane::AiLaneDispatcher::dispatch_with_workspace(
+                "? what folder am I in?",
+                &session_id,
+                ws_path,
+                ws_path,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+            assert_eq!(
+                out.stats.git_probes, 0,
+                "Trivial question must use 0 git subprocess probes"
+            );
+            assert!(out.response_text.contains("You are in folder"));
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn trivial_question_uses_zero_db_context_queries() {
+    run_with_test_timeout(
+        "trivial_question_uses_zero_db_context_queries",
+        UNIT_TIMEOUT,
+        |_ctx| async move {
+            let temp = tempdir().unwrap();
+            let ws_path = temp.path();
+            let session_id = InteractiveSessionId::new("sess-det-3").unwrap();
+
+            let db_path = canonical_workspace_db_path(ws_path);
+            let db = Database::open(&db_path).unwrap();
+
+            let out = omen_interactive::ai_lane::AiLaneDispatcher::dispatch_with_workspace(
+                "? what folder am I in?",
+                &session_id,
+                ws_path,
+                ws_path,
+                Some(&db),
+                None,
+                None,
+            )
+            .unwrap();
+
+            assert_eq!(
+                out.stats.db_context_queries, 0,
+                "Trivial question must use 0 DB context queries"
+            );
+            assert_eq!(
+                out.stats.service_scans, 0,
+                "Trivial question must use 0 service scans"
+            );
+            assert!(out.response_text.contains("You are in folder"));
+        },
+    )
+    .await;
+}

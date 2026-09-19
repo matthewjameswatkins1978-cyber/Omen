@@ -122,6 +122,12 @@ Omen 0.5 introduces zero competing policy, permission, lock, or approval systems
 | **Timeout** | Agent context timeout does not hang shell | `agent_regression_tests::agent_context_timeout_does_not_hang_shell` | **PASSED** |
 | **Zero Model** | Deterministic inquiries consume zero model calls | `agent_regression_tests::deterministic_question_uses_zero_model_calls` | **PASSED** |
 | **Registry** | Provider registry selection & status | `agent_regression_tests::provider_registry_selects_configured_provider` | **PASSED** |
+| **Real Switch**| Real interactive provider switching proof | `agent_lane_tests::test_provider_switching_real_interactive_proof` | **PASSED** |
+| **Auth Gate** | Strict semantic authority gate hostile proposal refusal | `agent_lane_tests::test_authority_bypass_hostile_proposals_refused` | **PASSED** |
+| **Hostile Exec**| Hostile proposal refuses execution in session | `agent_lane_tests::test_hostile_agent_proposal_does_not_execute_in_session` | **PASSED** |
+| **0 Model Calls**| Trivial question uses zero provider calls | `agent_lane_tests::trivial_question_uses_zero_provider_calls` | **PASSED** |
+| **0 Git Probes** | Trivial question uses zero git probes | `agent_lane_tests::trivial_question_uses_zero_git_probes` | **PASSED** |
+| **0 DB Queries** | Trivial question uses zero DB context queries | `agent_lane_tests::trivial_question_uses_zero_db_context_queries` | **PASSED** |
 | **Errors** | Provider failures translate to stable Omen errors | `agent_regression_tests::provider_failure_is_translated_to_omen_error` | **PASSED** |
 | **Diagnostics**| Raw provider traces never leak into normal UX | `agent_regression_tests::provider_diagnostics_do_not_leak_into_normal_agent_output` | **PASSED** |
 | **Protocol** | Incompatible MCP protocol version rejection | `mcp_tests::test_mcp_initialize_and_protocol_version` | **PASSED** |

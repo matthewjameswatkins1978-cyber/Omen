@@ -63,3 +63,43 @@ pub struct AgentContext {
 - Queries such as "what folder am I in?", "where am I?", "what branch am I on?", "what was the last command?", "is anything dirty?", and "what file is this?" are intercepted and answered directly from machine state by `DeterministicClassifier`.
 - Model provider call count remains exactly 0.
 - Verified in `agent_regression_tests::deterministic_question_uses_zero_model_calls`.
+
+### Proof 6: Genuine Cheapness of Deterministic Routing
+- Order of execution:
+  ```text
+  classify query cheaply (0 I/O)
+          ↓
+  fetch only deterministic fields required
+          ↓
+  answer
+  ```
+  Only when general reasoning is actually needed:
+  ```text
+  build bounded AgentContext
+          ↓
+  invoke selected provider
+  ```
+- For trivial queries such as `? what folder am I in?`:
+  - `provider_calls`: **0**
+  - `git_probes`: **0**
+  - `db_context_queries`: **0**
+  - `service_scans`: **0**
+- Instrumenting the real `?` dispatcher (`AiLaneDispatcher::dispatch_with_workspace`), verified in:
+  - `agent_lane_tests::trivial_question_uses_zero_provider_calls`
+  - `agent_lane_tests::trivial_question_uses_zero_git_probes`
+  - `agent_lane_tests::trivial_question_uses_zero_db_context_queries`
+
+### Proof 7: Real Provider Switching
+- Provider selection is a real product seam, not simulated state:
+  ```text
+  :agent use <provider>
+          ↓
+  ProviderRegistry::set_active_provider(...)
+          ↓
+  InteractiveSession.agent_provider = registry.active_provider()
+  ```
+- Verified in `agent_lane_tests::test_provider_switching_real_interactive_proof`:
+  - Register provider A and provider B.
+  - `:agent use B`.
+  - Query non-deterministic question.
+  - Proves B received the request (calls = 1), A did not (calls = 0), and `:agent status` truthfully reports B.

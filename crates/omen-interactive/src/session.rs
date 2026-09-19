@@ -194,6 +194,20 @@ impl InteractiveSession {
         self
     }
 
+    pub fn register_agent_provider(
+        &self,
+        descriptor: omen_agent::ProviderDescriptor,
+        provider: std::sync::Arc<dyn omen_agent::AgentProvider>,
+    ) {
+        self.agent_registry.register(descriptor, provider);
+    }
+
+    pub fn use_agent_provider(&mut self, id: &str) -> Result<(), omen_agent::AgentError> {
+        self.agent_registry.set_active_provider(id)?;
+        self.agent_provider = Some(self.agent_registry.active_provider());
+        Ok(())
+    }
+
     /// Runs the interactive REPL loop.
     pub fn run_loop(&mut self) -> Result<(), CoreError> {
         let completer = std::sync::Arc::new(std::sync::Mutex::new(
@@ -375,10 +389,12 @@ impl InteractiveSession {
                     &self.cwd,
                     &self.session_id,
                     self.db.as_mut(),
+                    Some(&self.agent_registry),
                 );
                 if let Ok(exit) = &res {
                     self.last_exit = Some(exit.clone());
                 }
+                self.agent_provider = Some(self.agent_registry.active_provider());
                 self.update_prompt_state();
                 res
             }
@@ -725,46 +741,124 @@ impl InteractiveSession {
     }
 
     /// Evaluates whether an agent action is permitted without secondary approval ceremony.
+    /// Follows default-closed doctrine: natural-language intent and agent output NEVER grant authority.
+    /// Narrowly permits verified read-only or non-destructive verification operations only.
     pub fn is_permitted_agent_action(action: &omen_agent::ProposedAction) -> bool {
         match action {
             omen_agent::ProposedAction::ChangeDirectory { .. } => true,
             omen_agent::ProposedAction::ExecuteTool {
-                tool, operation, ..
-            } => {
-                let t = tool.as_str();
-                let op = operation.as_str();
-                t == "cargo"
-                    || t == "test"
-                    || t == "git"
-                    || t == "exec"
-                    || t == "fs"
-                    || op == "check"
-                    || op == "test"
-                    || op == "status"
-                    || op == "build"
-            }
+                tool,
+                operation,
+                args,
+                ..
+            } => match tool.as_str() {
+                "cargo" => {
+                    let op = if operation.is_empty() {
+                        args.first().map(|s| s.as_str()).unwrap_or("")
+                    } else {
+                        operation.as_str()
+                    };
+                    matches!(op, "check" | "test")
+                }
+                "git" => {
+                    let op = if operation.is_empty() {
+                        args.first().map(|s| s.as_str()).unwrap_or("")
+                    } else {
+                        operation.as_str()
+                    };
+                    if matches!(op, "status" | "diff" | "log") {
+                        !Self::has_destructive_git_args(args)
+                    } else {
+                        false
+                    }
+                }
+                "fs" => {
+                    // Only read-only operations permitted. File mutations/deletions are blocked.
+                    matches!(operation.as_str(), "read" | "stat" | "list")
+                }
+                "exec" => {
+                    if let Some(cmd) = args.first() {
+                        Self::is_permitted_executable(cmd, &args[1..])
+                    } else {
+                        false
+                    }
+                }
+                _ => false, // Default closed
+            },
             omen_agent::ProposedAction::ExecuteCommand { argv, .. } => {
                 if let Some(cmd) = argv.first() {
-                    let c = cmd.as_str();
-                    c == "cargo"
-                        || c == "git"
-                        || c.ends_with("cargo")
-                        || c.ends_with("cargo.exe")
-                        || c.ends_with("git")
-                        || c.ends_with("git.exe")
+                    Self::is_permitted_executable(cmd, &argv[1..])
                 } else {
                     false
                 }
             }
             omen_agent::ProposedAction::SemanticAction { action, .. } => {
-                action == "status"
-                    || action == "why"
-                    || action == "show"
-                    || action == "inspect"
-                    || action == "history"
-                    || action == "agent"
+                // Only informational/read-only semantic actions permitted
+                matches!(
+                    action.as_str(),
+                    "status" | "why" | "show" | "inspect" | "history"
+                )
             }
         }
+    }
+
+    fn is_permitted_executable(cmd: &str, args: &[String]) -> bool {
+        let bin_name = std::path::Path::new(cmd)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(cmd)
+            .to_lowercase();
+        let clean_bin = bin_name.strip_suffix(".exe").unwrap_or(&bin_name);
+
+        match clean_bin {
+            "cargo" => {
+                let sub = args
+                    .iter()
+                    .find(|a| !a.starts_with('-'))
+                    .map(|s| s.as_str());
+                matches!(sub, Some("check" | "test"))
+            }
+            "git" => {
+                let sub = args
+                    .iter()
+                    .find(|a| !a.starts_with('-'))
+                    .map(|s| s.as_str());
+                if let Some(subcmd) = sub {
+                    if matches!(subcmd, "status" | "diff" | "log") {
+                        !Self::has_destructive_git_args(args)
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
+            _ => false, // Default closed: arbitrary exec (rm, sh, bash, powershell, python, curl, etc.) is refused
+        }
+    }
+
+    fn has_destructive_git_args(args: &[String]) -> bool {
+        for a in args {
+            let lower = a.to_lowercase();
+            if lower == "reset"
+                || lower == "clean"
+                || lower == "push"
+                || lower == "branch"
+                || lower == "checkout"
+                || lower == "rebase"
+                || lower == "rm"
+                || lower == "--hard"
+                || lower == "-fd"
+                || lower == "-df"
+                || lower == "--force"
+                || lower == "-f"
+                || lower == "-d"
+                || lower == "--delete"
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// Executes an operation through the shared daemon broker when connected, or local supervisor if standalone.

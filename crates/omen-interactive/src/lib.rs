@@ -12,7 +12,7 @@ pub mod services;
 pub mod session;
 
 pub use actions::SemanticDispatcher;
-pub use ai_lane::{AiLaneDispatcher, AiLaneOutput};
+pub use ai_lane::{AiLaneDispatchStats, AiLaneDispatcher, AiLaneOutput};
 pub use child::ChildHandoff;
 pub use completion::{CompletionContext, OmenCompleter, OmenHinter};
 pub use grammar::{GrammarScanner, InputLane, TypedReference};
