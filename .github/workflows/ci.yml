@@ -31,6 +31,27 @@ jobs:
       - name: Verify JSON Schemas
         run: cargo run --package xtask -- verify-schemas
 
+      - name: Verify Repository
+        run: cargo run --package xtask -- verify
+
+  rust-analyzer-acceptance:
+    needs: check-and-lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust toolchain and rust-analyzer
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component rust-analyzer
+          rustup default 1.98.1
+          rust-analyzer --version
+
+      - name: Run explicit rust-analyzer function acceptance proof
+        env:
+          OMEN_REQUIRE_SEMANTIC_EXTERNAL_PROOFS: "1"
+        run: cargo test -p omen-cli --test semantic_environment_proofs test_proof_c_real_lsp_symbol_definition_and_references -- --exact --nocapture
+
   matrix-test:
     needs: check-and-lint
     strategy:
