@@ -738,7 +738,15 @@ impl LspClient {
 
 fn uri_to_rel_path(uri: &str, workspace_root: &Path) -> String {
     let path_part = uri.strip_prefix("file:///").unwrap_or(uri);
-    let path = Path::new(path_part);
+    // `to_file_uri` omits the leading slash when constructing a Unix URI, so
+    // restore it before comparing the URI path with the absolute workspace
+    // root. On Windows, `file:///C:/...` must remain `C:/...`.
+    let path_part = if cfg!(unix) && uri.starts_with("file:///") {
+        format!("/{path_part}")
+    } else {
+        path_part.to_string()
+    };
+    let path = Path::new(&path_part);
     if let Ok(rel) = path.strip_prefix(workspace_root) {
         rel.to_string_lossy().replace('\\', "/")
     } else {
