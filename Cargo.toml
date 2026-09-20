@@ -16,6 +16,7 @@ members = [
     "crates/omen-agent",
     "crates/omen-mcp",
     "crates/omen-test-fixtures",
+    "crates/omen-semantic",
     "crates/xtask",
 ]
 exclude = [
@@ -45,6 +46,7 @@ omen-client = { path = "crates/omen-client", version = "0.2.0" }
 omen-agent = { path = "crates/omen-agent", version = "0.2.0" }
 omen-mcp = { path = "crates/omen-mcp", version = "0.2.0" }
 omen-test-fixtures = { path = "crates/omen-test-fixtures", version = "0.2.0" }
+omen-semantic = { path = "crates/omen-semantic", version = "0.2.0" }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

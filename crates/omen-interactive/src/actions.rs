@@ -472,9 +472,223 @@ impl SemanticDispatcher {
                     }
                 }
             }
+            "symbol" => {
+                if args.is_empty() {
+                    println!("Usage: :symbol <query>");
+                    return Ok(ProcessExit {
+                        code: Some(1),
+                        signal: None,
+                    });
+                }
+                let query = &args[0];
+                let reg = crate::semantic_service::build_semantic_registry(cwd);
+                let results =
+                    run_future_blocking(async { reg.symbol_search(query, Some(25), None).await })?;
+                if results.is_empty() {
+                    println!("No symbols found matching '{query}'.");
+                } else {
+                    println!("Found {} symbol(s) matching '{query}':", results.len());
+                    for s in results {
+                        println!(
+                            "  @{}  ({})  {}:{}:{}",
+                            s.uri.as_str(),
+                            s.kind.as_str(),
+                            s.location.file,
+                            s.location.range.start_line + 1,
+                            s.location.range.start_col + 1
+                        );
+                    }
+                }
+                Ok(ProcessExit {
+                    code: Some(0),
+                    signal: None,
+                })
+            }
+            "def" => {
+                if args.is_empty() {
+                    println!("Usage: :def <symbol_name>");
+                    return Ok(ProcessExit {
+                        code: Some(1),
+                        signal: None,
+                    });
+                }
+                let sym = &args[0];
+                let reg = crate::semantic_service::build_semantic_registry(cwd);
+                let res = run_future_blocking(async {
+                    reg.find_definition(sym, None, None, None, None).await
+                })?;
+                match res {
+                    omen_semantic::SemanticLookupResult::Resolved(loc) => {
+                        println!("Definition for @symbol://{sym}:");
+                        println!(
+                            "  Location: {}:{}:{}",
+                            loc.file,
+                            loc.range.start_line + 1,
+                            loc.range.start_col + 1
+                        );
+                    }
+                    omen_semantic::SemanticLookupResult::Ambiguous(candidates) => {
+                        println!(
+                            "Ambiguous symbol '{sym}' (found {} candidates):",
+                            candidates.len()
+                        );
+                        for (i, c) in candidates.iter().enumerate() {
+                            println!(
+                                "  [{}] @{} at {}:{}:{}",
+                                i + 1,
+                                c.uri.as_str(),
+                                c.location.file,
+                                c.location.range.start_line + 1,
+                                c.location.range.start_col + 1
+                            );
+                        }
+                    }
+                    omen_semantic::SemanticLookupResult::NotFound => {
+                        println!("Symbol '{sym}' not found.");
+                    }
+                    omen_semantic::SemanticLookupResult::Unsupported => {
+                        println!("Symbol definition lookup is unsupported by available providers.");
+                    }
+                }
+                Ok(ProcessExit {
+                    code: Some(0),
+                    signal: None,
+                })
+            }
+            "refs" => {
+                if args.is_empty() {
+                    println!("Usage: :refs <symbol_name>");
+                    return Ok(ProcessExit {
+                        code: Some(1),
+                        signal: None,
+                    });
+                }
+                let sym = &args[0];
+                let reg = crate::semantic_service::build_semantic_registry(cwd);
+                let res = run_future_blocking(async {
+                    reg.find_references(sym, None, None, None, Some(50), None)
+                        .await
+                })?;
+                match res {
+                    omen_semantic::SemanticLookupResult::Resolved(refs) => {
+                        if refs.is_empty() {
+                            println!("No references found for '{sym}'.");
+                        } else {
+                            println!("Found {} reference(s) for @symbol://{sym}:", refs.len());
+                            for r in refs {
+                                let tag = if r.is_definition { " (def)" } else { "" };
+                                println!(
+                                    "  {}:{}:{}{}",
+                                    r.location.file,
+                                    r.location.range.start_line + 1,
+                                    r.location.range.start_col + 1,
+                                    tag
+                                );
+                            }
+                        }
+                    }
+                    omen_semantic::SemanticLookupResult::Ambiguous(candidates) => {
+                        println!(
+                            "Ambiguous symbol '{sym}' for references (found {} candidates):",
+                            candidates.len()
+                        );
+                        for (i, c) in candidates.iter().enumerate() {
+                            println!("  [{}] @{} at {}", i + 1, c.uri.as_str(), c.location.file);
+                        }
+                    }
+                    omen_semantic::SemanticLookupResult::NotFound => {
+                        println!("Symbol '{sym}' not found.");
+                    }
+                    omen_semantic::SemanticLookupResult::Unsupported => {
+                        println!("Symbol references lookup is unsupported by available providers.");
+                    }
+                }
+                Ok(ProcessExit {
+                    code: Some(0),
+                    signal: None,
+                })
+            }
+            "structure" => {
+                if args.is_empty() {
+                    println!("Usage: :structure <pattern> [language]");
+                    return Ok(ProcessExit {
+                        code: Some(1),
+                        signal: None,
+                    });
+                }
+                let pattern = &args[0];
+                let lang = args.get(1).map(|s| s.as_str()).unwrap_or("rust");
+                let reg = crate::semantic_service::build_semantic_registry(cwd);
+                let matches = run_future_blocking(async {
+                    reg.structural_search(pattern, lang, Some(25), None).await
+                })?;
+                if matches.is_empty() {
+                    println!("No structural matches found for pattern '{pattern}'.");
+                } else {
+                    println!("Found {} structural match(es):", matches.len());
+                    for m in matches {
+                        println!(
+                            "  {}:{}:{}: {}",
+                            m.file,
+                            m.range.start_line + 1,
+                            m.range.start_col + 1,
+                            m.matched_text.lines().next().unwrap_or("").trim()
+                        );
+                    }
+                }
+                Ok(ProcessExit {
+                    code: Some(0),
+                    signal: None,
+                })
+            }
+            "packages" => {
+                let reg = crate::semantic_service::build_semantic_registry(cwd);
+                let pkgs = run_future_blocking(async { reg.packages(None).await })?;
+                if pkgs.is_empty() {
+                    println!("No workspace packages detected.");
+                } else {
+                    println!("Workspace Packages ({}):", pkgs.len());
+                    for p in pkgs {
+                        println!(
+                            "  @{} v{} [{}] (manifest: {})",
+                            p.uri.as_str(),
+                            p.version,
+                            p.ecosystem,
+                            p.manifest_path
+                        );
+                    }
+                }
+                Ok(ProcessExit {
+                    code: Some(0),
+                    signal: None,
+                })
+            }
+            "tasks" => {
+                let reg = crate::semantic_service::build_semantic_registry(cwd);
+                let pkgs = run_future_blocking(async { reg.packages(None).await })?;
+                let mut all_tasks = Vec::new();
+                for p in pkgs {
+                    for t in p.tasks {
+                        all_tasks.push((p.name.clone(), t));
+                    }
+                }
+                if all_tasks.is_empty() {
+                    println!("No workspace tasks found.");
+                } else {
+                    println!("Workspace Tasks ({}):", all_tasks.len());
+                    for (pkg, t) in all_tasks {
+                        let desc = t.description.as_deref().unwrap_or("");
+                        println!("  {:25} {:20} {}", t.name, pkg, desc);
+                    }
+                }
+                Ok(ProcessExit {
+                    code: Some(0),
+                    signal: None,
+                })
+            }
             other => {
                 println!(
-                    "Unknown Omen semantic action ':{other}'. Available: :status, :doctor, :tools, :inspect, :why, :history, :show, :open, :rerun, :services, :stop, :agent, :backend"
+                    "Unknown Omen semantic action ':{other}'. Available: :status, :doctor, :tools, :inspect, :why, :history, :show, :open, :rerun, :services, :stop, :agent, :backend, :symbol, :def, :refs, :structure, :packages, :tasks"
                 );
                 Ok(ProcessExit {
                     code: Some(1),
@@ -483,4 +697,22 @@ impl SemanticDispatcher {
             }
         }
     }
+}
+
+fn run_future_blocking<F, T>(future: F) -> T
+where
+    F: std::future::Future<Output = T> + Send,
+    T: Send,
+{
+    std::thread::scope(|s| {
+        s.spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to build tokio runtime")
+                .block_on(future)
+        })
+        .join()
+        .expect("Thread panicked")
+    })
 }

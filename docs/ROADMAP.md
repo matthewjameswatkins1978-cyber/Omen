@@ -85,11 +85,20 @@
 - [x] Interactive commands (`:backend list`, `:backend status`, `:backend use <id>`)
 - **Success Criteria**: *Omen can supervise normal developer workloads, hostile fixtures, services and interactive programs while truthfully describing what the platform actually enforced.*
 
-### Omen 0.7: Semantic Environment
+### Omen 0.7: Semantic Environment (Complete)
 - **Theme**: *Understand more than commands.*
-- **Structural Analysis & Metadata**: Ast-grep adapter for AST search/rewrites, compiler metadata extraction.
-- **Language Intelligence**: LSP and SCIP integration for symbol and reference navigation (`symbol://crate/auth/refresh_token`).
-- **Tool Ecosystem**: Richer domain understanding of Cargo/Rust, npm/pnpm, Python/uv, Go, Docker, GitHub CLI. Descriptive grammar ingestion (Carapace/Fig) without authority grant.
+- [x] Semantic models & vocabulary (`ResourceKind::Symbol`, `ResourceKind::Package`, `SourceLocation`, `SymbolRecord`)
+- [x] Structural analysis via `ast-grep run` distinguishing AST nodes from comments and strings (Proof A)
+- [x] Structural rewrite routing through `ThreadMothBridge` with pre/post hash checks and mutation certificates (Proof B)
+- [x] Language intelligence substrate with `rust-analyzer` JSON-RPC transport and `didOpen` syncing (Proof C)
+- [x] Hostile LSP timeout bounding, `$/cancelRequest` cancellation, and late-response discarding (Proof D)
+- [x] SCIP index parser with SHA-256 source file hash witness freshness checking (Proof E)
+- [x] Generational witness cache with targeted invalidation (`CURRENT -> DIRTY`) and lazy pessimism (Proof F)
+- [x] Canonical Cargo workspace metadata, targets, and task extraction (Proof G)
+- [x] Multi-ecosystem package metadata for npm, Python uv, Go, Docker, GitHub CLI (Proof H)
+- [x] Deterministic zero-model AI lane answering symbol/package queries with `provider_calls = 0` (Proof I)
+- [x] Zero-I/O hot keystroke completion path for `@symbol://` and `@package://` in < 5ms (Proof J)
+- [x] 5 Model Context Protocol typed semantic tools (`omen_symbol_search`, `omen_symbol_definition`, `omen_symbol_references`, `omen_structure_search`, `omen_package_query`)
 - **Success Criteria**: *Omen increasingly understands what developer actions mean, not merely which executables launched.*
 
 ### Omen 0.8: Composition

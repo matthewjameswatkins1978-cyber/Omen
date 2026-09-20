@@ -8,6 +8,7 @@ pub mod grammar;
 pub mod preflight;
 pub mod prompt_adapter;
 pub mod resolver;
+pub mod semantic_service;
 pub mod services;
 pub mod session;
 

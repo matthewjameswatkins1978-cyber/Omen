@@ -1,11 +1,17 @@
 use crate::protocol::*;
+use omen_adapters::{
+    AstGrepAdapter, CargoSemanticProvider, DockerSemanticProvider, GitHubCliSemanticProvider,
+    GoSemanticProvider, NpmSemanticProvider, PythonUvSemanticProvider, ScipProvider,
+};
 use omen_client::OmenClient;
 use omen_core::InteractiveSessionId;
 use omen_knowledge::{
     ContentAddressedStore, Database, canonical_workspace_db_path, resolve_workspace_dir,
 };
+use omen_semantic::{SemanticProvider, SemanticProviderRegistry};
 use serde_json::{Value, json};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 pub struct McpServer {
@@ -168,6 +174,70 @@ impl McpServer {
                     "properties": {}
                 }),
             },
+            ToolDefinition {
+                name: "omen_symbol_search".into(),
+                description: "Search for symbols across workspace semantic providers (LSP, SCIP).".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["query"],
+                    "properties": {
+                        "query": { "type": "string", "description": "Symbol name or substring" },
+                        "limit": { "type": "integer", "description": "Maximum results (default: 50)" }
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "omen_symbol_definition".into(),
+                description: "Find exact definition location for a symbol across workspace providers.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["symbol"],
+                    "properties": {
+                        "symbol": { "type": "string", "description": "Exact symbol name" },
+                        "file": { "type": "string", "description": "Optional file path hint" },
+                        "line": { "type": "integer", "description": "Optional 0-indexed line hint" },
+                        "col": { "type": "integer", "description": "Optional 0-indexed column hint" }
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "omen_symbol_references".into(),
+                description: "Find call sites and references to a symbol across workspace providers.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["symbol"],
+                    "properties": {
+                        "symbol": { "type": "string", "description": "Symbol identifier" },
+                        "file": { "type": "string", "description": "Optional file path hint" },
+                        "line": { "type": "integer", "description": "Optional 0-indexed line hint" },
+                        "col": { "type": "integer", "description": "Optional 0-indexed column hint" },
+                        "limit": { "type": "integer", "description": "Maximum references (default: 50)" }
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "omen_structure_search".into(),
+                description: "Search for code structure patterns using ast-grep syntax matching.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["pattern"],
+                    "properties": {
+                        "pattern": { "type": "string", "description": "ast-grep structural pattern (e.g. 'fn $NAME($$$) { $$$ }')" },
+                        "language": { "type": "string", "description": "Language (default: 'rust')" },
+                        "limit": { "type": "integer", "description": "Maximum matches (default: 50)" }
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "omen_package_query".into(),
+                description: "Query workspace packages, dependencies, targets, and tasks across ecosystems (Cargo, npm, uv, go, Docker).".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "target": { "type": "string", "description": "Optional package or target name to filter" }
+                    }
+                }),
+            },
         ];
 
         JsonRpcResponse::success(id, json!({ "tools": tools }))
@@ -197,6 +267,11 @@ impl McpServer {
             "omen_services_list" => self.tool_services_list().await,
             "omen_services_control" => self.tool_services_control(&arguments).await,
             "omen_capabilities_discover" => self.tool_capabilities_discover().await,
+            "omen_symbol_search" => self.tool_symbol_search(&arguments).await,
+            "omen_symbol_definition" => self.tool_symbol_definition(&arguments).await,
+            "omen_symbol_references" => self.tool_symbol_references(&arguments).await,
+            "omen_structure_search" => self.tool_structure_search(&arguments).await,
+            "omen_package_query" => self.tool_package_query(&arguments).await,
             other => CallToolResult::error(format!("Unknown tool: '{other}'")),
         };
 
@@ -511,6 +586,135 @@ impl McpServer {
             }
         });
         CallToolResult::text(serde_json::to_string_pretty(&caps).unwrap())
+    }
+
+    fn build_registry(&self) -> SemanticProviderRegistry {
+        let mut reg = SemanticProviderRegistry::new(self.workspace_path.clone());
+        let ast = AstGrepAdapter::new(self.workspace_path.clone());
+        if ast.is_available() {
+            reg.register(Arc::new(ast));
+        }
+        let cargo = CargoSemanticProvider::new(&self.workspace_path);
+        if cargo.is_available() {
+            reg.register(Arc::new(cargo));
+        }
+        let npm = NpmSemanticProvider::new(&self.workspace_path);
+        if npm.is_available() {
+            reg.register(Arc::new(npm));
+        }
+        let uv = PythonUvSemanticProvider::new(&self.workspace_path);
+        if uv.is_available() {
+            reg.register(Arc::new(uv));
+        }
+        let go = GoSemanticProvider::new(&self.workspace_path);
+        if go.is_available() {
+            reg.register(Arc::new(go));
+        }
+        let docker = DockerSemanticProvider::new(&self.workspace_path);
+        if docker.is_available() {
+            reg.register(Arc::new(docker));
+        }
+        let gh = GitHubCliSemanticProvider::new(&self.workspace_path);
+        if gh.is_available() {
+            reg.register(Arc::new(gh));
+        }
+        let scip_file = self.workspace_path.join("index.scip");
+        if scip_file.exists()
+            && let Ok(scip) = ScipProvider::load_from_file(self.workspace_path.clone(), scip_file)
+        {
+            reg.register(Arc::new(scip));
+        }
+        reg
+    }
+
+    async fn tool_symbol_search(&self, args: &Value) -> CallToolResult {
+        let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize);
+        let reg = self.build_registry();
+        match reg.symbol_search(query, limit, None).await {
+            Ok(symbols) => CallToolResult::text(serde_json::to_string_pretty(&symbols).unwrap()),
+            Err(e) => CallToolResult::error(format!("Symbol search failed: {e}")),
+        }
+    }
+
+    async fn tool_symbol_definition(&self, args: &Value) -> CallToolResult {
+        let symbol = match args.get("symbol").and_then(|v| v.as_str()) {
+            Some(s) => s,
+            None => return CallToolResult::error("Missing 'symbol' parameter"),
+        };
+        let file = args.get("file").and_then(|v| v.as_str());
+        let line = args
+            .get("line")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize);
+        let col = args.get("col").and_then(|v| v.as_u64()).map(|n| n as usize);
+        let reg = self.build_registry();
+        match reg.find_definition(symbol, file, line, col, None).await {
+            Ok(res) => CallToolResult::text(serde_json::to_string_pretty(&res).unwrap()),
+            Err(e) => CallToolResult::error(format!("Symbol definition lookup failed: {e}")),
+        }
+    }
+
+    async fn tool_symbol_references(&self, args: &Value) -> CallToolResult {
+        let symbol = match args.get("symbol").and_then(|v| v.as_str()) {
+            Some(s) => s,
+            None => return CallToolResult::error("Missing 'symbol' parameter"),
+        };
+        let file = args.get("file").and_then(|v| v.as_str());
+        let line = args
+            .get("line")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize);
+        let col = args.get("col").and_then(|v| v.as_u64()).map(|n| n as usize);
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize);
+        let reg = self.build_registry();
+        match reg
+            .find_references(symbol, file, line, col, limit, None)
+            .await
+        {
+            Ok(res) => CallToolResult::text(serde_json::to_string_pretty(&res).unwrap()),
+            Err(e) => CallToolResult::error(format!("Symbol references lookup failed: {e}")),
+        }
+    }
+
+    async fn tool_structure_search(&self, args: &Value) -> CallToolResult {
+        let pattern = match args.get("pattern").and_then(|v| v.as_str()) {
+            Some(p) => p,
+            None => return CallToolResult::error("Missing 'pattern' parameter"),
+        };
+        let language = args
+            .get("language")
+            .and_then(|v| v.as_str())
+            .unwrap_or("rust");
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize);
+        let reg = self.build_registry();
+        match reg.structural_search(pattern, language, limit, None).await {
+            Ok(matches) => CallToolResult::text(serde_json::to_string_pretty(&matches).unwrap()),
+            Err(e) => CallToolResult::error(format!("Structural search failed: {e}")),
+        }
+    }
+
+    async fn tool_package_query(&self, args: &Value) -> CallToolResult {
+        let target = args.get("target").and_then(|v| v.as_str());
+        let reg = self.build_registry();
+        match reg.packages(None).await {
+            Ok(mut pkgs) => {
+                if let Some(t) = target {
+                    pkgs.retain(|p| p.name == t || p.targets.iter().any(|tg| tg.name == t));
+                }
+                CallToolResult::text(serde_json::to_string_pretty(&pkgs).unwrap())
+            }
+            Err(e) => CallToolResult::error(format!("Package query failed: {e}")),
+        }
     }
 
     async fn handle_resources_list(&self, id: Option<Value>) -> JsonRpcResponse {

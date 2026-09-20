@@ -33,3 +33,6 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+omen-semantic = { workspace = true }
+omen-agent = { workspace = true }
+omen-test-fixtures = { workspace = true }

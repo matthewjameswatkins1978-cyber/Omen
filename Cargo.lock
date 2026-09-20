@@ -691,12 +691,14 @@ dependencies = [
  "omen-engine",
  "omen-knowledge",
  "omen-schema",
+ "omen-semantic",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "thiserror",
  "tokio",
+ "toml",
  "tracing",
 ]
 
@@ -747,6 +749,7 @@ version = "0.2.0"
 dependencies = [
  "clap",
  "omen-adapters",
+ "omen-agent",
  "omen-atlas",
  "omen-client",
  "omen-core",
@@ -757,6 +760,8 @@ dependencies = [
  "omen-knowledge",
  "omen-mcp",
  "omen-schema",
+ "omen-semantic",
+ "omen-test-fixtures",
  "omen-ui",
  "serde",
  "serde_json",
@@ -858,6 +863,7 @@ dependencies = [
  "omen-ipc",
  "omen-knowledge",
  "omen-schema",
+ "omen-semantic",
  "omen-test-fixtures",
  "omen-ui",
  "reedline",
@@ -905,6 +911,7 @@ name = "omen-mcp"
 version = "0.2.0"
 dependencies = [
  "clap",
+ "omen-adapters",
  "omen-agent",
  "omen-client",
  "omen-core",
@@ -912,6 +919,7 @@ dependencies = [
  "omen-engine",
  "omen-ipc",
  "omen-knowledge",
+ "omen-semantic",
  "omen-test-fixtures",
  "serde",
  "serde_json",
@@ -935,11 +943,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "omen-semantic"
+version = "0.2.0"
+dependencies = [
+ "hex",
+ "omen-core",
+ "omen-knowledge",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "omen-test-fixtures"
 version = "0.2.0"
 dependencies = [
  "clap",
  "crossterm",
+ "serde_json",
  "tokio",
 ]
 

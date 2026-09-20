@@ -27,6 +27,12 @@ pub struct HotSemanticIndex {
     pub known_actions: Vec<String>,
     /// Dynamic typed references.
     pub static_refs: Vec<String>,
+    /// Bounded in-memory symbols for zero-I/O keystroke completion.
+    pub cached_symbols: Vec<String>,
+    /// Bounded in-memory known packages.
+    pub known_packages: Vec<String>,
+    /// Bounded in-memory known tasks.
+    pub known_tasks: Vec<String>,
 }
 
 impl Default for HotSemanticIndex {
@@ -50,6 +56,12 @@ impl Default for HotSemanticIndex {
                 ":rerun".into(),
                 ":services".into(),
                 ":stop".into(),
+                ":symbol".into(),
+                ":def".into(),
+                ":refs".into(),
+                ":structure".into(),
+                ":packages".into(),
+                ":tasks".into(),
             ],
             static_refs: vec![
                 "@last".into(),
@@ -59,6 +71,9 @@ impl Default for HotSemanticIndex {
                 "@failed".into(),
                 "@errors".into(),
             ],
+            cached_symbols: Vec::new(),
+            known_packages: Vec::new(),
+            known_tasks: Vec::new(),
         }
     }
 }
@@ -89,6 +104,18 @@ impl HotSemanticIndex {
                     .push(entry.file_name().to_string_lossy().to_string());
             }
         }
+    }
+
+    /// Updates semantic index entries (symbols, packages, tasks) strictly out-of-band.
+    pub fn update_semantics(
+        &mut self,
+        symbols: Vec<String>,
+        packages: Vec<String>,
+        tasks: Vec<String>,
+    ) {
+        self.cached_symbols = symbols;
+        self.known_packages = packages;
+        self.known_tasks = tasks;
     }
 
     pub fn update_fact(&mut self, info: &omen_ipc::FactInfo) {
@@ -231,6 +258,18 @@ impl OmenCompleter {
                     ));
                 }
             }
+            for sym in &ctx.hot_index.cached_symbols {
+                let sym_ref = format!("@symbol://{sym}");
+                if let Some(score) = self.matcher.fuzzy_match(&sym_ref, word) {
+                    candidates.push((sym_ref, Some("symbol ref".into()), score));
+                }
+            }
+            for pkg in &ctx.hot_index.known_packages {
+                let pkg_ref = format!("@package://{pkg}");
+                if let Some(score) = self.matcher.fuzzy_match(&pkg_ref, word) {
+                    candidates.push((pkg_ref, Some("package ref".into()), score));
+                }
+            }
         } else if start == 0 {
             for tool in &ctx.hot_index.known_tools {
                 if let Some(score) = self.matcher.fuzzy_match(tool, word) {
@@ -250,6 +289,27 @@ impl OmenCompleter {
         } else {
             let first_word = line.split_whitespace().next().unwrap_or("");
             match first_word {
+                ":symbol" | ":def" | ":refs" => {
+                    for sym in &ctx.hot_index.cached_symbols {
+                        if let Some(score) = self.matcher.fuzzy_match(sym, word) {
+                            candidates.push((sym.clone(), Some("symbol".into()), score));
+                        }
+                    }
+                }
+                ":packages" => {
+                    for pkg in &ctx.hot_index.known_packages {
+                        if let Some(score) = self.matcher.fuzzy_match(pkg, word) {
+                            candidates.push((pkg.clone(), Some("package".into()), score));
+                        }
+                    }
+                }
+                ":tasks" => {
+                    for t in &ctx.hot_index.known_tasks {
+                        if let Some(score) = self.matcher.fuzzy_match(t, word) {
+                            candidates.push((t.clone(), Some("task".into()), score));
+                        }
+                    }
+                }
                 "cargo" => {
                     for sub in &["build", "test", "check", "run", "clean", "clippy", "fmt"] {
                         if let Some(score) = self.matcher.fuzzy_match(sub, word) {

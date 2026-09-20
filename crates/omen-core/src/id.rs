@@ -67,6 +67,8 @@ define_id!(OperationId, "op");
 define_id!(BackendId, "backend");
 define_id!(PtySessionId, "pty");
 define_id!(RuntimeLeaseId, "lease");
+define_id!(SemanticProviderId, "sprov");
+define_id!(SymbolId, "sym");
 
 impl InteractiveSessionId {
     /// Generates a genuinely unique opaque session ID using UUID v4.

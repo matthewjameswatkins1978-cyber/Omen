@@ -303,14 +303,17 @@ Independent developments across the developer tooling landscape validate Omen's 
   - Secrets handles: Strict separation of `secret.use` (execution injection) from `secret.expose` (value revelation).
 - **Success Criteria**: *Omen can supervise normal developer workloads, hostile fixtures, services and interactive programs while truthfully describing what the platform actually enforced.*
 
-### Omen 0.7 — Semantic Environment
+### Omen 0.7 — Semantic Environment (Complete)
 - **Theme**: *Understand more than commands.*
 - **Capabilities**:
-  - Ast-grep adapter for structural code search and AST rewrites.
-  - Compiler metadata extraction.
-  - LSP and SCIP integration for symbol and reference navigation (`symbol://crate/auth/refresh_token`).
-  - Richer ecosystem understanding: Rust/Cargo, npm/pnpm, Python/uv, Go, Docker, GitHub CLI.
-  - Descriptive grammar ingestion (Carapace/Fig) for descriptive syntax hints (without granting authority).
+  - Ast-grep adapter for structural code search (`ast-grep run`) and AST rewrites routed through ThreadMoth with cryptographic certificates.
+  - Language intelligence via asynchronous stdio LSP client (`rust-analyzer`) with `didOpen` syncing, cancellation (`$/cancelRequest`), and late-response discarding.
+  - SCIP index parser with SHA-256 source file hash witness freshness checking (`is_stale()`).
+  - Generational witness cache (`SemanticCache`) with targeted invalidation (`CURRENT -> DIRTY`) adhering to lazy pessimism.
+  - Canonical workspace package semantics, targets, and task extraction for Cargo, npm, Python uv, Go, Docker, and GitHub CLI.
+  - Deterministic AI lane classifying and resolving symbol and package queries with zero model calls (`provider_calls = 0`).
+  - Purely in-memory hot keystroke completion path for `@symbol://` and `@package://` in < 5ms.
+  - 5 Model Context Protocol typed semantic tools (`omen_symbol_search`, `omen_symbol_definition`, `omen_symbol_references`, `omen_structure_search`, `omen_package_query`).
 - **Success Criteria**: *Omen increasingly understands what developer actions mean, not merely which executables launched.*
 
 ### Omen 0.8 — Composition
