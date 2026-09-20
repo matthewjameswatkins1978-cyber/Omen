@@ -39,9 +39,20 @@ omen --machine action show <action-id>
 omen --machine action plan <action-id>
 ```
 
-These commands parse, validate and project a plan only. There is deliberately
-no `action run` surface in this checkpoint, and configuration cannot contain
-policy, authority, shell, interpolation, loop or conditional semantics.
+These commands parse, validate and project a plan only. Execution is an
+explicitly separate surface:
+
+```text
+omen --machine action run <action-id> \
+  --expect-plan sha256:... \
+  --execution-contract <step-id>=<contract.json>
+```
+
+`run` reloads configuration and context, recomputes the plan, and refuses
+before step one if the digest changed. Consequential steps re-check their
+current external contract immediately before execution. Configuration still
+cannot contain policy, authority, shell, interpolation, loop, conditional or
+nested-action semantics.
 
 ## Plan before run
 
@@ -58,6 +69,10 @@ Running a named composition tomorrow must still satisfy tomorrow's authority.
 Omen can remember what an operation means.
 
 Tethers decides whether this actor may do it now.
+
+Omen consumes the supplied `ExecutionContractWire` as the current external
+execution identity. It does not perform live Tethers revocation checking or
+create a competing policy or replay journal.
 
 ## Why composition belongs beside discoverability
 

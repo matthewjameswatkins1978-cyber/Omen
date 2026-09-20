@@ -1,4 +1,5 @@
 use clap::{Args, Parser, Subcommand};
+use omen_adapters::{DefaultCapabilityExecutor, execute_plan, get_workspace_semantic_registry};
 use omen_atlas::{RuntimeProfile, ToolValidator};
 use omen_core::composition::{self, OmenWorkspaceConfig};
 use omen_core::machine_contract::{self, CapabilityProjection};
@@ -10,9 +11,7 @@ use omen_knowledge::{
     ContentAddressedStore, Database, FactRegistry, canonical_workspace_db_path_readonly,
     workspace_state_dir_path,
 };
-use omen_schema::{
-    ExecutionContractWire, ExecutionResultWire, ProcessExitWire, SCHEMA_VERSION_RESULT,
-};
+use omen_schema::{ExecutionContractWire, ExecutionResultWire};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -102,6 +101,15 @@ enum ActionSubcommands {
     Show { action_id: String },
     /// Validate and build a deterministic read-only action plan.
     Plan { action_id: String },
+    /// Execute exactly the freshly recomputed plan identified by --expect-plan.
+    Run {
+        action_id: String,
+        #[arg(long)]
+        expect_plan: String,
+        /// Repeatable step-id=ExecutionContract JSON path binding.
+        #[arg(long = "execution-contract")]
+        execution_contract: Vec<String>,
+    },
 }
 
 #[derive(Debug)]
@@ -176,6 +184,45 @@ fn print_composition_error(error: impl std::fmt::Display, code: &str) {
         "{}",
         serde_json::json!({"error":code,"message":error.to_string(),"state_changed":false,"retryable":false,"next_actions":["action","show"]})
     );
+}
+
+fn load_execution_contracts(
+    bindings: &[String],
+) -> Result<std::collections::BTreeMap<String, ExecutionContract>, ConfigLoadError> {
+    let mut contracts = std::collections::BTreeMap::new();
+    for binding in bindings {
+        let (step_id, path) = binding.split_once('=').ok_or_else(|| ConfigLoadError {
+            code: "AUTHORITY_CONTRACT_INVALID",
+            message: format!("expected <step-id>=<path>, got '{binding}'"),
+        })?;
+        if step_id.is_empty() || path.is_empty() {
+            return Err(ConfigLoadError {
+                code: "AUTHORITY_CONTRACT_INVALID",
+                message: format!("invalid authority binding '{binding}'"),
+            });
+        }
+        if contracts.contains_key(step_id) {
+            return Err(ConfigLoadError {
+                code: "AUTHORITY_CONTRACT_INVALID",
+                message: format!("duplicate authority mapping for step '{step_id}'"),
+            });
+        }
+        let content = std::fs::read_to_string(path).map_err(|e| ConfigLoadError {
+            code: "AUTHORITY_CONTRACT_INVALID",
+            message: format!("cannot read contract for '{step_id}': {e}"),
+        })?;
+        let wire: ExecutionContractWire =
+            serde_json::from_str(&content).map_err(|e| ConfigLoadError {
+                code: "AUTHORITY_CONTRACT_INVALID",
+                message: format!("invalid contract for '{step_id}': {e}"),
+            })?;
+        let contract = ExecutionContract::try_from(wire).map_err(|e| ConfigLoadError {
+            code: "AUTHORITY_CONTRACT_INVALID",
+            message: e.to_string(),
+        })?;
+        contracts.insert(step_id.to_owned(), contract);
+    }
+    Ok(contracts)
 }
 
 #[derive(Args, Debug)]
@@ -605,6 +652,95 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+                ActionSubcommands::Run {
+                    action_id,
+                    expect_plan,
+                    execution_contract,
+                } => {
+                    let config = match loaded {
+                        Some(config) => config,
+                        None => {
+                            print_composition_error("Omen.toml is not present", "ACTION_NOT_FOUND");
+                            std::process::exit(2);
+                        }
+                    };
+                    let plan = match composition::plan_action(
+                        &config,
+                        &action_id,
+                        &machine_contract::contract(),
+                        &machine_context,
+                    ) {
+                        Ok(plan) => plan,
+                        Err(error) => {
+                            print_composition_error(&error, &error.code);
+                            std::process::exit(2);
+                        }
+                    };
+                    if plan.plan_digest != expect_plan {
+                        println!(
+                            "{}",
+                            serde_json::json!({"error":"PLAN_CHANGED","expected_plan_digest":expect_plan,"actual_plan_digest":plan.plan_digest,"message":"the current plan differs from --expect-plan; run action plan again","state_changed":false,"retryable":false,"next_actions":["action plan"]})
+                        );
+                        std::process::exit(2);
+                    }
+                    let authorities = match load_execution_contracts(&execution_contract) {
+                        Ok(contracts) => contracts,
+                        Err(error) => {
+                            print_composition_error(&error, error.code);
+                            std::process::exit(2);
+                        }
+                    };
+                    let supervisor = ProcessSupervisor::new();
+                    let registry = get_workspace_semantic_registry(&ws_root);
+                    let executor =
+                        DefaultCapabilityExecutor::new(ws_root.clone(), registry, supervisor);
+                    let mut db = match Database::open(&db_path) {
+                        Ok(db) => db,
+                        Err(error) => {
+                            print_composition_error(&error, "EXECUTION_STATE_UNAVAILABLE");
+                            std::process::exit(2);
+                        }
+                    };
+                    let cas = ContentAddressedStore::new(cas_dir);
+                    let report = match execute_plan(
+                        &plan,
+                        &executor,
+                        &authorities,
+                        &mut db,
+                        &cas,
+                        machine_context.context_generation,
+                    )
+                    .await
+                    {
+                        Ok(report) => report,
+                        Err(error) => {
+                            print_composition_error(&error.message, &error.code);
+                            std::process::exit(2);
+                        }
+                    };
+                    if json_mode {
+                        println!("{}", serde_json::to_string_pretty(&report)?);
+                    } else {
+                        println!("Action {}", report.action_id);
+                        println!("Plan {}", report.plan_digest);
+                        for (index, step) in report.steps.iter().enumerate() {
+                            println!(
+                                "{}. {} {} {:?}",
+                                index + 1,
+                                step.step_id,
+                                step.capability_id,
+                                step.status
+                            );
+                        }
+                        println!("{:?} in {}ms", report.status, report.duration_ms);
+                        if let Some(evidence) = report.evidence_artifact {
+                            println!("Evidence: {evidence}");
+                        }
+                    }
+                    if report.status != omen_core::composition::ActionRunStatus::Completed {
+                        std::process::exit(1);
+                    }
+                }
             }
         }
         Some(Commands::Tool(tool_args)) => match tool_args.subcommand {
@@ -735,19 +871,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let wire: ExecutionContractWire = serde_json::from_str(&content)?;
                 let contract = ExecutionContract::try_from(wire)?;
 
-                let req = ExecutionRequest {
-                    argv: contract.intent.args,
-                    cwd: ws_root,
-                    env: vec![],
-                    stdin_mode: contract.stdio.stdin,
-                    stdin_payload: None,
-                    timeout_ms: contract.constraints.timeout_ms,
-                    inline_budget: exec_args.budget,
-                    required_assurance: contract.required_assurance,
-                    secrets: vec![],
-                };
-
-                let output = supervisor.execute(req).await?;
+                let output = supervisor
+                    .execute_contract(&contract, ws_root.clone(), exec_args.budget, false)
+                    .await?;
                 let artifact = cas.store(
                     &mut db,
                     &output.stdout_all,
@@ -756,29 +882,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     omen_core::RetentionClass::Referenced,
                 )?;
 
-                let backend_caps = supervisor.backend().capabilities();
-                let res_wire = ExecutionResultWire {
-                    schema_version: SCHEMA_VERSION_RESULT.to_string(),
-                    execution_id: contract.execution_id.to_string(),
-                    action_id: ActionId::new("act-execution-result").unwrap().to_string(),
-                    runtime_status: format!("{:?}", output.runtime_status).to_uppercase(),
-                    process_exit: ProcessExitWire {
-                        code: output.process_exit.code,
-                        signal: None,
-                    },
-                    adapter_classification: "EXECUTION_COMPLETE".to_string(),
-                    enforcement: omen_schema::EnforcementReportWire {
-                        filesystem: format!("{:?}", backend_caps.filesystem).to_uppercase(),
-                        network: format!("{:?}", backend_caps.network).to_uppercase(),
-                        descendant_processes: format!("{:?}", backend_caps.descendants)
-                            .to_uppercase(),
-                        symlink_escape: "OBSERVED".to_string(),
-                    },
+                let result = omen_core::ExecutionResult {
+                    execution_id: contract.execution_id.clone(),
+                    action_id: ActionId::new("act-execution-result").unwrap(),
+                    runtime_status: output.runtime_status,
+                    process_exit: output.process_exit.clone(),
+                    adapter_classification: output.adapter_classification,
+                    enforcement: output.enforcement.clone(),
                     observations: vec![],
                     fact_updates: vec![],
-                    artifacts: vec![artifact.uri.to_string()],
+                    artifacts: vec![artifact.uri],
                     reduced_summary: String::from_utf8_lossy(&output.stdout_bounded).to_string(),
                 };
+                let res_wire = ExecutionResultWire::from(&result);
 
                 println!("{}", serde_json::to_string_pretty(&res_wire)?);
             } else {

@@ -3,6 +3,7 @@
 pub mod ast_grep;
 pub mod cargo;
 pub mod cargo_semantics;
+pub mod composition_executor;
 pub mod ecosystem;
 pub mod git;
 pub mod lsp;
@@ -18,6 +19,9 @@ pub use cargo::{
     CargoAdapter, CargoCheckResult, CargoTestResult, CompilerDiagnostic, CompilerDiagnosticSpan,
 };
 pub use cargo_semantics::CargoSemanticProvider;
+pub use composition_executor::{
+    CapabilityExecutor, CapabilityRequest, DefaultCapabilityExecutor, execute_plan,
+};
 pub use ecosystem::{
     DockerSemanticProvider, GitHubCliSemanticProvider, GoSemanticProvider, NpmSemanticProvider,
     PythonUvSemanticProvider,

@@ -36,12 +36,15 @@ Operate against a specific workspace root.
     omen --machine action list
     omen --machine action show <action-id>
     omen --machine action plan <action-id>
+    omen --machine action run <action-id> --expect-plan <sha256:...> \
+        --execution-contract <step-id>=<contract.json>
 
 These commands read only the selected workspace's optional `Omen.toml`.
 `list` and `show` are inert configuration inspection. `plan` performs
 deterministic capability, binding, type, effect, and status validation and
-never executes a step. There is intentionally no `action run` command in this
-checkpoint.
+never executes a step. `run` recomputes the plan and refuses unless its digest
+matches `--expect-plan`; each consequential step consumes a separately supplied
+current external execution contract.
 
 ## Health
 
@@ -64,6 +67,10 @@ checkpoint.
 
     omen exec [--timeout-ms <n>] [--budget <bytes>] <argv...>
     omen exec --contract <file>
+
+`action run` is sequential, bounded, non-interactive, and fail-closed. It does
+not add workflow language, policy, approval, retry, rollback, or nested action
+semantics.
 
 ## Artifacts
 
