@@ -173,8 +173,6 @@ async fn test_scip_provider_symbol_and_staleness() {
     assert!(stale_res.is_stale(), "Stale index must return Stale result");
     assert!(!stale_res.is_resolved());
 }
-
-
 fn gremlin_exe() -> PathBuf {
     let mut path = std::env::current_exe().expect("failed to get current_exe");
     path.pop();
@@ -207,7 +205,10 @@ fn gremlin_exe() -> PathBuf {
         .args(["build", "-p", "omen-test-fixtures", "--bin", "omen-gremlin"])
         .status()
         .expect("failed to invoke cargo for omen-gremlin");
-    assert!(status.success(), "failed to build omen-gremlin test fixture");
+    assert!(
+        status.success(),
+        "failed to build omen-gremlin test fixture"
+    );
     assert!(fallback.exists(), "omen-gremlin fixture was not produced");
     fallback
 }
@@ -241,10 +242,7 @@ pub struct SessionToken;
     temp
 }
 
-fn gremlin_provider(
-    workspace: &Path,
-    mode: &str,
-) -> RustAnalyzerProvider {
+fn gremlin_provider(workspace: &Path, mode: &str) -> RustAnalyzerProvider {
     RustAnalyzerProvider::with_binary_args(
         workspace.to_path_buf(),
         gremlin_exe(),
@@ -280,7 +278,9 @@ async fn rust_analyzer_all_symbol_lookup_finds_functions_and_preserves_ambiguity
         .as_resolved()
         .expect("function references must resolve through all-symbol lookup");
     assert!(
-        references.iter().any(|reference| reference.location.range.start_line == 2),
+        references
+            .iter()
+            .any(|reference| reference.location.range.start_line == 2),
         "known refresh_token call site must be returned"
     );
 
