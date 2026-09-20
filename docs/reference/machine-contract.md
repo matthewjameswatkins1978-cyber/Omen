@@ -8,6 +8,11 @@ The Machine Contract is Omen's versioned self-description for machine clients.
 
 Static definitions include capability IDs, groups, summaries, input/output schemas, effects, idempotency, reversibility, network characteristics, authority requirements, bounds, timeout semantics, examples and recipes.
 
+`execution.run` is potentially network-capable and consequential because it
+starts an arbitrary process. `composition.run` is likewise consequential and
+requires a current externally supplied execution contract; composition cannot
+contain `composition.plan` or `composition.run` child steps.
+
 ## Live status overlay
 
 Runtime status is separate and may include availability, admission, provider status, assurance, degradation reason, context generation, workspace and backend state.

@@ -8,6 +8,7 @@ use crate::machine_contract::{
     AdmissionState, CapabilityDefinition, CapabilityStatus, EffectClass, MachineContext,
     MachineContract, NetworkEffect, Reversibility,
 };
+use crate::{EnforcementReport, ProcessExit};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -100,7 +101,72 @@ pub struct PlanEffectSummary {
     pub effect_classes: Vec<EffectClass>,
     pub network_effect: NetworkEffect,
     pub mutating_steps: Vec<String>,
+    pub consequential_steps: Vec<String>,
     pub authority_requirements: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ActionRunStatus {
+    Completed,
+    Failed,
+    Refused,
+    TimedOut,
+    Partial,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum StateChange {
+    No,
+    Yes,
+    Possible,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActionExecutionError {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ActionStepRunStatus {
+    Completed,
+    Failed,
+    Refused,
+    TimedOut,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActionStepRunResult {
+    pub step_id: String,
+    pub capability_id: String,
+    pub status: ActionStepRunStatus,
+    pub duration_ms: u64,
+    pub output: Option<Value>,
+    pub error: Option<ActionExecutionError>,
+    pub artifacts: Vec<String>,
+    pub process_exit: Option<ProcessExit>,
+    pub enforcement: Option<EnforcementReport>,
+    pub state_changed: StateChange,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActionRunReport {
+    pub action_id: String,
+    pub plan_digest: String,
+    pub contract_digest: String,
+    pub context_generation_before: Option<i64>,
+    pub context_generation_after: Option<i64>,
+    pub status: ActionRunStatus,
+    pub state_changed: StateChange,
+    pub completed_steps: usize,
+    pub failed_step: Option<String>,
+    pub steps: Vec<ActionStepRunResult>,
+    pub artifacts: Vec<String>,
+    pub duration_ms: u64,
+    pub evidence_artifact: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -305,6 +371,7 @@ pub fn plan_action(
     let mut effect_classes = BTreeSet::new();
     let mut network = NetworkEffect::None;
     let mut mutating_steps = Vec::new();
+    let mut consequential_steps = Vec::new();
     let mut authorities = BTreeSet::new();
     let mut warnings = Vec::new();
 
@@ -430,6 +497,12 @@ pub fn plan_action(
         if definition.effect_class == EffectClass::Mutate {
             mutating_steps.push(step.id.clone());
         }
+        if matches!(
+            definition.effect_class,
+            EffectClass::Mutate | EffectClass::SpawnProcess
+        ) {
+            consequential_steps.push(step.id.clone());
+        }
         if definition.authority != "none" {
             authorities.insert(definition.authority.clone());
         }
@@ -472,6 +545,7 @@ pub fn plan_action(
             effect_classes: effect_classes.into_iter().collect(),
             network_effect: network,
             mutating_steps,
+            consequential_steps,
             authority_requirements: authorities.into_iter().collect(),
         },
         planning_valid: true,

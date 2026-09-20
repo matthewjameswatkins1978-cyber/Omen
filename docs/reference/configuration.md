@@ -42,5 +42,7 @@ refused. A resolved configuration path outside the selected workspace is
 refused.
 
 `omen action list` and `omen action show` inspect configuration only.
-`omen action plan` validates and produces a read-only deterministic plan. No
-action execution exists in this checkpoint.
+`omen action plan` validates and produces a read-only deterministic plan.
+`omen action run` is separate from configuration: it requires an explicit
+`--expect-plan` digest and repeatable `--execution-contract <step-id>=<path>`
+bindings. Authority material is never stored in `Omen.toml`.

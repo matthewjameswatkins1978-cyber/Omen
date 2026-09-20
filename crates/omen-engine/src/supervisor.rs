@@ -1,7 +1,7 @@
 use crate::backend::{ExecutionBackend, NativeExecutionBackend};
 use omen_core::{
-    AdapterClassification, CoreError, EnforcementReport, ProcessExit, RequiredAssurance,
-    RuntimeStatus, SecretInjectionContract, StdioMode,
+    AdapterClassification, CoreError, EnforcementReport, ExecutionContract, ProcessExit,
+    RequiredAssurance, RuntimeStatus, SecretInjectionContract, StdioMode,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -127,6 +127,78 @@ impl ProcessSupervisor {
 
     pub fn backend(&self) -> &dyn ExecutionBackend {
         self.backend.as_ref()
+    }
+
+    /// Validate contract semantics that this physical backend can actually enforce.
+    /// This is shared by direct contract execution and composition execution.
+    pub fn validate_contract(
+        &self,
+        contract: &ExecutionContract,
+        expected_argv: Option<&[String]>,
+        composition: bool,
+    ) -> Result<(), CoreError> {
+        if contract.intent.args.is_empty() {
+            return Err(CoreError::ExecutionFailed(
+                "AUTHORITY_CONTRACT_INVALID: empty argv".into(),
+            ));
+        }
+        if let Some(expected) = expected_argv
+            && expected != contract.intent.args.as_slice()
+        {
+            return Err(CoreError::ExecutionFailed(
+                "AUTHORITY_CONTRACT_MISMATCH: contract argv does not exactly match resolved inputs"
+                    .into(),
+            ));
+        }
+        if contract.constraints.network_denied
+            && self.backend().capabilities().network != omen_core::EnforcementLevel::Enforced
+        {
+            return Err(CoreError::ExecutionFailed(
+                "NETWORK_CONSTRAINT_UNENFORCEABLE: active backend cannot enforce network denial"
+                    .into(),
+            ));
+        }
+        if !contract.leases.is_empty() {
+            return Err(CoreError::ExecutionFailed(
+                "CONTRACT_SEMANTICS_UNSUPPORTED: lease enforcement is not implemented by the active physical path".into(),
+            ));
+        }
+        if composition
+            && [
+                contract.stdio.stdin,
+                contract.stdio.stdout,
+                contract.stdio.stderr,
+            ]
+            .iter()
+            .any(|mode| matches!(mode, StdioMode::Interactive | StdioMode::Inherit))
+        {
+            return Err(CoreError::ExecutionFailed(
+                "CONTRACT_SEMANTICS_UNSUPPORTED: interactive or inherited stdio is refused in composition".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn execute_contract(
+        &self,
+        contract: &ExecutionContract,
+        cwd: PathBuf,
+        inline_budget: usize,
+        composition: bool,
+    ) -> Result<ExecutionOutput, CoreError> {
+        self.validate_contract(contract, None, composition)?;
+        self.execute(ExecutionRequest {
+            argv: contract.intent.args.clone(),
+            cwd,
+            env: Vec::new(),
+            stdin_mode: contract.stdio.stdin,
+            stdin_payload: None,
+            timeout_ms: contract.constraints.timeout_ms,
+            inline_budget,
+            required_assurance: contract.required_assurance.clone(),
+            secrets: Vec::new(),
+        })
+        .await
     }
 
     pub async fn execute(&self, mut req: ExecutionRequest) -> Result<ExecutionOutput, CoreError> {

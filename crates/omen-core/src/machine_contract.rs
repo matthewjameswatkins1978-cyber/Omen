@@ -118,7 +118,7 @@ fn object_schema(properties: Value, required: &[&str]) -> Value {
 
 fn result_schema() -> Value {
     object_schema(
-        json!({"status":{"type":"string"},"results":{"type":"array","maxItems":100},"references":{"type":"array","maxItems":16}}),
+        json!({"status":{"type":"string"},"results":{"type":"array","maxItems":100},"references":{"type":"array","maxItems":16},"content":{"type":"string"},"stdout":{"type":"string"},"stderr":{"type":"string"}}),
         &["status"],
     )
 }
@@ -211,7 +211,7 @@ pub fn contract() -> MachineContract {
             ),
             output_schema: result.clone(),
             effect_class: EffectClass::SpawnProcess,
-            network_effect: NetworkEffect::None,
+            network_effect: NetworkEffect::External,
             reversibility: Reversibility::Irreversible,
             idempotent: false,
             authority: "Tethers admission".into(),
@@ -233,6 +233,27 @@ pub fn contract() -> MachineContract {
             bounds: "bounded diff and artifact evidence".into(),
             timeout: "bounded mutation timeout".into(),
             examples: vec![json!({"plan":"threadmoth://plan/example"})],
+        },
+        CapabilityDefinition {
+            id: "composition.run".into(),
+            group: "composition".into(),
+            summary: "Execute one explicitly planned sequential action.".into(),
+            input_schema: object_schema(
+                json!({"action_id":{"type":"string","minLength":1},"expect_plan":{"type":"string","minLength":1}}),
+                &["action_id", "expect_plan"],
+            ),
+            output_schema: object_schema(
+                json!({"status":{"type":"string"},"steps":{"type":"array"}}),
+                &["status", "steps"],
+            ),
+            effect_class: EffectClass::SpawnProcess,
+            network_effect: NetworkEffect::External,
+            reversibility: Reversibility::Irreversible,
+            idempotent: false,
+            authority: "current external execution contracts".into(),
+            bounds: "bounded sequential action; no nested actions, retry or rollback".into(),
+            timeout: "bounded by child capability timeouts".into(),
+            examples: vec![json!({"action_id":"verify-core","expect_plan":"sha256:..."})],
         },
         CapabilityDefinition {
             id: "filesystem.read".into(),
