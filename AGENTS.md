@@ -35,6 +35,10 @@ Do not blur these boundaries. Never create competing policy, replay, approval, o
 
 ## 3. Standing AI-First Engineering Rules
 
+Runtime-facing fixes require Preview Conveyor installation and proof before
+external acceptance. Do not hand-roll release, install, or proof PowerShell;
+use `cargo xtask preview` unless debugging the conveyor itself.
+
 These rules apply to all future Omen development unless a component explicitly documents why an exception is necessary.
 
 ### 1. Nothing May Wait Forever

@@ -19,3 +19,15 @@ schema-gen:
 
 schema-verify:
     cargo xtask verify-schemas
+
+preview-status:
+    cargo xtask preview status --json
+
+preview-preflight package="omen-mcp":
+    cargo xtask preview preflight --package {{package}}
+
+preview-package:
+    cargo xtask preview package
+
+preview-prove:
+    cargo xtask preview prove
