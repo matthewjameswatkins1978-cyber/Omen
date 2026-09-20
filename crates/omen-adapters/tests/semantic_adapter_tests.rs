@@ -1,9 +1,9 @@
 use omen_adapters::{
     CargoSemanticProvider, GoSemanticProvider, NpmSemanticProvider, PythonUvSemanticProvider,
-    ScipProvider,
+    RustAnalyzerProvider, ScipProvider,
 };
-use omen_semantic::{ProviderKind, SemanticProvider};
-use std::path::Path;
+use omen_semantic::{ProviderKind, SemanticLookupResult, SemanticProvider, SymbolKind};
+use std::path::{Path, PathBuf};
 
 #[test]
 fn test_npm_semantic_provider_parse() {
@@ -172,4 +172,153 @@ async fn test_scip_provider_symbol_and_staleness() {
         .unwrap();
     assert!(stale_res.is_stale(), "Stale index must return Stale result");
     assert!(!stale_res.is_resolved());
+}
+
+
+fn gremlin_exe() -> PathBuf {
+    let mut path = std::env::current_exe().expect("failed to get current_exe");
+    path.pop();
+    if path.ends_with("deps") {
+        path.pop();
+    }
+    let name = if cfg!(windows) {
+        "omen-gremlin.exe"
+    } else {
+        "omen-gremlin"
+    };
+    let exe = path.join(name);
+    if exe.exists() {
+        return exe;
+    }
+
+    let fallback = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("target")
+        .join("debug")
+        .join(name);
+    if fallback.exists() {
+        return fallback;
+    }
+
+    let status = std::process::Command::new("cargo")
+        .args(["build", "-p", "omen-test-fixtures", "--bin", "omen-gremlin"])
+        .status()
+        .expect("failed to invoke cargo for omen-gremlin");
+    assert!(status.success(), "failed to build omen-gremlin test fixture");
+    assert!(fallback.exists(), "omen-gremlin fixture was not produced");
+    fallback
+}
+
+fn rust_semantic_fixture() -> tempfile::TempDir {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(temp.path().join("src")).unwrap();
+    std::fs::write(
+        temp.path().join("Cargo.toml"),
+        r#"[package]
+name = "omen-semantic-fixture"
+version = "0.1.0"
+edition = "2024"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        temp.path().join("src/lib.rs"),
+        r#"pub fn refresh_token() -> &'static str { "token" }
+
+pub fn caller() -> &'static str { refresh_token() }
+
+pub fn duplicate() {}
+
+pub mod other { pub fn duplicate() {} }
+
+pub struct SessionToken;
+"#,
+    )
+    .unwrap();
+    temp
+}
+
+fn gremlin_provider(
+    workspace: &Path,
+    mode: &str,
+) -> RustAnalyzerProvider {
+    RustAnalyzerProvider::with_binary_args(
+        workspace.to_path_buf(),
+        gremlin_exe(),
+        vec!["--lsp-mode".into(), mode.into()],
+    )
+}
+
+#[tokio::test]
+async fn rust_analyzer_all_symbol_lookup_finds_functions_and_preserves_ambiguity() {
+    let temp = rust_semantic_fixture();
+    let provider = gremlin_provider(temp.path(), "semantic-filtered");
+
+    let symbols = provider.symbol_search("refresh_token", 10).await.unwrap();
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0].name, "refresh_token");
+    assert_eq!(symbols[0].kind, SymbolKind::Function);
+
+    let definition = provider
+        .symbol_definition("refresh_token", None, None, None)
+        .await
+        .unwrap();
+    let location = definition
+        .as_resolved()
+        .expect("function definition must resolve through all-symbol lookup");
+    assert_eq!(location.file, "src/lib.rs");
+    assert_eq!(location.range.start_line, 0);
+
+    let references = provider
+        .symbol_references("refresh_token", None, None, None, 10)
+        .await
+        .unwrap();
+    let references = references
+        .as_resolved()
+        .expect("function references must resolve through all-symbol lookup");
+    assert!(
+        references.iter().any(|reference| reference.location.range.start_line == 2),
+        "known refresh_token call site must be returned"
+    );
+
+    let duplicate = provider
+        .symbol_definition("duplicate", None, None, None)
+        .await
+        .unwrap();
+    match duplicate {
+        SemanticLookupResult::Ambiguous(candidates) => assert_eq!(candidates.len(), 2),
+        other => panic!("duplicate exact names must remain ambiguous, got {other:?}"),
+    }
+
+    let type_definition = provider
+        .symbol_definition("SessionToken", None, None, None)
+        .await
+        .unwrap();
+    assert!(
+        type_definition.is_resolved(),
+        "broadening workspace lookup must not regress type resolution"
+    );
+}
+
+#[tokio::test]
+async fn rust_analyzer_all_symbol_lookup_uses_hash_fallback_without_extension() {
+    let temp = rust_semantic_fixture();
+    let provider = gremlin_provider(temp.path(), "semantic-fallback");
+
+    let symbols = provider.symbol_search("refresh_token", 10).await.unwrap();
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0].name, "refresh_token");
+    assert_eq!(symbols[0].kind, SymbolKind::Function);
+
+    let definition = provider
+        .symbol_definition("refresh_token", None, None, None)
+        .await
+        .unwrap();
+    assert!(
+        definition.is_resolved(),
+        "documented rust-analyzer # fallback must remain internal and resolve functions"
+    );
 }
