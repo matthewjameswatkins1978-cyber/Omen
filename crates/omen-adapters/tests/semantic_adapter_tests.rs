@@ -113,32 +113,43 @@ fn test_cargo_semantics_parse() {
 
 #[tokio::test]
 async fn test_scip_provider_symbol_and_staleness() {
-    let raw_scip = r#"{
-        "documents": [
-            {
-                "relative_path": "src/auth.rs",
-                "occurrences": [
-                    {
-                        "range": [10, 4, 10, 17],
-                        "symbol": "crates/auth/refresh_token",
-                        "symbol_roles": 1
-                    },
-                    {
-                        "range": [25, 8, 25, 21],
-                        "symbol": "crates/auth/refresh_token",
-                        "symbol_roles": 0
-                    }
-                ]
-            }
-        ]
-    }"#;
+    use omen_adapters::scip_proto;
+
+    let index = scip_proto::Index {
+        metadata: None,
+        documents: vec![scip_proto::Document {
+            language: "rust".into(),
+            relative_path: "src/auth.rs".into(),
+            occurrences: vec![
+                scip_proto::Occurrence {
+                    range: vec![10, 4, 10, 17],
+                    symbol: "crates/auth/refresh_token".into(),
+                    symbol_roles: 1,
+                    override_documentation: vec![],
+                    syntax_kind: 0,
+                },
+                scip_proto::Occurrence {
+                    range: vec![25, 8, 25, 21],
+                    symbol: "crates/auth/refresh_token".into(),
+                    symbol_roles: 0,
+                    override_documentation: vec![],
+                    syntax_kind: 0,
+                },
+            ],
+            symbols: vec![],
+            text: String::new(),
+        }],
+        external_symbols: vec![],
+    };
+
     let temp_dir = tempfile::tempdir().unwrap();
     let auth_file = temp_dir.path().join("src/auth.rs");
     std::fs::create_dir_all(auth_file.parent().unwrap()).unwrap();
     std::fs::write(&auth_file, "pub fn refresh_token() {}\n").unwrap();
 
+    let index_bytes = ScipProvider::encode_index(&index);
     let index_file = temp_dir.path().join("index.scip");
-    std::fs::write(&index_file, raw_scip).unwrap();
+    std::fs::write(&index_file, index_bytes).unwrap();
 
     let provider = ScipProvider::load_from_file(temp_dir.path().to_path_buf(), index_file).unwrap();
     assert_eq!(provider.kind(), ProviderKind::Indexed);
@@ -153,4 +164,12 @@ async fn test_scip_provider_symbol_and_staleness() {
     // Mutate source file to invalidate hash witness
     std::fs::write(&auth_file, "pub fn refresh_token_modified() {}\n").unwrap();
     assert!(provider.is_stale());
+
+    // When stale, must report Stale and not Resolved
+    let stale_res = provider
+        .symbol_definition("crates/auth/refresh_token", None, None, None)
+        .await
+        .unwrap();
+    assert!(stale_res.is_stale(), "Stale index must return Stale result");
+    assert!(!stale_res.is_resolved());
 }

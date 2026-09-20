@@ -302,3 +302,52 @@ pub struct TaskRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 }
+
+/// Converts an LSP UTF-16 code unit offset within `line_text` to a canonical 0-indexed UTF-8 byte column.
+pub fn lsp_utf16_to_utf8_col(line_text: &str, utf16_col: usize) -> usize {
+    let mut current_utf16 = 0;
+    for (byte_offset, ch) in line_text.char_indices() {
+        if current_utf16 >= utf16_col {
+            return byte_offset;
+        }
+        current_utf16 += ch.len_utf16();
+    }
+    line_text.len()
+}
+
+/// Converts a canonical 0-indexed UTF-8 byte column within `line_text` to an LSP UTF-16 code unit offset.
+pub fn utf8_to_lsp_utf16_col(line_text: &str, utf8_col: usize) -> usize {
+    let target = utf8_col.min(line_text.len());
+    line_text[..target].encode_utf16().count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_coordinate_normalization_multilingual() {
+        // Line with ASCII, 2-byte UTF-8 (é), 3-byte UTF-8 (漢字), and 4-byte UTF-8 / surrogate pair (🦀)
+        let sample = "aé字🦀z";
+        // Offsets:
+        // 'a': byte 0..1, utf16 0..1
+        // 'é': byte 1..3 (2 bytes), utf16 1..2 (1 code unit)
+        // '字': byte 3..6 (3 bytes), utf16 2..3 (1 code unit)
+        // '🦀': byte 6..10 (4 bytes), utf16 3..5 (2 code units / surrogate pair in UTF-16)
+        // 'z': byte 10..11 (1 byte), utf16 5..6 (1 code unit)
+
+        assert_eq!(lsp_utf16_to_utf8_col(sample, 0), 0); // 'a'
+        assert_eq!(lsp_utf16_to_utf8_col(sample, 1), 1); // 'é'
+        assert_eq!(lsp_utf16_to_utf8_col(sample, 2), 3); // '字'
+        assert_eq!(lsp_utf16_to_utf8_col(sample, 3), 6); // '🦀'
+        assert_eq!(lsp_utf16_to_utf8_col(sample, 5), 10); // 'z'
+        assert_eq!(lsp_utf16_to_utf8_col(sample, 6), 11); // end of line
+
+        assert_eq!(utf8_to_lsp_utf16_col(sample, 0), 0);
+        assert_eq!(utf8_to_lsp_utf16_col(sample, 1), 1);
+        assert_eq!(utf8_to_lsp_utf16_col(sample, 3), 2);
+        assert_eq!(utf8_to_lsp_utf16_col(sample, 6), 3);
+        assert_eq!(utf8_to_lsp_utf16_col(sample, 10), 5);
+        assert_eq!(utf8_to_lsp_utf16_col(sample, 11), 6);
+    }
+}

@@ -68,3 +68,4 @@ crossterm = "0.29.0"
 nu-ansi-term = "0.50.3"
 fuzzy-matcher = "0.3.7"
 uuid = { version = "1.15", features = ["v4"] }
+prost = "0.13"

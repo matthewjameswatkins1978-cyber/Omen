@@ -186,6 +186,9 @@ impl SemanticProviderRegistry {
                 SemanticLookupResult::Ambiguous(c) => {
                     return Ok(SemanticLookupResult::Ambiguous(c));
                 }
+                SemanticLookupResult::Stale(loc) => {
+                    return Ok(SemanticLookupResult::Stale(loc));
+                }
                 SemanticLookupResult::NotFound => {}
                 SemanticLookupResult::Unsupported => {}
             }
@@ -226,6 +229,9 @@ impl SemanticProviderRegistry {
                 }
                 SemanticLookupResult::Ambiguous(c) => {
                     return Ok(SemanticLookupResult::Ambiguous(c));
+                }
+                SemanticLookupResult::Stale(loc) => {
+                    return Ok(SemanticLookupResult::Stale(loc));
                 }
                 SemanticLookupResult::NotFound => {}
                 SemanticLookupResult::Unsupported => {}
@@ -291,6 +297,9 @@ impl SemanticProviderRegistry {
                 SemanticLookupResult::Ambiguous(c) => {
                     return Ok(SemanticLookupResult::Ambiguous(c));
                 }
+                SemanticLookupResult::Stale(refs) => {
+                    return Ok(SemanticLookupResult::Stale(refs));
+                }
                 SemanticLookupResult::NotFound => {}
                 SemanticLookupResult::Unsupported => {}
             }
@@ -331,6 +340,9 @@ impl SemanticProviderRegistry {
                 }
                 SemanticLookupResult::Ambiguous(c) => {
                     return Ok(SemanticLookupResult::Ambiguous(c));
+                }
+                SemanticLookupResult::Stale(refs) => {
+                    return Ok(SemanticLookupResult::Stale(refs));
                 }
                 SemanticLookupResult::NotFound => {}
                 SemanticLookupResult::Unsupported => {}

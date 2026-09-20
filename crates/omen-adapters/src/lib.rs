@@ -7,6 +7,7 @@ pub mod ecosystem;
 pub mod git;
 pub mod lsp;
 pub mod lsp_fixture;
+pub mod registry_builder;
 pub mod ripgrep;
 pub mod scip;
 pub mod threadmoth;
@@ -24,8 +25,9 @@ pub use ecosystem::{
 pub use git::{GitAdapter, GitStatusResult};
 pub use lsp::{LspClient, RustAnalyzerProvider};
 pub use lsp_fixture::HostileLspServer;
+pub use registry_builder::{build_workspace_semantic_registry, get_workspace_semantic_registry};
 pub use ripgrep::{RipgrepAdapter, RipgrepMatch, RipgrepSearchResult};
-pub use scip::ScipProvider;
+pub use scip::{ScipProvider, proto as scip_proto};
 pub use threadmoth::{
     ThreadMothAdapter, ThreadMothBudget, ThreadMothByteRange, ThreadMothCardinality,
     ThreadMothCertificate, ThreadMothNamespace, ThreadMothOperationWrapper, ThreadMothRequest,

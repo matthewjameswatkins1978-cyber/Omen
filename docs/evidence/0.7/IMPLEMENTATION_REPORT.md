@@ -114,24 +114,38 @@ Registered 5 typed MCP tools:
 
 ## 4. Verification & Proof Suite
 
-All 10 real-path proofs in `crates/omen-cli/tests/semantic_environment_proofs.rs` pass completely:
+All 13 proofs in `crates/omen-cli/tests/semantic_environment_proofs.rs` pass completely:
 
 | Proof | Title | Description | Result |
 |---|---|---|---|
 | **Proof A** | Structural search distinguishes syntax from text | AST match finds 1 real function, text search finds 3 (comment, fn, string) | `PASSED` |
 | **Proof B** | Structural rewrite routes through ThreadMoth | `ast-grep` derives rewrite candidate -> ThreadMoth mutation certificate | `PASSED` |
-| **Proof C** | Real LSP symbol definition & references | `rust-analyzer` JSON-RPC query resolves definition/references in bounded time | `PASSED` |
-| **Proof D** | LSP timeout & late-response are bounded | Hostile LSP fixture times out cleanly, late responses discarded safely | `PASSED` |
-| **Proof E** | SCIP symbol query & stale index detection | Queries SCIP index; file modification detects stale index via SHA-256 witness | `PASSED` |
+| **Proof C** | Real LSP symbol definition & references | Live `rust-analyzer` JSON-RPC query resolves definition/references in bounded time | `PASSED` |
+| **Proof D** | LSP timeout & late-response are bounded | Hostile LSP fixture times out cleanly, late responses discarded safely, 16 MiB cap | `PASSED` |
+| **Proof E** | SCIP genuine Protobuf query & stale detection | Queries real Protobuf wire model; file change detects stale index via SHA-256 witness | `PASSED` |
 | **Proof F** | Semantic result invalidates after source change | File edit invalidates cached witness (`CURRENT -> DIRTY`), cache refuses stale fact | `PASSED` |
 | **Proof G** | Cargo workspace metadata is canonical | Parses workspace packages, targets, and emits canonical `package://cargo/<name>` | `PASSED` |
 | **Proof H** | Two non-Rust ecosystems produce metadata | `package.json` (npm) and `pyproject.toml` (python) produce typed package records | `PASSED` |
 | **Proof I** | Deterministic question uses zero model calls | `? where is refresh_token defined?` returns definition with `provider_calls = 0` | `PASSED` |
 | **Proof J** | Hot completion uses zero provider I/O | In-memory tab completion completes `@symbol://` items with 0 I/O in < 5ms | `PASSED` |
+| **Proof K** | Multilingual coordinate normalization | Normalized UTF-8 bytes to LSP UTF-16 code units across ASCII, Latin, CJK, and emoji | `PASSED` |
+| **Proof L** | Product path wiring through def and lane | Shared registry routes `:def` and `? where is SessionToken defined?` to live LSP | `PASSED` |
+| **Harness Watchdog** | Hard test deadline & clean phase timeout | Proves harness watchdog triggers in 200ms with exact phase on uncooperative fixture | `PASSED` |
+
+### Acceptance Veto Repairs:
+1. **SCIP Genuine Protobuf Ingestion**: Fully migrated `crates/omen-adapters/src/scip.rs` to real Protobuf wire model using `prost`. Replaced mock JSON parsing with genuine binary Protobuf decoder and index encoder. Stale indexes report `SemanticLookupResult::Stale(T)`, never `Resolved(T)`.
+2. **Real LSP Provider Product Wiring**: Unified registry builder (`build_workspace_semantic_registry` and `get_workspace_semantic_registry`) shared across CLI, interactive actions, MCP, and tests. Eliminated registry divergence across subsystems.
+3. **LSP Hard-Cap & Diagnostics**: Hard-capped maximum message size to 16 MiB (`DEFAULT_MAX_LSP_MESSAGE_BYTES`), discarding hostile payloads before allocation. Real LSP diagnostics ingestion mapping severities and UTF-16 code units to UTF-8 columns.
+4. **Coordinate Normalization**: Implemented bidirectional `utf8_to_lsp_utf16_col` and `lsp_utf16_to_utf8_col` conversions verified across 1-byte, 2-byte, 3-byte, and 4-byte surrogate-pair emoji coordinates.
+5. **Case-Preserving Symbol Extraction**: `DeterministicClassifier` preserves exact casing from user queries (`SessionToken`), avoiding case mangling on case-sensitive languages.
+6. **Test Harness Hardening**: Layered phase timeouts (`run_phase`) and outer watchdogs (`run_with_watchdog`) applied across all integration proof tests. Background task cancellation and child process killing on shutdown and drop prevent orphan processes or Windows locks.
+7. **30 Omen AI-First Engineering Rules**: Formally incorporated into `AGENTS.md` and `docs/evidence/0.7/ARCHITECTURE_DOCTRINE.md`.
 
 ### Full Verification Results:
 - `cargo fmt --check`: PASSED
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`: PASSED
 - `cargo test --workspace`: PASSED (all unit and integration tests across 16 crates)
+- `OMEN_REQUIRE_SEMANTIC_EXTERNAL_PROOFS=1 cargo test -p omen-cli --test semantic_environment_proofs`: PASSED (all 13 proofs passing)
 - `cargo deny check`: PASSED (`advisories ok, bans ok, licenses ok, sources ok`)
 - `cargo run -p xtask -- verify`: PASSED
+

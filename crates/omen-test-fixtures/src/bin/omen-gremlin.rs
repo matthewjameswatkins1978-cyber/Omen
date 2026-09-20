@@ -283,17 +283,9 @@ fn run_hostile_lsp(mode: &str) {
                         write_response(&resp);
                     }
                     "huge-response" => {
-                        let mut items = Vec::new();
-                        for i in 0..1000 {
-                            items.push(format!(
-                                r#"{{"name":"sym_{i}","kind":12,"location":{{"uri":"file:///test.rs","range":{{"start":{{"line":0,"character":0}},"end":{{"line":0,"character":5}}}}}}}}"#
-                            ));
-                        }
-                        let resp = format!(
-                            r#"{{"jsonrpc":"2.0","id":{req_id},"result":[{}]}}"#,
-                            items.join(",")
-                        );
-                        write_response(&resp);
+                        let header = "Content-Length: 52428800\r\n\r\n";
+                        let _ = stdout.write_all(header.as_bytes());
+                        let _ = stdout.flush();
                     }
                     "flood" => {
                         for i in 0..100 {

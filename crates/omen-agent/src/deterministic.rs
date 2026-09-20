@@ -29,12 +29,13 @@ pub struct DeterministicClassifier;
 impl DeterministicClassifier {
     /// Classifies a query using cheap string matching with zero I/O, zero subprocesses, and zero model calls.
     pub fn classify(query: &str) -> Option<DeterministicKind> {
-        let q = query.trim().to_lowercase();
-        let q_clean = q
+        let q_raw = query.trim();
+        let q_clean_raw = q_raw
             .trim_start_matches('?')
             .trim()
             .trim_end_matches('?')
             .trim();
+        let q_clean = q_clean_raw.to_lowercase();
 
         // 1. "what folder am I in?" / "where am I?" / "pwd"
         if q_clean == "what folder am i in"
@@ -92,10 +93,14 @@ impl DeterministicClassifier {
             "def ",
         ];
         for prefix in &def_prefixes {
-            if let Some(rest) = q_clean.strip_prefix(prefix) {
-                let sym = rest
-                    .strip_suffix(" defined")
-                    .unwrap_or(rest)
+            if let Some(rest_lower) = q_clean.strip_prefix(prefix) {
+                let rest_raw = &q_clean_raw[prefix.len()..];
+                let sym_raw = if rest_lower.ends_with(" defined") {
+                    &rest_raw[..rest_raw.len() - " defined".len()]
+                } else {
+                    rest_raw
+                };
+                let sym = sym_raw
                     .trim()
                     .trim_matches('`')
                     .trim_matches('"')
@@ -117,17 +122,25 @@ impl DeterministicClassifier {
             "where is ",
         ];
         for prefix in &ref_prefixes {
-            if let Some(rest) = q_clean.strip_prefix(prefix) {
-                if let Some(sym) = rest
-                    .strip_suffix(" used")
-                    .or_else(|| rest.strip_suffix(" called"))
-                {
-                    let sym = sym.trim().trim_matches('`').trim_matches('"').trim();
-                    if !sym.is_empty() && !sym.contains(' ') {
-                        return Some(DeterministicKind::SymbolReferences(sym.to_string()));
-                    }
+            if let Some(rest_lower) = q_clean.strip_prefix(prefix) {
+                let rest_raw = &q_clean_raw[prefix.len()..];
+                let sym_raw = if rest_lower.ends_with(" used") {
+                    Some(&rest_raw[..rest_raw.len() - " used".len()])
+                } else if rest_lower.ends_with(" called") {
+                    Some(&rest_raw[..rest_raw.len() - " called".len()])
                 } else if prefix != &"where is " {
-                    let sym = rest.trim().trim_matches('`').trim_matches('"').trim();
+                    Some(rest_raw)
+                } else {
+                    None
+                };
+
+                if let Some(s) = sym_raw {
+                    let sym = s
+                        .trim()
+                        .trim_matches('`')
+                        .trim_matches('"')
+                        .trim_matches('\'')
+                        .trim();
                     if !sym.is_empty() && !sym.contains(' ') {
                         return Some(DeterministicKind::SymbolReferences(sym.to_string()));
                     }

@@ -13,6 +13,8 @@ pub struct AiLaneDispatchStats {
     pub git_probes: usize,
     pub db_context_queries: usize,
     pub service_scans: usize,
+    #[serde(default)]
+    pub semantic_provider_calls: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,6 +187,7 @@ impl AiLaneDispatcher {
                     });
                 }
                 omen_agent::DeterministicKind::SymbolDefinition(sym) => {
+                    stats.semantic_provider_calls += 1;
                     let reg = crate::semantic_service::build_semantic_registry(workspace_root);
                     let res = run_future_blocking(async {
                         reg.find_definition(&sym, None, None, None, None).await
@@ -193,6 +196,15 @@ impl AiLaneDispatcher {
                         Ok(omen_semantic::SemanticLookupResult::Resolved(loc)) => (
                             format!(
                                 "Symbol `{sym}` is defined at `{}:{}:{}`.",
+                                loc.file,
+                                loc.range.start_line + 1,
+                                loc.range.start_col + 1
+                            ),
+                            vec![format!("@symbol://{sym}")],
+                        ),
+                        Ok(omen_semantic::SemanticLookupResult::Stale(loc)) => (
+                            format!(
+                                "Symbol `{sym}` is defined at `{}:{}:{}` (STALE index — source file has changed).",
                                 loc.file,
                                 loc.range.start_line + 1,
                                 loc.range.start_col + 1
@@ -232,6 +244,7 @@ impl AiLaneDispatcher {
                     });
                 }
                 omen_agent::DeterministicKind::SymbolReferences(sym) => {
+                    stats.semantic_provider_calls += 1;
                     let reg = crate::semantic_service::build_semantic_registry(workspace_root);
                     let res = run_future_blocking(async {
                         reg.find_references(&sym, None, None, None, Some(50), None)
@@ -240,6 +253,13 @@ impl AiLaneDispatcher {
                     let (msg, refs) = match res {
                         Ok(omen_semantic::SemanticLookupResult::Resolved(r_list)) => (
                             format!("Found {} reference(s) to symbol `{sym}`.", r_list.len()),
+                            vec![format!("@symbol://{sym}")],
+                        ),
+                        Ok(omen_semantic::SemanticLookupResult::Stale(r_list)) => (
+                            format!(
+                                "Found {} reference(s) to symbol `{sym}` (STALE index — source file has changed).",
+                                r_list.len()
+                            ),
                             vec![format!("@symbol://{sym}")],
                         ),
                         Ok(omen_semantic::SemanticLookupResult::Ambiguous(candidates)) => (
@@ -681,7 +701,8 @@ where
 {
     std::thread::scope(|s| {
         s.spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
                 .enable_all()
                 .build()
                 .expect("Failed to build tokio runtime")

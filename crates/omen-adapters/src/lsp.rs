@@ -15,13 +15,18 @@ use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
 
 pub const DEFAULT_LSP_TIMEOUT: Duration = Duration::from_millis(5000);
+pub const DEFAULT_MAX_LSP_MESSAGE_BYTES: usize = 16 * 1024 * 1024; // 16 MiB hard-cap
+
+type PendingRequestMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, CoreError>>>>>;
 
 /// Real JSON-RPC stdio LSP client with request correlation, bounded timeouts, and cancellation.
 pub struct LspClient {
     child: Option<Child>,
     stdin: tokio::process::ChildStdin,
     next_id: AtomicU64,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
+    pending: PendingRequestMap,
+    diagnostics_by_file: Arc<Mutex<HashMap<String, Vec<SemanticDiagnostic>>>>,
+    reader_task: Option<tokio::task::JoinHandle<()>>,
     workspace_root: PathBuf,
     provider_id: SemanticProviderId,
     generation: SemanticGeneration,
@@ -55,12 +60,17 @@ impl LspClient {
             CoreError::ExecutionFailed("Failed to capture LSP server stdout".into())
         })?;
 
-        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let pending: PendingRequestMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_clone = pending.clone();
 
+        let diagnostics_by_file: Arc<Mutex<HashMap<String, Vec<SemanticDiagnostic>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let diagnostics_clone = diagnostics_by_file.clone();
+        let root_clone = workspace_root.clone();
+        let prov_id_clone = provider_id.clone();
+
         // Background reader reading Content-Length framed JSON-RPC messages
-        tokio::spawn(async move {
+        let reader_task = tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
             let mut header_line = String::new();
 
@@ -87,19 +97,47 @@ impl LspClient {
                 }
 
                 if let Some(len) = content_length {
+                    // Hard-cap message size to 16 MiB before allocating
+                    if len > DEFAULT_MAX_LSP_MESSAGE_BYTES {
+                        tracing::error!(
+                            "LSP message size {} bytes exceeds hard-cap of {} bytes",
+                            len,
+                            DEFAULT_MAX_LSP_MESSAGE_BYTES
+                        );
+                        let mut map = pending_clone.lock().unwrap();
+                        for (_, tx) in map.drain() {
+                            let _ = tx.send(Err(CoreError::ExecutionFailed(format!(
+                                "LSP message size {len} bytes exceeded maximum allowed {DEFAULT_MAX_LSP_MESSAGE_BYTES} bytes"
+                            ))));
+                        }
+                        return;
+                    }
+
                     let mut body = vec![0u8; len];
                     if reader.read_exact(&mut body).await.is_err() {
                         return;
                     }
 
-                    if let Ok(val) = serde_json::from_slice::<Value>(&body)
-                        && let Some(id_val) = val.get("id").and_then(|id| id.as_u64())
-                    {
-                        let mut map = pending_clone.lock().unwrap();
-                        if let Some(tx) = map.remove(&id_val) {
-                            let _ = tx.send(val);
+                    if let Ok(val) = serde_json::from_slice::<Value>(&body) {
+                        if let Some(id_val) = val.get("id").and_then(|id| id.as_u64()) {
+                            let mut map = pending_clone.lock().unwrap();
+                            if let Some(tx) = map.remove(&id_val) {
+                                let _ = tx.send(Ok(val));
+                            }
+                            // If not in map: safely discarded as a late or canceled response!
+                        } else if let Some(method) = val.get("method").and_then(|m| m.as_str()) {
+                            // Handle asynchronous server notifications
+                            if method == "textDocument/publishDiagnostics"
+                                && let Some(params) = val.get("params")
+                            {
+                                parse_and_store_diagnostics(
+                                    params,
+                                    &root_clone,
+                                    &prov_id_clone,
+                                    &diagnostics_clone,
+                                );
+                            }
                         }
-                        // If not in map: safely discarded as a late or canceled response!
                     }
                 }
             }
@@ -110,10 +148,21 @@ impl LspClient {
             stdin,
             next_id: AtomicU64::new(1),
             pending,
+            diagnostics_by_file,
+            reader_task: Some(reader_task),
             workspace_root,
             provider_id,
             generation: SemanticGeneration::new(1, 1),
         })
+    }
+
+    pub fn get_diagnostics(&self, file: Option<&str>) -> Vec<SemanticDiagnostic> {
+        let guard = self.diagnostics_by_file.lock().unwrap();
+        if let Some(f) = file {
+            guard.get(f).cloned().unwrap_or_default()
+        } else {
+            guard.values().flatten().cloned().collect()
+        }
     }
 
     pub async fn send_request(
@@ -155,7 +204,7 @@ impl LspClient {
 
         // Await with bounded timeout
         match tokio::time::timeout(timeout_duration, rx).await {
-            Ok(Ok(response)) => {
+            Ok(Ok(Ok(response))) => {
                 if let Some(error) = response.get("error") {
                     return Err(CoreError::ExecutionFailed(format!(
                         "LSP error response: {error}"
@@ -163,6 +212,7 @@ impl LspClient {
                 }
                 Ok(response.get("result").cloned().unwrap_or(Value::Null))
             }
+            Ok(Ok(Err(err))) => Err(err),
             Ok(Err(_)) => {
                 self.pending.lock().unwrap().remove(&id);
                 Err(CoreError::ExecutionFailed(
@@ -232,7 +282,8 @@ impl LspClient {
                 },
                 "textDocument": {
                     "definition": { "dynamicRegistration": false },
-                    "references": { "dynamicRegistration": false }
+                    "references": { "dynamicRegistration": false },
+                    "publishDiagnostics": { "relatedInformation": true }
                 }
             }
         });
@@ -302,9 +353,22 @@ impl LspClient {
     ) -> Result<SemanticLookupResult<SourceLocation>, CoreError> {
         let _ = self.did_open_file(file).await;
         let uri = self.to_file_uri(file);
+
+        // Convert canonical UTF-8 byte column to LSP UTF-16 code units
+        let full_path = self.workspace_root.join(file);
+        let utf16_col = if let Ok(content) = std::fs::read_to_string(&full_path) {
+            content
+                .lines()
+                .nth(line)
+                .map(|l| utf8_to_lsp_utf16_col(l, col))
+                .unwrap_or(col)
+        } else {
+            col
+        };
+
         let params = json!({
             "textDocument": { "uri": uri },
-            "position": { "line": line, "character": col }
+            "position": { "line": line, "character": utf16_col }
         });
 
         let res = self
@@ -360,9 +424,22 @@ impl LspClient {
     ) -> Result<SemanticLookupResult<Vec<ReferenceRecord>>, CoreError> {
         let _ = self.did_open_file(file).await;
         let uri = self.to_file_uri(file);
+
+        // Convert canonical UTF-8 byte column to LSP UTF-16 code units
+        let full_path = self.workspace_root.join(file);
+        let utf16_col = if let Ok(content) = std::fs::read_to_string(&full_path) {
+            content
+                .lines()
+                .nth(line)
+                .map(|l| utf8_to_lsp_utf16_col(l, col))
+                .unwrap_or(col)
+        } else {
+            col
+        };
+
         let params = json!({
             "textDocument": { "uri": uri },
-            "position": { "line": line, "character": col },
+            "position": { "line": line, "character": utf16_col },
             "context": { "includeDeclaration": true }
         });
 
@@ -395,6 +472,9 @@ impl LspClient {
             .send_request("shutdown", json!(null), Duration::from_millis(2000))
             .await;
         let _ = self.send_notification("exit", json!(null)).await;
+        if let Some(task) = self.reader_task.take() {
+            task.abort();
+        }
         if let Some(mut child) = self.child.take() {
             let _ = child.kill().await;
         }
@@ -416,11 +496,32 @@ impl LspClient {
         let end = range_val.get("end")?;
 
         let start_line = start.get("line")?.as_u64()? as usize;
-        let start_col = start.get("character")?.as_u64()? as usize;
+        let start_col_raw = start.get("character")?.as_u64()? as usize;
         let end_line = end.get("line")?.as_u64()? as usize;
-        let end_col = end.get("character")?.as_u64()? as usize;
+        let end_col_raw = end.get("character")?.as_u64()? as usize;
 
         let file = self.uri_to_relative_file(uri_str);
+        let full_path = self.workspace_root.join(&file);
+        let file_text = std::fs::read_to_string(&full_path).ok();
+
+        // Convert LSP UTF-16 code units to canonical UTF-8 byte column
+        let start_col = if let Some(ref text) = file_text {
+            text.lines()
+                .nth(start_line)
+                .map(|l| lsp_utf16_to_utf8_col(l, start_col_raw))
+                .unwrap_or(start_col_raw)
+        } else {
+            start_col_raw
+        };
+
+        let end_col = if let Some(ref text) = file_text {
+            text.lines()
+                .nth(end_line)
+                .map(|l| lsp_utf16_to_utf8_col(l, end_col_raw))
+                .unwrap_or(end_col_raw)
+        } else {
+            end_col_raw
+        };
 
         Some(SourceLocation::new(
             file,
@@ -477,18 +578,136 @@ impl LspClient {
     }
 
     fn uri_to_relative_file(&self, uri: &str) -> String {
-        let path_part = uri.strip_prefix("file:///").unwrap_or(uri);
-        let path = Path::new(path_part);
-        if let Ok(rel) = path.strip_prefix(&self.workspace_root) {
-            rel.to_string_lossy().replace('\\', "/")
-        } else {
-            path_part.replace('\\', "/")
+        uri_to_rel_path(uri, &self.workspace_root)
+    }
+}
+
+fn uri_to_rel_path(uri: &str, workspace_root: &Path) -> String {
+    let path_part = uri.strip_prefix("file:///").unwrap_or(uri);
+    let path = Path::new(path_part);
+    if let Ok(rel) = path.strip_prefix(workspace_root) {
+        rel.to_string_lossy().replace('\\', "/")
+    } else {
+        path_part.replace('\\', "/")
+    }
+}
+
+fn parse_and_store_diagnostics(
+    params: &Value,
+    workspace_root: &Path,
+    provider_id: &SemanticProviderId,
+    target: &Arc<Mutex<HashMap<String, Vec<SemanticDiagnostic>>>>,
+) {
+    let Some(uri_str) = params.get("uri").and_then(|u| u.as_str()) else {
+        return;
+    };
+    let file = uri_to_rel_path(uri_str, workspace_root);
+    let diags_arr = params.get("diagnostics").and_then(|d| d.as_array());
+
+    let mut results = Vec::new();
+    if let Some(arr) = diags_arr {
+        let full_path = workspace_root.join(&file);
+        let file_text = std::fs::read_to_string(&full_path).ok();
+
+        for d in arr {
+            let message = d
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .to_string();
+            let source = d
+                .get("source")
+                .and_then(|s| s.as_str())
+                .unwrap_or("rust-analyzer")
+                .to_string();
+            let code = d.get("code").map(|c| {
+                if let Some(s) = c.as_str() {
+                    s.to_string()
+                } else {
+                    c.to_string()
+                }
+            });
+            let severity_num = d.get("severity").and_then(|s| s.as_u64()).unwrap_or(1);
+            let severity = match severity_num {
+                1 => DiagnosticSeverity::Error,
+                2 => DiagnosticSeverity::Warning,
+                3 => DiagnosticSeverity::Information,
+                4 => DiagnosticSeverity::Hint,
+                _ => DiagnosticSeverity::Error,
+            };
+
+            let range_val = d.get("range");
+            let (start_line, start_col, end_line, end_col) = if let Some(r) = range_val {
+                let sl = r
+                    .get("start")
+                    .and_then(|s| s.get("line"))
+                    .and_then(|l| l.as_u64())
+                    .unwrap_or(0) as usize;
+                let sc = r
+                    .get("start")
+                    .and_then(|s| s.get("character"))
+                    .and_then(|c| c.as_u64())
+                    .unwrap_or(0) as usize;
+                let el = r
+                    .get("end")
+                    .and_then(|s| s.get("line"))
+                    .and_then(|l| l.as_u64())
+                    .unwrap_or(0) as usize;
+                let ec = r
+                    .get("end")
+                    .and_then(|s| s.get("character"))
+                    .and_then(|c| c.as_u64())
+                    .unwrap_or(0) as usize;
+
+                let sc_utf8 = if let Some(ref text) = file_text {
+                    text.lines()
+                        .nth(sl)
+                        .map(|l| lsp_utf16_to_utf8_col(l, sc))
+                        .unwrap_or(sc)
+                } else {
+                    sc
+                };
+                let ec_utf8 = if let Some(ref text) = file_text {
+                    text.lines()
+                        .nth(el)
+                        .map(|l| lsp_utf16_to_utf8_col(l, ec))
+                        .unwrap_or(ec)
+                } else {
+                    ec
+                };
+                (sl, sc_utf8, el, ec_utf8)
+            } else {
+                (0, 0, 0, 0)
+            };
+
+            let location = SourceLocation::new(
+                file.clone(),
+                SourceRange::new(start_line, start_col, end_line, end_col),
+                provider_id.clone(),
+                SemanticGeneration::new(1, 1),
+            );
+
+            results.push(SemanticDiagnostic {
+                severity,
+                message,
+                source,
+                code,
+                location,
+                related_locations: Vec::new(),
+                provider: provider_id.clone(),
+            });
         }
     }
+
+    let mut guard = target.lock().unwrap();
+    guard.insert(file, results);
 }
 
 impl Drop for LspClient {
     fn drop(&mut self) {
+        if let Some(task) = self.reader_task.take() {
+            task.abort();
+        }
         if let Some(mut child) = self.child.take() {
             let _ = child.start_kill();
         }
@@ -527,6 +746,8 @@ impl RustAnalyzerProvider {
 
     pub fn is_available(&self) -> bool {
         self.binary_path.is_some()
+            && (self.workspace_root.join("Cargo.toml").exists()
+                || self.workspace_root.join("rust-project.json").exists())
     }
 
     async fn get_or_start_client(
@@ -628,6 +849,20 @@ impl SemanticProvider for RustAnalyzerProvider {
                         }
                     }
                 } else {
+                    // Open files in src/ so rust-analyzer indexes them immediately
+                    let src_dir = self.workspace_root.join("src");
+                    if let Ok(entries) = std::fs::read_dir(&src_dir) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.extension().and_then(|s| s.to_str()) == Some("rs")
+                                && let Ok(rel) = path.strip_prefix(&self.workspace_root)
+                            {
+                                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                                let _ = client.did_open_file(&rel_str).await;
+                            }
+                        }
+                    }
+
                     // Fall back to workspace symbol search if exact line/col not given
                     match client.workspace_symbol(symbol, DEFAULT_LSP_TIMEOUT).await {
                         Ok(syms) => {
@@ -716,6 +951,23 @@ impl SemanticProvider for RustAnalyzerProvider {
                 }
             } else {
                 Ok(SemanticLookupResult::Unsupported)
+            }
+        })
+    }
+
+    fn diagnostics<'a>(&'a self) -> BoxFuture<'a, Result<Vec<SemanticDiagnostic>, CoreError>> {
+        Box::pin(async move {
+            let guard = match self.get_or_start_client().await {
+                Ok(g) => g,
+                Err(e) => {
+                    tracing::warn!("Failed to start rust-analyzer for diagnostics: {e}");
+                    return Ok(Vec::new());
+                }
+            };
+            if let Some(client) = guard.as_ref() {
+                Ok(client.get_diagnostics(None))
+            } else {
+                Ok(Vec::new())
             }
         })
     }

@@ -39,6 +39,8 @@ pub enum SemanticLookupResult<T> {
     Resolved(T),
     /// Ambiguous candidates found — never guess or collapse!
     Ambiguous(Vec<SymbolRecord>),
+    /// Stale result from an indexed provider whose source witness has changed.
+    Stale(T),
     /// Requested symbol not found.
     NotFound,
     /// Requested operation not supported by this provider.
@@ -54,14 +56,33 @@ impl<T> SemanticLookupResult<T> {
         matches!(self, Self::Ambiguous(_))
     }
 
+    pub fn is_stale(&self) -> bool {
+        matches!(self, Self::Stale(_))
+    }
+
     pub fn is_not_found(&self) -> bool {
         matches!(self, Self::NotFound)
+    }
+
+    pub fn as_resolved(&self) -> Option<&T> {
+        match self {
+            Self::Resolved(val) => Some(val),
+            _ => None,
+        }
+    }
+
+    pub fn into_resolved(self) -> Option<T> {
+        match self {
+            Self::Resolved(val) => Some(val),
+            _ => None,
+        }
     }
 
     pub fn as_ref(&self) -> SemanticLookupResult<&T> {
         match self {
             Self::Resolved(val) => SemanticLookupResult::Resolved(val),
             Self::Ambiguous(c) => SemanticLookupResult::Ambiguous(c.clone()),
+            Self::Stale(val) => SemanticLookupResult::Stale(val),
             Self::NotFound => SemanticLookupResult::NotFound,
             Self::Unsupported => SemanticLookupResult::Unsupported,
         }

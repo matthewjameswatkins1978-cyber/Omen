@@ -1,17 +1,12 @@
 use crate::protocol::*;
-use omen_adapters::{
-    AstGrepAdapter, CargoSemanticProvider, DockerSemanticProvider, GitHubCliSemanticProvider,
-    GoSemanticProvider, NpmSemanticProvider, PythonUvSemanticProvider, ScipProvider,
-};
 use omen_client::OmenClient;
 use omen_core::InteractiveSessionId;
 use omen_knowledge::{
     ContentAddressedStore, Database, canonical_workspace_db_path, resolve_workspace_dir,
 };
-use omen_semantic::{SemanticProvider, SemanticProviderRegistry};
+use omen_semantic::SemanticProviderRegistry;
 use serde_json::{Value, json};
 use std::path::PathBuf;
-use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 pub struct McpServer {
@@ -588,43 +583,8 @@ impl McpServer {
         CallToolResult::text(serde_json::to_string_pretty(&caps).unwrap())
     }
 
-    fn build_registry(&self) -> SemanticProviderRegistry {
-        let mut reg = SemanticProviderRegistry::new(self.workspace_path.clone());
-        let ast = AstGrepAdapter::new(self.workspace_path.clone());
-        if ast.is_available() {
-            reg.register(Arc::new(ast));
-        }
-        let cargo = CargoSemanticProvider::new(&self.workspace_path);
-        if cargo.is_available() {
-            reg.register(Arc::new(cargo));
-        }
-        let npm = NpmSemanticProvider::new(&self.workspace_path);
-        if npm.is_available() {
-            reg.register(Arc::new(npm));
-        }
-        let uv = PythonUvSemanticProvider::new(&self.workspace_path);
-        if uv.is_available() {
-            reg.register(Arc::new(uv));
-        }
-        let go = GoSemanticProvider::new(&self.workspace_path);
-        if go.is_available() {
-            reg.register(Arc::new(go));
-        }
-        let docker = DockerSemanticProvider::new(&self.workspace_path);
-        if docker.is_available() {
-            reg.register(Arc::new(docker));
-        }
-        let gh = GitHubCliSemanticProvider::new(&self.workspace_path);
-        if gh.is_available() {
-            reg.register(Arc::new(gh));
-        }
-        let scip_file = self.workspace_path.join("index.scip");
-        if scip_file.exists()
-            && let Ok(scip) = ScipProvider::load_from_file(self.workspace_path.clone(), scip_file)
-        {
-            reg.register(Arc::new(scip));
-        }
-        reg
+    fn build_registry(&self) -> std::sync::Arc<SemanticProviderRegistry> {
+        omen_adapters::get_workspace_semantic_registry(&self.workspace_path)
     }
 
     async fn tool_symbol_search(&self, args: &Value) -> CallToolResult {

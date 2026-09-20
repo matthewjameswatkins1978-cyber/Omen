@@ -527,6 +527,15 @@ impl SemanticDispatcher {
                             loc.range.start_col + 1
                         );
                     }
+                    omen_semantic::SemanticLookupResult::Stale(loc) => {
+                        println!("Definition for @symbol://{sym} (STALE index):");
+                        println!(
+                            "  Location: {}:{}:{}",
+                            loc.file,
+                            loc.range.start_line + 1,
+                            loc.range.start_col + 1
+                        );
+                    }
                     omen_semantic::SemanticLookupResult::Ambiguous(candidates) => {
                         println!(
                             "Ambiguous symbol '{sym}' (found {} candidates):",
@@ -585,6 +594,22 @@ impl SemanticDispatcher {
                                     tag
                                 );
                             }
+                        }
+                    }
+                    omen_semantic::SemanticLookupResult::Stale(refs) => {
+                        println!(
+                            "Found {} reference(s) for @symbol://{sym} (STALE index):",
+                            refs.len()
+                        );
+                        for r in refs {
+                            let tag = if r.is_definition { " (def)" } else { "" };
+                            println!(
+                                "  {}:{}:{}{}",
+                                r.location.file,
+                                r.location.range.start_line + 1,
+                                r.location.range.start_col + 1,
+                                tag
+                            );
                         }
                     }
                     omen_semantic::SemanticLookupResult::Ambiguous(candidates) => {
@@ -706,7 +731,8 @@ where
 {
     std::thread::scope(|s| {
         s.spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
                 .enable_all()
                 .build()
                 .expect("Failed to build tokio runtime")
