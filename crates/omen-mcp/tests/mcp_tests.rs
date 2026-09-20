@@ -1,8 +1,12 @@
+use omen_adapters::RustAnalyzerProvider;
 use omen_mcp::McpServer;
 use omen_mcp::protocol::*;
+use omen_semantic::SemanticProviderRegistry;
 use omen_test_fixtures::{INTEGRATION_TIMEOUT, UNIT_TIMEOUT, run_with_test_timeout};
 use serde_json::{Value, json};
 use std::fs;
+use std::path::PathBuf;
+use std::sync::Arc;
 use tempfile::tempdir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
