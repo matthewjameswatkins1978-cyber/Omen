@@ -65,6 +65,7 @@ impl CargoAdapter {
             timeout_ms: 15000,
             inline_budget: 65536,
             required_assurance: RequiredAssurance::default(),
+            secrets: vec![],
         };
 
         let output = supervisor.execute(req).await?;
@@ -101,6 +102,7 @@ impl CargoAdapter {
             timeout_ms: 60000,
             inline_budget: 65536,
             required_assurance: RequiredAssurance::default(),
+            secrets: vec![],
         };
 
         let output = supervisor.execute(req).await?;
@@ -201,6 +203,7 @@ impl CargoAdapter {
             timeout_ms: 120000,
             inline_budget: 65536,
             required_assurance: RequiredAssurance::default(),
+            secrets: vec![],
         };
 
         let output = supervisor.execute(req).await?;

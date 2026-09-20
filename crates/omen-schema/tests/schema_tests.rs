@@ -69,7 +69,7 @@ fn roundtrip_execution_result() {
             filesystem: EnforcementLevel::Enforced,
             network: EnforcementLevel::Enforced,
             descendant_processes: EnforcementLevel::Enforced,
-            symlink_escape: EnforcementLevel::Prevented,
+            symlink_escape: EnforcementLevel::Enforced,
         },
         observations: vec!["test timeout warning".into()],
         fact_updates: vec![ResourceId::new("fact://test/status").unwrap()],

@@ -24,14 +24,38 @@ pub enum ValidityState {
     Historical,
 }
 
-/// Containment enforcement level.
+/// Containment enforcement level according to Omen 0.6 assurance standard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum EnforcementLevel {
+    /// The OS/runtime will deny the prohibited action independent of Omen's continued cooperation.
+    #[serde(alias = "PREVENTED")]
     Enforced,
+    /// The action must pass through a controller/broker that can deny it, but the process is not completely confined against alternate paths.
+    Mediated,
+    /// Omen can detect/report the behaviour but cannot reliably prevent it.
     Observed,
-    Prevented,
+    /// Omen attempts to constrain behaviour but known escape/gap classes exist.
+    BestEffort,
+    /// No meaningful mechanism exists in the active backend.
     Unsupported,
+}
+
+impl EnforcementLevel {
+    /// Canonical assurance level.
+    pub fn canonicalize(self) -> Self {
+        self
+    }
+
+    /// Converts enforcement level to an overall Assurance level.
+    pub fn to_assurance(self) -> Assurance {
+        match self {
+            Self::Enforced => Assurance::Enforced,
+            Self::Mediated => Assurance::Verified,
+            Self::Observed | Self::BestEffort => Assurance::Observed,
+            Self::Unsupported => Assurance::Unknown,
+        }
+    }
 }
 
 /// Execution classification.
@@ -80,4 +104,39 @@ pub enum BlobState {
     Present,
     Evicted,
     Missing,
+}
+
+/// Lifecycle state of a daemon-managed PTY session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PtyState {
+    Starting,
+    Running,
+    Detached,
+    Exited,
+    Lost,
+    Unknown,
+}
+
+/// Lifecycle state of a physical process runtime lease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RuntimeLeaseState {
+    Owned,
+    Detached,
+    Expired,
+    Observed,
+    Lost,
+}
+
+/// Injection mechanism approved for physical secret usage.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretInjectionContract {
+    /// Injected into environment variable.
+    EnvironmentVariable { name: String },
+    /// Injected into process stdin stream.
+    Stdin,
+    /// Written to a temporary file with restricted permissions and explicit bounded cleanup.
+    TemporaryFile { file_name: Option<String> },
 }

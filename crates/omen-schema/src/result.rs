@@ -84,9 +84,11 @@ impl TryFrom<ExecutionResultWire> for ExecutionResult {
         let parse_enforcement = |s: &str| -> Result<EnforcementLevel, CoreError> {
             match s.to_uppercase().as_str() {
                 "ENFORCED" => Ok(EnforcementLevel::Enforced),
+                "MEDIATED" => Ok(EnforcementLevel::Mediated),
                 "OBSERVED" => Ok(EnforcementLevel::Observed),
-                "PREVENTED" => Ok(EnforcementLevel::Prevented),
+                "BEST_EFFORT" => Ok(EnforcementLevel::BestEffort),
                 "UNSUPPORTED" => Ok(EnforcementLevel::Unsupported),
+                "PREVENTED" => Ok(EnforcementLevel::Enforced),
                 other => Err(CoreError::SchemaViolation(format!(
                     "Invalid enforcement level '{other}'"
                 ))),

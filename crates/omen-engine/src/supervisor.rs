@@ -1,15 +1,62 @@
-use crate::backend::{ExecutionBackend, create_platform_backend};
+use crate::backend::{ExecutionBackend, NativeExecutionBackend};
 use omen_core::{
     AdapterClassification, CoreError, EnforcementReport, ProcessExit, RequiredAssurance,
-    RuntimeStatus, StdioMode,
+    RuntimeStatus, SecretInjectionContract, StdioMode,
 };
 use std::path::PathBuf;
-use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
-use tokio::process::Command;
 
 pub const DEFAULT_INLINE_BUDGET: usize = 8192;
+
+/// A secret injected into an execution request with a strict injection contract.
+#[derive(Clone)]
+pub struct ExecutionSecret {
+    pub name: String,
+    pub value: String,
+    pub contract: SecretInjectionContract,
+}
+
+impl std::fmt::Debug for ExecutionSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecutionSecret")
+            .field("name", &self.name)
+            .field("value", &"[REDACTED]")
+            .field("contract", &self.contract)
+            .finish()
+    }
+}
+
+impl ExecutionSecret {
+    pub fn env(name: impl Into<String>, value: impl Into<String>) -> Self {
+        let n = name.into();
+        Self {
+            name: n.clone(),
+            value: value.into(),
+            contract: SecretInjectionContract::EnvironmentVariable { name: n },
+        }
+    }
+
+    pub fn stdin(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+            contract: SecretInjectionContract::Stdin,
+        }
+    }
+
+    pub fn temp_file(
+        name: impl Into<String>,
+        value: impl Into<String>,
+        file_name: Option<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+            contract: SecretInjectionContract::TemporaryFile { file_name },
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ExecutionRequest {
@@ -21,6 +68,23 @@ pub struct ExecutionRequest {
     pub timeout_ms: u64,
     pub inline_budget: usize,
     pub required_assurance: RequiredAssurance,
+    pub secrets: Vec<ExecutionSecret>,
+}
+
+impl ExecutionRequest {
+    pub fn simple(argv: Vec<String>, cwd: PathBuf) -> Self {
+        Self {
+            argv,
+            cwd,
+            env: Vec::new(),
+            stdin_mode: StdioMode::Closed,
+            stdin_payload: None,
+            timeout_ms: 10000,
+            inline_budget: DEFAULT_INLINE_BUDGET,
+            required_assurance: RequiredAssurance::default(),
+            secrets: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -36,18 +100,28 @@ pub struct ExecutionOutput {
     pub duration_ms: u64,
 }
 
+impl ExecutionOutput {
+    pub fn stdout_sanitized(&self) -> String {
+        crate::pty::sanitize_terminal_escapes(&self.stdout_bounded)
+    }
+
+    pub fn stderr_sanitized(&self) -> String {
+        crate::pty::sanitize_terminal_escapes(&self.stderr_bounded)
+    }
+}
+
 pub struct ProcessSupervisor {
-    backend: Box<dyn ExecutionBackend>,
+    backend: Arc<dyn ExecutionBackend>,
 }
 
 impl ProcessSupervisor {
     pub fn new() -> Self {
         Self {
-            backend: create_platform_backend(),
+            backend: Arc::new(NativeExecutionBackend::new()),
         }
     }
 
-    pub fn with_backend(backend: Box<dyn ExecutionBackend>) -> Self {
+    pub fn with_backend(backend: Arc<dyn ExecutionBackend>) -> Self {
         Self { backend }
     }
 
@@ -55,8 +129,8 @@ impl ProcessSupervisor {
         self.backend.as_ref()
     }
 
-    pub async fn execute(&self, req: ExecutionRequest) -> Result<ExecutionOutput, CoreError> {
-        // 1. Preflight check: reject if required assurance exceeds platform capabilities
+    pub async fn execute(&self, mut req: ExecutionRequest) -> Result<ExecutionOutput, CoreError> {
+        // 1. Preflight check: fail-closed if required assurance cannot be enforced
         self.backend.preflight(&req.required_assurance)?;
 
         if req.argv.is_empty() {
@@ -65,106 +139,52 @@ impl ProcessSupervisor {
 
         let start_time = std::time::Instant::now();
 
-        let mut cmd = Command::new(&req.argv[0]);
-        if req.argv.len() > 1 {
-            cmd.args(&req.argv[1..]);
-        }
-        cmd.current_dir(&req.cwd);
-
-        for (k, v) in &req.env {
-            cmd.env(k, v);
-        }
-
-        // Stdio setup: closed stdin receives EOF immediately
-        match req.stdin_mode {
-            StdioMode::Closed | StdioMode::Inline => {
-                cmd.stdin(Stdio::piped());
+        // Handle temporary file secret injection
+        let _temp_dir_guard = if req
+            .secrets
+            .iter()
+            .any(|s| matches!(s.contract, SecretInjectionContract::TemporaryFile { .. }))
+        {
+            let tmp = tempfile::tempdir().map_err(|e| {
+                CoreError::ExecutionFailed(format!("Failed to create secret temp dir: {e}"))
+            })?;
+            for secret in &req.secrets {
+                if let SecretInjectionContract::TemporaryFile { file_name } = &secret.contract {
+                    let fname = file_name.as_deref().unwrap_or("secret.token");
+                    let fpath = tmp.path().join(fname);
+                    std::fs::write(&fpath, &secret.value).map_err(|e| {
+                        CoreError::ExecutionFailed(format!("Failed to write secret file: {e}"))
+                    })?;
+                    req.env.push((
+                        format!("{}_FILE", secret.name),
+                        fpath.to_string_lossy().to_string(),
+                    ));
+                }
             }
-            StdioMode::Inherit => {
-                cmd.stdin(Stdio::inherit());
-            }
-            _ => {
-                cmd.stdin(Stdio::null());
-            }
-        }
-
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-
-        #[cfg(windows)]
-        let job_guard = crate::platform::windows::JobObjectGuard::new().map_err(|e| {
-            CoreError::ExecutionFailed(format!("Job object initialization error: {e}"))
-        })?;
-
-        let mut child = cmd.spawn().map_err(|e| {
-            CoreError::ExecutionFailed(format!("Process spawn failed for '{}': {e}", req.argv[0]))
-        })?;
-
-        #[cfg(windows)]
-        if let Some(pid) = child.id() {
-            let _ = job_guard.assign_pid(pid);
-        }
-
-        // Handle stdin delivery or close
-        if let Some(mut stdin) = child.stdin.take() {
-            if let (StdioMode::Inline, Some(payload)) = (req.stdin_mode, &req.stdin_payload) {
-                use tokio::io::AsyncWriteExt;
-                let _ = stdin.write_all(payload).await;
-            }
-            // Dropping stdin immediately sends EOF to the child
-            drop(stdin);
-        }
-
-        let mut stdout_pipe = child.stdout.take().expect("stdout pipe missing");
-        let mut stderr_pipe = child.stderr.take().expect("stderr pipe missing");
-
-        let stdout_task = tokio::spawn(async move {
-            let mut buf = Vec::new();
-            let _ = stdout_pipe.read_to_end(&mut buf).await;
-            buf
-        });
-
-        let stderr_task = tokio::spawn(async move {
-            let mut buf = Vec::new();
-            let _ = stderr_pipe.read_to_end(&mut buf).await;
-            buf
-        });
-
-        let timeout_duration = Duration::from_millis(req.timeout_ms);
-        let wait_result = tokio::time::timeout(timeout_duration, child.wait()).await;
-
-        let (runtime_status, process_exit) = match wait_result {
-            Ok(Ok(exit_status)) => {
-                let code = exit_status.code();
-                (RuntimeStatus::Completed, ProcessExit { code, signal: None })
-            }
-            Ok(Err(e)) => (
-                RuntimeStatus::IoFailed,
-                ProcessExit {
-                    code: None,
-                    signal: Some(e.to_string()),
-                },
-            ),
-            Err(_) => {
-                // Timeout fired: terminate process tree
-                #[cfg(windows)]
-                job_guard.terminate(1);
-
-                let _ = child.kill().await;
-
-                (
-                    RuntimeStatus::TimedOut,
-                    ProcessExit {
-                        code: None,
-                        signal: Some("SIGKILL_TIMEOUT".into()),
-                    },
-                )
-            }
+            Some(tmp)
+        } else {
+            None
         };
 
-        let stdout_all = stdout_task.await.unwrap_or_default();
-        let stderr_all = stderr_task.await.unwrap_or_default();
+        // 2. Physical spawn through the execution backend
+        let handle = self.backend.spawn(&req)?;
 
+        // 3. Supervised wait with bounded timeout and tree cleanup
+        let timeout_duration = Duration::from_millis(req.timeout_ms);
+        let (runtime_status, process_exit, mut stdout_all, mut stderr_all) =
+            handle.wait_bounded(timeout_duration).await?;
+
+        // 4. Automatic secret redaction from captured stdout and stderr
+        for secret in &req.secrets {
+            if !secret.value.is_empty() {
+                let needle = secret.value.as_bytes();
+                let replacement = format!("[REDACTED:{}]", secret.name).into_bytes();
+                stdout_all = redact_bytes(&stdout_all, needle, &replacement);
+                stderr_all = redact_bytes(&stderr_all, needle, &replacement);
+            }
+        }
+
+        // 5. Bounded context slices
         let stdout_bounded = if stdout_all.len() > req.inline_budget {
             stdout_all[..req.inline_budget].to_vec()
         } else {
@@ -214,5 +234,59 @@ impl ProcessSupervisor {
 impl Default for ProcessSupervisor {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn redact_bytes(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
+    if needle.is_empty() || haystack.is_empty() || haystack.len() < needle.len() {
+        return haystack.to_vec();
+    }
+    let mut result = Vec::with_capacity(haystack.len());
+    let mut i = 0;
+    while i <= haystack.len().saturating_sub(needle.len()) {
+        if &haystack[i..i + needle.len()] == needle {
+            result.extend_from_slice(replacement);
+            i += needle.len();
+        } else {
+            result.push(haystack[i]);
+            i += 1;
+        }
+    }
+    if i < haystack.len() {
+        result.extend_from_slice(&haystack[i..]);
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_redact_bytes() {
+        let original = b"LOG: token=OMEN_SECRET_CANARY_XYZ12345 in stream";
+        let redacted = redact_bytes(
+            original,
+            b"OMEN_SECRET_CANARY_XYZ12345",
+            b"[REDACTED:token]",
+        );
+        assert_eq!(
+            String::from_utf8(redacted).unwrap(),
+            "LOG: token=[REDACTED:token] in stream"
+        );
+    }
+
+    #[test]
+    fn test_secret_debug_redaction() {
+        let secret = ExecutionSecret::env("API_KEY", "super_secret_cleartext_value_12345");
+        let debug_str = format!("{secret:?}");
+        assert!(
+            !debug_str.contains("super_secret_cleartext_value_12345"),
+            "Debug string leaked secret!"
+        );
+        assert!(
+            debug_str.contains("[REDACTED]"),
+            "Debug string missing [REDACTED]!"
+        );
     }
 }

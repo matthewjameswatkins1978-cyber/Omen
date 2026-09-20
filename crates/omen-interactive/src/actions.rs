@@ -14,6 +14,7 @@ impl SemanticDispatcher {
         session_id: &omen_core::InteractiveSessionId,
         db: Option<&mut Database>,
         agent_registry: Option<&omen_agent::ProviderRegistry>,
+        backend_registry: Option<&omen_engine::BackendRegistry>,
     ) -> Result<ProcessExit, CoreError> {
         match action {
             "status" => {
@@ -383,9 +384,97 @@ impl SemanticDispatcher {
                     }
                 }
             }
+            "backend" => {
+                let sub = args.first().map(|s| s.as_str()).unwrap_or("status");
+                match sub {
+                    "list" => {
+                        println!("Available Physical Execution Backends:");
+                        if let Some(reg) = backend_registry {
+                            for b in reg.list() {
+                                println!(
+                                    "  {:10} {:28} status={:?} fs={:?} net={:?} desc={:?}",
+                                    b.id.as_str(),
+                                    b.name,
+                                    b.availability,
+                                    b.capabilities.filesystem,
+                                    b.capabilities.network,
+                                    b.capabilities.descendants
+                                );
+                            }
+                        } else {
+                            println!("  native     Native Host                  Available");
+                        }
+                        Ok(ProcessExit {
+                            code: Some(0),
+                            signal: None,
+                        })
+                    }
+                    "status" => {
+                        if let Some(reg) = backend_registry {
+                            let active = reg.active();
+                            let desc = active.descriptor();
+                            println!(
+                                "Active Execution Backend: {} ({})",
+                                desc.name,
+                                desc.id.as_str()
+                            );
+                            println!("Kind:         {:?}", desc.kind);
+                            println!("Availability: {:?}", desc.availability);
+                            println!("Capabilities:");
+                            println!("  Filesystem:   {:?}", desc.capabilities.filesystem);
+                            println!("  Network:      {:?}", desc.capabilities.network);
+                            println!("  Descendants:  {:?}", desc.capabilities.descendants);
+                            println!("  Symlinks:     {:?}", desc.capabilities.symlink_escape);
+                            println!("  PTY:          {}", desc.capabilities.pty);
+                        } else {
+                            println!("Active Execution Backend: Native Host (native)");
+                        }
+                        Ok(ProcessExit {
+                            code: Some(0),
+                            signal: None,
+                        })
+                    }
+                    "use" => {
+                        if let Some(target) = args.get(1) {
+                            if let Some(reg) = backend_registry {
+                                let bid = omen_core::BackendId::new(target).map_err(|e| {
+                                    CoreError::ExecutionFailed(format!("Invalid backend ID: {e}"))
+                                })?;
+                                if let Err(e) = reg.set_active(&bid) {
+                                    println!("Error switching backend: {e}");
+                                    return Ok(ProcessExit {
+                                        code: Some(1),
+                                        signal: None,
+                                    });
+                                }
+                                println!("Active execution backend switched to '{target}'.");
+                            }
+                            Ok(ProcessExit {
+                                code: Some(0),
+                                signal: None,
+                            })
+                        } else {
+                            println!("Usage: :backend use <backend_id>");
+                            Ok(ProcessExit {
+                                code: Some(1),
+                                signal: None,
+                            })
+                        }
+                    }
+                    other => {
+                        println!(
+                            "Unknown backend subcommand '{other}'. Available: list, status, use"
+                        );
+                        Ok(ProcessExit {
+                            code: Some(1),
+                            signal: None,
+                        })
+                    }
+                }
+            }
             other => {
                 println!(
-                    "Unknown Omen semantic action ':{other}'. Available: :status, :doctor, :tools, :inspect, :why, :history, :show, :open, :rerun, :services, :stop, :agent"
+                    "Unknown Omen semantic action ':{other}'. Available: :status, :doctor, :tools, :inspect, :why, :history, :show, :open, :rerun, :services, :stop, :agent, :backend"
                 );
                 Ok(ProcessExit {
                     code: Some(1),

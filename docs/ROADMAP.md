@@ -71,13 +71,18 @@
 - **Compatibility Profiles & Interop Sets**: Declarative manifests validating protocol conformance before activation (no authority grant).
 - **Success Criteria**: *A capable coding agent using Omen should need raw terminal scraping dramatically less often.*
 
-### Omen 0.6: Physical Maturity
+### Omen 0.6: Physical Maturity (Complete)
 - **Theme**: *Make physical execution genuinely mature.*
-- **Pluggable Execution Backends**: Native host, WSL, container, microVM sandbox, remote runtime.
-- **Interactive & Process Capabilities**: First-class PTY execution, attachable/resumable sessions, process-tree ownership, service leases.
-- **Hardened Containment**: Linux Landlock/pidfd/cgroups v2/namespaces; Windows Job Objects/restricted tokens/AppContainer; macOS Endpoint Security.
-- **Truthful Platform Assurance**: Unforgeable reporting (`ENFORCED`, `MEDIATED`, `OBSERVED`, `BEST_EFFORT`, `UNSUPPORTED`).
-- **Secrets Handles**: Strict separation of `secret.use` from `secret.expose`.
+- [x] Pluggable execution backend SPI (`ExecutionBackend`, `BackendRegistry`)
+- [x] Native execution backend (Windows Job Objects kill-on-close, Unix process groups)
+- [x] Non-native execution backend (WSL execution backend with path translation)
+- [x] Daemon-owned PTY sessions with detach/reattach, escape sequence sanitization, bounded ring buffer
+- [x] Process-tree ownership & termination (Job Objects / process groups)
+- [x] Physical service lifecycle leases (`RuntimeLeaseId`, service survival across client disconnect)
+- [x] Truthful platform assurance matrix & fail-closed preflight (`ENFORCED`, `MEDIATED`, `OBSERVED`, `BEST_EFFORT`, `UNSUPPORTED`)
+- [x] Secret handles & automatic redaction (`secret.use` vs `secret.expose`, CAS/stdout redaction)
+- [x] Real-path proofs suite (Proofs A through G)
+- [x] Interactive commands (`:backend list`, `:backend status`, `:backend use <id>`)
 - **Success Criteria**: *Omen can supervise normal developer workloads, hostile fixtures, services and interactive programs while truthfully describing what the platform actually enforced.*
 
 ### Omen 0.7: Semantic Environment

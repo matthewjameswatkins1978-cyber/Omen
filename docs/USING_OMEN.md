@@ -908,6 +908,42 @@ The machine simply clears its throat.
 
 ---
 
+# Execution Backends
+
+In Omen 0.6, execution backends are pluggable and inspectable:
+
+```text
+[shared] > :backend list
+Available Execution Backends:
+  * native (backend://native) [Active] - Native Host OS Execution (Windows Job Objects / POSIX process groups)
+    wsl (backend://wsl) - Windows Subsystem for Linux (WSL) Subsystem Backend
+```
+
+You can inspect the exact capabilities and enforcement guarantees of your active backend:
+
+```text
+[shared] > :backend status
+Active Execution Backend: Native Host OS Execution (backend://native)
+Kind:         NativeHost
+Availability: Available
+Capabilities:
+  Process Isolation:    Enforced
+  Filesystem Isolation: Observed
+  Network Isolation:    Observed
+  Resource Limits:      Enforced
+  PTY Support:          Enforced
+  Secret Redaction:     Enforced
+```
+
+And switch backends seamlessly without leaving the shell:
+
+```text
+[shared] > :backend use wsl
+Switched active execution backend to: backend://wsl
+```
+
+---
+
 # The advantage in one sentence
 
 A conventional shell is excellent at:

@@ -129,3 +129,10 @@ pub struct ExecutionResult {
     pub artifacts: Vec<ResourceUri>,
     pub reduced_summary: String,
 }
+
+/// Reference to a secret managed outside execution logs, with an approved injection contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretHandle {
+    pub name: String,
+    pub contract: crate::types::SecretInjectionContract,
+}

@@ -43,6 +43,7 @@ impl RipgrepAdapter {
             timeout_ms: 15000,
             inline_budget: 65536,
             required_assurance: omen_core::RequiredAssurance::default(),
+            secrets: vec![],
         };
 
         let output = supervisor.execute(req).await?;

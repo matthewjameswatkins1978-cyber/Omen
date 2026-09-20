@@ -512,6 +512,7 @@ pub fn build_agent_context_with_workspace(
                 command: s.command,
                 state: s.state,
                 uptime_secs: 0,
+                lease_id: None,
             });
         }
     }

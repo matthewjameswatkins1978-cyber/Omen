@@ -19,6 +19,7 @@ pub struct DaemonServer {
     epoch: u64,
     endpoint: String,
     registry: Arc<WorkspaceRegistry>,
+    pty_manager: Arc<crate::pty_service::PtySessionManager>,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
 }
@@ -29,6 +30,7 @@ impl DaemonServer {
         let epoch = chrono::Utc::now().timestamp_millis() as u64;
         let instance_id = format!("dmn_{}", Uuid::new_v4());
         let registry = Arc::new(WorkspaceRegistry::new(epoch));
+        let pty_manager = Arc::new(crate::pty_service::PtySessionManager::new());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         Self {
@@ -36,9 +38,14 @@ impl DaemonServer {
             epoch,
             endpoint,
             registry,
+            pty_manager,
             shutdown_tx,
             shutdown_rx,
         }
+    }
+
+    pub fn pty_manager(&self) -> Arc<crate::pty_service::PtySessionManager> {
+        self.pty_manager.clone()
     }
 
     pub fn instance_id(&self) -> &str {
@@ -84,10 +91,11 @@ impl DaemonServer {
                         Ok(stream) => {
                             let instance_id = self.instance_id.clone();
                             let registry = self.registry.clone();
+                            let pty_manager = self.pty_manager.clone();
                             let shutdown_rx = self.shutdown_rx.clone();
                             let shutdown_tx = self.shutdown_tx.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = Self::handle_connection_internal(stream, instance_id, registry, shutdown_rx, shutdown_tx).await {
+                                if let Err(e) = Self::handle_connection_internal(stream, instance_id, registry, pty_manager, shutdown_rx, shutdown_tx).await {
                                     error!("Client connection handler finished with error: {e}");
                                 }
                             });
@@ -117,10 +125,12 @@ impl DaemonServer {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let (shutdown_tx, _) = watch::channel(false);
+        let pty_manager = Arc::new(crate::pty_service::PtySessionManager::new());
         Self::handle_connection_internal(
             stream,
             daemon_instance_id,
             registry,
+            pty_manager,
             shutdown_rx,
             shutdown_tx,
         )
@@ -131,6 +141,7 @@ impl DaemonServer {
         stream: S,
         daemon_instance_id: String,
         registry: Arc<WorkspaceRegistry>,
+        pty_manager: Arc<crate::pty_service::PtySessionManager>,
         mut shutdown_rx: watch::Receiver<bool>,
         shutdown_tx: watch::Sender<bool>,
     ) -> Result<(), LocalIpcError>
@@ -186,6 +197,7 @@ impl DaemonServer {
                                 request,
                                 registry.clone(),
                                 attached_workspace.clone(),
+                                pty_manager.clone(),
                                 write_mutex.clone(),
                                 event_pump_handle.clone(),
                                 shutdown_tx.clone(),
@@ -230,6 +242,7 @@ impl DaemonServer {
         request: IpcRequest,
         registry: Arc<WorkspaceRegistry>,
         attached_workspace: Arc<RwLock<Option<Arc<WorkspaceState>>>>,
+        pty_manager: Arc<crate::pty_service::PtySessionManager>,
         write_mutex: Arc<Mutex<W>>,
         event_pump_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
         shutdown_tx: watch::Sender<bool>,
@@ -505,6 +518,74 @@ impl DaemonServer {
                         "No workspace attached for this session".into(),
                     )),
                 }
+            }
+
+            RequestPayload::CreatePtySession {
+                session_id,
+                argv,
+                cwd,
+                env,
+                rows,
+                cols,
+            } => pty_manager
+                .create(
+                    &session_id,
+                    argv,
+                    Path::new(&cwd).to_path_buf(),
+                    env,
+                    rows,
+                    cols,
+                )
+                .await
+                .map(|pid| ResponsePayload::PtySessionCreated { session_id, pid }),
+
+            RequestPayload::AttachPtySession { session_id } => pty_manager
+                .attach(&session_id)
+                .await
+                .map(|(output, state)| ResponsePayload::PtySessionAttached {
+                    session_id,
+                    output,
+                    state: format!("{:?}", state).to_uppercase(),
+                }),
+
+            RequestPayload::DetachPtySession { session_id } => pty_manager
+                .detach(&session_id)
+                .await
+                .map(|_| ResponsePayload::PtySessionDetached { session_id }),
+
+            RequestPayload::WritePtyInput { session_id, data } => pty_manager
+                .write_input(&session_id, &data)
+                .await
+                .map(|_| ResponsePayload::PtyInputWritten),
+
+            RequestPayload::ReadPtyOutput { session_id, offset } => {
+                pty_manager.read_output(&session_id, offset).await.map(
+                    |(output, total_written, state)| ResponsePayload::PtyOutputRead {
+                        session_id,
+                        output,
+                        total_written,
+                        state: format!("{:?}", state).to_uppercase(),
+                    },
+                )
+            }
+
+            RequestPayload::ResizePty {
+                session_id,
+                rows,
+                cols,
+            } => pty_manager
+                .resize(&session_id, rows, cols)
+                .await
+                .map(|_| ResponsePayload::PtyResized),
+
+            RequestPayload::TerminatePty { session_id } => pty_manager
+                .terminate(&session_id)
+                .await
+                .map(|_| ResponsePayload::PtyTerminated { session_id }),
+
+            RequestPayload::ListPtySessions => {
+                let sessions = pty_manager.list().await;
+                Ok(ResponsePayload::PtySessionsList { sessions })
             }
 
             RequestPayload::ReportOfflineGap { .. } => Ok(ResponsePayload::OfflineGapAcknowledged),

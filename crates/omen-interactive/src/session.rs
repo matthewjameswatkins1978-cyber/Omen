@@ -21,6 +21,7 @@ pub struct InteractiveSession {
     pub client: Option<omen_client::OmenClient>,
     pub agent_provider: Option<std::sync::Arc<dyn omen_agent::AgentProvider>>,
     pub agent_registry: std::sync::Arc<omen_agent::ProviderRegistry>,
+    pub backend_registry: std::sync::Arc<omen_engine::BackendRegistry>,
 }
 
 pub fn block_on_async<F>(future: F) -> F::Output
@@ -96,7 +97,8 @@ impl InteractiveSession {
         db: Option<Database>,
         client: Option<omen_client::OmenClient>,
     ) -> Result<Self, CoreError> {
-        let supervisor = ProcessSupervisor::new();
+        let backend_registry = std::sync::Arc::new(omen_engine::BackendRegistry::new());
+        let supervisor = ProcessSupervisor::with_backend(backend_registry.active());
         let caps = TerminalCapabilities::detect();
         let mode_label = if client.is_some() {
             "[shared]"
@@ -181,6 +183,7 @@ impl InteractiveSession {
             client,
             agent_provider,
             agent_registry,
+            backend_registry,
         };
         sess.update_prompt_state();
         Ok(sess)
@@ -390,10 +393,12 @@ impl InteractiveSession {
                     &self.session_id,
                     self.db.as_mut(),
                     Some(&self.agent_registry),
+                    Some(&self.backend_registry),
                 );
                 if let Ok(exit) = &res {
                     self.last_exit = Some(exit.clone());
                 }
+                self.supervisor = ProcessSupervisor::with_backend(self.backend_registry.active());
                 self.agent_provider = Some(self.agent_registry.active_provider());
                 self.update_prompt_state();
                 res
@@ -577,6 +582,7 @@ impl InteractiveSession {
                     timeout_ms: 60000,
                     inline_budget: 65536,
                     required_assurance: RequiredAssurance::default(),
+                    secrets: vec![],
                 };
 
                 print!(
@@ -936,6 +942,7 @@ impl InteractiveSession {
             timeout_ms: 60000,
             inline_budget: 65536,
             required_assurance: RequiredAssurance::default(),
+            secrets: vec![],
         };
 
         print!(

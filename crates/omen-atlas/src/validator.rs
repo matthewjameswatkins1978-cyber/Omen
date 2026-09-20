@@ -42,6 +42,7 @@ impl ToolValidator {
             timeout_ms: 5000,
             inline_budget: 4096,
             required_assurance: RequiredAssurance::default(),
+            secrets: vec![],
         };
 
         let output = self.supervisor.execute(req).await?;

@@ -64,10 +64,49 @@ define_id!(ArtifactId, "artifact");
 define_id!(ProcessId, "proc");
 define_id!(InteractiveSessionId, "sess");
 define_id!(OperationId, "op");
+define_id!(BackendId, "backend");
+define_id!(PtySessionId, "pty");
+define_id!(RuntimeLeaseId, "lease");
 
 impl InteractiveSessionId {
     /// Generates a genuinely unique opaque session ID using UUID v4.
     pub fn generate() -> Self {
         Self(format!("sess-{}", uuid::Uuid::new_v4()))
+    }
+}
+
+impl PtySessionId {
+    /// Generates a genuinely unique opaque PTY session ID using UUID v4.
+    pub fn generate() -> Self {
+        Self(format!("pty-{}", uuid::Uuid::new_v4()))
+    }
+}
+
+impl RuntimeLeaseId {
+    /// Generates a genuinely unique opaque runtime lease ID using UUID v4.
+    pub fn generate() -> Self {
+        Self(format!("lease-{}", uuid::Uuid::new_v4()))
+    }
+}
+
+impl BackendId {
+    pub fn native() -> Self {
+        Self("native".into())
+    }
+
+    pub fn wsl() -> Self {
+        Self("wsl".into())
+    }
+
+    pub fn container() -> Self {
+        Self("container".into())
+    }
+
+    pub fn microvm() -> Self {
+        Self("microvm".into())
+    }
+
+    pub fn remote() -> Self {
+        Self("remote".into())
     }
 }

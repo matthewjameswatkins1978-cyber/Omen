@@ -119,6 +119,7 @@ fn run_bounded_probe(
         timeout_ms,
         inline_budget: 8192,
         required_assurance: omen_core::RequiredAssurance::default(),
+        secrets: vec![],
     };
 
     let out = block_on_async(supervisor.execute(req))
