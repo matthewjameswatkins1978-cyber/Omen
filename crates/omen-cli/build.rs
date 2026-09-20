@@ -25,7 +25,7 @@ fn main() {
     let target = std::env::var("TARGET").expect("TARGET is required by Cargo");
     let profile = std::env::var("PROFILE").expect("PROFILE is required by Cargo");
     let identity = format!(
-        "{}\ncontract: 0.8\ncommit: {git_sha}\ntarget: {target}\nprofile: {profile}",
+        "{} contract:0.8 commit:{git_sha} target:{target} profile:{profile}",
         std::env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION is required by Cargo")
     );
 
