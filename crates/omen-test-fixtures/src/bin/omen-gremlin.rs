@@ -244,6 +244,13 @@ fn run_hostile_lsp(mode: &str) {
                 "never-init" => {
                     thread::sleep(Duration::from_secs(3600));
                 }
+                "semantic-filtered" => {
+                    let resp = format!(
+                        r#"{{"jsonrpc":"2.0","id":{},"result":{{"capabilities":{{"experimental":{{"workspaceSymbolScopeKindFiltering":true}}}}}}}}"#,
+                        id.unwrap_or(1)
+                    );
+                    write_response(&resp);
+                }
                 _ => {
                     let resp = format!(
                         r#"{{"jsonrpc":"2.0","id":{},"result":{{"capabilities":{{}}}}}}"#,
@@ -253,6 +260,7 @@ fn run_hostile_lsp(mode: &str) {
                 }
             },
             "initialized" => {}
+            "textDocument/didOpen" => {}
             "shutdown" => {
                 let resp = format!(
                     r#"{{"jsonrpc":"2.0","id":{},"result":null}}"#,
@@ -299,6 +307,126 @@ fn run_hostile_lsp(mode: &str) {
                     }
                     "exit-mid" => {
                         std::process::exit(1);
+                    }
+                    "semantic-filtered" | "semantic-fallback" => {
+                        let params = val.get("params").cloned().unwrap_or_default();
+                        match method {
+                            "workspace/symbol" => {
+                                let query = params
+                                    .get("query")
+                                    .and_then(|q| q.as_str())
+                                    .unwrap_or("");
+
+                                let (valid_request, canonical_query) = if mode == "semantic-filtered" {
+                                    let valid = params
+                                        .get("searchScope")
+                                        .and_then(|v| v.as_str())
+                                        == Some("workspace")
+                                        && params
+                                            .get("searchKind")
+                                            .and_then(|v| v.as_str())
+                                            == Some("allSymbols");
+                                    (valid, query)
+                                } else {
+                                    (query.ends_with('#'), query.strip_suffix('#').unwrap_or(query))
+                                };
+
+                                let symbols = if !valid_request {
+                                    serde_json::json!([])
+                                } else {
+                                    match canonical_query {
+                                        "refresh_token" => serde_json::json!([
+                                            {
+                                                "name": "refresh_token",
+                                                "kind": 12,
+                                                "location": {
+                                                    "uri": "file:///src/lib.rs",
+                                                    "range": {
+                                                        "start": {"line": 0, "character": 7},
+                                                        "end": {"line": 0, "character": 20}
+                                                    }
+                                                }
+                                            }
+                                        ]),
+                                        "duplicate" => serde_json::json!([
+                                            {
+                                                "name": "duplicate",
+                                                "kind": 12,
+                                                "location": {
+                                                    "uri": "file:///src/lib.rs",
+                                                    "range": {
+                                                        "start": {"line": 4, "character": 7},
+                                                        "end": {"line": 4, "character": 16}
+                                                    }
+                                                }
+                                            },
+                                            {
+                                                "name": "duplicate",
+                                                "kind": 12,
+                                                "location": {
+                                                    "uri": "file:///src/lib.rs",
+                                                    "range": {
+                                                        "start": {"line": 6, "character": 7},
+                                                        "end": {"line": 6, "character": 16}
+                                                    }
+                                                }
+                                            }
+                                        ]),
+                                        "SessionToken" => serde_json::json!([
+                                            {
+                                                "name": "SessionToken",
+                                                "kind": 5,
+                                                "location": {
+                                                    "uri": "file:///src/lib.rs",
+                                                    "range": {
+                                                        "start": {"line": 8, "character": 11},
+                                                        "end": {"line": 8, "character": 23}
+                                                    }
+                                                }
+                                            }
+                                        ]),
+                                        _ => serde_json::json!([])
+                                    }
+                                };
+
+                                let resp = serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": req_id,
+                                    "result": symbols
+                                });
+                                write_response(&resp.to_string());
+                            }
+                            "textDocument/references" => {
+                                let refs = serde_json::json!([
+                                    {
+                                        "uri": "file:///src/lib.rs",
+                                        "range": {
+                                            "start": {"line": 0, "character": 7},
+                                            "end": {"line": 0, "character": 20}
+                                        }
+                                    },
+                                    {
+                                        "uri": "file:///src/lib.rs",
+                                        "range": {
+                                            "start": {"line": 2, "character": 4},
+                                            "end": {"line": 2, "character": 17}
+                                        }
+                                    }
+                                ]);
+                                let resp = serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": req_id,
+                                    "result": refs
+                                });
+                                write_response(&resp.to_string());
+                            }
+                            _ => {
+                                let resp = format!(
+                                    r#"{{"jsonrpc":"2.0","id":{req_id},"result":[]}}"#
+                                );
+                                write_response(&resp);
+                            }
+                        }
                     }
                     _ => {
                         let resp = format!(r#"{{"jsonrpc":"2.0","id":{req_id},"result":[]}}"#);
