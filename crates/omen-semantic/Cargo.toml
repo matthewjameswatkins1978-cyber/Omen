@@ -1,5 +1,5 @@
 [package]
-name = "omen-adapters"
+name = "omen-semantic"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,21 +9,14 @@ publish = false
 
 [dependencies]
 omen-core = { workspace = true }
-omen-schema = { workspace = true }
-omen-engine = { workspace = true }
 omen-knowledge = { workspace = true }
-omen-atlas = { workspace = true }
-omen-semantic = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
-tempfile = { workspace = true }
-thiserror = { workspace = true }
 tracing = { workspace = true }
-tokio = { workspace = true }
-toml = { workspace = true }
-prost = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+tempfile = { workspace = true }

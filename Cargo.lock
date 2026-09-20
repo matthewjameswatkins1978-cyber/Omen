@@ -71,6 +71,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.104"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -515,6 +521,15 @@ checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
 name = "itertools"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
+dependencies = [
+ "either",
+]
+
+[[package]]
+name = "itertools"
 version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b4baf93f58d4425749ca49a51c50ebab072c5df6994d08fed93541c331481dc"
@@ -691,12 +706,15 @@ dependencies = [
  "omen-engine",
  "omen-knowledge",
  "omen-schema",
+ "omen-semantic",
+ "prost",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "thiserror",
  "tokio",
+ "toml",
  "tracing",
 ]
 
@@ -747,6 +765,7 @@ version = "0.2.0"
 dependencies = [
  "clap",
  "omen-adapters",
+ "omen-agent",
  "omen-atlas",
  "omen-client",
  "omen-core",
@@ -757,6 +776,8 @@ dependencies = [
  "omen-knowledge",
  "omen-mcp",
  "omen-schema",
+ "omen-semantic",
+ "omen-test-fixtures",
  "omen-ui",
  "serde",
  "serde_json",
@@ -858,6 +879,7 @@ dependencies = [
  "omen-ipc",
  "omen-knowledge",
  "omen-schema",
+ "omen-semantic",
  "omen-test-fixtures",
  "omen-ui",
  "reedline",
@@ -905,6 +927,7 @@ name = "omen-mcp"
 version = "0.2.0"
 dependencies = [
  "clap",
+ "omen-adapters",
  "omen-agent",
  "omen-client",
  "omen-core",
@@ -912,6 +935,7 @@ dependencies = [
  "omen-engine",
  "omen-ipc",
  "omen-knowledge",
+ "omen-semantic",
  "omen-test-fixtures",
  "serde",
  "serde_json",
@@ -935,11 +959,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "omen-semantic"
+version = "0.2.0"
+dependencies = [
+ "hex",
+ "omen-core",
+ "omen-knowledge",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "omen-test-fixtures"
 version = "0.2.0"
 dependencies = [
  "clap",
  "crossterm",
+ "serde_json",
  "tokio",
 ]
 
@@ -1015,6 +1056,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "prost"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2796faa41db3ec313a31f7624d9286acf277b52de526150b7e69f3debf891ee5"
+dependencies = [
+ "bytes",
+ "prost-derive",
+]
+
+[[package]]
+name = "prost-derive"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
+dependencies = [
+ "anyhow",
+ "itertools 0.14.0",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1047,7 +1111,7 @@ dependencies = [
  "chrono",
  "crossterm",
  "fd-lock",
- "itertools",
+ "itertools 0.15.0",
  "nu-ansi-term",
  "serde",
  "strip-ansi-escapes",

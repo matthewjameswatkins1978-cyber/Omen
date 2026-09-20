@@ -18,6 +18,8 @@ pub enum ResourceKind {
     Net,
     Actor,
     Trace,
+    Symbol,
+    Package,
 }
 
 impl ResourceKind {
@@ -34,6 +36,8 @@ impl ResourceKind {
             Self::Net => "net",
             Self::Actor => "actor",
             Self::Trace => "trace",
+            Self::Symbol => "symbol",
+            Self::Package => "package",
         }
     }
 }
@@ -66,6 +70,8 @@ impl ResourceUri {
             "net" => ResourceKind::Net,
             "actor" => ResourceKind::Actor,
             "trace" => ResourceKind::Trace,
+            "symbol" => ResourceKind::Symbol,
+            "package" => ResourceKind::Package,
             other => {
                 return Err(CoreError::InvalidUri(format!(
                     "Unknown resource scheme '{other}' in '{raw}'"
@@ -135,6 +141,8 @@ impl ResourceUri {
             "net" => ResourceKind::Net,
             "actor" => ResourceKind::Actor,
             "trace" => ResourceKind::Trace,
+            "symbol" => ResourceKind::Symbol,
+            "package" => ResourceKind::Package,
             _ => unreachable!("Scheme validated during construction"),
         }
     }

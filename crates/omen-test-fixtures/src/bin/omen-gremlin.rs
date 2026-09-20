@@ -47,6 +47,9 @@ struct GremlinArgs {
     #[arg(long)]
     print_env: Option<String>,
 
+    #[arg(long)]
+    lsp_mode: Option<String>,
+
     #[arg(long, default_value_t = 0)]
     exit: i32,
 
@@ -57,6 +60,11 @@ struct GremlinArgs {
 #[allow(clippy::zombie_processes)]
 fn main() {
     let args = GremlinArgs::parse();
+
+    if let Some(mode) = &args.lsp_mode {
+        run_hostile_lsp(mode);
+        return;
+    }
 
     if let Ok(stall_str) = std::env::var("OMEN_GREMLIN_STALL_MS")
         && let Ok(ms) = stall_str.parse::<u64>()
@@ -177,4 +185,127 @@ fn main() {
     }
 
     std::process::exit(args.exit);
+}
+
+fn run_hostile_lsp(mode: &str) {
+    use std::io::{BufRead, Read, Write};
+    let stdin = std::io::stdin();
+    let mut stdin_lock = stdin.lock();
+    let mut stdout = std::io::stdout();
+
+    let write_response = |body: &str| {
+        let header = format!("Content-Length: {}\r\n\r\n", body.len());
+        let mut out = std::io::stdout();
+        let _ = out.write_all(header.as_bytes());
+        let _ = out.write_all(body.as_bytes());
+        let _ = out.flush();
+    };
+
+    loop {
+        let mut header_line = String::new();
+        let mut content_length = None;
+        loop {
+            header_line.clear();
+            if stdin_lock.read_line(&mut header_line).unwrap_or(0) == 0 {
+                return;
+            }
+            let trimmed = header_line.trim();
+            if trimmed.is_empty() {
+                break;
+            }
+            if let Some(rest) = trimmed.strip_prefix("Content-Length:") {
+                content_length = rest.trim().parse::<usize>().ok();
+            }
+        }
+
+        let Some(len) = content_length else { continue };
+        let mut body = vec![0u8; len];
+        if stdin_lock.read_exact(&mut body).is_err() {
+            return;
+        }
+
+        let Ok(val) = serde_json::from_slice::<serde_json::Value>(&body) else {
+            continue;
+        };
+
+        let method = val.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        let id = val.get("id").and_then(|i| i.as_u64());
+
+        match method {
+            "initialize" => match mode {
+                "slow-init" => {
+                    thread::sleep(Duration::from_millis(5000));
+                    let resp = format!(
+                        r#"{{"jsonrpc":"2.0","id":{},"result":{{"capabilities":{{}}}}}}"#,
+                        id.unwrap_or(1)
+                    );
+                    write_response(&resp);
+                }
+                "never-init" => {
+                    thread::sleep(Duration::from_secs(3600));
+                }
+                _ => {
+                    let resp = format!(
+                        r#"{{"jsonrpc":"2.0","id":{},"result":{{"capabilities":{{}}}}}}"#,
+                        id.unwrap_or(1)
+                    );
+                    write_response(&resp);
+                }
+            },
+            "initialized" => {}
+            "shutdown" => {
+                let resp = format!(
+                    r#"{{"jsonrpc":"2.0","id":{},"result":null}}"#,
+                    id.unwrap_or(1)
+                );
+                write_response(&resp);
+            }
+            "exit" => {
+                std::process::exit(0);
+            }
+            "$/cancelRequest" => {}
+            _ => {
+                let req_id = id.unwrap_or(1);
+                match mode {
+                    "malformed" => {
+                        let header = "Content-Length: 25\r\n\r\n";
+                        let _ = stdout.write_all(header.as_bytes());
+                        let _ = stdout.write_all(b"this is not valid json!!!");
+                        let _ = stdout.flush();
+                    }
+                    "wrong-id" => {
+                        let resp = r#"{"jsonrpc":"2.0","id":99999,"result":[]}"#;
+                        write_response(resp);
+                    }
+                    "late-response" => {
+                        thread::sleep(Duration::from_millis(3000));
+                        let resp = format!(r#"{{"jsonrpc":"2.0","id":{req_id},"result":[]}}"#);
+                        write_response(&resp);
+                    }
+                    "huge-response" => {
+                        let header = "Content-Length: 52428800\r\n\r\n";
+                        let _ = stdout.write_all(header.as_bytes());
+                        let _ = stdout.flush();
+                    }
+                    "flood" => {
+                        for i in 0..100 {
+                            let notif = format!(
+                                r#"{{"jsonrpc":"2.0","method":"window/logMessage","params":{{"type":3,"message":"flood_{i}"}}}}"#
+                            );
+                            write_response(&notif);
+                        }
+                        let resp = format!(r#"{{"jsonrpc":"2.0","id":{req_id},"result":[]}}"#);
+                        write_response(&resp);
+                    }
+                    "exit-mid" => {
+                        std::process::exit(1);
+                    }
+                    _ => {
+                        let resp = format!(r#"{{"jsonrpc":"2.0","id":{req_id},"result":[]}}"#);
+                        write_response(&resp);
+                    }
+                }
+            }
+        }
+    }
 }

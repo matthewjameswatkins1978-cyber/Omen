@@ -13,6 +13,8 @@ pub struct AiLaneDispatchStats {
     pub git_probes: usize,
     pub db_context_queries: usize,
     pub service_scans: usize,
+    #[serde(default)]
+    pub semantic_provider_calls: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,6 +183,160 @@ impl AiLaneDispatcher {
                         suggested_commands: vec![":status".to_string()],
                         proposed_actions: Vec::new(),
                         references: Vec::new(),
+                        stats,
+                    });
+                }
+                omen_agent::DeterministicKind::SymbolDefinition(sym) => {
+                    stats.semantic_provider_calls += 1;
+                    let reg = crate::semantic_service::build_semantic_registry(workspace_root);
+                    let res = run_future_blocking(async {
+                        reg.find_definition(&sym, None, None, None, None).await
+                    });
+                    let (msg, refs) = match res {
+                        Ok(omen_semantic::SemanticLookupResult::Resolved(loc)) => (
+                            format!(
+                                "Symbol `{sym}` is defined at `{}:{}:{}`.",
+                                loc.file,
+                                loc.range.start_line + 1,
+                                loc.range.start_col + 1
+                            ),
+                            vec![format!("@symbol://{sym}")],
+                        ),
+                        Ok(omen_semantic::SemanticLookupResult::Stale(loc)) => (
+                            format!(
+                                "Symbol `{sym}` is defined at `{}:{}:{}` (STALE index — source file has changed).",
+                                loc.file,
+                                loc.range.start_line + 1,
+                                loc.range.start_col + 1
+                            ),
+                            vec![format!("@symbol://{sym}")],
+                        ),
+                        Ok(omen_semantic::SemanticLookupResult::Ambiguous(candidates)) => (
+                            format!(
+                                "Symbol `{sym}` is ambiguous (found {} candidates across workspace).",
+                                candidates.len()
+                            ),
+                            candidates
+                                .into_iter()
+                                .map(|c| format!("@{}", c.uri.as_str()))
+                                .collect(),
+                        ),
+                        Ok(omen_semantic::SemanticLookupResult::NotFound) => (
+                            format!("Symbol `{sym}` was not found in workspace semantic index."),
+                            Vec::new(),
+                        ),
+                        Ok(omen_semantic::SemanticLookupResult::Unsupported) | Err(_) => (
+                            format!(
+                                "Symbol definition for `{sym}` is unsupported by current semantic providers."
+                            ),
+                            Vec::new(),
+                        ),
+                    };
+
+                    return Ok(AiLaneOutput {
+                        configured: true,
+                        query: query.to_string(),
+                        response_text: format!("Agent\n\n{msg}"),
+                        suggested_commands: vec![format!(":def {sym}")],
+                        proposed_actions: Vec::new(),
+                        references: refs,
+                        stats,
+                    });
+                }
+                omen_agent::DeterministicKind::SymbolReferences(sym) => {
+                    stats.semantic_provider_calls += 1;
+                    let reg = crate::semantic_service::build_semantic_registry(workspace_root);
+                    let res = run_future_blocking(async {
+                        reg.find_references(&sym, None, None, None, Some(50), None)
+                            .await
+                    });
+                    let (msg, refs) = match res {
+                        Ok(omen_semantic::SemanticLookupResult::Resolved(r_list)) => (
+                            format!("Found {} reference(s) to symbol `{sym}`.", r_list.len()),
+                            vec![format!("@symbol://{sym}")],
+                        ),
+                        Ok(omen_semantic::SemanticLookupResult::Stale(r_list)) => (
+                            format!(
+                                "Found {} reference(s) to symbol `{sym}` (STALE index — source file has changed).",
+                                r_list.len()
+                            ),
+                            vec![format!("@symbol://{sym}")],
+                        ),
+                        Ok(omen_semantic::SemanticLookupResult::Ambiguous(candidates)) => (
+                            format!(
+                                "Symbol `{sym}` is ambiguous ({} candidates).",
+                                candidates.len()
+                            ),
+                            vec![format!("@symbol://{sym}")],
+                        ),
+                        Ok(omen_semantic::SemanticLookupResult::NotFound) => (
+                            format!("No references found for symbol `{sym}`."),
+                            Vec::new(),
+                        ),
+                        Ok(omen_semantic::SemanticLookupResult::Unsupported) | Err(_) => (
+                            format!(
+                                "Reference lookup for `{sym}` is unsupported by current semantic providers."
+                            ),
+                            Vec::new(),
+                        ),
+                    };
+
+                    return Ok(AiLaneOutput {
+                        configured: true,
+                        query: query.to_string(),
+                        response_text: format!("Agent\n\n{msg}"),
+                        suggested_commands: vec![format!(":refs {sym}")],
+                        proposed_actions: Vec::new(),
+                        references: refs,
+                        stats,
+                    });
+                }
+                omen_agent::DeterministicKind::PackageQuery(pkg_opt) => {
+                    let reg = crate::semantic_service::build_semantic_registry(workspace_root);
+                    let pkgs =
+                        run_future_blocking(async { reg.packages(None).await }).unwrap_or_default();
+
+                    let (msg, refs) = match pkg_opt {
+                        Some(target) => {
+                            if let Some(p) = pkgs.iter().find(|p| {
+                                p.name == target || p.targets.iter().any(|t| t.name == target)
+                            }) {
+                                (
+                                    format!(
+                                        "Target `{target}` belongs to package `{}` (v{}) [{}].",
+                                        p.name, p.version, p.ecosystem
+                                    ),
+                                    vec![format!("@{}", p.uri.as_str())],
+                                )
+                            } else {
+                                (
+                                    format!("No package found owning target `{target}`."),
+                                    Vec::new(),
+                                )
+                            }
+                        }
+                        None => (
+                            format!(
+                                "Workspace contains {} package(s): {}.",
+                                pkgs.len(),
+                                pkgs.iter()
+                                    .map(|p| p.name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ),
+                            pkgs.into_iter()
+                                .map(|p| format!("@{}", p.uri.as_str()))
+                                .collect(),
+                        ),
+                    };
+
+                    return Ok(AiLaneOutput {
+                        configured: true,
+                        query: query.to_string(),
+                        response_text: format!("Agent\n\n{msg}"),
+                        suggested_commands: vec![":packages".to_string()],
+                        proposed_actions: Vec::new(),
+                        references: refs,
                         stats,
                     });
                 }
@@ -536,4 +692,23 @@ pub fn build_agent_context_with_workspace(
     }
 
     ctx
+}
+
+fn run_future_blocking<F, T>(future: F) -> T
+where
+    F: std::future::Future<Output = T> + Send,
+    T: Send,
+{
+    std::thread::scope(|s| {
+        s.spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("Failed to build tokio runtime")
+                .block_on(future)
+        })
+        .join()
+        .expect("Thread panicked")
+    })
 }

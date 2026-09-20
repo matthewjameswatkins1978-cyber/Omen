@@ -9,7 +9,7 @@ pub mod types;
 pub use error::{CoreError, ErrorCode};
 pub use id::{
     ActionId, ArtifactId, BackendId, ExecutionId, FactId, InteractiveSessionId, OperationId,
-    ProcessId, PtySessionId, ResourceId, RuntimeLeaseId, ToolId,
+    ProcessId, PtySessionId, ResourceId, RuntimeLeaseId, SemanticProviderId, SymbolId, ToolId,
 };
 pub use model::{
     AdapterClassification, EnforcementReport, ExecutionConstraints, ExecutionContract,

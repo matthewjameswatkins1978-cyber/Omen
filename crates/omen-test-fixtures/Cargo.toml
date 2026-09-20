@@ -15,4 +15,5 @@ path = "src/bin/omen-gremlin.rs"
 clap = { workspace = true }
 tokio = { workspace = true }
 crossterm = { workspace = true }
+serde_json = { workspace = true }
 

@@ -2,7 +2,7 @@ use crate::context::AgentContext;
 use crate::provider::AgentResponse;
 
 /// Category of deterministic query identified cheaply with zero I/O.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeterministicKind {
     /// Query about current directory/location: requires only cwd (0 git, 0 db, 0 model)
     CurrentDirectory,
@@ -14,6 +14,12 @@ pub enum DeterministicKind {
     WorkspaceDirty,
     /// Query about current file focus: requires only cwd (0 git, 0 db, 0 model)
     FileFocus,
+    /// Query about symbol definition location
+    SymbolDefinition(String),
+    /// Query about symbol call sites or references
+    SymbolReferences(String),
+    /// Query about workspace packages
+    PackageQuery(Option<String>),
 }
 
 /// Deterministic classifier providing instant answers directly from Omen machine truth
@@ -23,12 +29,13 @@ pub struct DeterministicClassifier;
 impl DeterministicClassifier {
     /// Classifies a query using cheap string matching with zero I/O, zero subprocesses, and zero model calls.
     pub fn classify(query: &str) -> Option<DeterministicKind> {
-        let q = query.trim().to_lowercase();
-        let q_clean = q
+        let q_raw = query.trim();
+        let q_clean_raw = q_raw
             .trim_start_matches('?')
             .trim()
             .trim_end_matches('?')
             .trim();
+        let q_clean = q_clean_raw.to_lowercase();
 
         // 1. "what folder am I in?" / "where am I?" / "pwd"
         if q_clean == "what folder am i in"
@@ -73,6 +80,86 @@ impl DeterministicClassifier {
         // 5. "what file is this?"
         if q_clean == "what file is this" || q_clean == "what file am i looking at" {
             return Some(DeterministicKind::FileFocus);
+        }
+
+        // 6. Semantic symbol definition: "where is X defined?" / "where is function X defined?" / "def X"
+        let def_prefixes = [
+            "where is function ",
+            "where is struct ",
+            "where is symbol ",
+            "where is fn ",
+            "where is ",
+            "definition of ",
+            "def ",
+        ];
+        for prefix in &def_prefixes {
+            if let Some(rest_lower) = q_clean.strip_prefix(prefix) {
+                let rest_raw = &q_clean_raw[prefix.len()..];
+                let sym_raw = if rest_lower.ends_with(" defined") {
+                    &rest_raw[..rest_raw.len() - " defined".len()]
+                } else {
+                    rest_raw
+                };
+                let sym = sym_raw
+                    .trim()
+                    .trim_matches('`')
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .trim();
+                if !sym.is_empty() && !sym.contains(' ') {
+                    return Some(DeterministicKind::SymbolDefinition(sym.to_string()));
+                }
+            }
+        }
+
+        // 7. Semantic symbol references: "what calls X?" / "who calls X?" / "references to X" / "refs X"
+        let ref_prefixes = [
+            "what calls ",
+            "who calls ",
+            "references to ",
+            "refs to ",
+            "refs ",
+            "where is ",
+        ];
+        for prefix in &ref_prefixes {
+            if let Some(rest_lower) = q_clean.strip_prefix(prefix) {
+                let rest_raw = &q_clean_raw[prefix.len()..];
+                let sym_raw = if rest_lower.ends_with(" used") {
+                    Some(&rest_raw[..rest_raw.len() - " used".len()])
+                } else if rest_lower.ends_with(" called") {
+                    Some(&rest_raw[..rest_raw.len() - " called".len()])
+                } else if prefix != &"where is " {
+                    Some(rest_raw)
+                } else {
+                    None
+                };
+
+                if let Some(s) = sym_raw {
+                    let sym = s
+                        .trim()
+                        .trim_matches('`')
+                        .trim_matches('"')
+                        .trim_matches('\'')
+                        .trim();
+                    if !sym.is_empty() && !sym.contains(' ') {
+                        return Some(DeterministicKind::SymbolReferences(sym.to_string()));
+                    }
+                }
+            }
+        }
+
+        // 8. Semantic package queries: "what package owns Y?" / "what packages exist?" / "list packages"
+        if q_clean == "what packages exist" || q_clean == "list packages" || q_clean == "packages" {
+            return Some(DeterministicKind::PackageQuery(None));
+        }
+        if let Some(rest) = q_clean
+            .strip_prefix("what package owns ")
+            .or_else(|| q_clean.strip_prefix("which package owns "))
+        {
+            let target = rest.trim().trim_matches('`').trim_matches('"').trim();
+            if !target.is_empty() {
+                return Some(DeterministicKind::PackageQuery(Some(target.to_string())));
+            }
         }
 
         None
@@ -144,6 +231,19 @@ impl DeterministicClassifier {
             }
             DeterministicKind::FileFocus => {
                 let msg = format!("Current focus is directory `{}`.", ctx.cwd.display());
+                Some(AgentResponse::explanation(msg))
+            }
+            DeterministicKind::SymbolDefinition(sym) => Some(AgentResponse::explanation(format!(
+                "Searching definition for symbol `{sym}`."
+            ))),
+            DeterministicKind::SymbolReferences(sym) => Some(AgentResponse::explanation(format!(
+                "Searching references for symbol `{sym}`."
+            ))),
+            DeterministicKind::PackageQuery(pkg) => {
+                let msg = match pkg {
+                    Some(p) => format!("Querying package ownership for `{p}`."),
+                    None => "Listing packages in workspace.".to_string(),
+                };
                 Some(AgentResponse::explanation(msg))
             }
         }

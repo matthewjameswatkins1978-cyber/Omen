@@ -36,14 +36,15 @@ Omen gives humans and AI the same workspace through different interfaces, while 
 
 ## Repository Topology
 
-- `crates/omen-core`: Pure domain types, typed IDs (`ResourceId`, `FactId`, `ArtifactId`), URI grammar, assurance levels, error codes.
+- `crates/omen-core`: Pure domain types, typed IDs (`ResourceId`, `FactId`, `ArtifactId`, `SymbolId`, `SemanticProviderId`), URI grammar, assurance levels, error codes.
 - `crates/omen-schema`: Wire serialization, JSON Schemas, strict contract/result schemas (`deny_unknown_fields`).
+- `crates/omen-semantic`: Semantic environment subsystem, AST/symbol records, generational witness cache, provider registry.
 - `crates/omen-engine`: Process supervisor, stream capture, timeouts, platform containment (Job Objects, Landlock, POSIX).
 - `crates/omen-knowledge`: SQLite Fact Registry, resource generations, CAS blob store.
 - `crates/omen-atlas`: Tool registry, TOML runtime profiles, probing validator harness.
-- `crates/omen-adapters`: Dedicated adapters for ThreadMoth, Cargo, Git, and ripgrep.
+- `crates/omen-adapters`: Dedicated adapters for ThreadMoth, Cargo, Git, ripgrep, ast-grep, LSP (rust-analyzer), SCIP, and ecosystem manifests (npm, uv, go, docker, gh).
 - `crates/omen-agent`: Canonical agent context extraction, bounded summaries, AgentProvider trait, deterministic reasoning engine.
-- `crates/omen-mcp`: Model Context Protocol (MCP) server adapter over stdio and streams (`omen mcp`).
+- `crates/omen-mcp`: Model Context Protocol (MCP) server adapter over stdio and streams (`omen mcp`) with typed semantic tools.
 - `crates/omen-interactive`: Interactive shell core, 3-lane grammar scanner, hot semantic index, fact-aware completer, session history, blast radius, paste guard, AI lane.
 - `crates/omen-ui`: Terminal capability detection, prompt rendering, progressive diagnostics (Levels 0–3), semantic blocks (OSC 7/8/133).
 - `crates/omen-cli`: The unified `omen` CLI, daemon manager, MCP runner, and interactive shell binary.
@@ -56,8 +57,8 @@ Omen gives humans and AI the same workspace through different interfaces, while 
 2. **Omen 0.3: Human Interface** — *Complete*
 3. **Omen 0.4: Shared Runtime** — *Complete*
 4. **Omen 0.5: Agent Interoperability** — *Complete*
-5. **Omen 0.6: Physical Maturity** — Pluggable execution backends, PTY persistence, hardened containment, truthful platform assurance.
-6. **Omen 0.7: Semantic Environment** — Structural search (ast-grep), compiler metadata, language servers, symbol references.
+5. **Omen 0.6: Physical Maturity** — *Complete*
+6. **Omen 0.7: Semantic Environment** — *Complete* (Structural AST search via ast-grep, LSP integration, SCIP parser, multi-ecosystem package metadata, zero-model deterministic queries, hot keystroke symbol completion)
 7. **Omen 0.8: Composition** — Typed pipeline composition, `Omen.toml`, deterministic reconstruction re-admitted under Tethers.
 8. **Omen 0.9: Stabilisation** — Protocol freeze, backwards compatibility, migrations, torture testing, fuzzing, security audit.
 9. **Omen 1.0: Stable Human + Agent Developer Runtime** — Production guarantees across human, agent, and shared reality.

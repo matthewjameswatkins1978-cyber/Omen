@@ -14,6 +14,7 @@ omen-engine = { workspace = true }
 omen-knowledge = { workspace = true }
 omen-atlas = { workspace = true }
 omen-adapters = { workspace = true }
+omen-semantic = { workspace = true }
 omen-ui = { workspace = true }
 omen-ipc = { workspace = true }
 omen-client = { workspace = true }

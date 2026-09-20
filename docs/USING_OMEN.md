@@ -944,6 +944,85 @@ Switched active execution backend to: backend://wsl
 
 ---
 
+# Semantic Environment (Omen 0.7)
+
+Omen 0.7 gives the runtime a semantic understanding of your code, symbols, structures, and packages.
+
+### 1. Symbol Search, Definition, and References
+
+Inspect symbols across LSP (`rust-analyzer`) and SCIP indexes:
+
+```text
+[shared] > :symbol refresh_token
+Found 1 symbol(s) matching 'refresh_token':
+  @symbol://omen_auth/src/auth.rs#refresh_token  (function)  src/auth.rs:12:8
+
+[shared] > :def refresh_token
+Definition for @symbol://refresh_token:
+  Location: src/auth.rs:12:8
+
+[shared] > :refs refresh_token
+References to @symbol://refresh_token (found 3):
+  [1] src/auth.rs:12:8
+  [2] src/handlers.rs:45:12
+  [3] tests/auth_test.rs:18:5
+```
+
+If a symbol name is ambiguous across multiple crates or files, Omen **never** guesses or silently picks the first match. It reports all candidates for explicit selection.
+
+### 2. Structural Syntax Search (`ast-grep`)
+
+Query the true syntax tree, ignoring comments and string literals:
+
+```text
+[shared] > :structure fn refresh_token($$$) -> bool { $$$ } rust
+Found 1 structural match(es):
+  src/auth.rs:12:8
+    Matched: fn refresh_token() -> bool { ... }
+```
+
+### 3. Package & Task Discovery
+
+Discover packages, build targets, and runnable scripts across Cargo, npm, Python (uv/pyproject), Go, Docker, and GitHub workflows:
+
+```text
+[shared] > :packages
+Found 3 workspace package(s):
+  @package://cargo/omen-core  (v0.2.0, cargo) - crates/omen-core/Cargo.toml [1 targets, 0 tasks]
+  @package://npm/web-ui       (v1.4.0, npm)   - web-ui/package.json [0 targets, 2 tasks]
+  @package://python/ml-pipe   (v0.8.2, python)- ml/pyproject.toml [0 targets, 1 tasks]
+
+[shared] > :tasks
+Runnable Workspace Tasks:
+  [npm] web-ui: build -> vite build
+  [npm] web-ui: test -> vitest
+  [python] ml-pipe: train -> pipeline.train:run
+```
+
+### 4. Zero-I/O In-Memory Completion
+
+Type `@symbol://` or `@package://` and press `<Tab>`:
+
+```text
+[shared] > @symbol://ref<Tab>
+  @symbol://refresh_token
+  @symbol://refresh_session
+```
+
+Completions resolve from the hot in-memory index in `< 1ms` with **zero** subprocess spawns, **zero** disk reads, and **zero** network roundtrips.
+
+### 5. Zero-Model Semantic Queries
+
+Ask the AI lane natural questions about code symbols or packages:
+
+```text
+[shared] > ? where is refresh_token defined?
+```
+
+Omen's deterministic classifier resolves the query directly against the semantic registry. The answer returns in `< 15ms` with `provider_calls = 0` (zero LLM inference tokens, zero API cost, zero hallucination risk).
+
+---
+
 # The advantage in one sentence
 
 A conventional shell is excellent at:
