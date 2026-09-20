@@ -31,6 +31,9 @@ jobs:
       - name: Verify JSON Schemas
         run: cargo run --package xtask -- verify-schemas
 
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --version 0.20.2 --locked
+
       - name: Verify Repository
         run: cargo run --package xtask -- verify
 
