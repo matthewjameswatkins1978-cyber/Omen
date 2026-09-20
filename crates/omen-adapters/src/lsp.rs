@@ -354,10 +354,7 @@ impl LspClient {
         query: &str,
         timeout_duration: Duration,
     ) -> Result<Vec<SymbolRecord>, CoreError> {
-        let params = workspace_symbol_all_params(
-            query,
-            self.workspace_symbol_scope_kind_filtering,
-        );
+        let params = workspace_symbol_all_params(query, self.workspace_symbol_scope_kind_filtering);
         self.workspace_symbol_with_params(params, timeout_duration)
             .await
     }
@@ -879,7 +876,10 @@ impl SemanticProvider for RustAnalyzerProvider {
                 }
             };
             if let Some(client) = guard.as_mut() {
-                match client.workspace_symbol_all(query, DEFAULT_LSP_TIMEOUT).await {
+                match client
+                    .workspace_symbol_all(query, DEFAULT_LSP_TIMEOUT)
+                    .await
+                {
                     Ok(res) => Ok(res),
                     Err(e) => {
                         tracing::warn!("LSP symbol search error: {e}");
@@ -932,7 +932,10 @@ impl SemanticProvider for RustAnalyzerProvider {
                     }
 
                     // Fall back to workspace symbol search if exact line/col not given
-                    match client.workspace_symbol_all(symbol, DEFAULT_LSP_TIMEOUT).await {
+                    match client
+                        .workspace_symbol_all(symbol, DEFAULT_LSP_TIMEOUT)
+                        .await
+                    {
                         Ok(syms) => {
                             let exact: Vec<_> =
                                 syms.into_iter().filter(|s| s.name == symbol).collect();
@@ -983,7 +986,10 @@ impl SemanticProvider for RustAnalyzerProvider {
                     }
                 } else {
                     // Look up definition first to get exact location
-                    match client.workspace_symbol_all(symbol, DEFAULT_LSP_TIMEOUT).await {
+                    match client
+                        .workspace_symbol_all(symbol, DEFAULT_LSP_TIMEOUT)
+                        .await
+                    {
                         Ok(syms) => {
                             let exact: Vec<_> =
                                 syms.into_iter().filter(|s| s.name == symbol).collect();
@@ -1040,8 +1046,6 @@ impl SemanticProvider for RustAnalyzerProvider {
         })
     }
 }
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1057,8 +1061,12 @@ mod tests {
         });
         let unsupported = json!({ "capabilities": { "experimental": {} } });
 
-        assert!(initialize_supports_workspace_symbol_scope_kind_filtering(&supported));
-        assert!(!initialize_supports_workspace_symbol_scope_kind_filtering(&unsupported));
+        assert!(initialize_supports_workspace_symbol_scope_kind_filtering(
+            &supported
+        ));
+        assert!(!initialize_supports_workspace_symbol_scope_kind_filtering(
+            &unsupported
+        ));
     }
 
     #[test]
