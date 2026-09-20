@@ -467,3 +467,56 @@ async fn test_mcp_duplex_stream_transport() {
     )
     .await;
 }
+
+
+fn semantic_gremlin_exe() -> PathBuf {
+    let mut path = std::env::current_exe().expect("failed to get current_exe");
+    path.pop();
+    if path.ends_with("deps") {
+        path.pop();
+    }
+    let name = if cfg!(windows) {
+        "omen-gremlin.exe"
+    } else {
+        "omen-gremlin"
+    };
+    let exe = path.join(name);
+    if exe.exists() {
+        return exe;
+    }
+
+    let fallback = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("target")
+        .join("debug")
+        .join(name);
+    if fallback.exists() {
+        return fallback;
+    }
+
+    let status = std::process::Command::new("cargo")
+        .args(["build", "-p", "omen-test-fixtures", "--bin", "omen-gremlin"])
+        .status()
+        .expect("failed to invoke cargo for omen-gremlin");
+    assert!(status.success(), "failed to build omen-gremlin test fixture");
+    assert!(fallback.exists(), "omen-gremlin fixture was not produced");
+    fallback
+}
+
+async fn call_semantic_mcp_tool(server: &McpServer, name: &str, arguments: Value) -> Value {
+    let response = server
+        .handle_request(JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(name)),
+            method: "tools/call".into(),
+            params: Some(json!({"name": name, "arguments": arguments})),
+        })
+        .await;
+    assert!(response.error.is_none(), "{name} returned RPC error");
+    let result: CallToolResult = serde_json::from_value(response.result.unwrap()).unwrap();
+    assert_ne!(result.is_error, Some(true), "{name} returned tool error");
+    serde_json::from_str(&result.content[0].text).unwrap()
+}
