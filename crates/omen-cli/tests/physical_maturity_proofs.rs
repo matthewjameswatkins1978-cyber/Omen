@@ -81,24 +81,40 @@ async fn test_proof_a_pty_detach_reattach_real_path() {
     );
 
     // 2. Client 1 attaches, verifies initial prompt, and sends input
-    let (initial_out, state) = pty_manager
+    let (_initial_out, state) = pty_manager
         .attach(&sid_str)
         .await
         .expect("Client 1 must attach");
     assert_eq!(state, omen_core::PtyState::Running);
 
-    // Wait bounded time for PTY_READY
+    // Wait bounded time for PTY_READY and child-observed terminal semantics
     let start = std::time::Instant::now();
-    let mut ready = String::from_utf8_lossy(&initial_out).contains("PTY_READY");
-    while !ready && start.elapsed() < Duration::from_millis(5000) {
+    let mut ready = false;
+    let mut is_term = false;
+    let mut initial_size = false;
+    while (!ready || !is_term || !initial_size) && start.elapsed() < Duration::from_millis(5000) {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let (out, _, _) = pty_manager.read_output(&sid_str, 0).await.unwrap();
-        if String::from_utf8_lossy(&out).contains("PTY_READY") {
+        let text = String::from_utf8_lossy(&out);
+        if text.contains("PTY_READY") {
             ready = true;
-            break;
+        }
+        if text.contains("IS_TERMINAL:true") {
+            is_term = true;
+        }
+        if text.contains("INITIAL_SIZE:80x24") {
+            initial_size = true;
         }
     }
     assert!(ready, "PTY interactive echo must emit PTY_READY");
+    assert!(
+        is_term,
+        "Child process must observe attached terminal (isatty)"
+    );
+    assert!(
+        initial_size,
+        "Child process must observe initial terminal size 80x24"
+    );
 
     // Write input from Client 1
     pty_manager
@@ -145,13 +161,34 @@ async fn test_proof_a_pty_detach_reattach_real_path() {
         "Client 2 must receive buffered output upon reattach"
     );
 
-    // 5. Test real OS PTY resize
+    // 5. Test real OS PTY resize and verify child observes new dimensions (100x30)
     pty_manager
         .resize(&sid_str, 30, 100)
         .await
         .expect("PTY resize must succeed");
     // Allow terminal redraw from resize to settle in ring buffer
     tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Send get_size request to query the child's live terminal dimensions
+    pty_manager
+        .write_input(&sid_str, b"get_size\n")
+        .await
+        .expect("Must write get_size command to PTY");
+
+    let start = std::time::Instant::now();
+    let mut resized = false;
+    while !resized && start.elapsed() < Duration::from_millis(5000) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (out, _, _) = pty_manager.read_output(&sid_str, 0).await.unwrap();
+        if String::from_utf8_lossy(&out).contains("CURRENT_SIZE:100x30") {
+            resized = true;
+            break;
+        }
+    }
+    assert!(
+        resized,
+        "Child process must observe resized dimensions 100x30"
+    );
 
     // 6. Test real ring-buffer offset semantics
     let (read_0, total_offset_1, _) = pty_manager.read_output(&sid_str, 0).await.unwrap();
@@ -365,6 +402,11 @@ async fn test_proof_d_containment_real_path() {
         EnforcementLevel::Observed,
         "Filesystem without container/sandbox must report OBSERVED"
     );
+    assert_eq!(
+        output.enforcement.symlink_escape,
+        EnforcementLevel::Observed,
+        "Symlink escape without sandbox boundary must report OBSERVED"
+    );
 
     #[cfg(windows)]
     assert_eq!(
@@ -398,7 +440,7 @@ async fn test_proof_e_non_native_wsl_backend_real_path() {
     assert_eq!(caps.descendants, EnforcementLevel::Mediated);
     assert_eq!(caps.filesystem, EnforcementLevel::Mediated);
     assert_eq!(caps.network, EnforcementLevel::Mediated);
-    assert_eq!(caps.symlink_escape, EnforcementLevel::Enforced);
+    assert_eq!(caps.symlink_escape, EnforcementLevel::Mediated);
 
     let supervisor = ProcessSupervisor::with_backend(wsl_backend);
 
@@ -459,7 +501,7 @@ async fn test_proof_f_secret_injection_and_redaction_real_path() {
             gremlin.to_string_lossy().to_string(),
             "--print-env".into(),
             "AUTH_TOKEN".into(),
-            "--read-stdin".into(),
+            "--echo-stdin".into(),
         ],
         cwd: std::env::current_dir().unwrap(),
         env: vec![],
@@ -475,15 +517,17 @@ async fn test_proof_f_secret_injection_and_redaction_real_path() {
     };
 
     // Assert that Debug implementation does not leak secret in cleartext
-    let secret_debug = format!("{:?}", req.secrets[0]);
-    assert!(
-        !secret_debug.contains(&canary_env),
-        "Secret Debug implementation leaked raw secret value: {secret_debug}"
-    );
-    assert!(
-        secret_debug.contains("[REDACTED]"),
-        "Secret Debug implementation missing [REDACTED]: {secret_debug}"
-    );
+    for (idx, secret) in req.secrets.iter().enumerate() {
+        let secret_debug = format!("{:?}", secret);
+        assert!(
+            !secret_debug.contains(&canary_env) && !secret_debug.contains(&canary_stdin),
+            "Secret[{idx}] Debug implementation leaked raw secret value: {secret_debug}"
+        );
+        assert!(
+            secret_debug.contains("[REDACTED]"),
+            "Secret[{idx}] Debug implementation missing [REDACTED]: {secret_debug}"
+        );
+    }
 
     let output = supervisor
         .execute(req)
@@ -492,14 +536,22 @@ async fn test_proof_f_secret_injection_and_redaction_real_path() {
 
     let stdout = String::from_utf8_lossy(&output.stdout_all);
 
-    // 1. Redaction verification: plaintext canary must NOT appear in output
+    // 1. Redaction verification: plaintext canaries must NOT appear in output
     assert!(
         !stdout.contains(&canary_env),
-        "Raw canary secret must be redacted from stdout! Got: {stdout}"
+        "Raw env canary secret must be redacted from stdout! Got: {stdout}"
+    );
+    assert!(
+        !stdout.contains(&canary_stdin),
+        "Raw stdin canary secret must be redacted from stdout! Got: {stdout}"
     );
     assert!(
         stdout.contains("[REDACTED:AUTH_TOKEN]"),
-        "Redaction tag must appear in place of secret! Got: {stdout}"
+        "Redaction tag for AUTH_TOKEN must appear in place of secret! Got: {stdout}"
+    );
+    assert!(
+        stdout.contains("[REDACTED:STDIN_TOKEN]"),
+        "Redaction tag for STDIN_TOKEN must appear in place of secret! Got: {stdout}"
     );
 
     // 2. CAS Storage verification: unreduced artifact in CAS must also be redacted
@@ -520,9 +572,105 @@ async fn test_proof_f_secret_injection_and_redaction_real_path() {
     let cas_text = String::from_utf8_lossy(&cas_content);
     assert!(
         !cas_text.contains(&canary_env),
-        "CAS artifact must not leak plaintext canary secret"
+        "CAS artifact must not leak plaintext env canary secret"
+    );
+    assert!(
+        !cas_text.contains(&canary_stdin),
+        "CAS artifact must not leak plaintext stdin canary secret"
     );
     assert!(cas_text.contains("[REDACTED:AUTH_TOKEN]"));
+    assert!(cas_text.contains("[REDACTED:STDIN_TOKEN]"));
+}
+
+/// PROOF H: Hostile Terminal Escape Sanitization vs Verbatim Raw Evidence
+#[tokio::test]
+async fn test_proof_hostile_terminal_sanitization_vs_raw_evidence() {
+    let supervisor = ProcessSupervisor::new();
+    let gremlin = gremlin_exe();
+    let temp_dir = tempdir().unwrap();
+    let mut db = Database::open(&temp_dir.path().join("state.sqlite")).unwrap();
+    let cas = ContentAddressedStore::new(temp_dir.path().join("cas"));
+
+    let req = ExecutionRequest {
+        argv: vec![
+            gremlin.to_string_lossy().to_string(),
+            "--hostile-terminal-escapes".into(),
+        ],
+        cwd: std::env::current_dir().unwrap(),
+        env: vec![],
+        stdin_mode: StdioMode::Closed,
+        stdin_payload: None,
+        timeout_ms: 10000,
+        inline_budget: 8192,
+        required_assurance: RequiredAssurance::default(),
+        secrets: vec![],
+    };
+
+    let output = supervisor
+        .execute(req)
+        .await
+        .expect("Execution with hostile escapes must succeed");
+
+    // 1. Raw execution output preserves verbatim untampered byte stream for forensics/CAS
+    let raw_stdout = &output.stdout_all;
+    assert!(
+        raw_stdout.windows(2).any(|w| w == b"\x1b["),
+        "Raw stdout must retain untampered ANSI CSI escape sequences"
+    );
+    assert!(
+        raw_stdout.windows(2).any(|w| w == b"\x1b]"),
+        "Raw stdout must retain untampered ANSI OSC escape sequences"
+    );
+    assert!(
+        raw_stdout.contains(&0x07),
+        "Raw stdout must retain untampered BEL control character"
+    );
+    assert!(
+        String::from_utf8_lossy(raw_stdout).contains("HostileWindowTitle"),
+        "Raw stdout must retain full hostile OSC payload"
+    );
+
+    // 2. CAS storage of raw output preserves exact unreduced forensic evidence
+    let artifact = cas
+        .store(
+            &mut db,
+            &output.stdout_all,
+            "application/octet-stream",
+            "omen://execution/hostile_escape_raw",
+            RetentionClass::Referenced,
+        )
+        .expect("CAS store must succeed");
+
+    let cas_content = cas
+        .read_slice(&mut db, &artifact.digest, 0, artifact.size)
+        .expect("Must read back from CAS");
+    assert_eq!(
+        cas_content, output.stdout_all,
+        "CAS stored content must match raw untampered bytes verbatim"
+    );
+
+    // 3. Sanitized view (for daemon display, agent context, and logs) strips all hostile escapes
+    let sanitized = output.stdout_sanitized();
+    assert!(
+        !sanitized.contains('\x1b'),
+        "Sanitized output must contain zero ESC bytes"
+    );
+    assert!(
+        !sanitized.contains('\x07'),
+        "Sanitized output must contain zero BEL characters"
+    );
+    assert!(
+        !sanitized.contains("HostileWindowTitle"),
+        "Sanitized output must not leak OSC window title payload"
+    );
+    assert!(
+        !sanitized.contains("HackedTitle"),
+        "Sanitized output must not leak hacked OSC title payload"
+    );
+    assert!(
+        sanitized.contains("LEGITIMATE_DATA"),
+        "Sanitized output must preserve safe legitimate payload: got '{sanitized}'"
+    );
 }
 
 /// PROOF G: Physical Service Lifecycle Lease and Disconnect Survival Real Path

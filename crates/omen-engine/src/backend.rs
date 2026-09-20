@@ -301,7 +301,7 @@ impl ExecutionBackend for NativeExecutionBackend {
             filesystem: EnforcementLevel::Observed,
             network: EnforcementLevel::Observed,
             descendants: EnforcementLevel::Enforced, // Windows Job Objects guarantee descendant termination
-            symlink_escape: EnforcementLevel::Enforced,
+            symlink_escape: EnforcementLevel::Observed,
             pty: true,
         };
 
@@ -310,7 +310,7 @@ impl ExecutionBackend for NativeExecutionBackend {
             filesystem: EnforcementLevel::Observed,
             network: EnforcementLevel::Observed,
             descendants: EnforcementLevel::BestEffort,
-            symlink_escape: EnforcementLevel::Enforced,
+            symlink_escape: EnforcementLevel::Observed,
             pty: true,
         };
 
@@ -319,7 +319,7 @@ impl ExecutionBackend for NativeExecutionBackend {
             filesystem: EnforcementLevel::Observed,
             network: EnforcementLevel::Observed,
             descendants: EnforcementLevel::BestEffort,
-            symlink_escape: EnforcementLevel::Enforced,
+            symlink_escape: EnforcementLevel::Observed,
             pty: true,
         };
 
@@ -533,7 +533,7 @@ impl ExecutionBackend for WslExecutionBackend {
                 filesystem: EnforcementLevel::Mediated,
                 network: EnforcementLevel::Mediated,
                 descendants: EnforcementLevel::Mediated,
-                symlink_escape: EnforcementLevel::Enforced,
+                symlink_escape: EnforcementLevel::Mediated,
                 pty: true,
             },
         }

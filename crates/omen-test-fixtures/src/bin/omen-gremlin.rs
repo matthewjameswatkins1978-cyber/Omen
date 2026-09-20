@@ -1,5 +1,5 @@
 use clap::Parser;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
@@ -22,6 +22,12 @@ struct GremlinArgs {
 
     #[arg(long)]
     read_stdin: bool,
+
+    #[arg(long)]
+    echo_stdin: bool,
+
+    #[arg(long)]
+    hostile_terminal_escapes: bool,
 
     #[arg(long)]
     spawn_child: bool,
@@ -74,10 +80,25 @@ fn main() {
         let _ = io::stderr().flush();
     }
 
+    if args.hostile_terminal_escapes {
+        println!(
+            "\x1b[2J\x1b[H\x1b[31;1mHOSTILE_CSI\x1b[0m\x1b]0;HostileWindowTitle\x07\x07HOSTILE_ALERT\x1b]2;HackedTitle\x1b\\LEGITIMATE_DATA"
+        );
+        let _ = io::stdout().flush();
+    }
+
     if args.read_stdin {
         let mut buffer = String::new();
         let bytes_read = io::stdin().read_to_string(&mut buffer).unwrap_or(0);
         println!("READ_STDIN_BYTES:{bytes_read}");
+        let _ = io::stdout().flush();
+    }
+
+    if args.echo_stdin {
+        let mut buffer = String::new();
+        let bytes_read = io::stdin().read_to_string(&mut buffer).unwrap_or(0);
+        println!("READ_STDIN_BYTES:{bytes_read}");
+        print!("STDIN_ECHO:{buffer}");
         let _ = io::stdout().flush();
     }
 
@@ -120,7 +141,11 @@ fn main() {
     }
 
     if args.pty_echo {
+        let is_term = std::io::stdout().is_terminal();
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((0, 0));
         println!("PTY_READY");
+        println!("IS_TERMINAL:{is_term}");
+        println!("INITIAL_SIZE:{cols}x{rows}");
         let _ = io::stdout().flush();
 
         let stdin = io::stdin();
@@ -132,6 +157,12 @@ fn main() {
                         println!("PTY_EXITING");
                         let _ = io::stdout().flush();
                         std::process::exit(0);
+                    }
+                    if trimmed == "get_size" {
+                        let (c, r) = crossterm::terminal::size().unwrap_or((0, 0));
+                        println!("CURRENT_SIZE:{c}x{r}");
+                        let _ = io::stdout().flush();
+                        continue;
                     }
                     println!("ECHO:{trimmed}");
                     let _ = io::stdout().flush();

@@ -939,6 +939,7 @@ name = "omen-test-fixtures"
 version = "0.2.0"
 dependencies = [
  "clap",
+ "crossterm",
  "tokio",
 ]
 

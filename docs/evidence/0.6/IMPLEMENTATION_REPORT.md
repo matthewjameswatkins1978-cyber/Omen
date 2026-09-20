@@ -22,12 +22,13 @@ Headline doctrine:
 
 Omen 0.6 delivers:
 1. **Pluggable Execution Backend SPI**: Strict separation of execution requests from execution backends (`ExecutionBackend`, `BackendRegistry`, `NativeExecutionBackend`, `WslExecutionBackend`).
-2. **First-Class Daemon-Owned PTY Engine**: Detachable and resumable interactive sessions with bounded 64 KiB ring buffers, terminal escape sequence sanitization for logs/CAS, and disconnect resilience.
-3. **True Process-Tree Ownership**: Windows Job Objects (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) and Unix process groups (`setpgid(0, 0)`) ensuring that terminating a process kills all children, grandchildren, and daemonized descendants.
-4. **Physical Lifecycle Leases**: `RuntimeLeaseId` tracking service lifecycles with bounded cleanup deadlines (SIGTERM/graceful -> timeout -> SIGKILL/TerminateProcess).
-5. **Truthful Platform Assurance Matrix**: Canonical enforcement levels (`ENFORCED`, `MEDIATED`, `OBSERVED`, `BEST_EFFORT`, `UNSUPPORTED`) with fail-closed preflight refusing execution when required assurance cannot be met.
-6. **Secret Handles & Redaction**: Strict separation of `secret.use` from `secret.expose`, with automatic byte-level canary redaction in stdout, stderr, and CAS storage.
-7. **Interactive Shell Control**: Added `:backend list`, `:backend status`, and `:backend use <id>` for inspection and backend switching.
+2. **First-Class Daemon-Owned PTY Engine**: Detachable and resumable interactive sessions with bounded 64 KiB ring buffers, real OS pseudo-terminal sizing and resize event propagation observed by the child process, and disconnect resilience.
+3. **True Process-Tree Ownership**: Windows Job Objects (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) providing `ENFORCED` kernel-level descendant termination; Unix process groups (`setpgid(0, 0)`) providing `BEST_EFFORT` descendant termination (truthfully acknowledging that unconfined POSIX descendants calling `setsid()` / `setpgid()` escape ordinary process groups without cgroups v2).
+4. **Physical Lifecycle Leases**: `RuntimeLeaseId` tracking service lifecycles with bounded cleanup deadlines (graceful signal -> timeout -> hard termination).
+5. **Truthful Platform Assurance Matrix**: Canonical enforcement levels (`ENFORCED`, `MEDIATED`, `OBSERVED`, `BEST_EFFORT`, `UNSUPPORTED`) with fail-closed preflight refusing execution when required assurance cannot be met. Symlink escape is reported truthfully as `OBSERVED` on native host platforms and `MEDIATED` on WSL.
+6. **Secret Handles & Redaction**: Strict separation of `secret.use` from `secret.expose`, with automatic byte-level canary redaction for environment variables, standard input streams, and temporary credential files in stdout, stderr, and CAS storage.
+7. **Dual Raw / Sanitized Evidence Model**: Verbatim untampered raw bytes (with secrets redacted) are preserved in CAS (`artifact://`) for forensic integrity and deterministic audit, while `stdout_sanitized()` and `stderr_sanitized()` strip hostile CSI/OSC/BEL control sequences to safeguard terminal emulators, daemon logs, and AI agent prompts.
+8. **Interactive Shell Control**: Added `:backend list`, `:backend status`, and `:backend use <id>` for live inspection and backend switching.
 
 ---
 
@@ -52,34 +53,35 @@ Tethers controls authority; Omen reports enforceability. Omen introduces zero co
 ## 3. Implemented Deliverables
 
 ### Slice A: Physical Vocabulary & Schema (`crates/omen-core`, `crates/omen-schema`)
-- Added strongly typed IDs: `BackendId`, `PtySessionId`, `RuntimeLeaseId`.
-- Added canonical enforcement levels in `EnforcementLevel`: `Enforced`, `Mediated`, `Observed`, `BestEffort`, `Unsupported`.
-- Added `PtyState` (`Running`, `Detached`, `Exited`) and `RuntimeLeaseState` (`Active`, `Releasing`, `Released`, `Expired`).
-- Added `SecretInjectionContract` (`EnvironmentVariable`, `StandardInput`, `TemporaryFile`) and `SecretHandle`.
-- Updated wire parser in `omen-schema` for all 0.6 enforcement levels and execution structures.
+- Strongly typed IDs: `BackendId`, `PtySessionId`, `RuntimeLeaseId`.
+- Canonical enforcement levels in `EnforcementLevel`: `Enforced`, `Mediated`, `Observed`, `BestEffort`, `Unsupported`.
+- Session & Lease lifecycle states: `PtyState` (`Running`, `Detached`, `Exited`) and `RuntimeLeaseState` (`Active`, `Releasing`, `Released`, `Expired`).
+- Secret injection contracts: `SecretInjectionContract` (`EnvironmentVariable`, `Stdin`, `TemporaryFile`) and `SecretHandle`.
+- Updated wire schema parser in `omen-schema` supporting all 0.6 enforcement levels and execution structures.
 
 ### Slice B & C: Execution Backend SPI & Registry (`crates/omen-engine`)
-- Trait: `ExecutionBackend` with `spawn()` and `spawn_pty()`.
-- Handles: `ExecutionHandle` and `PtyExecutionHandle` providing bounded async waits, process tree termination, and I/O streaming.
+- Pluggable SPI trait: `ExecutionBackend` with `spawn()` and `spawn_pty()`.
+- Async execution handles: `ExecutionHandle` and `PtyExecutionHandle` providing bounded timeouts, process tree termination, and I/O streaming.
 - `BackendRegistry`: Thread-safe backend management with discovery and active backend selection.
-- `NativeExecutionBackend`: Native host OS backend using Windows Job Objects and Unix process groups.
-- `WslExecutionBackend`: Non-native execution backend bridging Windows host commands to WSL Linux instances, including automatic Windows-to-WSL path translation (`C:\...` -> `/mnt/c/...`).
+- `NativeExecutionBackend`: Native host OS backend using Windows Job Objects on Windows and POSIX process groups on Unix.
+- `WslExecutionBackend`: Non-native execution backend bridging Windows host commands to WSL Linux instances, including automatic Windows-to-WSL path translation (`D:\...` -> `/mnt/d/...`).
 
 ### Slice D & E: Bounded PTY Engine & Daemon Service (`crates/omen-engine`, `crates/omen-daemon`, `crates/omen-ipc`)
 - Bounded Ring Buffer: `RingBuffer` retaining at most 64 KiB of output, supporting offset-based slicing and eviction tracking.
-- Terminal Escape Sanitization: Strips ANSI escape sequences, CSI/OSC control codes, and bell characters for human logs, fact provenance, and CAS storage.
+- PTY Child Terminal Awareness: Child processes observe a real terminal (`isatty` / `IsTerminal`), detect initial window geometry (e.g. 80x24), and receive live resize signals (`SIGWINCH` / ConPTY resize) to adjust dimensions (e.g. 100x30).
+- Dual Evidence Pipeline: Verbatim untampered byte stream stored in CAS for deterministic replay; sanitized output (`sanitize_terminal_escapes`) stripping CSI/OSC sequences and BEL codes for UI logs and LLM context.
 - Daemon PTY Service: `PtySessionManager` managing background PTY sessions independent of client connection lifecycle.
-- IPC Protocol: Added PTY request/response messages (`CreatePtySession`, `AttachPtySession`, `DetachPtySession`, `WritePtyInput`, `ReadPtyOutput`, `ResizePty`, `TerminatePty`, `ListPtySessions`).
+- IPC Protocol: PTY messages (`CreatePtySession`, `AttachPtySession`, `DetachPtySession`, `WritePtyInput`, `ReadPtyOutput`, `ResizePty`, `TerminatePty`, `ListPtySessions`).
 
 ### Slice F & G: Process Tree Containment & Service Leases (`crates/omen-engine`, `crates/omen-daemon`)
-- Process-Tree Ownership: Configures Windows Job Objects with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. When parent execution completes or times out, all descendant processes terminate immediately.
-- Physical Lifecycle Leases: `RuntimeLeaseId` associated with managed background services. Services survive client disconnects.
+- Process-Tree Ownership: Configures Windows Job Objects with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. When parent execution completes or times out, all descendant processes terminate immediately (`ENFORCED`). On Unix, process groups (`setpgid(0, 0)`) provide `BEST_EFFORT` termination.
+- Physical Lifecycle Leases: `RuntimeLeaseId` associated with managed background services. Services survive client disconnects under daemon supervision.
 - Bounded Cleanup: Service shutdown executes graceful signal followed by hard termination deadline (`kill_process`).
 
 ### Slice H & I: Truthful Assurance & Secret Redaction (`crates/omen-engine`)
-- Preflight Validation: `ProcessSupervisor` validates requested assurance against backend capabilities. If unsupported, execution fails closed with `CoreError::PreflightFailed`.
+- Preflight Validation: `ProcessSupervisor` validates requested assurance against backend capabilities. If unsupported, execution fails closed with `CoreError::AssuranceNotSatisfied`.
 - Secret Injection: Supports environment variables, standard input streams, and temporary credential files.
-- Byte Redaction: Plaintext secret values are scrubbed and replaced with `[REDACTED:<id>]` from stdout and stderr prior to CAS storage and context pagination.
+- Byte Redaction: Plaintext secret values are scrubbed and replaced with `[REDACTED:<id>]` from stdout, stderr, and CAS storage. `Debug` implementations mask secret values with `[REDACTED]`.
 
 ### Slice J: Interactive Shell Integration (`crates/omen-interactive`)
 - Added `:backend list`, `:backend status`, and `:backend use <id>`.
@@ -89,16 +91,41 @@ Tethers controls authority; Omen reports enforceability. Omen introduces zero co
 
 ## 4. Verification & Proof Suite
 
-All 7 real-path proofs pass completely in `crates/omen-cli/tests/physical_maturity_proofs.rs`:
-- **Proof A**: Daemon PTY detach and reattach real path (64 KiB bounded ring buffer, offset continuity).
-- **Proof B**: Process tree kill real path (Windows Job Object termination of deep hostile process trees).
-- **Proof C**: Assurance refusal real path (preflight rejection when requesting `ENFORCED` on unsupported platform).
-- **Proof D**: Containment real path (timeout enforcement and clean termination).
-- **Proof E**: Non-native backend real path (WSL execution and Windows-to-WSL path translation).
-- **Proof F**: Secret injection and redaction real path (plaintext canary secret scrubbed from stdout and CAS).
-- **Proof G**: Service ownership and disconnect survival real path (daemon-owned service surviving client detachment).
+All 8 real-path proofs pass completely in `crates/omen-cli/tests/physical_maturity_proofs.rs`:
 
-Additionally:
-- Full workspace test suite: `cargo test --workspace` passes (0 failed).
-- Lints and formatting: `cargo fmt --check` and `cargo clippy --workspace --all-targets --all-features -- -D warnings` pass cleanly.
-- Repository verification: `cargo run -p xtask -- verify` passes all supply chain, bans, licenses, and schema audits.
+1. **Proof A: Daemon PTY Detach, Reattach & Child Terminal Resize Real Path** (`test_proof_a_pty_detach_reattach_real_path`):
+   - Proves child detects a real terminal (`IS_TERMINAL:true`) and initial size (`80x24`).
+   - Proves interactive input and output across client detachment.
+   - Proves dynamic resize to `100x30` is received and observed by the child process (`CURRENT_SIZE:100x30`).
+   - Proves offset continuity and ring buffer bounded retention.
+
+2. **Proof B: Process Tree Kill Real Path** (`test_proof_b_process_tree_kill_real_path`):
+   - Proves deep hostile process tree (child, grandchild) spawned by `omen-gremlin --spawn-tree 2`.
+   - Proves Windows Job Object terminates all descendants upon timeout; process table confirms zero lingering processes.
+
+3. **Proof C: Assurance Refusal Real Path** (`test_proof_c_assurance_refusal_real_path`):
+   - Proves fail-closed preflight refusal when requesting `ENFORCED` filesystem isolation on native host without sandbox.
+   - Proves process is never spawned.
+
+4. **Proof D: Containment Real Path** (`test_proof_d_containment_real_path`):
+   - Proves execution timeout terminates uncooperative long-running processes within bounded latency.
+   - Proves truthful reporting of `EnforcementLevel::Observed` for native filesystem and symlink escape.
+
+5. **Proof E: Non-Native WSL Backend Real Path** (`test_proof_e_non_native_wsl_backend_real_path`):
+   - Proves execution through WSL2 Linux kernel with Windows-to-WSL path translation.
+   - Proves backend capabilities report `EnforcementLevel::Mediated`.
+
+6. **Proof F: Secret Injection & Redaction Real Path** (`test_proof_f_secret_injection_and_redaction_real_path`):
+   - Proves both environment variable and stdin secret injection (`AUTH_TOKEN` and `STDIN_TOKEN`).
+   - Proves child echoes secrets, but plaintext canary tokens are scrubbed from stdout and CAS storage.
+   - Proves `[REDACTED:AUTH_TOKEN]` and `[REDACTED:STDIN_TOKEN]` replace the canaries.
+   - Proves `Debug` representation never leaks cleartext secrets.
+
+7. **Proof G: Service Ownership & Disconnect Survival Real Path** (`test_proof_g_service_ownership_real_path`):
+   - Proves managed background service with `RuntimeLeaseId` survives shell disconnect and reconnect.
+   - Proves bounded service shutdown terminates physical process.
+
+8. **Proof H: Hostile Terminal Escape Sanitization vs Verbatim Raw Evidence** (`test_proof_hostile_terminal_sanitization_vs_raw_evidence`):
+   - Proves child emitting hostile CSI, OSC window titles, and BEL characters.
+   - Proves CAS stores verbatim untampered byte stream for forensics and cryptographic replay.
+   - Proves `stdout_sanitized()` strips all escape sequences, BEL bytes, and malicious title payloads, preserving safe legitimate data.

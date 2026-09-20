@@ -7,9 +7,10 @@
    - Slicing and offset indexing are \(O(1)\) operations.
    - Long-running interactive processes can run indefinitely without unbounded memory consumption or OOM hazards.
 
-2. **Terminal Escape Stripping**:
-   - Sanitization algorithm processes stream bytes linearly (\(O(n)\)) without allocating unless escape sequences are present.
-   - Strips 7-bit ASCII control codes, CSI sequences (`ESC [ ...`), and OSC sequences (`ESC ] ... ST/BEL`).
+2. **Terminal Escape Stripping vs Raw CAS Storage**:
+   - Sanitization algorithm (`sanitize_terminal_escapes`) processes stream bytes linearly (\(O(n)\)) without allocating unless escape sequences are present.
+   - Strips 7-bit ASCII control codes, CSI sequences (`ESC [ ...`), OSC sequences (`ESC ] ... ST/BEL`), and BEL characters.
+   - Raw output retained in Content-Addressed Storage (CAS) preserves untampered byte streams for immutable forensic evidence and deterministic replay.
 
 3. **Process Tree Termination Latency**:
    - Windows Job Object termination closes the job handle immediately. OS kernel terminates all member processes concurrently in < 100ms.
