@@ -24,6 +24,25 @@ It must not grant permission.
 
 Reading it must be inert.
 
+Omen 0.8 accepts an optional strict `Omen.toml` at the selected workspace
+root. The bounded schema contains `schema_version = 1`, optional project
+identity, and named actions made from ordered capability steps. Each input is
+either a typed literal or a reference to an output field from an earlier step.
+Unknown fields, unsupported schema versions, unknown capabilities, forward
+references and incompatible types are refused during planning.
+
+The public planning surfaces are:
+
+```text
+omen --machine action list
+omen --machine action show <action-id>
+omen --machine action plan <action-id>
+```
+
+These commands parse, validate and project a plan only. There is deliberately
+no `action run` surface in this checkpoint, and configuration cannot contain
+policy, authority, shell, interpolation, loop or conditional semantics.
+
 ## Plan before run
 
 A composition should expose ordered steps, stable capability IDs, expected effects, typed routing, availability, current admission requirements and bounds before execution.

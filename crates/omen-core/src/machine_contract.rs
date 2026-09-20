@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 
 pub const CONTRACT_VERSION: &str = "0.8";
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum EffectClass {
     Read,
@@ -126,6 +126,10 @@ fn result_schema() -> Value {
 pub fn contract() -> MachineContract {
     let empty = object_schema(json!({}), &[]);
     let result = result_schema();
+    let plan_result = object_schema(
+        json!({"plan":{"type":"object"},"status":{"type":"string"}}),
+        &["plan", "status"],
+    );
     let capability_definitions = vec![
         CapabilityDefinition {
             id: "semantic.references".into(),
@@ -262,6 +266,24 @@ pub fn contract() -> MachineContract {
             bounds: "bounded content".into(),
             timeout: "bounded filesystem write".into(),
             examples: vec![json!({"path":"src/lib.rs","content":"..."})],
+        },
+        CapabilityDefinition {
+            id: "composition.plan".into(),
+            group: "composition".into(),
+            summary: "Validate a named action and build a deterministic read-only plan.".into(),
+            input_schema: object_schema(
+                json!({"action_id":{"type":"string","minLength":1}}),
+                &["action_id"],
+            ),
+            output_schema: plan_result,
+            effect_class: EffectClass::Compute,
+            network_effect: NetworkEffect::None,
+            reversibility: Reversibility::NotApplicable,
+            idempotent: true,
+            authority: "none".into(),
+            bounds: "bounded action and plan size".into(),
+            timeout: "bounded local parse and validation".into(),
+            examples: vec![json!({"action_id":"inspect-auth"})],
         },
     ];
     let recipe_definitions = vec![

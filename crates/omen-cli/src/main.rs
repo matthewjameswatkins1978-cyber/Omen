@@ -1,5 +1,6 @@
 use clap::{Args, Parser, Subcommand};
 use omen_atlas::{RuntimeProfile, ToolValidator};
+use omen_core::composition::{self, OmenWorkspaceConfig};
 use omen_core::machine_contract::{self, CapabilityProjection};
 use omen_core::{
     ActionId, CoreError, ExecutionContract, RequiredAssurance, ResourceUri, StdioMode,
@@ -12,7 +13,10 @@ use omen_knowledge::{
 use omen_schema::{
     ExecutionContractWire, ExecutionResultWire, ProcessExitWire, SCHEMA_VERSION_RESULT,
 };
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+
+const MAX_OMEN_TOML_BYTES: u64 = 256 * 1024;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -53,6 +57,8 @@ enum Commands {
         #[arg(long)]
         since: Option<u64>,
     },
+    /// Inspect and deterministically plan inert Omen.toml actions.
+    Action(ActionArgs),
     /// Tool atlas management and inspection
     Tool(ToolArgs),
     /// Fact query and provenance
@@ -80,6 +86,96 @@ struct OrientArgs {
     /// Compare the cached static contract digest without returning the full map.
     #[arg(long)]
     since: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct ActionArgs {
+    #[command(subcommand)]
+    subcommand: ActionSubcommands,
+}
+
+#[derive(Subcommand, Debug)]
+enum ActionSubcommands {
+    /// List configured actions without probing or executing anything.
+    List,
+    /// Show one stored action definition.
+    Show { action_id: String },
+    /// Validate and build a deterministic read-only action plan.
+    Plan { action_id: String },
+}
+
+#[derive(Debug)]
+struct ConfigLoadError {
+    code: &'static str,
+    message: String,
+}
+
+impl std::fmt::Display for ConfigLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+impl std::error::Error for ConfigLoadError {}
+
+fn omen_config_path(workspace: &Path) -> Result<PathBuf, ConfigLoadError> {
+    let root = workspace.canonicalize().map_err(|e| ConfigLoadError {
+        code: "OMEN_CONFIG_INVALID",
+        message: format!("cannot resolve workspace root: {e}"),
+    })?;
+    let path = root.join("Omen.toml");
+    if !path.exists() {
+        return Ok(path);
+    }
+    let resolved = path.canonicalize().map_err(|e| ConfigLoadError {
+        code: "OMEN_CONFIG_INVALID",
+        message: format!("cannot resolve Omen.toml: {e}"),
+    })?;
+    if !resolved.starts_with(&root) {
+        return Err(ConfigLoadError {
+            code: "OMEN_CONFIG_PATH_ESCAPE",
+            message: "Omen.toml resolves outside the selected workspace".into(),
+        });
+    }
+    Ok(resolved)
+}
+
+fn load_omen_config(workspace: &Path) -> Result<Option<OmenWorkspaceConfig>, ConfigLoadError> {
+    let path = omen_config_path(workspace)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let size = std::fs::metadata(&path)
+        .map_err(|e| ConfigLoadError {
+            code: "OMEN_CONFIG_INVALID",
+            message: e.to_string(),
+        })?
+        .len();
+    if size > MAX_OMEN_TOML_BYTES {
+        return Err(ConfigLoadError {
+            code: "OMEN_CONFIG_TOO_LARGE",
+            message: format!("Omen.toml is {size} bytes; maximum is {MAX_OMEN_TOML_BYTES}"),
+        });
+    }
+    let text = std::fs::read_to_string(&path).map_err(|e| ConfigLoadError {
+        code: "OMEN_CONFIG_INVALID",
+        message: e.to_string(),
+    })?;
+    let config: OmenWorkspaceConfig = toml::from_str(&text).map_err(|e| ConfigLoadError {
+        code: "OMEN_CONFIG_INVALID",
+        message: e.to_string(),
+    })?;
+    composition::validate_config(&config).map_err(|e| ConfigLoadError {
+        code: "OMEN_CONFIG_INVALID",
+        message: e.to_string(),
+    })?;
+    Ok(Some(config))
+}
+
+fn print_composition_error(error: impl std::fmt::Display, code: &str) {
+    println!(
+        "{}",
+        serde_json::json!({"error":code,"message":error.to_string(),"state_changed":false,"retryable":false,"next_actions":["action","show"]})
+    );
 }
 
 #[derive(Args, Debug)]
@@ -222,6 +318,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", serde_json::to_string_pretty(&doc)?);
                 return Ok(());
             }
+            let contract = machine_contract::contract();
+            let capability_groups: Vec<String> = contract
+                .capability_definitions
+                .iter()
+                .map(|definition| definition.group.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
             let doc = serde_json::json!({
                 "contract_version": machine_contract::CONTRACT_VERSION,
                 "omen_version": env!("CARGO_PKG_VERSION"),
@@ -231,7 +335,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "workspace": {"name": ws_root.file_name().and_then(|s| s.to_str()).unwrap_or("workspace"), "root": "."},
                 "platform": std::env::consts::OS,
                 "backend": "native",
-                "capability_groups": ["execution", "semantic", "structure", "mutation", "filesystem"],
+                "capability_groups": capability_groups,
                 "references": ["@last", "@failed"],
                 "recipes": machine_contract::contract().recipe_definitions.iter().map(|recipe| &recipe.id).collect::<Vec<_>>(),
                 "next": ["capabilities", "describe <capability>", "how <recipe>", "context --since <generation>"]
@@ -243,7 +347,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "Omen {} contract {}",
                     doc["omen_version"], doc["contract_digest"]
                 );
-                println!("Groups: execution, semantic, structure, mutation, filesystem");
+                println!("Groups: {}", capability_groups.join(", "));
                 println!("Next: omen capabilities; omen describe <capability>; omen how <recipe>");
             }
         }
@@ -386,6 +490,121 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             println!("{}", serde_json::to_string_pretty(&doc)?);
+        }
+        Some(Commands::Action(action_args)) => {
+            let loaded = match load_omen_config(&ws_root) {
+                Ok(config) => config,
+                Err(error) => {
+                    if json_mode {
+                        print_composition_error(&error, error.code);
+                    } else {
+                        eprintln!("{error}");
+                    }
+                    std::process::exit(2);
+                }
+            };
+            match action_args.subcommand {
+                ActionSubcommands::List => {
+                    let doc = match loaded {
+                        None => {
+                            serde_json::json!({"config_present":false,"schema_version":null,"project":null,"actions":[]})
+                        }
+                        Some(config) => serde_json::json!({
+                            "config_present":true,
+                            "schema_version":config.schema_version,
+                            "project":config.project.as_ref().and_then(|project| project.name.clone()),
+                            "actions":config.actions.iter().map(|(id, action)| serde_json::json!({"action_id":id,"description":action.description,"step_count":action.steps.len()})).collect::<Vec<_>>()
+                        }),
+                    };
+                    if json_mode {
+                        println!("{}", serde_json::to_string_pretty(&doc)?);
+                    } else {
+                        if !doc["config_present"].as_bool().unwrap_or(false) {
+                            println!("No Omen.toml present.");
+                        } else if let Some(actions) = doc["actions"].as_array() {
+                            for action in actions {
+                                println!(
+                                    "{} ({} steps)",
+                                    action["action_id"].as_str().unwrap_or(""),
+                                    action["step_count"]
+                                );
+                            }
+                        }
+                    }
+                }
+                ActionSubcommands::Show { action_id } => {
+                    let config = match loaded {
+                        Some(config) => config,
+                        None => {
+                            let error = "Omen.toml is not present";
+                            if json_mode {
+                                print_composition_error(error, "ACTION_NOT_FOUND");
+                            } else {
+                                eprintln!("{error}");
+                            }
+                            std::process::exit(2);
+                        }
+                    };
+                    let action = match config.actions.get(&action_id) {
+                        Some(action) => action,
+                        None => {
+                            let error = format!("action '{action_id}' does not exist");
+                            if json_mode {
+                                print_composition_error(&error, "ACTION_NOT_FOUND");
+                            } else {
+                                eprintln!("{error}");
+                            }
+                            std::process::exit(2);
+                        }
+                    };
+                    if json_mode {
+                        println!("{}", serde_json::to_string_pretty(action)?);
+                    } else {
+                        println!(
+                            "{}",
+                            action.description.as_deref().unwrap_or("(no description)")
+                        );
+                        for step in &action.steps {
+                            println!("{}: {}", step.id, step.capability);
+                        }
+                    }
+                }
+                ActionSubcommands::Plan { action_id } => {
+                    let config = match loaded {
+                        Some(config) => config,
+                        None => {
+                            print_composition_error("Omen.toml is not present", "ACTION_NOT_FOUND");
+                            std::process::exit(2);
+                        }
+                    };
+                    match composition::plan_action(
+                        &config,
+                        &action_id,
+                        &machine_contract::contract(),
+                        &machine_context,
+                    ) {
+                        Ok(plan) => {
+                            if json_mode {
+                                println!("{}", serde_json::to_string_pretty(&plan)?);
+                            } else {
+                                println!("Plan {} ({})", plan.action_id, plan.plan_digest);
+                                for step in &plan.steps {
+                                    println!(
+                                        "{}. {} -> {}",
+                                        step.order + 1,
+                                        step.step_id,
+                                        step.capability_id
+                                    );
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            print_composition_error(&error, &error.code);
+                            std::process::exit(2);
+                        }
+                    }
+                }
+            }
         }
         Some(Commands::Tool(tool_args)) => match tool_args.subcommand {
             ToolSubcommands::List => {

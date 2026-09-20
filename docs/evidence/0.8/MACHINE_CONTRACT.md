@@ -31,6 +31,10 @@ typed `availability` and `admission` independently. Until a real provider or
 authority surface supplies those facts, discovery reports `unknown` rather than
 inventing availability or permission.
 
+The contract also exposes the inert `composition.plan` capability. It validates
+and projects a named `Omen.toml` action; it does not execute the action or grant
+admission.
+
 Schemas use JSON Schema 2020-12. Built-in recipes are advisory references to
 current capability IDs and do not grant permission or execute during discovery.
 
@@ -42,7 +46,7 @@ current capability IDs and do not grant permission or execute during discovery.
 - Public smoke calls for orient, semantic capability filtering, describe,
   recipe discovery, and unavailable historical context delta passed on Windows.
 - Contract digest observed as stable across repeated orientation calls:
-  `sha256:e2dd42b5aa3d04da2173f155cb83df22dda405d175383c30b09757cd186dfada`.
+  `sha256:e3721dffac0f0a3c2350aa1386ccb6d8e49b5935d8001c4f8dcfa88e15a434d4`.
 - Runtime status changes are covered by a static digest proof and do not alter
   that digest; changing a static definition does alter it.
 - An unknown digest returns `changed: true`, `delta_available: false`, the

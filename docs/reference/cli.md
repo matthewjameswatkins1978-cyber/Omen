@@ -31,6 +31,18 @@ Operate against a specific workspace root.
 
 0.8 discovery surfaces remain development APIs until 0.8 acceptance.
 
+## Composition planning
+
+    omen --machine action list
+    omen --machine action show <action-id>
+    omen --machine action plan <action-id>
+
+These commands read only the selected workspace's optional `Omen.toml`.
+`list` and `show` are inert configuration inspection. `plan` performs
+deterministic capability, binding, type, effect, and status validation and
+never executes a step. There is intentionally no `action run` command in this
+checkpoint.
+
 ## Health
 
     omen doctor
