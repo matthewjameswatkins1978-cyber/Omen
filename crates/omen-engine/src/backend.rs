@@ -169,10 +169,11 @@ impl ExecutionHandle for NativeExecutionHandle {
             jg.terminate(1);
         }
         #[cfg(unix)]
-        if let Some(pgid) = self.pgid {
-            unsafe {
-                let _ = libc::kill(-(pgid as i32), libc::SIGKILL);
-            }
+        if let Some(pid_val) = self
+            .pgid
+            .and_then(|pgid| rustix::process::Pid::from_raw(pgid as i32))
+        {
+            let _ = rustix::process::kill_process_group(pid_val, rustix::process::Signal::KILL);
         }
         if let Some(mut child) = self.child.take() {
             let _ = child.start_kill();
@@ -228,10 +229,14 @@ impl ExecutionHandle for NativeExecutionHandle {
                             jg.terminate(1);
                         }
                         #[cfg(unix)]
-                        if let Some(pgid) = self.pgid {
-                            unsafe {
-                                let _ = libc::kill(-(pgid as i32), libc::SIGKILL);
-                            }
+                        if let Some(pid_val) = self
+                            .pgid
+                            .and_then(|pgid| rustix::process::Pid::from_raw(pgid as i32))
+                        {
+                            let _ = rustix::process::kill_process_group(
+                                pid_val,
+                                rustix::process::Signal::KILL,
+                            );
                         }
                         let _ = child.start_kill();
                         (

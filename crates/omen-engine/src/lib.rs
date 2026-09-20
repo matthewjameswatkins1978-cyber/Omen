@@ -86,7 +86,11 @@ pub fn kill_process(pid: u32) -> bool {
 
     #[cfg(unix)]
     {
-        unsafe { libc::kill(pid as i32, libc::SIGKILL) == 0 }
+        if let Some(pid_val) = rustix::process::Pid::from_raw(pid as i32) {
+            rustix::process::kill_process(pid_val, rustix::process::Signal::KILL).is_ok()
+        } else {
+            false
+        }
     }
 
     #[cfg(not(any(windows, unix)))]
