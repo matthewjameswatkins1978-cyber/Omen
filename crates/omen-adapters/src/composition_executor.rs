@@ -424,6 +424,7 @@ pub async fn execute_plan(
                 } else {
                     StateChange::Possible
                 };
+                overall_change = merge_change(overall_change, state_changed);
                 steps.push(ActionStepRunResult {
                     step_id: step.step_id.clone(),
                     capability_id: step.capability_id.clone(),
@@ -455,6 +456,13 @@ pub async fn execute_plan(
                 .any(|s| s.status == ActionStepRunStatus::Refused) =>
         {
             ActionRunStatus::Refused
+        }
+        Some(_)
+            if steps
+                .iter()
+                .any(|s| s.status == ActionStepRunStatus::TimedOut) =>
+        {
+            ActionRunStatus::TimedOut
         }
         Some(_) => ActionRunStatus::Failed,
     };
@@ -682,6 +690,7 @@ mod tests {
     struct FakeExecutor {
         calls: Arc<Mutex<Vec<FakeCall>>>,
         failure: Option<String>,
+        failure_code: Option<String>,
         invalid_output: bool,
     }
 
@@ -717,7 +726,10 @@ mod tests {
                     )
                 {
                     return Err(ActionExecutionError {
-                        code: "STEP_FAILED".into(),
+                        code: self
+                            .failure_code
+                            .clone()
+                            .unwrap_or_else(|| "STEP_FAILED".into()),
                         message: "fake failure".into(),
                     });
                 }
@@ -770,6 +782,15 @@ mod tests {
         }
     }
 
+    async fn run_fake(plan: &ActionPlan, executor: &FakeExecutor) -> ActionRunReport {
+        let temp = tempfile::tempdir().unwrap();
+        let mut db = Database::open_in_memory().unwrap();
+        let cas = ContentAddressedStore::new(temp.path().join("cas"));
+        execute_plan(plan, executor, &BTreeMap::new(), &mut db, &cas, None)
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn fake_executor_stops_on_failure_and_reports_partial() {
         let plan = plan_with_steps(vec![step("a", "one"), step("b", "two"), step("c", "three")]);
@@ -777,6 +798,7 @@ mod tests {
         let executor = FakeExecutor {
             calls: calls.clone(),
             failure: Some("two".into()),
+            failure_code: None,
             invalid_output: false,
         };
         let temp = tempfile::tempdir().unwrap();
@@ -810,6 +832,7 @@ mod tests {
         let executor = FakeExecutor {
             calls: calls.clone(),
             failure: None,
+            failure_code: None,
             invalid_output: false,
         };
         let temp = tempfile::tempdir().unwrap();
@@ -823,11 +846,83 @@ mod tests {
         let bad = FakeExecutor {
             calls: Arc::new(Mutex::new(Vec::new())),
             failure: None,
+            failure_code: None,
             invalid_output: true,
         };
         let error = execute_plan(&plan, &bad, &BTreeMap::new(), &mut db, &cas, None)
             .await
             .unwrap_err();
         assert_eq!(error.code, "CAPABILITY_OUTPUT_SCHEMA_VIOLATION");
+    }
+
+    #[tokio::test]
+    async fn first_step_timeout_is_timed_out_and_possible() {
+        let plan = plan_with_steps(vec![step("a", "one")]);
+        let executor = FakeExecutor {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            failure: Some("one".into()),
+            failure_code: Some("TIMEOUT".into()),
+            invalid_output: false,
+        };
+
+        let report = run_fake(&plan, &executor).await;
+
+        assert_eq!(report.status, ActionRunStatus::TimedOut);
+        assert_eq!(report.steps[0].status, ActionStepRunStatus::TimedOut);
+        assert_eq!(report.steps[0].state_changed, StateChange::Possible);
+        assert_eq!(report.state_changed, StateChange::Possible);
+    }
+
+    #[tokio::test]
+    async fn completed_step_then_timeout_is_partial_and_possible() {
+        let plan = plan_with_steps(vec![step("a", "one"), step("b", "two")]);
+        let executor = FakeExecutor {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            failure: Some("two".into()),
+            failure_code: Some("TIMEOUT".into()),
+            invalid_output: false,
+        };
+
+        let report = run_fake(&plan, &executor).await;
+
+        assert_eq!(report.status, ActionRunStatus::Partial);
+        assert_eq!(report.failed_step.as_deref(), Some("b"));
+        assert_eq!(report.steps[1].status, ActionStepRunStatus::TimedOut);
+        assert_eq!(report.state_changed, StateChange::Possible);
+    }
+
+    #[tokio::test]
+    async fn ordinary_failure_after_possible_execution_is_reflected_at_action_level() {
+        let plan = plan_with_steps(vec![step("a", "one")]);
+        let executor = FakeExecutor {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            failure: Some("one".into()),
+            failure_code: Some("STEP_FAILED".into()),
+            invalid_output: false,
+        };
+
+        let report = run_fake(&plan, &executor).await;
+
+        assert_eq!(report.status, ActionRunStatus::Failed);
+        assert_eq!(report.steps[0].state_changed, StateChange::Possible);
+        assert_eq!(report.state_changed, StateChange::Possible);
+    }
+
+    #[tokio::test]
+    async fn refusal_before_execution_has_no_state_change() {
+        let plan = plan_with_steps(vec![step("a", "one")]);
+        let executor = FakeExecutor {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            failure: Some("one".into()),
+            failure_code: Some("AUTHORITY_REQUIRED".into()),
+            invalid_output: false,
+        };
+
+        let report = run_fake(&plan, &executor).await;
+
+        assert_eq!(report.status, ActionRunStatus::Refused);
+        assert_eq!(report.steps[0].status, ActionStepRunStatus::Refused);
+        assert_eq!(report.steps[0].state_changed, StateChange::No);
+        assert_eq!(report.state_changed, StateChange::No);
     }
 }
