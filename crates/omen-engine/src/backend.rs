@@ -497,9 +497,10 @@ impl WslExecutionBackend {
     pub fn is_available() -> bool {
         #[cfg(windows)]
         {
-            // Probe wsl.exe --status
+            // Probe wsl.exe -e true to confirm that WSL2 and an installed Linux distribution are runnable
             std::process::Command::new("wsl.exe")
-                .arg("--status")
+                .arg("-e")
+                .arg("true")
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status()

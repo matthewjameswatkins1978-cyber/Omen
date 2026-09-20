@@ -149,21 +149,24 @@ async fn test_proof_a_pty_detach_reattach_real_path() {
         .await
         .expect("Must write exit to PTY");
 
-    // Bounded wait for process exit
+    // Bounded wait for process exit via PTY state polling (which reaps child process)
     let start = std::time::Instant::now();
     let mut exited = false;
     while !exited && start.elapsed() < Duration::from_millis(2000) {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        if !omen_engine::is_process_alive(proc_pid) {
+        if let Ok((_, _, omen_core::PtyState::Exited)) = pty_manager.read_output(&sid_str, 0).await
+        {
             exited = true;
             break;
         }
     }
     assert!(exited, "Process must terminate upon receiving exit");
 
-    // Verify final state is Exited
-    let (_, _, final_state) = pty_manager.read_output(&sid_str, 0).await.unwrap();
-    assert_eq!(final_state, omen_core::PtyState::Exited);
+    // Verify process PID is no longer alive once reaped
+    assert!(
+        !omen_engine::is_process_alive(proc_pid),
+        "Process PID must be dead once reaped"
+    );
 }
 
 /// PROOF B: Process-Tree Ownership and Descendant Termination Real Path
