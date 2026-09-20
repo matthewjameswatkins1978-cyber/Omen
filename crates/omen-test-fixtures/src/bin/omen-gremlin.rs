@@ -312,23 +312,22 @@ fn run_hostile_lsp(mode: &str) {
                         let params = val.get("params").cloned().unwrap_or_default();
                         match method {
                             "workspace/symbol" => {
-                                let query = params
-                                    .get("query")
-                                    .and_then(|q| q.as_str())
-                                    .unwrap_or("");
+                                let query =
+                                    params.get("query").and_then(|q| q.as_str()).unwrap_or("");
 
-                                let (valid_request, canonical_query) = if mode == "semantic-filtered" {
-                                    let valid = params
-                                        .get("searchScope")
-                                        .and_then(|v| v.as_str())
+                                let (valid_request, canonical_query) = if mode
+                                    == "semantic-filtered"
+                                {
+                                    let valid = params.get("searchScope").and_then(|v| v.as_str())
                                         == Some("workspace")
-                                        && params
-                                            .get("searchKind")
-                                            .and_then(|v| v.as_str())
+                                        && params.get("searchKind").and_then(|v| v.as_str())
                                             == Some("allSymbols");
                                     (valid, query)
                                 } else {
-                                    (query.ends_with('#'), query.strip_suffix('#').unwrap_or(query))
+                                    (
+                                        query.ends_with('#'),
+                                        query.strip_suffix('#').unwrap_or(query),
+                                    )
                                 };
 
                                 let symbols = if !valid_request {
@@ -385,7 +384,7 @@ fn run_hostile_lsp(mode: &str) {
                                                 }
                                             }
                                         ]),
-                                        _ => serde_json::json!([])
+                                        _ => serde_json::json!([]),
                                     }
                                 };
 
@@ -421,9 +420,8 @@ fn run_hostile_lsp(mode: &str) {
                                 write_response(&resp.to_string());
                             }
                             _ => {
-                                let resp = format!(
-                                    r#"{{"jsonrpc":"2.0","id":{req_id},"result":[]}}"#
-                                );
+                                let resp =
+                                    format!(r#"{{"jsonrpc":"2.0","id":{req_id},"result":[]}}"#);
                                 write_response(&resp);
                             }
                         }
