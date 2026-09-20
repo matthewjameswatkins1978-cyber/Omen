@@ -385,6 +385,81 @@ async fn test_mcp_execute_and_read_cas_artifact_proof_d() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_mcp_persistent_notification_does_not_emit_response() {
+    run_with_test_timeout(
+        "test_mcp_persistent_notification_does_not_emit_response",
+        UNIT_TIMEOUT,
+        |_ctx| async move {
+            let temp = tempdir().unwrap();
+            let server = McpServer::new(temp.path().to_path_buf(), None);
+            let (client_read, server_write) = tokio::io::duplex(65536);
+            let (server_read, mut client_write) = tokio::io::duplex(65536);
+
+            tokio::spawn(async move {
+                let _ = server.run_stream(server_read, server_write).await;
+            });
+            let mut client_lines = BufReader::new(client_read).lines();
+
+            let initialize = serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "clientInfo": {"name": "persistent-test", "version": "1"}
+                }
+            }))
+            .unwrap();
+            client_write.write_all(initialize.as_bytes()).await.unwrap();
+            client_write.write_all(b"\n").await.unwrap();
+            client_write.flush().await.unwrap();
+            let initialize_response = client_lines.next_line().await.unwrap().unwrap();
+            let initialize_value: Value = serde_json::from_str(&initialize_response).unwrap();
+            assert_eq!(initialize_value["id"], 1);
+
+            client_write
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\",\"params\":{}}\n")
+                .await
+                .unwrap();
+            client_write.flush().await.unwrap();
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    client_lines.next_line()
+                )
+                .await
+                .is_err(),
+                "notifications must not produce a response"
+            );
+
+            client_write
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\n")
+                .await
+                .unwrap();
+            client_write.flush().await.unwrap();
+            let tools_response = client_lines.next_line().await.unwrap().unwrap();
+            let tools_value: Value = serde_json::from_str(&tools_response).unwrap();
+            assert_eq!(tools_value["id"], 2);
+            let names: Vec<&str> = tools_value["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|tool| tool["name"].as_str())
+                .collect();
+            for name in [
+                "omen_orient",
+                "omen_symbol_search",
+                "omen_symbol_definition",
+                "omen_symbol_references",
+            ] {
+                assert!(names.contains(&name), "missing {name}");
+            }
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_malformed_json_rpc_handling() {
     run_with_test_timeout(
         "test_mcp_malformed_json_rpc_handling",

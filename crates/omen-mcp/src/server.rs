@@ -1012,8 +1012,13 @@ impl McpServer {
 
         match serde_json::from_str::<JsonRpcRequest>(trimmed) {
             Ok(req) => {
+                let is_notification = req.id.is_none();
                 let resp = self.handle_request(req).await;
-                serde_json::to_string(&resp).ok()
+                if is_notification {
+                    None
+                } else {
+                    serde_json::to_string(&resp).ok()
+                }
             }
             Err(e) => {
                 let resp = JsonRpcResponse::error(None, -32700, format!("Parse error: {e}"));
