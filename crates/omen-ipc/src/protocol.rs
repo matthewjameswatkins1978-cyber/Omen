@@ -80,6 +80,37 @@ pub enum RequestPayload {
     ReportOfflineGap {
         modified_paths: Vec<String>,
     },
+    CreatePtySession {
+        session_id: String,
+        argv: Vec<String>,
+        cwd: String,
+        env: Vec<(String, String)>,
+        rows: u16,
+        cols: u16,
+    },
+    AttachPtySession {
+        session_id: String,
+    },
+    DetachPtySession {
+        session_id: String,
+    },
+    WritePtyInput {
+        session_id: String,
+        data: Vec<u8>,
+    },
+    ReadPtyOutput {
+        session_id: String,
+        offset: usize,
+    },
+    ResizePty {
+        session_id: String,
+        rows: u16,
+        cols: u16,
+    },
+    TerminatePty {
+        session_id: String,
+    },
+    ListPtySessions,
     Shutdown,
     Disconnect,
 }
@@ -146,6 +177,32 @@ pub enum ResponsePayload {
         execution_id: Option<String>,
     },
     OfflineGapAcknowledged,
+    PtySessionCreated {
+        session_id: String,
+        pid: Option<u32>,
+    },
+    PtySessionAttached {
+        session_id: String,
+        output: Vec<u8>,
+        state: String,
+    },
+    PtySessionDetached {
+        session_id: String,
+    },
+    PtyInputWritten,
+    PtyOutputRead {
+        session_id: String,
+        output: Vec<u8>,
+        total_written: usize,
+        state: String,
+    },
+    PtyResized,
+    PtyTerminated {
+        session_id: String,
+    },
+    PtySessionsList {
+        sessions: Vec<PtySessionInfo>,
+    },
     Success,
 }
 
@@ -232,6 +289,18 @@ pub struct ManagedServiceInfo {
     pub pid: Option<u32>,
     pub command: String,
     pub state: String,
+    pub uptime_secs: u64,
+    #[serde(default)]
+    pub lease_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PtySessionInfo {
+    pub session_id: String,
+    pub pid: Option<u32>,
+    pub command: String,
+    pub state: String,
+    pub attached_clients: usize,
     pub uptime_secs: u64,
 }
 

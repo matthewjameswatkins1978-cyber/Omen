@@ -8,16 +8,16 @@ pub mod types;
 
 pub use error::{CoreError, ErrorCode};
 pub use id::{
-    ActionId, ArtifactId, ExecutionId, FactId, InteractiveSessionId, OperationId, ProcessId,
-    ResourceId, ToolId,
+    ActionId, ArtifactId, BackendId, ExecutionId, FactId, InteractiveSessionId, OperationId,
+    ProcessId, PtySessionId, ResourceId, RuntimeLeaseId, ToolId,
 };
 pub use model::{
     AdapterClassification, EnforcementReport, ExecutionConstraints, ExecutionContract,
     ExecutionResult, Intent, LeaseRequest, ProcessExit, RequiredAssurance, RuntimeStatus,
-    StdioConfig,
+    SecretHandle, StdioConfig,
 };
 pub use resource::{ResourceKind, ResourceUri};
 pub use types::{
-    Assurance, BlobState, EnforcementLevel, ExecutionClass, LeaseRights, RetentionClass, StdioMode,
-    ValidityState,
+    Assurance, BlobState, EnforcementLevel, ExecutionClass, LeaseRights, PtyState, RetentionClass,
+    RuntimeLeaseState, SecretInjectionContract, StdioMode, ValidityState,
 };

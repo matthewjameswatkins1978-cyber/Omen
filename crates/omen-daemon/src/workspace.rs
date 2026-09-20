@@ -26,6 +26,7 @@ pub struct ManagedChildService {
     pub command: String,
     pub argv: Vec<String>,
     pub pid: u32,
+    pub lease_id: omen_core::RuntimeLeaseId,
     pub started_at: std::time::Instant,
     pub log_lines: Arc<RwLock<Vec<String>>>,
     pub stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
@@ -170,6 +171,7 @@ impl WorkspaceState {
                         command: s.command,
                         state,
                         uptime_secs: 0,
+                        lease_id: None,
                     },
                 );
             }
@@ -498,11 +500,13 @@ impl WorkspaceState {
             }
         });
 
+        let lease_id = omen_core::RuntimeLeaseId::generate();
         let managed_service = ManagedChildService {
             name: name.to_string(),
             command: command.to_string(),
             argv: argv.to_vec(),
             pid,
+            lease_id: lease_id.clone(),
             started_at: std::time::Instant::now(),
             log_lines: log_lines.clone(),
             stop_tx: Some(stop_tx),
@@ -524,6 +528,7 @@ impl WorkspaceState {
             command: format!("{} {}", command, argv.join(" ")),
             state: "running".to_string(),
             uptime_secs: 0,
+            lease_id: Some(lease_id.to_string()),
         };
         self.register_service(info.clone()).await;
         Ok(info)
@@ -532,11 +537,23 @@ impl WorkspaceState {
     pub async fn stop_managed_service(&self, name: &str) -> Result<String, LocalIpcError> {
         let mut managed = self.managed_processes.lock().await;
         if let Some(mut proc) = managed.remove(name) {
+            let pid = proc.pid;
             if let Some(stop_tx) = proc.stop_tx.take() {
                 let _ = stop_tx.send(());
             }
             drop(managed);
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            // Bounded wait up to 1000ms for graceful stop
+            let start = std::time::Instant::now();
+            while omen_engine::is_process_alive(pid) && start.elapsed().as_millis() < 1000 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+
+            // If still alive after deadline, force terminate
+            if omen_engine::is_process_alive(pid) {
+                omen_engine::kill_process(pid);
+            }
+
             self.update_service_state(name, "stopped", None).await;
             Ok(name.to_string())
         } else {
@@ -947,6 +964,7 @@ impl WorkspaceState {
                 timeout_ms: if timeout_ms == 0 { 60000 } else { timeout_ms },
                 inline_budget: 8192,
                 required_assurance: omen_core::RequiredAssurance::default(),
+                secrets: vec![],
             };
 
             let exec_result = this.supervisor.execute(req).await;

@@ -1,5 +1,5 @@
 use clap::Parser;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
@@ -25,6 +25,12 @@ struct GremlinArgs {
 
     #[arg(long)]
     spawn_child: bool,
+
+    #[arg(long)]
+    spawn_tree: Option<usize>,
+
+    #[arg(long)]
+    pty_echo: bool,
 
     #[arg(long)]
     write: Option<PathBuf>,
@@ -72,6 +78,7 @@ fn main() {
         let mut buffer = String::new();
         let bytes_read = io::stdin().read_to_string(&mut buffer).unwrap_or(0);
         println!("READ_STDIN_BYTES:{bytes_read}");
+        let _ = io::stdout().flush();
     }
 
     if let Some(path) = args.write {
@@ -81,6 +88,7 @@ fn main() {
     if let Some(env_name) = args.print_env {
         let val = std::env::var(&env_name).unwrap_or_else(|_| "<UNSET>".into());
         println!("{env_name}={val}");
+        let _ = io::stdout().flush();
     }
 
     if args.spawn_child {
@@ -91,6 +99,46 @@ fn main() {
             .spawn()
             .expect("gremlin failed to spawn child");
         println!("CHILD_SPAWNED:{}", child.id());
+        let _ = io::stdout().flush();
+    }
+
+    if let Some(depth) = args.spawn_tree {
+        if depth == 0 {
+            // Leaf node
+        } else {
+            let exe = std::env::current_exe().expect("failed to get current_exe");
+            let mut cmd = Command::new(exe);
+            cmd.arg("--spawn-tree")
+                .arg((depth - 1).to_string())
+                .arg("--sleep-ms")
+                .arg("60000");
+
+            let child = cmd.spawn().expect("gremlin failed to spawn subtree");
+            println!("TREE_SPAWNED:{}", child.id());
+            let _ = io::stdout().flush();
+        }
+    }
+
+    if args.pty_echo {
+        println!("PTY_READY");
+        let _ = io::stdout().flush();
+
+        let stdin = io::stdin();
+        for line in stdin.lock().lines() {
+            match line {
+                Ok(l) => {
+                    let trimmed = l.trim();
+                    if trimmed == "exit" || trimmed == "quit" {
+                        println!("PTY_EXITING");
+                        let _ = io::stdout().flush();
+                        std::process::exit(0);
+                    }
+                    println!("ECHO:{trimmed}");
+                    let _ = io::stdout().flush();
+                }
+                Err(_) => break,
+            }
+        }
     }
 
     if let Some(ms) = args.sleep_ms {

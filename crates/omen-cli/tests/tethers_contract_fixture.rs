@@ -66,6 +66,7 @@ async fn test_tethers_contract_boundary_execution() {
         timeout_ms: contract.constraints.timeout_ms,
         inline_budget: 4096,
         required_assurance: contract.required_assurance,
+        secrets: vec![],
     };
 
     let exec_output = supervisor

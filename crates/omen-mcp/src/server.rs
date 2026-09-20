@@ -308,6 +308,7 @@ impl McpServer {
                 timeout_ms,
                 inline_budget: 8192,
                 required_assurance: omen_core::RequiredAssurance::default(),
+                secrets: vec![],
             };
             match supervisor.execute(req).await {
                 Ok(output) => {

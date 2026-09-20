@@ -34,6 +34,7 @@ impl GitAdapter {
             timeout_ms: 10000,
             inline_budget: 65536,
             required_assurance: RequiredAssurance::default(),
+            secrets: vec![],
         };
 
         let output = supervisor.execute(req).await?;

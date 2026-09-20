@@ -62,6 +62,7 @@ async fn gremlin_closed_stdin_receives_eof() {
         timeout_ms: 10000,
         inline_budget: 8192,
         required_assurance: RequiredAssurance::default(),
+        secrets: vec![],
     };
 
     let output = supervisor.execute(req).await.unwrap();
@@ -94,6 +95,7 @@ async fn gremlin_stdout_and_stderr_captured_separately() {
         timeout_ms: 10000,
         inline_budget: 8192,
         required_assurance: RequiredAssurance::default(),
+        secrets: vec![],
     };
 
     let output = supervisor.execute(req).await.unwrap();
@@ -120,6 +122,7 @@ async fn gremlin_timeout_terminates_execution() {
         timeout_ms: 200, // Short timeout
         inline_budget: 8192,
         required_assurance: RequiredAssurance::default(),
+        secrets: vec![],
     };
 
     let output = supervisor.execute(req).await.unwrap();
@@ -148,6 +151,7 @@ async fn gremlin_exit_code_separated_from_runtime_completion() {
         timeout_ms: 10000,
         inline_budget: 8192,
         required_assurance: RequiredAssurance::default(),
+        secrets: vec![],
     };
 
     let output = supervisor.execute(req).await.unwrap();
@@ -178,6 +182,7 @@ async fn gremlin_bounded_output() {
         timeout_ms: 10000,
         inline_budget: 100, // Strict bound
         required_assurance: RequiredAssurance::default(),
+        secrets: vec![],
     };
 
     let output = supervisor.execute(req).await.unwrap();
@@ -203,6 +208,7 @@ async fn preflight_rejects_unsupported_assurance() {
             network: None,
             descendants: None,
         },
+        secrets: vec![],
     };
 
     let res = supervisor.execute(req).await;

@@ -359,6 +359,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     timeout_ms: contract.constraints.timeout_ms,
                     inline_budget: exec_args.budget,
                     required_assurance: contract.required_assurance,
+                    secrets: vec![],
                 };
 
                 let output = supervisor.execute(req).await?;
@@ -410,6 +411,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     timeout_ms: exec_args.timeout_ms,
                     inline_budget: exec_args.budget,
                     required_assurance: RequiredAssurance::default(),
+                    secrets: vec![],
                 };
 
                 let output = supervisor.execute(req).await?;
