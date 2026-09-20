@@ -750,7 +750,15 @@ fn uri_to_rel_path(uri: &str, workspace_root: &Path) -> String {
     if let Ok(rel) = path.strip_prefix(workspace_root) {
         rel.to_string_lossy().replace('\\', "/")
     } else {
-        path_part.replace('\\', "/")
+        let relative_candidate = path_part.trim_start_matches('/');
+        if cfg!(unix)
+            && path_part.starts_with('/')
+            && workspace_root.join(relative_candidate).exists()
+        {
+            relative_candidate.replace('\\', "/")
+        } else {
+            path_part.replace('\\', "/")
+        }
     }
 }
 
