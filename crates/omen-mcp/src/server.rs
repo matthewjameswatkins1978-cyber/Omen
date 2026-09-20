@@ -15,6 +15,7 @@ pub struct McpServer {
     workspace_path: PathBuf,
     session_id: String,
     client: Option<OmenClient>,
+    semantic_registry: Option<std::sync::Arc<SemanticProviderRegistry>>,
 }
 
 impl McpServer {
@@ -24,6 +25,22 @@ impl McpServer {
             workspace_path,
             session_id,
             client,
+            semantic_registry: None,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn with_semantic_registry(
+        workspace_path: PathBuf,
+        client: Option<OmenClient>,
+        semantic_registry: std::sync::Arc<SemanticProviderRegistry>,
+    ) -> Self {
+        let session_id = format!("sess_mcp_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        Self {
+            workspace_path,
+            session_id,
+            client,
+            semantic_registry: Some(semantic_registry),
         }
     }
 
@@ -806,7 +823,9 @@ impl McpServer {
     }
 
     fn build_registry(&self) -> std::sync::Arc<SemanticProviderRegistry> {
-        omen_adapters::get_workspace_semantic_registry(&self.workspace_path)
+        self.semantic_registry
+            .clone()
+            .unwrap_or_else(|| omen_adapters::get_workspace_semantic_registry(&self.workspace_path))
     }
 
     async fn tool_symbol_search(&self, args: &Value) -> CallToolResult {
