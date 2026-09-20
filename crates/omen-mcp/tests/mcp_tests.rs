@@ -467,8 +467,6 @@ async fn test_mcp_duplex_stream_transport() {
     )
     .await;
 }
-
-
 fn semantic_gremlin_exe() -> PathBuf {
     let mut path = std::env::current_exe().expect("failed to get current_exe");
     path.pop();
@@ -501,7 +499,10 @@ fn semantic_gremlin_exe() -> PathBuf {
         .args(["build", "-p", "omen-test-fixtures", "--bin", "omen-gremlin"])
         .status()
         .expect("failed to invoke cargo for omen-gremlin");
-    assert!(status.success(), "failed to build omen-gremlin test fixture");
+    assert!(
+        status.success(),
+        "failed to build omen-gremlin test fixture"
+    );
     assert!(fallback.exists(), "omen-gremlin fixture was not produced");
     fallback
 }
@@ -520,8 +521,6 @@ async fn call_semantic_mcp_tool(server: &McpServer, name: &str, arguments: Value
     assert_ne!(result.is_error, Some(true), "{name} returned tool error");
     serde_json::from_str(&result.content[0].text).unwrap()
 }
-
-
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_public_semantic_surface_finds_rust_function_through_adapter() {
     run_with_test_timeout(
