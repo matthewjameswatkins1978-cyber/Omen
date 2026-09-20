@@ -58,9 +58,25 @@ pub struct AstGrepAdapter {
     workspace_root: PathBuf,
 }
 
+fn find_ast_grep_binary() -> Option<PathBuf> {
+    if let Some(bin) = find_binary_on_path("ast-grep") {
+        return Some(bin);
+    }
+    // Only accept 'sg' if it is verified to be ast-grep, avoiding standard Unix /usr/bin/sg
+    if let Some(bin) = find_binary_on_path("sg")
+        && let Ok(output) = std::process::Command::new(&bin).arg("--version").output()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.contains("ast-grep") {
+            return Some(bin);
+        }
+    }
+    None
+}
+
 impl AstGrepAdapter {
     pub fn new(workspace_root: PathBuf) -> Self {
-        let binary_path = find_binary_on_path("ast-grep").or_else(|| find_binary_on_path("sg"));
+        let binary_path = find_ast_grep_binary();
         let id = SemanticProviderId::new("ast-grep").unwrap();
         Self {
             id,
