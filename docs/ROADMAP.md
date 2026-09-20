@@ -18,7 +18,8 @@
        ▼                    ▼                    ▼                    ▼
 ┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
 │  Omen 0.6    │ ──> │  Omen 0.7    │ ──> │  Omen 0.8    │ ──> │  Omen 0.9    │
-│Phys. Maturity│     │Semantic Env. │     │ Composition  │     │Stabilisation │
+│Phys. Maturity│     │Semantic Env. │     │ Composition &│     │Stabilisation │
+│              │     │              │     │Discoverability│    │              │
 └──────────────┘     └──────────────┘     └──────────────┘     └──────────────┘
                                                                       │
                                                                       ▼
@@ -101,7 +102,9 @@
 - [x] 5 Model Context Protocol typed semantic tools (`omen_symbol_search`, `omen_symbol_definition`, `omen_symbol_references`, `omen_structure_search`, `omen_package_query`)
 - **Success Criteria**: *Omen increasingly understands what developer actions mean, not merely which executables launched.*
 
-### Omen 0.8: Composition
+### Omen 0.8: Composition & Discoverability
+- **Machine Contract**: Bounded `orient`, progressive capability listing, capability descriptions, typed status, and advisory recipes teach an unfamiliar agent the current Omen surface.
+- **Contract Economy**: Static contract truth has a deterministic digest separate from live context generation; `orient --since` avoids resending unchanged contract data.
 - **Theme**: *Make repeated work concise without inventing another programming language.*
 - **Project Configuration (`Omen.toml`)**: Optional declarative workspace configuration (identity, known services, named checks, common actions, adapter config). No policy; does not replace package manifests.
 - **Composition Engine**: Named actions combining checks, typed value routing, large output handling via CAS artifacts and bounded previews.

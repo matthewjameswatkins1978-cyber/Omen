@@ -113,7 +113,7 @@ into ordinary portable code and tests. Platform-specific behaviour belongs stric
       ↓
 0.7  Semantic Environment
       ↓
-0.8  Composition
+0.8  Composition & Discoverability
       ↓
 0.9  Stabilisation
       ↓
@@ -316,7 +316,9 @@ Independent developments across the developer tooling landscape validate Omen's 
   - 5 Model Context Protocol typed semantic tools (`omen_symbol_search`, `omen_symbol_definition`, `omen_symbol_references`, `omen_structure_search`, `omen_package_query`).
 - **Success Criteria**: *Omen increasingly understands what developer actions mean, not merely which executables launched.*
 
-### Omen 0.8 — Composition
+### Omen 0.8 — Composition & Discoverability
+- **Machine Contract**: Bounded `omen orient --machine`, progressive capability discovery, machine-readable descriptions, and advisory recipes.
+- **Contract Economy**: Stable static contract digest is kept separate from changing live context generation.
 - **Theme**: *Make repeated work concise without inventing another programming language.*
 - **Project Configuration (`Omen.toml`)**:
   - Optional declarative workspace configuration: Project identity, known services, named checks, common semantic operations, adapter configuration, important resources.

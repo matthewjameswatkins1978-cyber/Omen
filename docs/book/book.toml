@@ -1,0 +1,16 @@
+[book]
+title = "The Omen Book"
+authors = ["Matthew Watkins and contributors"]
+description = "A guide to Omen, an agent-native developer runtime and human shell."
+language = "en"
+multilingual = false
+src = "src"
+
+[build]
+build-dir = "book"
+
+[output.html]
+default-theme = "light"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/matthewjameswatkins1978-cyber/Omen"
+edit-url-template = "https://github.com/matthewjameswatkins1978-cyber/Omen/edit/feature/omen-0.8-composition-discoverability/docs/book/{path}"

@@ -1,5 +1,6 @@
 use clap::{Args, Parser, Subcommand};
 use omen_atlas::{RuntimeProfile, ToolValidator};
+use omen_core::machine_contract::{self, CapabilityProjection};
 use omen_core::{
     ActionId, CoreError, ExecutionContract, RequiredAssurance, ResourceUri, StdioMode,
 };
@@ -24,6 +25,10 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
+    /// Emit bounded deterministic machine-readable output.
+    #[arg(long, global = true)]
+    machine: bool,
+
     #[arg(long, global = true)]
     workspace: Option<PathBuf>,
 
@@ -33,10 +38,21 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Bootstrap an unfamiliar client with the bounded machine contract.
+    Orient(OrientArgs),
+    /// List the static capability catalogue, optionally filtered by group.
+    Capabilities { group: Option<String> },
     /// Inspect environment and health
     Doctor,
     /// Describe Omen runtime capabilities
-    Describe,
+    Describe(DescribeArgs),
+    /// Explain a bounded advisory recipe.
+    How { recipe: String },
+    /// Report bounded live context or an unavailable historical delta.
+    Context {
+        #[arg(long)]
+        since: Option<u64>,
+    },
     /// Tool atlas management and inspection
     Tool(ToolArgs),
     /// Fact query and provenance
@@ -51,6 +67,19 @@ enum Commands {
     Daemon(DaemonArgs),
     /// Model Context Protocol (MCP) server over stdio
     Mcp(McpArgs),
+}
+
+#[derive(Args, Debug)]
+struct DescribeArgs {
+    /// Capability ID to describe; omit for the legacy runtime description.
+    capability: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct OrientArgs {
+    /// Compare the cached static contract digest without returning the full map.
+    #[arg(long)]
+    since: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -161,17 +190,81 @@ struct GcArgs {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    let json_mode = cli.json;
+    let json_mode = cli.json || cli.machine;
 
     let current_dir = std::env::current_dir()?;
     let ws_root = cli.workspace.unwrap_or(current_dir);
     let state_dir = resolve_workspace_dir(&ws_root);
     let db_path = canonical_workspace_db_path(&ws_root);
     let cas_dir = state_dir.join("cas");
+    let context_generation = Database::open(&db_path)
+        .ok()
+        .and_then(|db| FactRegistry::get_generation(&db, "fs:workspace").ok());
+    let machine_context = machine_contract::context_with_generation(context_generation);
 
     let supervisor = ProcessSupervisor::new();
 
     match cli.command {
+        Some(Commands::Orient(args)) => {
+            let digest = machine_contract::contract_digest();
+            if let Some(previous) = args.since {
+                let doc = if previous == digest {
+                    serde_json::json!({"changed": false, "contract_digest": digest})
+                } else {
+                    serde_json::json!({
+                        "changed": true,
+                        "delta_available": false,
+                        "previous_digest": previous,
+                        "contract_digest": digest,
+                        "next_actions": ["orient"]
+                    })
+                };
+                println!("{}", serde_json::to_string_pretty(&doc)?);
+                return Ok(());
+            }
+            let doc = serde_json::json!({
+                "contract_version": machine_contract::CONTRACT_VERSION,
+                "omen_version": env!("CARGO_PKG_VERSION"),
+                "contract_digest": digest,
+                "context_generation": machine_context.context_generation,
+                "generation_status": machine_context.generation_status,
+                "workspace": {"name": ws_root.file_name().and_then(|s| s.to_str()).unwrap_or("workspace"), "root": "."},
+                "platform": std::env::consts::OS,
+                "backend": "native",
+                "capability_groups": ["execution", "semantic", "structure", "mutation", "filesystem"],
+                "references": ["@last", "@failed"],
+                "recipes": machine_contract::contract().recipe_definitions.iter().map(|recipe| &recipe.id).collect::<Vec<_>>(),
+                "next": ["capabilities", "describe <capability>", "how <recipe>", "context --since <generation>"]
+            });
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&doc)?);
+            } else {
+                println!(
+                    "Omen {} contract {}",
+                    doc["omen_version"], doc["contract_digest"]
+                );
+                println!("Groups: execution, semantic, structure, mutation, filesystem");
+                println!("Next: omen capabilities; omen describe <capability>; omen how <recipe>");
+            }
+        }
+        Some(Commands::Capabilities { group }) => {
+            let contract = machine_contract::contract();
+            let entries: Vec<CapabilityProjection> =
+                machine_contract::project(&contract, &machine_context)
+                    .into_iter()
+                    .filter(|entry| group.as_deref().is_none_or(|g| entry.definition.group == g))
+                    .collect();
+            if json_mode {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({"capabilities": entries}))?
+                );
+            } else {
+                for entry in entries {
+                    println!("{} — {}", entry.definition.id, entry.definition.summary);
+                }
+            }
+        }
         Some(Commands::Doctor) => {
             let backend_caps = supervisor.backend().capabilities();
             if json_mode {
@@ -194,7 +287,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Descendant Containment: {:?}", backend_caps.descendants);
             }
         }
-        Some(Commands::Describe) => {
+        Some(Commands::Describe(args)) => {
+            if let Some(id) = args.capability {
+                match machine_contract::capability(&id) {
+                    Some(definition) => {
+                        let status = machine_context
+                            .capability_statuses
+                            .iter()
+                            .find(|status| status.id == definition.id)
+                            .cloned()
+                            .expect("every static capability has a runtime overlay");
+                        let entry = CapabilityProjection { definition, status };
+                        if json_mode {
+                            println!("{}", serde_json::to_string_pretty(&entry)?);
+                        } else {
+                            println!("{}: {}", entry.definition.id, entry.definition.summary);
+                            println!("Effect: {:?}", entry.definition.effect_class);
+                            println!(
+                                "Availability: {:?}, Admission: {:?}",
+                                entry.status.availability, entry.status.admission
+                            );
+                        }
+                    }
+                    None => {
+                        let err = serde_json::json!({"error":"CAPABILITY_NOT_FOUND","operation":id,"state_changed":false,"retryable":false,"next_actions":["capabilities"]});
+                        if json_mode {
+                            println!("{}", serde_json::to_string_pretty(&err)?);
+                        } else {
+                            eprintln!("Capability not found: {id}");
+                        }
+                        std::process::exit(2);
+                    }
+                }
+                return Ok(());
+            }
             let backend_caps = supervisor.backend().capabilities();
             let desc = serde_json::json!({
                 "name": "omen",
@@ -222,6 +348,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 println!("Enforcement: Descendants: {:?}", backend_caps.descendants);
             }
+        }
+        Some(Commands::How { recipe }) => match machine_contract::recipe(&recipe) {
+            Some(doc) => {
+                if json_mode {
+                    println!("{}", serde_json::to_string_pretty(&doc)?);
+                } else {
+                    println!("{recipe}");
+                    for (i, step) in doc.steps.iter().enumerate() {
+                        println!("{}. {}", i + 1, step.capability_id);
+                        println!("   {}", step.purpose);
+                    }
+                }
+            }
+            None => {
+                let err = serde_json::json!({"error":"RECIPE_NOT_FOUND","operation":recipe,"state_changed":false,"retryable":false,"next_actions":["orient"]});
+                if json_mode {
+                    println!("{}", serde_json::to_string_pretty(&err)?);
+                } else {
+                    eprintln!("Recipe not found: {recipe}");
+                }
+                std::process::exit(2);
+            }
+        },
+        Some(Commands::Context { since }) => {
+            let doc = match since {
+                None => {
+                    serde_json::json!({"context_generation":machine_context.context_generation,"generation_status":machine_context.generation_status,"delta":"CURRENT_SNAPSHOT","workspace":{"root":"."},"provider_status":"not_probed"})
+                }
+                Some(generation)
+                    if Some(generation as i64) == machine_context.context_generation =>
+                {
+                    serde_json::json!({"changed":false,"from_generation":generation,"context_generation":generation,"changes":[]})
+                }
+                Some(generation) => {
+                    serde_json::json!({"error":"DELTA_UNAVAILABLE","from_generation":generation,"state_changed":false,"retryable":true,"context_generation":machine_context.context_generation,"reason":"Omen does not retain that historical generation","next_actions":["context"]})
+                }
+            };
+            println!("{}", serde_json::to_string_pretty(&doc)?);
         }
         Some(Commands::Tool(tool_args)) => match tool_args.subcommand {
             ToolSubcommands::List => {
