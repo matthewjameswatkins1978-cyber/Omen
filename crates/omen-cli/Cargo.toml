@@ -6,6 +6,7 @@ rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
 publish = false
+build = "build.rs"
 
 [[bin]]
 name = "omen"

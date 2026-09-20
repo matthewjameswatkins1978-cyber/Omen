@@ -21,7 +21,7 @@ const MAX_OMEN_TOML_BYTES: u64 = 256 * 1024;
 #[command(
     name = "omen",
     author,
-    version,
+    version = env!("OMEN_BUILD_IDENTITY"),
     about = "Agent-native developer runtime. Substrate, not sovereign."
 )]
 struct Cli {
