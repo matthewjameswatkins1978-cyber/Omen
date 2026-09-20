@@ -22,7 +22,4 @@
 - [19. Glossary](19-glossary.md)
 - [20. Index](20-index.md)
 - [21. Notes and sources](21-sources.md)
-
-# Reference
-
-- [Omen Reference](../../reference/README.md)
+- [Reference](22-reference.md)
