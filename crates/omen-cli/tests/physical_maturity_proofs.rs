@@ -92,6 +92,7 @@ async fn test_proof_a_pty_detach_reattach_real_path() {
     let mut ready = false;
     let mut is_term = false;
     let mut initial_size = false;
+    let mut initial_size_str = String::new();
     while (!ready || !is_term || !initial_size) && start.elapsed() < Duration::from_millis(5000) {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let (out, _, _) = pty_manager.read_output(&sid_str, 0).await.unwrap();
@@ -101,6 +102,9 @@ async fn test_proof_a_pty_detach_reattach_real_path() {
         }
         if text.contains("IS_TERMINAL:true") {
             is_term = true;
+        }
+        if let Some(pos) = text.find("INITIAL_SIZE:") {
+            initial_size_str = text[pos..].lines().next().unwrap_or("").to_string();
         }
         if text.contains("INITIAL_SIZE:80x24") {
             initial_size = true;
@@ -113,7 +117,7 @@ async fn test_proof_a_pty_detach_reattach_real_path() {
     );
     assert!(
         initial_size,
-        "Child process must observe initial terminal size 80x24"
+        "Child process must observe initial terminal size 80x24, got: {initial_size_str}"
     );
 
     // Write input from Client 1

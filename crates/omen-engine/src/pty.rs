@@ -564,6 +564,7 @@ impl NativePtyHandle {
             rustix::fs::Mode::empty(),
         )
         .map_err(|e| CoreError::ExecutionFailed(format!("open slave pty failed: {e}")))?;
+        let _ = tcsetwinsize(&slave_fd, ws);
 
         let mut cmd = tokio::process::Command::new(&req.argv[0]);
         if req.argv.len() > 1 {
