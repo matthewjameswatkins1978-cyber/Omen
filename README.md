@@ -59,7 +59,7 @@ Omen gives humans and AI the same workspace through different interfaces, while 
 4. **Omen 0.5: Agent Interoperability** — *Complete*
 5. **Omen 0.6: Physical Maturity** — *Complete*
 6. **Omen 0.7: Semantic Environment** — *Complete* (Structural AST search via ast-grep, LSP integration, SCIP parser, multi-ecosystem package metadata, zero-model deterministic queries, hot keystroke symbol completion)
-7. **Omen 0.8: Composition** — Typed pipeline composition, `Omen.toml`, deterministic reconstruction re-admitted under Tethers.
+7. **Omen 0.8: Composition & Discoverability** — Bounded machine contract and progressive discovery, followed by typed pipeline composition and `Omen.toml`; deterministic reconstruction remains re-admitted under Tethers.
 8. **Omen 0.9: Stabilisation** — Protocol freeze, backwards compatibility, migrations, torture testing, fuzzing, security audit.
 9. **Omen 1.0: Stable Human + Agent Developer Runtime** — Production guarantees across human, agent, and shared reality.
 

@@ -2,6 +2,7 @@
 
 pub mod error;
 pub mod id;
+pub mod machine_contract;
 pub mod model;
 pub mod resource;
 pub mod types;
