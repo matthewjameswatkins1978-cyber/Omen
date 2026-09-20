@@ -1,5 +1,6 @@
 //! Omen Core domain types and identity primitives.
 
+pub mod composition;
 pub mod error;
 pub mod id;
 pub mod machine_contract;
