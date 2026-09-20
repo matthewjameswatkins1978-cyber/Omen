@@ -1,7 +1,8 @@
 use crate::grammar::TypedReference;
 use omen_atlas::RuntimeProfile;
-use omen_core::{CoreError, ProcessExit, ResourceUri};
+use omen_core::{CoreError, ProcessExit, ResourceUri, composition, machine_contract};
 use omen_knowledge::{Database, FactRegistry};
+use std::fs;
 use std::path::Path;
 
 pub struct SemanticDispatcher;
@@ -472,6 +473,187 @@ impl SemanticDispatcher {
                     }
                 }
             }
+            "orient" => {
+                let contract = machine_contract::contract();
+                let groups: Vec<String> = contract
+                    .capability_definitions
+                    .iter()
+                    .map(|definition| definition.group.clone())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                println!(
+                    "Omen {} contract {}",
+                    machine_contract::CONTRACT_VERSION,
+                    machine_contract::contract_digest()
+                );
+                println!(
+                    "Context: {:?}",
+                    machine_context(db.as_deref()).context_generation
+                );
+                println!("Groups: {}", groups.join(", "));
+                println!("Next: :capabilities; :describe <capability>; :how <recipe>; :actions");
+                Ok(ProcessExit {
+                    code: Some(0),
+                    signal: None,
+                })
+            }
+            "capabilities" => {
+                let group = args.first().map(String::as_str);
+                let contract = machine_contract::contract();
+                let context = machine_context(db.as_deref());
+                for entry in machine_contract::project(&contract, &context)
+                    .into_iter()
+                    .filter(|entry| group.is_none_or(|wanted| entry.definition.group == wanted))
+                {
+                    println!(
+                        "{} — {} [{:?}]",
+                        entry.definition.id, entry.definition.summary, entry.status.availability
+                    );
+                }
+                Ok(ProcessExit {
+                    code: Some(0),
+                    signal: None,
+                })
+            }
+            "describe" => {
+                let Some(id) = args.first() else {
+                    println!("Usage: :describe <capability>");
+                    return Ok(ProcessExit {
+                        code: Some(1),
+                        signal: None,
+                    });
+                };
+                match machine_contract::capability(id) {
+                    Some(definition) => {
+                        let context = machine_context(db.as_deref());
+                        let status = context
+                            .capability_statuses
+                            .into_iter()
+                            .find(|status| status.id == *id)
+                            .unwrap();
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&machine_contract::CapabilityProjection {
+                                definition,
+                                status
+                            })
+                            .unwrap()
+                        );
+                        Ok(ProcessExit {
+                            code: Some(0),
+                            signal: None,
+                        })
+                    }
+                    None => {
+                        eprintln!("Capability not found: {id}");
+                        Ok(ProcessExit {
+                            code: Some(1),
+                            signal: None,
+                        })
+                    }
+                }
+            }
+            "how" => {
+                let Some(id) = args.first() else {
+                    println!("Usage: :how <recipe>");
+                    return Ok(ProcessExit {
+                        code: Some(1),
+                        signal: None,
+                    });
+                };
+                match machine_contract::recipe(id) {
+                    Some(recipe) => {
+                        println!("{} — {}", recipe.id, recipe.summary);
+                        for (index, step) in recipe.steps.iter().enumerate() {
+                            println!("{}. {} — {}", index + 1, step.capability_id, step.purpose);
+                        }
+                        println!("Advisory: {}", recipe.advisory);
+                        Ok(ProcessExit {
+                            code: Some(0),
+                            signal: None,
+                        })
+                    }
+                    None => {
+                        eprintln!("Recipe not found: {id}");
+                        Ok(ProcessExit {
+                            code: Some(1),
+                            signal: None,
+                        })
+                    }
+                }
+            }
+            "actions" => match load_interactive_config(cwd) {
+                Ok(Some(config)) => {
+                    for (id, action) in config.actions {
+                        println!("{} ({} steps)", id, action.steps.len());
+                    }
+                    Ok(ProcessExit {
+                        code: Some(0),
+                        signal: None,
+                    })
+                }
+                Ok(None) => {
+                    println!("No Omen.toml present.");
+                    Ok(ProcessExit {
+                        code: Some(0),
+                        signal: None,
+                    })
+                }
+                Err(error) => {
+                    eprintln!("Failed to load Omen.toml: {error}");
+                    Ok(ProcessExit {
+                        code: Some(1),
+                        signal: None,
+                    })
+                }
+            },
+            "plan" => {
+                let Some(id) = args.first() else {
+                    println!("Usage: :plan <action>");
+                    return Ok(ProcessExit {
+                        code: Some(1),
+                        signal: None,
+                    });
+                };
+                match load_interactive_config(cwd) {
+                    Ok(Some(config)) => match composition::plan_action(
+                        &config,
+                        id,
+                        &machine_contract::contract(),
+                        &machine_context(db.as_deref()),
+                    ) {
+                        Ok(plan) => {
+                            println!("{}", serde_json::to_string_pretty(&plan).unwrap());
+                            Ok(ProcessExit {
+                                code: Some(0),
+                                signal: None,
+                            })
+                        }
+                        Err(error) => {
+                            eprintln!("{error}");
+                            Ok(ProcessExit {
+                                code: Some(1),
+                                signal: None,
+                            })
+                        }
+                    },
+                    Ok(None) => {
+                        eprintln!("Omen.toml is not present");
+                        Ok(ProcessExit {
+                            code: Some(1),
+                            signal: None,
+                        })
+                    }
+                    Err(error) => {
+                        eprintln!("Failed to load Omen.toml: {error}");
+                        Ok(ProcessExit {
+                            code: Some(1),
+                            signal: None,
+                        })
+                    }
+                }
+            }
             "symbol" => {
                 if args.is_empty() {
                     println!("Usage: :symbol <query>");
@@ -713,7 +895,7 @@ impl SemanticDispatcher {
             }
             other => {
                 println!(
-                    "Unknown Omen semantic action ':{other}'. Available: :status, :doctor, :tools, :inspect, :why, :history, :show, :open, :rerun, :services, :stop, :agent, :backend, :symbol, :def, :refs, :structure, :packages, :tasks"
+                    "Unknown Omen semantic action ':{other}'. Available: :status, :doctor, :tools, :orient, :capabilities, :describe, :how, :actions, :plan, :inspect, :why, :history, :show, :rerun, :services, :stop, :agent, :backend, :symbol, :def, :refs, :structure, :packages, :tasks"
                 );
                 Ok(ProcessExit {
                     code: Some(1),
@@ -722,6 +904,30 @@ impl SemanticDispatcher {
             }
         }
     }
+}
+
+fn machine_context(db: Option<&Database>) -> machine_contract::MachineContext {
+    let generation = db
+        .and_then(|db| FactRegistry::get_generation_if_present(db, "fs:workspace").ok())
+        .flatten();
+    machine_contract::context_with_generation(generation)
+}
+
+fn load_interactive_config(
+    cwd: &Path,
+) -> Result<Option<omen_core::composition::OmenWorkspaceConfig>, String> {
+    let path = cwd.join("Omen.toml");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let metadata = fs::metadata(&path).map_err(|e| e.to_string())?;
+    if metadata.len() > 256 * 1024 {
+        return Err("OMEN_CONFIG_TOO_LARGE".into());
+    }
+    let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let config = toml::from_str(&text).map_err(|e| e.to_string())?;
+    composition::validate_config(&config).map_err(|e| e.to_string())?;
+    Ok(Some(config))
 }
 
 fn run_future_blocking<F, T>(future: F) -> T

@@ -73,5 +73,15 @@ immutable bounded JSON action evidence artifact is written at the end.
 Live Tethers revocation is not implemented in this slice; Omen consumes the
 current externally supplied contract. Native network denial is unavailable when
 the backend reports only observed network control. ThreadMoth and filesystem
-write composition execution remain truthful unsupported capabilities. MCP and
-interactive `:run` projections are deliberately deferred.
+write composition execution remain truthful unsupported capabilities.
+
+`THREADMOTH_COMPOSITION = BLOCKED_BY_LIVE_TETHERS_AUTHORITY_BOUNDARY`.
+The current public Tethers host seam does not provide Omen with a
+capability-specific, current admission for a structured ThreadMoth mutation.
+Omen therefore keeps the existing ThreadMoth request/certificate machinery and
+does not calculate, serialize, or manufacture Tethers permission.
+
+MCP now exposes read-only canonical projections for orientation, capabilities,
+recipes, context, and action planning. Interactive discovery exposes the same
+contract through `:orient`, `:capabilities`, `:describe`, `:how`, `:actions`,
+and `:plan`. Neither surface exposes an unsafe composition `:run` path.

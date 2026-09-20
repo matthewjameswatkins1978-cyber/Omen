@@ -24,7 +24,7 @@ Omen is an agent-native developer runtime substrate, not an autonomous agent or 
 4. **Suggests Typed Substrate Actions**: When reasoning about failures, the AI lane suggests concrete, typed Omen operations:
    - `:show @failed`
    - `:why @last`
-   - `:open @errors`
+   - `:show @errors`
    - `:rerun @failed`
 5. **Bounded Context**: Rather than scraping megabytes of raw terminal ANSI text, the AI lane supplies bounded structured context (`AgentContext`):
    - Working directory, environment info, Git status (branch, modified/staged files).

@@ -31,7 +31,7 @@ Omen avoids rigid global user personas (FAST / STANDARD / GUIDED / LEARN). Exper
 
 - **Level 0 (Silent Flow)**: Normal successful operation. Prompt returns cleanly without chatty noise (`✓ cargo test (exit 0, 340ms)`).
 - **Level 1 (State Communication)**: Compact notification of notable state changes (e.g. `! Tests out of date · src/auth.rs changed`).
-- **Level 2 (Diagnostic)**: Focused failure diagnostic with deterministic next actions (e.g. `:open @failed`, `:why @last`).
+- **Level 2 (Diagnostic)**: Focused failure diagnostic with deterministic next actions (e.g. `:show @failed`, `:why @last`).
 - **Level 3 (Explanation on Demand)**: Detailed causal explanation generated from structured machine state and provenance tree (`:why @fact.test`).
 
 > **Dense first. Explanation on demand.**

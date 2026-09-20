@@ -36,7 +36,9 @@ Developer architecture and milestone evidence remain in the existing docs tree:
 
 The accepted product baseline is Omen 0.7 Semantic Environment.
 
-Omen 0.8 Composition & Discoverability is under active development. The Book marks 0.8 material as in progress where it is not yet part of an accepted release.
+Omen 0.8 Composition & Discoverability is accepted for its documented
+discoverability and composition boundaries. ThreadMoth composition execution
+remains explicitly deferred pending a suitable current Tethers host seam.
 
 Documentation rule:
 

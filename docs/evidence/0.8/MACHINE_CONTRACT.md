@@ -56,4 +56,16 @@ current capability IDs and do not grant permission or execute during discovery.
   `fs:workspace`. A newly opened canonical database reports the real initial
   generation `0` with `generation_status: "known"`; no second counter exists.
 
-This is an implementation checkpoint, not the final 0.8 completion report.
+## Closeout status
+
+The contract is complete for the 0.8 discoverability boundary. MCP and
+interactive projections are read-only views over the same canonical contract
+and action planner. Composition execution remains separately gated by current
+external execution contracts.
+
+ThreadMoth composition execution is intentionally deferred:
+
+`THREADMOTH_COMPOSITION = BLOCKED_BY_LIVE_TETHERS_AUTHORITY_BOUNDARY`
+
+No Omen-owned permission, admission, approval, or grant representation is
+introduced to bridge that gap.

@@ -33,6 +33,19 @@ This list is checked against crates/omen-interactive/src/actions.rs on the 0.8 d
     :backend list
     :backend use <backend-id>
 
+## Omen 0.8 contract and composition discovery
+
+    :orient
+    :capabilities [group]
+    :describe <capability>
+    :how <recipe>
+    :actions
+    :plan <action>
+
+These commands are read-only. `:plan` validates and projects an action without
+granting authority or executing it. There is no interactive composition `:run`
+command in this release.
+
 ## Semantic code intelligence
 
     :symbol <query>

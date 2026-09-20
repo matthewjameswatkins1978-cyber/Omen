@@ -377,7 +377,7 @@ Instead of scrolling backwards through terminal archaeology:
 Or:
 
 ```text
-:open @errors
+:show @errors
 ```
 
 Or:
@@ -453,13 +453,13 @@ Nothing needs to pretend Neovim is JSON.
 Omen can also expose objects directly:
 
 ```text
-:open @errors
+:show @errors
 ```
 
 or:
 
 ```text
-:open @last.artifact
+:show @last.artifact
 ```
 
 ### What Omen adds

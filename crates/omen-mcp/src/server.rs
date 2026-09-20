@@ -1,11 +1,13 @@
 use crate::protocol::*;
 use omen_client::OmenClient;
-use omen_core::InteractiveSessionId;
+use omen_core::{InteractiveSessionId, composition, machine_contract};
 use omen_knowledge::{
-    ContentAddressedStore, Database, canonical_workspace_db_path, resolve_workspace_dir,
+    ContentAddressedStore, Database, FactRegistry, canonical_workspace_db_path,
+    canonical_workspace_db_path_readonly, resolve_workspace_dir,
 };
 use omen_semantic::SemanticProviderRegistry;
 use serde_json::{Value, json};
+use std::fs;
 use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -82,6 +84,46 @@ impl McpServer {
 
     async fn handle_tools_list(&self, id: Option<Value>) -> JsonRpcResponse {
         let tools = vec![
+            ToolDefinition {
+                name: "omen_orient".into(),
+                description: "Read-only bootstrap discovery: canonical contract, digest, context status, capability groups, recipes, and next calls.".into(),
+                input_schema: json!({"type":"object","properties":{}}),
+            },
+            ToolDefinition {
+                name: "omen_capabilities".into(),
+                description: "Read-only projection of canonical capability definitions and runtime overlays, optionally filtered by group.".into(),
+                input_schema: json!({"type":"object","properties":{"group":{"type":"string"}}}),
+            },
+            ToolDefinition {
+                name: "omen_describe".into(),
+                description: "Read-only canonical definition plus runtime overlay for one capability.".into(),
+                input_schema: json!({"type":"object","required":["capability_id"],"properties":{"capability_id":{"type":"string"}}}),
+            },
+            ToolDefinition {
+                name: "omen_recipe".into(),
+                description: "Read-only advisory recipe showing canonical capability steps; it grants no authority.".into(),
+                input_schema: json!({"type":"object","required":["recipe_id"],"properties":{"recipe_id":{"type":"string"}}}),
+            },
+            ToolDefinition {
+                name: "omen_context".into(),
+                description: "Read-only current context snapshot, or DELTA_UNAVAILABLE for an unretained historical generation.".into(),
+                input_schema: json!({"type":"object","properties":{"since":{"type":"integer","minimum":0}}}),
+            },
+            ToolDefinition {
+                name: "omen_action_list".into(),
+                description: "Read-only list of actions from the canonical Omen.toml parser; no probing or execution.".into(),
+                input_schema: json!({"type":"object","properties":{}}),
+            },
+            ToolDefinition {
+                name: "omen_action_show".into(),
+                description: "Read-only display of one canonical Omen.toml action definition.".into(),
+                input_schema: json!({"type":"object","required":["action_id"],"properties":{"action_id":{"type":"string"}}}),
+            },
+            ToolDefinition {
+                name: "omen_action_plan".into(),
+                description: "Build a deterministic read-only action plan and digest from canonical Omen.toml semantics.".into(),
+                input_schema: json!({"type":"object","required":["action_id"],"properties":{"action_id":{"type":"string"}}}),
+            },
             ToolDefinition {
                 name: "omen_workspace_status".into(),
                 description: "Query Omen structured workspace status, active facts, dirty count, and services.".into(),
@@ -254,6 +296,14 @@ impl McpServer {
         let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
         let result = match tool_name {
+            "omen_orient" => self.tool_orient().await,
+            "omen_capabilities" => self.tool_capabilities(&arguments).await,
+            "omen_describe" => self.tool_describe(&arguments).await,
+            "omen_recipe" => self.tool_recipe(&arguments).await,
+            "omen_context" => self.tool_context(&arguments).await,
+            "omen_action_list" => self.tool_action_list().await,
+            "omen_action_show" => self.tool_action_show(&arguments).await,
+            "omen_action_plan" => self.tool_action_plan(&arguments).await,
             "omen_workspace_status" => self.tool_workspace_status().await,
             "omen_facts_query" => self.tool_facts_query(&arguments).await,
             "omen_execute" => self.tool_execute(&arguments).await,
@@ -271,6 +321,178 @@ impl McpServer {
         };
 
         JsonRpcResponse::success(id, serde_json::to_value(result).unwrap())
+    }
+
+    fn machine_context(&self) -> machine_contract::MachineContext {
+        let generation =
+            Database::open_read_only(&canonical_workspace_db_path_readonly(&self.workspace_path))
+                .ok()
+                .and_then(|db| FactRegistry::get_generation_if_present(&db, "fs:workspace").ok())
+                .flatten();
+        machine_contract::context_with_generation(generation)
+    }
+
+    async fn tool_orient(&self) -> CallToolResult {
+        let contract = machine_contract::contract();
+        let context = self.machine_context();
+        let groups: Vec<String> = contract
+            .capability_definitions
+            .iter()
+            .map(|definition| definition.group.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        CallToolResult::text(serde_json::to_string_pretty(&json!({
+            "contract_version": machine_contract::CONTRACT_VERSION,
+            "omen_version": env!("CARGO_PKG_VERSION"),
+            "contract_digest": machine_contract::contract_digest(),
+            "context_generation": context.context_generation,
+            "generation_status": context.generation_status,
+            "workspace": {"name": self.workspace_path.file_name().and_then(|s| s.to_str()).unwrap_or("workspace"), "root": "."},
+            "platform": std::env::consts::OS,
+            "backend": "native",
+            "capability_groups": groups,
+            "references": ["@last", "@failed"],
+            "recipes": contract.recipe_definitions.iter().map(|recipe| &recipe.id).collect::<Vec<_>>(),
+            "next": ["capabilities", "describe <capability>", "recipe <recipe>", "context"]
+        })).unwrap())
+    }
+
+    async fn tool_capabilities(&self, args: &Value) -> CallToolResult {
+        let group = args.get("group").and_then(Value::as_str);
+        let contract = machine_contract::contract();
+        let context = self.machine_context();
+        let capabilities: Vec<_> = machine_contract::project(&contract, &context)
+            .into_iter()
+            .filter(|entry| group.is_none_or(|wanted| entry.definition.group == wanted))
+            .collect();
+        CallToolResult::text(
+            serde_json::to_string_pretty(&json!({"capabilities": capabilities})).unwrap(),
+        )
+    }
+
+    async fn tool_describe(&self, args: &Value) -> CallToolResult {
+        let Some(id) = args.get("capability_id").and_then(Value::as_str) else {
+            return CallToolResult::error("Missing 'capability_id'");
+        };
+        let Some(definition) = machine_contract::capability(id) else {
+            return CallToolResult::error(serde_json::to_string(&json!({
+                "error":"CAPABILITY_NOT_FOUND", "operation":id, "next_actions":["omen_capabilities"]
+            })).unwrap());
+        };
+        let context = self.machine_context();
+        let status = context
+            .capability_statuses
+            .into_iter()
+            .find(|status| status.id == id)
+            .unwrap();
+        CallToolResult::text(
+            serde_json::to_string_pretty(&machine_contract::CapabilityProjection {
+                definition,
+                status,
+            })
+            .unwrap(),
+        )
+    }
+
+    async fn tool_recipe(&self, args: &Value) -> CallToolResult {
+        let Some(id) = args.get("recipe_id").and_then(Value::as_str) else {
+            return CallToolResult::error("Missing 'recipe_id'");
+        };
+        match machine_contract::recipe(id) {
+            Some(recipe) => CallToolResult::text(serde_json::to_string_pretty(&recipe).unwrap()),
+            None => CallToolResult::error(
+                serde_json::to_string(&json!({
+                    "error":"RECIPE_NOT_FOUND", "operation":id, "next_actions":["omen_orient"]
+                }))
+                .unwrap(),
+            ),
+        }
+    }
+
+    async fn tool_context(&self, args: &Value) -> CallToolResult {
+        let context = self.machine_context();
+        match args.get("since").and_then(Value::as_i64) {
+            None => CallToolResult::text(serde_json::to_string_pretty(&json!({
+                "context_generation":context.context_generation,
+                "generation_status":context.generation_status,
+                "delta":"CURRENT_SNAPSHOT",
+                "workspace":{"root":"."},
+                "provider_status":"not_probed"
+            })).unwrap()),
+            Some(generation) if Some(generation) == context.context_generation =>
+                CallToolResult::text(serde_json::to_string_pretty(&json!({"changed":false,"from_generation":generation,"context_generation":generation,"changes":[]})).unwrap()),
+            Some(generation) => CallToolResult::text(serde_json::to_string_pretty(&json!({
+                "error":"DELTA_UNAVAILABLE", "from_generation":generation, "state_changed":false,
+                "retryable":true, "context_generation":context.context_generation,
+                "reason":"Omen does not retain that historical generation", "next_actions":["omen_context"]
+            })).unwrap()),
+        }
+    }
+
+    fn load_action_config(
+        &self,
+    ) -> Result<Option<omen_core::composition::OmenWorkspaceConfig>, String> {
+        let path = self.workspace_path.join("Omen.toml");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let metadata = fs::metadata(&path).map_err(|e| e.to_string())?;
+        if metadata.len() > 256 * 1024 {
+            return Err("OMEN_CONFIG_TOO_LARGE".into());
+        }
+        let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let config = toml::from_str(&text).map_err(|e| e.to_string())?;
+        composition::validate_config(&config).map_err(|e| e.to_string())?;
+        Ok(Some(config))
+    }
+
+    async fn tool_action_list(&self) -> CallToolResult {
+        match self.load_action_config() {
+            Ok(None) => CallToolResult::text(serde_json::to_string_pretty(&json!({"config_present":false,"actions":[]})).unwrap()),
+            Ok(Some(config)) => CallToolResult::text(serde_json::to_string_pretty(&json!({
+                "config_present":true,
+                "schema_version":config.schema_version,
+                "project":config.project.as_ref().and_then(|project| project.name.clone()),
+                "actions":config.actions.iter().map(|(id, action)| json!({"action_id":id,"description":action.description,"step_count":action.steps.len()})).collect::<Vec<_>>()
+            })).unwrap()),
+            Err(error) => CallToolResult::error(error),
+        }
+    }
+
+    async fn tool_action_show(&self, args: &Value) -> CallToolResult {
+        let Some(id) = args.get("action_id").and_then(Value::as_str) else {
+            return CallToolResult::error("Missing 'action_id'");
+        };
+        match self.load_action_config() {
+            Ok(Some(config)) => match config.actions.get(id) {
+                Some(action) => CallToolResult::text(serde_json::to_string_pretty(action).unwrap()),
+                None => {
+                    CallToolResult::error(format!("ACTION_NOT_FOUND: action '{id}' does not exist"))
+                }
+            },
+            Ok(None) => CallToolResult::error("ACTION_NOT_FOUND: Omen.toml is not present"),
+            Err(error) => CallToolResult::error(error),
+        }
+    }
+
+    async fn tool_action_plan(&self, args: &Value) -> CallToolResult {
+        let Some(id) = args.get("action_id").and_then(Value::as_str) else {
+            return CallToolResult::error("Missing 'action_id'");
+        };
+        match self.load_action_config() {
+            Ok(Some(config)) => match composition::plan_action(
+                &config,
+                id,
+                &machine_contract::contract(),
+                &self.machine_context(),
+            ) {
+                Ok(plan) => CallToolResult::text(serde_json::to_string_pretty(&plan).unwrap()),
+                Err(error) => CallToolResult::error(error.to_string()),
+            },
+            Ok(None) => CallToolResult::error("ACTION_NOT_FOUND: Omen.toml is not present"),
+            Err(error) => CallToolResult::error(error),
+        }
     }
 
     async fn tool_workspace_status(&self) -> CallToolResult {

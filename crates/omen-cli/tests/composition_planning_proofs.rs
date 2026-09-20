@@ -60,6 +60,49 @@ fn optional_config_and_valid_plan_are_inert() {
 }
 
 #[test]
+fn machine_discovery_path_is_cold_start_learnable() {
+    let workspace = tempdir().unwrap();
+    let state_home = workspace.path().join("omen-state");
+
+    let (ok, orient) = run(workspace.path(), &state_home, &["orient", "--machine"]);
+    assert!(ok);
+    assert_eq!(orient["contract_version"], "0.8");
+    assert!(orient["next"].as_array().unwrap().len() >= 3);
+
+    let (ok, capabilities) = run(
+        workspace.path(),
+        &state_home,
+        &["capabilities", "mutation", "--machine"],
+    );
+    assert!(ok);
+    assert_eq!(capabilities["capabilities"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        capabilities["capabilities"][0]["definition"]["id"],
+        "mutation.threadmoth"
+    );
+
+    let (ok, described) = run(
+        workspace.path(),
+        &state_home,
+        &["describe", "mutation.threadmoth", "--machine"],
+    );
+    assert!(ok);
+    assert_eq!(described["definition"]["authority"], "Tethers admission");
+
+    let (ok, recipe) = run(
+        workspace.path(),
+        &state_home,
+        &["how", "safe-mutation", "--machine"],
+    );
+    assert!(ok);
+    assert_eq!(recipe["id"], "safe-mutation");
+
+    let (ok, context) = run(workspace.path(), &state_home, &["context", "--machine"]);
+    assert!(ok);
+    assert_eq!(context["delta"], "CURRENT_SNAPSHOT");
+}
+
+#[test]
 fn strict_config_rejects_unknown_fields_and_unknown_capabilities() {
     let workspace = tempdir().unwrap();
     fs::write(

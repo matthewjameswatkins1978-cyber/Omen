@@ -893,6 +893,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "toml",
  "tracing",
 ]
 
@@ -946,6 +947,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "uuid",

@@ -84,7 +84,108 @@ async fn test_mcp_tools_list() {
         assert!(tool_names.contains(&"omen_services_list".to_string()));
         assert!(tool_names.contains(&"omen_services_control".to_string()));
         assert!(tool_names.contains(&"omen_capabilities_discover".to_string()));
+        for name in [
+            "omen_orient",
+            "omen_capabilities",
+            "omen_describe",
+            "omen_recipe",
+            "omen_context",
+            "omen_action_list",
+            "omen_action_show",
+            "omen_action_plan",
+        ] {
+            assert!(tool_names.contains(&name.to_string()), "missing {name}");
+        }
     })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mcp_canonical_discovery_and_action_projection() {
+    run_with_test_timeout(
+        "test_mcp_canonical_discovery_and_action_projection",
+        UNIT_TIMEOUT,
+        |_ctx| async move {
+            let temp = tempdir().unwrap();
+            fs::write(
+                temp.path().join("Omen.toml"),
+                r#"schema_version = 1
+
+[actions.inspect]
+description = "Inspect a symbol"
+[[actions.inspect.steps]]
+id = "definition"
+capability = "semantic.definition"
+input = { symbol = { kind = "literal", value = "SessionToken" } }
+"#,
+            )
+            .unwrap();
+            let server = McpServer::new(temp.path().to_path_buf(), None);
+
+            async fn call(server: &McpServer, name: &str, arguments: Value) -> Value {
+                let response = server
+                    .handle_request(JsonRpcRequest {
+                        jsonrpc: "2.0".into(),
+                        id: Some(json!(name)),
+                        method: "tools/call".into(),
+                        params: Some(json!({"name": name, "arguments": arguments})),
+                    })
+                    .await;
+                assert!(response.error.is_none(), "{name} returned RPC error");
+                let result: CallToolResult =
+                    serde_json::from_value(response.result.unwrap()).unwrap();
+                assert_ne!(result.is_error, Some(true), "{name} returned tool error");
+                serde_json::from_str(&result.content[0].text).unwrap()
+            }
+
+            let orient = call(&server, "omen_orient", json!({})).await;
+            assert_eq!(orient["contract_version"], "0.8");
+            assert!(
+                orient["contract_digest"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("sha256:")
+            );
+
+            let capabilities =
+                call(&server, "omen_capabilities", json!({"group":"mutation"})).await;
+            assert_eq!(capabilities["capabilities"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                capabilities["capabilities"][0]["definition"]["id"],
+                "mutation.threadmoth"
+            );
+
+            let described = call(
+                &server,
+                "omen_describe",
+                json!({"capability_id":"mutation.threadmoth"}),
+            )
+            .await;
+            assert_eq!(described["definition"]["authority"], "Tethers admission");
+            assert!(described["status"]["availability"].is_string());
+
+            let recipe = call(&server, "omen_recipe", json!({"recipe_id":"safe-mutation"})).await;
+            assert_eq!(recipe["id"], "safe-mutation");
+            assert!(
+                recipe["steps"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|step| { step["capability_id"] == "mutation.threadmoth" })
+            );
+
+            let context = call(&server, "omen_context", json!({})).await;
+            assert_eq!(context["delta"], "CURRENT_SNAPSHOT");
+
+            let actions = call(&server, "omen_action_list", json!({})).await;
+            assert_eq!(actions["config_present"], true);
+            assert_eq!(actions["actions"][0]["action_id"], "inspect");
+
+            let plan = call(&server, "omen_action_plan", json!({"action_id":"inspect"})).await;
+            assert_eq!(plan["planning_valid"], true);
+            assert_eq!(plan["admission_snapshot_only"], true);
+        },
+    )
     .await;
 }
 

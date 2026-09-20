@@ -57,11 +57,20 @@ Direct, typed operations on the Omen runtime substrate:
 :history [filter]        # Subordinate physical history for current session
 :rerun <ref>             # Re-runs a previous or failed command
 :show <ref>              # Displays bounded stdout/stderr or CAS artifact summary
-:open <ref>              # Opens CAS artifact or file in user editor
+:orient                  # Canonical contract orientation
+:capabilities [group]    # Canonical capability projections
+:describe <capability>  # One capability definition and live status
+:how <recipe>            # Advisory recipe projection
+:actions                 # Workspace action listing
+:plan <action>           # Read-only action plan
 :services                # Lists background managed processes (proc://)
 :stop <service>          # Gracefully terminates a managed service
 :restart <service>       # Restarts a managed background service
 ```
+
+Composition planning is read-only. Interactive composition execution is not
+exposed; consequential execution remains on the explicitly contract-bound CLI
+surface.
 
 ### Lane 3: Optional AI Reasoning Lane (Prefix: `?`)
 Advisory reasoning invoked only when explicit human judgement is requested:

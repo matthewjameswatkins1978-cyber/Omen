@@ -1,0 +1,5 @@
+{
+  "schema": "tethers.project/1",
+  "config_version": 1,
+  "workspace_root": "."
+}

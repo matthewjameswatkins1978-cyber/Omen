@@ -24,6 +24,7 @@ Future reference generation should consume clap definitions, Machine Contract de
 
 ## Version status
 
-Accepted baseline: Omen 0.7.
+Accepted baseline: Omen 0.8 Composition & Discoverability.
 
-In-progress surfaces: Omen 0.8 Composition & Discoverability.
+Deferred boundary: ThreadMoth composition execution requires a current public
+Tethers authority seam and is not exposed by Omen 0.8.
