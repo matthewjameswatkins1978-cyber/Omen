@@ -7,8 +7,8 @@ use omen_core::{
 };
 use omen_engine::{ExecutionRequest, ProcessSupervisor};
 use omen_knowledge::{
-    ContentAddressedStore, Database, FactRegistry, canonical_workspace_db_path,
-    resolve_workspace_dir,
+    ContentAddressedStore, Database, FactRegistry, canonical_workspace_db_path_readonly,
+    workspace_state_dir_path,
 };
 use omen_schema::{
     ExecutionContractWire, ExecutionResultWire, ProcessExitWire, SCHEMA_VERSION_RESULT,
@@ -290,15 +290,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let current_dir = std::env::current_dir()?;
     let ws_root = cli.workspace.unwrap_or(current_dir);
-    let state_dir = resolve_workspace_dir(&ws_root);
-    let db_path = canonical_workspace_db_path(&ws_root);
+    let state_dir = workspace_state_dir_path(&ws_root);
+    let db_path = canonical_workspace_db_path_readonly(&ws_root);
     let cas_dir = state_dir.join("cas");
-    let context_generation = Database::open(&db_path)
+    let context_generation = Database::open_read_only(&db_path)
         .ok()
-        .and_then(|db| FactRegistry::get_generation(&db, "fs:workspace").ok());
+        .and_then(|db| FactRegistry::get_generation_if_present(&db, "fs:workspace").ok())
+        .flatten();
     let machine_context = machine_contract::context_with_generation(context_generation);
-
-    let supervisor = ProcessSupervisor::new();
 
     match cli.command {
         Some(Commands::Orient(args)) => {
@@ -370,6 +369,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Some(Commands::Doctor) => {
+            let supervisor = ProcessSupervisor::new();
             let backend_caps = supervisor.backend().capabilities();
             if json_mode {
                 let doc = serde_json::json!({
@@ -425,6 +425,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 return Ok(());
             }
+            let supervisor = ProcessSupervisor::new();
             let backend_caps = supervisor.backend().capabilities();
             let desc = serde_json::json!({
                 "name": "omen",
@@ -725,6 +726,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         },
         Some(Commands::Exec(exec_args)) => {
+            let supervisor = ProcessSupervisor::new();
             let mut db = Database::open(&db_path)?;
             let cas = ContentAddressedStore::new(cas_dir);
 

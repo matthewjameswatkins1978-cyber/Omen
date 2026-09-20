@@ -46,14 +46,27 @@ pub struct PublishFactRequest<'a> {
 pub struct FactRegistry;
 
 impl FactRegistry {
-    pub fn get_generation(db: &crate::db::Database, name: &str) -> Result<i64, CoreError> {
+    pub fn get_generation_if_present(
+        db: &crate::db::Database,
+        name: &str,
+    ) -> Result<Option<i64>, CoreError> {
         let mut stmt = db
             .conn()
             .prepare("SELECT generation FROM resource_generations WHERE name = ?1")
             .map_err(|e| CoreError::Internal(format!("Failed to prepare generation query: {e}")))?;
 
-        let generation_val = stmt.query_row(params![name], |row| row.get(0)).unwrap_or(0);
-        Ok(generation_val)
+        stmt.query_row(params![name], |row| row.get(0))
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(CoreError::Internal(format!(
+                    "Failed to read generation: {other}"
+                ))),
+            })
+    }
+
+    pub fn get_generation(db: &crate::db::Database, name: &str) -> Result<i64, CoreError> {
+        Ok(Self::get_generation_if_present(db, name)?.unwrap_or(0))
     }
 
     pub fn set_generation(

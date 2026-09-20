@@ -23,6 +23,13 @@ pub fn deterministic_workspace_id(root: &Path) -> String {
 
 /// Resolves the Omen state directory for a given workspace.
 pub fn resolve_workspace_dir(root: &Path) -> PathBuf {
+    let ws_dir = workspace_state_dir_path(root);
+    fs::create_dir_all(&ws_dir).expect("Failed to create workspace state directory");
+    ws_dir
+}
+
+/// Computes the workspace state directory without creating it.
+pub fn workspace_state_dir_path(root: &Path) -> PathBuf {
     let base_dir = if let Ok(custom) = env::var("OMEN_STATE_HOME") {
         PathBuf::from(custom)
     } else if let Ok(local_app_data) = env::var("LOCALAPPDATA") {
@@ -33,10 +40,9 @@ pub fn resolve_workspace_dir(root: &Path) -> PathBuf {
         PathBuf::from(".omen-state")
     };
 
-    let ws_id = deterministic_workspace_id(root);
-    let ws_dir = base_dir.join("workspaces").join(ws_id);
-    fs::create_dir_all(&ws_dir).expect("Failed to create workspace state directory");
-    ws_dir
+    base_dir
+        .join("workspaces")
+        .join(deterministic_workspace_id(root))
 }
 
 /// Canonical database file name used by all Omen runtimes for a workspace.
@@ -45,6 +51,11 @@ pub const CANONICAL_DB_FILE_NAME: &str = "state.sqlite";
 /// Resolves the canonical database file path for a workspace.
 pub fn canonical_workspace_db_path(root: &Path) -> PathBuf {
     resolve_workspace_dir(root).join(CANONICAL_DB_FILE_NAME)
+}
+
+/// Computes the canonical database path without creating state.
+pub fn canonical_workspace_db_path_readonly(root: &Path) -> PathBuf {
+    workspace_state_dir_path(root).join(CANONICAL_DB_FILE_NAME)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

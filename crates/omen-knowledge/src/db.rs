@@ -1,5 +1,5 @@
 use omen_core::CoreError;
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
 
 pub struct Database {
@@ -27,6 +27,36 @@ impl Database {
         let db = Self { conn };
         db.migrate()?;
         Ok(db)
+    }
+
+    /// Opens an existing SQLite database without creating or migrating state.
+    pub fn open_read_only(path: &Path) -> Result<Self, CoreError> {
+        if !path.is_file() {
+            return Err(CoreError::Internal(format!(
+                "SQLite database does not exist: {}",
+                path.display()
+            )));
+        }
+
+        let normalized = path
+            .canonicalize()
+            .map_err(|e| CoreError::Internal(format!("Failed to resolve SQLite database: {e}")))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let normalized = normalized.strip_prefix("//?/").unwrap_or(&normalized);
+        let uri = if normalized.as_bytes().get(1) == Some(&b':') {
+            format!("file:///{normalized}?immutable=1")
+        } else {
+            format!("file://{normalized}?immutable=1")
+        };
+        let conn = Connection::open_with_flags(
+            uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(|e| {
+            CoreError::Internal(format!("Failed to open SQLite database read-only: {e}"))
+        })?;
+        Ok(Self { conn })
     }
 
     pub fn open_in_memory() -> Result<Self, CoreError> {
@@ -174,5 +204,34 @@ impl Database {
             .map_err(|e| CoreError::Internal(format!("Database migration failed: {e}")))?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn immutable_read_only_open_uses_existing_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.sqlite");
+        {
+            let db = Database::open(&path).unwrap();
+            db.conn()
+                .execute("INSERT INTO resource_generations (name, generation) VALUES ('fs:workspace', 7)", [])
+                .unwrap();
+        }
+        let db = Database::open_read_only(&path).unwrap();
+        let generation: i64 = db
+            .conn()
+            .query_row(
+                "SELECT generation FROM resource_generations WHERE name = 'fs:workspace'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(generation, 7);
+        assert!(!path.with_extension("sqlite-wal").exists());
+        assert!(!path.with_extension("sqlite-shm").exists());
     }
 }

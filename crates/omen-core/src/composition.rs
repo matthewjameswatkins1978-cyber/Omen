@@ -330,11 +330,22 @@ pub fn plan_action(
         })?;
         let mut inputs = BTreeMap::new();
         for (target_field, binding) in &step.input {
-            let target_type = schema_field_type(&definition.input_schema, target_field)
-                .ok_or_else(|| {
+            let target_property =
+                schema_field(&definition.input_schema, target_field).ok_or_else(|| {
                     error(
                         "INPUT_FIELD_NOT_FOUND",
                         format!("capability input has no field '{target_field}'"),
+                        Some(&step.id),
+                        Some(target_field),
+                    )
+                })?;
+            let target_type = target_property
+                .get("type")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    error(
+                        "TYPE_COMPATIBILITY_UNKNOWN",
+                        format!("capability input type for '{target_field}' is unknown"),
                         Some(&step.id),
                         Some(target_field),
                     )
@@ -374,11 +385,22 @@ pub fn plan_action(
                             )
                         }
                     })?;
-                    let source_type = schema_field_type(&source_definition.output_schema, field)
+                    let source_property = schema_field(&source_definition.output_schema, field)
                         .ok_or_else(|| {
                             error(
                                 "OUTPUT_FIELD_NOT_FOUND",
                                 format!("capability output has no field '{field}'"),
+                                Some(&step.id),
+                                Some(target_field),
+                            )
+                        })?;
+                    let source_type = source_property
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            error(
+                                "TYPE_COMPATIBILITY_UNKNOWN",
+                                format!("capability output type for '{field}' is unknown"),
                                 Some(&step.id),
                                 Some(target_field),
                             )
@@ -477,8 +499,8 @@ fn plan_digest(plan: &ActionPlan) -> String {
     format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
-fn schema_field_type<'a>(schema: &'a Value, field: &str) -> Option<&'a str> {
-    schema.get("properties")?.get(field)?.get("type")?.as_str()
+fn schema_field<'a>(schema: &'a Value, field: &str) -> Option<&'a Value> {
+    schema.get("properties")?.get(field)
 }
 fn value_matches_type(value: &Value, expected: &str) -> bool {
     match expected {
@@ -515,6 +537,47 @@ mod tests {
             )]
             .into_iter()
             .collect(),
+        }
+    }
+
+    fn config_with_steps(steps: Vec<ActionStepDefinition>) -> OmenWorkspaceConfig {
+        OmenWorkspaceConfig {
+            schema_version: 1,
+            project: None,
+            actions: [(
+                "inspect".into(),
+                NamedActionDefinition {
+                    description: None,
+                    steps,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        }
+    }
+
+    fn step(
+        id: &str,
+        capability: &str,
+        input: BTreeMap<String, InputBinding>,
+    ) -> ActionStepDefinition {
+        ActionStepDefinition {
+            id: id.into(),
+            capability: capability.into(),
+            input,
+        }
+    }
+
+    fn literal(value: &str) -> InputBinding {
+        InputBinding::Literal {
+            value: Value::String(value.into()),
+        }
+    }
+
+    fn output(source: &str, field: &str) -> InputBinding {
+        InputBinding::StepOutput {
+            step: source.into(),
+            field: field.into(),
         }
     }
 
@@ -560,5 +623,255 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.code, "UNKNOWN_CAPABILITY");
+    }
+
+    #[test]
+    fn prior_step_output_routes_when_types_match() {
+        let c = config_with_steps(vec![
+            step(
+                "definition",
+                "semantic.definition",
+                [("symbol".into(), literal("Token"))].into(),
+            ),
+            step(
+                "search",
+                "structure.search",
+                [("pattern".into(), output("definition", "status"))].into(),
+            ),
+        ]);
+        let plan = plan_action(
+            &c,
+            "inspect",
+            &machine_contract::contract(),
+            &machine_contract::unknown_context(),
+        )
+        .unwrap();
+        assert!(matches!(
+            plan.steps[1].inputs["pattern"],
+            PlannedInput::StepOutput { .. }
+        ));
+    }
+
+    #[test]
+    fn references_refuse_self_forward_missing_source_and_missing_output() {
+        let cases = [
+            (
+                vec![step(
+                    "definition",
+                    "semantic.definition",
+                    [("symbol".into(), output("definition", "status"))].into(),
+                )],
+                "SELF_STEP_REFERENCE",
+            ),
+            (
+                vec![
+                    step(
+                        "search",
+                        "structure.search",
+                        [("pattern".into(), output("definition", "status"))].into(),
+                    ),
+                    step(
+                        "definition",
+                        "semantic.definition",
+                        [("symbol".into(), literal("Token"))].into(),
+                    ),
+                ],
+                "FORWARD_STEP_REFERENCE",
+            ),
+            (
+                vec![step(
+                    "search",
+                    "structure.search",
+                    [("pattern".into(), output("missing", "status"))].into(),
+                )],
+                "STEP_REFERENCE_NOT_FOUND",
+            ),
+            (
+                vec![
+                    step(
+                        "definition",
+                        "semantic.definition",
+                        [("symbol".into(), literal("Token"))].into(),
+                    ),
+                    step(
+                        "search",
+                        "structure.search",
+                        [("pattern".into(), output("definition", "missing"))].into(),
+                    ),
+                ],
+                "OUTPUT_FIELD_NOT_FOUND",
+            ),
+        ];
+        for (steps, expected) in cases {
+            let error = plan_action(
+                &config_with_steps(steps),
+                "inspect",
+                &machine_contract::contract(),
+                &machine_contract::unknown_context(),
+            )
+            .unwrap_err();
+            assert_eq!(error.code, expected);
+        }
+    }
+
+    #[test]
+    fn missing_input_and_incompatible_types_refuse() {
+        let missing = config_with_steps(vec![step(
+            "search",
+            "structure.search",
+            [("missing".into(), literal("x"))].into(),
+        )]);
+        assert_eq!(
+            plan_action(
+                &missing,
+                "inspect",
+                &machine_contract::contract(),
+                &machine_contract::unknown_context()
+            )
+            .unwrap_err()
+            .code,
+            "INPUT_FIELD_NOT_FOUND"
+        );
+
+        let incompatible = config_with_steps(vec![
+            step(
+                "definition",
+                "semantic.definition",
+                [("symbol".into(), literal("Token"))].into(),
+            ),
+            step(
+                "run",
+                "execution.run",
+                [("argv".into(), output("definition", "status"))].into(),
+            ),
+        ]);
+        assert_eq!(
+            plan_action(
+                &incompatible,
+                "inspect",
+                &machine_contract::contract(),
+                &machine_contract::unknown_context()
+            )
+            .unwrap_err()
+            .code,
+            "TYPE_MISMATCH"
+        );
+    }
+
+    #[test]
+    fn unknown_schema_type_refuses() {
+        let mut contract = machine_contract::contract();
+        let definition = contract
+            .capability_definitions
+            .iter_mut()
+            .find(|definition| definition.id == "semantic.definition")
+            .unwrap();
+        definition.input_schema = serde_json::json!({"properties":{"symbol":{}}});
+        let c = config(literal("Token"));
+        let error = plan_action(
+            &c,
+            "inspect",
+            &contract,
+            &machine_contract::unknown_context(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "TYPE_COMPATIBILITY_UNKNOWN");
+    }
+
+    #[test]
+    fn duplicate_and_invalid_ids_refuse() {
+        let duplicate = config_with_steps(vec![
+            step(
+                "definition",
+                "semantic.definition",
+                [].into_iter().collect(),
+            ),
+            step(
+                "definition",
+                "semantic.definition",
+                [].into_iter().collect(),
+            ),
+        ]);
+        assert_eq!(
+            validate_config(&duplicate).unwrap_err().code,
+            "DUPLICATE_STEP_ID"
+        );
+
+        let mut invalid_action = duplicate.clone();
+        let action = invalid_action.actions.remove("inspect").unwrap();
+        invalid_action.actions.insert("Bad".into(), action);
+        assert_eq!(
+            validate_config(&invalid_action).unwrap_err().code,
+            "INVALID_ACTION_ID"
+        );
+
+        let invalid_step = config_with_steps(vec![step(
+            "Bad",
+            "semantic.definition",
+            [].into_iter().collect(),
+        )]);
+        assert_eq!(
+            validate_config(&invalid_step).unwrap_err().code,
+            "INVALID_STEP_ID"
+        );
+    }
+
+    #[test]
+    fn configured_bounds_and_schema_version_refuse() {
+        let mut too_many_actions = OmenWorkspaceConfig {
+            schema_version: 1,
+            project: None,
+            actions: BTreeMap::new(),
+        };
+        for i in 0..=MAX_ACTIONS {
+            too_many_actions.actions.insert(
+                format!("action-{i}"),
+                NamedActionDefinition {
+                    description: None,
+                    steps: vec![],
+                },
+            );
+        }
+        assert_eq!(
+            validate_config(&too_many_actions).unwrap_err().code,
+            "OMEN_CONFIG_TOO_MANY_ACTIONS"
+        );
+
+        let too_many_steps = config_with_steps(
+            (0..=MAX_STEPS_PER_ACTION)
+                .map(|i| {
+                    step(
+                        &format!("step-{i}"),
+                        "semantic.diagnostics",
+                        BTreeMap::new(),
+                    )
+                })
+                .collect(),
+        );
+        assert_eq!(
+            validate_config(&too_many_steps).unwrap_err().code,
+            "OMEN_CONFIG_TOO_MANY_STEPS"
+        );
+
+        let too_many_inputs = config_with_steps(vec![step(
+            "diagnostics",
+            "semantic.diagnostics",
+            (0..=MAX_INPUT_BINDINGS_PER_STEP)
+                .map(|i| (format!("field-{i}"), literal("x")))
+                .collect(),
+        )]);
+        assert_eq!(
+            validate_config(&too_many_inputs).unwrap_err().code,
+            "OMEN_CONFIG_BOUNDS"
+        );
+
+        let unsupported = OmenWorkspaceConfig {
+            schema_version: 2,
+            ..config(literal("Token"))
+        };
+        assert_eq!(
+            validate_config(&unsupported).unwrap_err().code,
+            "OMEN_CONFIG_VERSION_UNSUPPORTED"
+        );
     }
 }

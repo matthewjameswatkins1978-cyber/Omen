@@ -14,6 +14,6 @@ pub use registry::{
 };
 pub use workspace::{
     CANONICAL_DB_FILE_NAME, RequestReceiptRecord, ServiceRecord, WorkspacePersistence,
-    WorkspaceRecord, canonical_workspace_db_path, deterministic_workspace_id,
-    resolve_workspace_dir,
+    WorkspaceRecord, canonical_workspace_db_path, canonical_workspace_db_path_readonly,
+    deterministic_workspace_id, resolve_workspace_dir, workspace_state_dir_path,
 };
