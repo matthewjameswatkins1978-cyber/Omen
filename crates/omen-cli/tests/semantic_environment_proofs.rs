@@ -301,7 +301,7 @@ async fn test_proof_b_structural_rewrite_routes_through_threadmoth() {
 }
 
 // =============================================================================
-// PROOF C: Real LSP symbol definition and references with deterministic SessionToken fixture
+// PROOF C: Real rust-analyzer all-symbol function search, definition, and references
 // =============================================================================
 #[tokio::test]
 async fn test_proof_c_real_lsp_symbol_definition_and_references() {
@@ -318,17 +318,19 @@ async fn test_proof_c_real_lsp_symbol_definition_and_references() {
         let cargo_toml = r#"[package]
 name = "fixture-lsp"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 "#;
         std::fs::write(temp_dir.path().join("Cargo.toml"), cargo_toml).unwrap();
 
-        let lib_code = r#"pub struct SessionToken {
-    pub id: String,
+        let lib_code = r#"pub fn refresh_token() -> &'static str {
+    "token"
 }
 
-pub fn validate_session(token: &SessionToken) -> bool {
-    !token.id.is_empty()
+pub fn caller() -> &'static str {
+    refresh_token()
 }
+
+pub struct SessionToken;
 "#;
         std::fs::write(src_dir.join("lib.rs"), lib_code).unwrap();
 
@@ -337,72 +339,67 @@ pub fn validate_session(token: &SessionToken) -> bool {
             return;
         }
 
-        // rust-analyzer needs time on cold startup to run cargo metadata and build index.
-        // Bounded phase timeout of 15 seconds.
-        let def = run_phase(
+        let symbols = run_phase(
             "test_proof_c",
-            "lsp_symbol_definition_discovery",
-            Duration::from_secs(15),
-            async {
-                let start = Instant::now();
-                while start.elapsed() < Duration::from_secs(14) {
-                    if let Ok(r) = ra_provider
-                        .symbol_definition("SessionToken", Some("src/lib.rs"), Some(0), Some(11))
-                        .await
-                        && r.is_resolved()
-                    {
-                        return r;
-                    }
-                    tokio::time::sleep(Duration::from_millis(400)).await;
-                }
-                panic!("rust-analyzer failed to resolve SessionToken definition within 14s");
-            },
-        )
-        .await;
-
-        assert!(def.is_resolved(), "SessionToken definition must resolve");
-        let loc = def.as_resolved().unwrap();
-        assert_eq!(loc.file, "src/lib.rs");
-        assert_eq!(
-            loc.range.start_line, 0,
-            "SessionToken declaration must be on line 0"
-        );
-        assert_eq!(
-            loc.provider.as_str(),
-            "rust-analyzer",
-            "Provenance must truthfully report rust-analyzer"
-        );
-
-        // References query: SessionToken must have at least 2 references (declaration + argument type)
-        let refs_res = run_phase(
-            "test_proof_c",
-            "lsp_symbol_references",
-            Duration::from_secs(5),
-            ra_provider.symbol_references(
-                "SessionToken",
-                Some("src/lib.rs"),
-                Some(0),
-                Some(11),
-                10,
-            ),
+            "lsp_function_symbol_search",
+            Duration::from_secs(8),
+            ra_provider.symbol_search("refresh_token", 10),
         )
         .await
-        .expect("LSP references lookup must succeed");
+        .expect("real rust-analyzer function symbol search must succeed");
+        assert!(
+            symbols.iter().any(|symbol| {
+                symbol.name == "refresh_token"
+                    && symbol.kind == omen_semantic::SymbolKind::Function
+            }),
+            "real rust-analyzer all-symbol search must return refresh_token"
+        );
 
+        let definition = run_phase(
+            "test_proof_c",
+            "lsp_function_definition",
+            Duration::from_secs(8),
+            ra_provider.symbol_definition("refresh_token", None, None, None),
+        )
+        .await
+        .expect("real rust-analyzer function definition lookup must succeed");
         assert!(
-            refs_res.is_resolved(),
-            "SessionToken references must resolve"
+            definition.is_resolved(),
+            "real rust-analyzer must resolve refresh_token without a caller-provided location"
         );
-        let refs = refs_res.as_resolved().unwrap();
+        let location = definition.as_resolved().unwrap();
+        assert_eq!(location.file, "src/lib.rs");
+        assert_eq!(location.range.start_line, 0);
+        assert_eq!(location.provider.as_str(), "rust-analyzer");
+
+        let references = run_phase(
+            "test_proof_c",
+            "lsp_function_references",
+            Duration::from_secs(8),
+            ra_provider.symbol_references("refresh_token", None, None, None, 10),
+        )
+        .await
+        .expect("real rust-analyzer function references lookup must succeed");
+        let references = references
+            .as_resolved()
+            .expect("real rust-analyzer refresh_token references must resolve");
         assert!(
-            refs.len() >= 2,
-            "Expected at least 2 references to SessionToken, found {}",
-            refs.len()
+            references.iter().any(|reference| reference.location.range.start_line == 5),
+            "real rust-analyzer references must include the fixture caller"
         );
-        for r in refs {
-            assert_eq!(r.location.file, "src/lib.rs");
-            assert_eq!(r.location.provider.as_str(), "rust-analyzer");
-        }
+
+        let type_definition = run_phase(
+            "test_proof_c",
+            "lsp_type_regression",
+            Duration::from_secs(8),
+            ra_provider.symbol_definition("SessionToken", None, None, None),
+        )
+        .await
+        .expect("real rust-analyzer type lookup must succeed");
+        assert!(
+            type_definition.is_resolved(),
+            "all-symbol function repair must not regress ordinary type lookup"
+        );
 
         record_proof_status("rust-analyzer", true);
         emit_external_proofs_summary();
