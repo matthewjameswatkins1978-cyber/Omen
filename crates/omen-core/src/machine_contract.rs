@@ -1,13 +1,54 @@
 //! Canonical, bounded machine-facing Omen contract.
 //!
-//! This module deliberately contains static contract truth only.  Workspace and
-//! provider state belongs to the runtime overlay in the CLI/daemon layers.
+//! `MachineContract` contains static semantic truth only. Runtime availability,
+//! admission, workspace and provider state live in `MachineContext` and are
+//! joined only when a caller asks for a projected discovery response.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 pub const CONTRACT_VERSION: &str = "0.8";
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectClass {
+    Read,
+    Compute,
+    SpawnProcess,
+    Mutate,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkEffect {
+    None,
+    External,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Reversibility {
+    Reversible,
+    Irreversible,
+    NotApplicable,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AvailabilityState {
+    Available,
+    Unavailable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmissionState {
+    Admitted,
+    NotAdmitted,
+    Unknown,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CapabilityDefinition {
@@ -16,11 +57,10 @@ pub struct CapabilityDefinition {
     pub summary: String,
     pub input_schema: Value,
     pub output_schema: Value,
-    pub effect: String,
-    pub read_only: bool,
+    pub effect_class: EffectClass,
+    pub network_effect: NetworkEffect,
+    pub reversibility: Reversibility,
     pub idempotent: bool,
-    pub reversible: bool,
-    pub network: bool,
     pub authority: String,
     pub bounds: String,
     pub timeout: String,
@@ -30,323 +70,323 @@ pub struct CapabilityDefinition {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CapabilityStatus {
     pub id: String,
-    pub available: bool,
-    pub admitted: bool,
+    pub availability: AvailabilityState,
+    pub admission: AdmissionState,
     pub provider: String,
     pub assurance: String,
     pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CapabilityEntry {
+pub struct CapabilityProjection {
     pub definition: CapabilityDefinition,
     pub status: CapabilityStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecipeStep {
+    pub capability_id: String,
+    pub purpose: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecipeDefinition {
+    pub id: String,
+    pub summary: String,
+    pub steps: Vec<RecipeStep>,
+    pub advisory: bool,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MachineContract {
     pub contract_version: String,
-    pub capabilities: Vec<CapabilityEntry>,
-    pub recipes: Vec<String>,
+    pub capability_definitions: Vec<CapabilityDefinition>,
+    pub recipe_definitions: Vec<RecipeDefinition>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MachineContext {
+    pub context_generation: Option<i64>,
+    pub generation_status: String,
+    pub capability_statuses: Vec<CapabilityStatus>,
 }
 
 fn object_schema(properties: Value, required: &[&str]) -> Value {
-    json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "type": "object",
-        "properties": properties,
-        "required": required,
-        "additionalProperties": false
-    })
+    json!({"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":properties,"required":required,"additionalProperties":false})
 }
 
-fn make_capability(
-    id: &str,
-    group: &str,
-    summary: &str,
-    input_schema: Value,
-    output_schema: Value,
-    effect: &str,
-    read_only: bool,
-    idempotent: bool,
-    reversible: bool,
-    network: bool,
-    authority: &str,
-    bounds: &str,
-    timeout: &str,
-    examples: Vec<Value>,
-    available: bool,
-    admitted: bool,
-    provider: &str,
-    assurance: &str,
-    reason: Option<&str>,
-) -> CapabilityEntry {
-    CapabilityEntry {
-        definition: CapabilityDefinition {
-            id: id.into(),
-            group: group.into(),
-            summary: summary.into(),
-            input_schema,
-            output_schema,
-            effect: effect.into(),
-            read_only,
-            idempotent,
-            reversible,
-            network,
-            authority: authority.into(),
-            bounds: bounds.into(),
-            timeout: timeout.into(),
-            examples,
-        },
-        status: CapabilityStatus {
-            id: id.into(),
-            available,
-            admitted,
-            provider: provider.into(),
-            assurance: assurance.into(),
-            reason: reason.map(str::to_owned),
-        },
-    }
+fn result_schema() -> Value {
+    object_schema(
+        json!({"status":{"type":"string"},"results":{"type":"array","maxItems":100},"references":{"type":"array","maxItems":16}}),
+        &["status"],
+    )
 }
 
 pub fn contract() -> MachineContract {
     let empty = object_schema(json!({}), &[]);
-    let result = object_schema(
-        json!({
-            "status": {"type": "string"},
-            "results": {"type": "array", "maxItems": 100},
-            "references": {"type": "array", "maxItems": 16}
-        }),
-        &["status"],
-    );
+    let result = result_schema();
+    let capability_definitions = vec![
+        CapabilityDefinition {
+            id: "semantic.references".into(),
+            group: "semantic".into(),
+            summary: "Find references to a known symbol.".into(),
+            input_schema: object_schema(
+                json!({"symbol":{"type":"string","minLength":1}}),
+                &["symbol"],
+            ),
+            output_schema: result.clone(),
+            effect_class: EffectClass::Read,
+            network_effect: NetworkEffect::None,
+            reversibility: Reversibility::NotApplicable,
+            idempotent: true,
+            authority: "none".into(),
+            bounds: "max 100 results".into(),
+            timeout: "bounded provider timeout".into(),
+            examples: vec![json!({"symbol":"refresh_token"})],
+        },
+        CapabilityDefinition {
+            id: "semantic.definition".into(),
+            group: "semantic".into(),
+            summary: "Resolve the definition of a known symbol.".into(),
+            input_schema: object_schema(
+                json!({"symbol":{"type":"string","minLength":1}}),
+                &["symbol"],
+            ),
+            output_schema: result.clone(),
+            effect_class: EffectClass::Read,
+            network_effect: NetworkEffect::None,
+            reversibility: Reversibility::NotApplicable,
+            idempotent: true,
+            authority: "none".into(),
+            bounds: "one bounded result".into(),
+            timeout: "bounded provider timeout".into(),
+            examples: vec![json!({"symbol":"refresh_token"})],
+        },
+        CapabilityDefinition {
+            id: "semantic.diagnostics".into(),
+            group: "semantic".into(),
+            summary: "Return deterministic workspace diagnostics when a provider is available."
+                .into(),
+            input_schema: empty.clone(),
+            output_schema: result.clone(),
+            effect_class: EffectClass::Read,
+            network_effect: NetworkEffect::None,
+            reversibility: Reversibility::NotApplicable,
+            idempotent: true,
+            authority: "none".into(),
+            bounds: "bounded diagnostics".into(),
+            timeout: "bounded provider timeout".into(),
+            examples: vec![json!({})],
+        },
+        CapabilityDefinition {
+            id: "structure.search".into(),
+            group: "structure".into(),
+            summary: "Search source using the structural adapter.".into(),
+            input_schema: object_schema(
+                json!({"pattern":{"type":"string","minLength":1}}),
+                &["pattern"],
+            ),
+            output_schema: result.clone(),
+            effect_class: EffectClass::Read,
+            network_effect: NetworkEffect::None,
+            reversibility: Reversibility::NotApplicable,
+            idempotent: true,
+            authority: "none".into(),
+            bounds: "bounded matches".into(),
+            timeout: "bounded adapter timeout".into(),
+            examples: vec![json!({"pattern":"fn $NAME($$$ARGS) { $$$BODY }"})],
+        },
+        CapabilityDefinition {
+            id: "execution.run".into(),
+            group: "execution".into(),
+            summary: "Run an explicitly supplied argv under an execution contract.".into(),
+            input_schema: object_schema(
+                json!({"argv":{"type":"array","minItems":1,"maxItems":64,"items":{"type":"string"}}}),
+                &["argv"],
+            ),
+            output_schema: result.clone(),
+            effect_class: EffectClass::SpawnProcess,
+            network_effect: NetworkEffect::None,
+            reversibility: Reversibility::Irreversible,
+            idempotent: false,
+            authority: "Tethers admission".into(),
+            bounds: "bounded output and timeout".into(),
+            timeout: "caller supplied timeout".into(),
+            examples: vec![json!({"argv":["cargo","check"]})],
+        },
+        CapabilityDefinition {
+            id: "mutation.threadmoth".into(),
+            group: "mutation".into(),
+            summary: "Apply a deterministic ThreadMoth mutation.".into(),
+            input_schema: object_schema(json!({"plan":{"type":"string","minLength":1}}), &["plan"]),
+            output_schema: result.clone(),
+            effect_class: EffectClass::Mutate,
+            network_effect: NetworkEffect::None,
+            reversibility: Reversibility::Reversible,
+            idempotent: false,
+            authority: "Tethers admission".into(),
+            bounds: "bounded diff and artifact evidence".into(),
+            timeout: "bounded mutation timeout".into(),
+            examples: vec![json!({"plan":"threadmoth://plan/example"})],
+        },
+        CapabilityDefinition {
+            id: "filesystem.read".into(),
+            group: "filesystem".into(),
+            summary: "Read bounded workspace data.".into(),
+            input_schema: object_schema(json!({"path":{"type":"string","minLength":1}}), &["path"]),
+            output_schema: result.clone(),
+            effect_class: EffectClass::Read,
+            network_effect: NetworkEffect::None,
+            reversibility: Reversibility::NotApplicable,
+            idempotent: true,
+            authority: "none".into(),
+            bounds: "bounded bytes or artifact reference".into(),
+            timeout: "bounded filesystem read".into(),
+            examples: vec![json!({"path":"src/lib.rs"})],
+        },
+        CapabilityDefinition {
+            id: "filesystem.write".into(),
+            group: "filesystem".into(),
+            summary: "Write workspace data when separately admitted by Tethers.".into(),
+            input_schema: object_schema(
+                json!({"path":{"type":"string","minLength":1},"content":{"type":"string"}}),
+                &["path", "content"],
+            ),
+            output_schema: result,
+            effect_class: EffectClass::Mutate,
+            network_effect: NetworkEffect::None,
+            reversibility: Reversibility::Reversible,
+            idempotent: false,
+            authority: "Tethers admission".into(),
+            bounds: "bounded content".into(),
+            timeout: "bounded filesystem write".into(),
+            examples: vec![json!({"path":"src/lib.rs","content":"..."})],
+        },
+    ];
+    let recipe_definitions = vec![
+        RecipeDefinition {
+            id: "investigate-failure".into(),
+            summary: "Inspect a failure using bounded evidence before interpreting it.".into(),
+            steps: vec![
+                RecipeStep {
+                    capability_id: "filesystem.read".into(),
+                    purpose: "inspect @failed or its bounded artifact reference".into(),
+                },
+                RecipeStep {
+                    capability_id: "semantic.diagnostics".into(),
+                    purpose: "resolve deterministic diagnostics when available".into(),
+                },
+                RecipeStep {
+                    capability_id: "semantic.definition".into(),
+                    purpose: "resolve relevant symbols only when needed".into(),
+                },
+            ],
+            advisory: true,
+            notes: vec!["Read large artifacts only through bounded slices or references.".into()],
+        },
+        RecipeDefinition {
+            id: "safe-mutation".into(),
+            summary: "Discover, preview, re-admit, mutate, and verify deterministically.".into(),
+            steps: vec![
+                RecipeStep {
+                    capability_id: "structure.search".into(),
+                    purpose: "discover the target structurally".into(),
+                },
+                RecipeStep {
+                    capability_id: "mutation.threadmoth".into(),
+                    purpose: "apply only an explicitly previewed and admitted mutation plan".into(),
+                },
+                RecipeStep {
+                    capability_id: "execution.run".into(),
+                    purpose: "run relevant verification after current authority is re-checked"
+                        .into(),
+                },
+            ],
+            advisory: true,
+            notes: vec![
+                "Preview and Tethers admission are required gates; this recipe grants neither."
+                    .into(),
+            ],
+        },
+    ];
     MachineContract {
         contract_version: CONTRACT_VERSION.into(),
-        capabilities: vec![
-            make_capability(
-                "semantic.references",
-                "semantic",
-                "Find references to a known symbol.",
-                object_schema(
-                    json!({"symbol": {"type": "string", "minLength": 1}}),
-                    &["symbol"],
-                ),
-                result.clone(),
-                "read workspace semantic index",
-                true,
-                true,
-                true,
-                false,
-                "none",
-                "max 100 results",
-                "bounded provider timeout",
-                vec![json!({"symbol": "refresh_token"})],
-                true,
-                true,
-                "semantic-registry",
-                "DETERMINISTIC",
-                None,
-            ),
-            make_capability(
-                "semantic.definition",
-                "semantic",
-                "Resolve the definition of a known symbol.",
-                object_schema(
-                    json!({"symbol": {"type": "string", "minLength": 1}}),
-                    &["symbol"],
-                ),
-                result.clone(),
-                "read workspace semantic index",
-                true,
-                true,
-                true,
-                false,
-                "none",
-                "one bounded result",
-                "bounded provider timeout",
-                vec![json!({"symbol": "refresh_token"})],
-                true,
-                true,
-                "semantic-registry",
-                "DETERMINISTIC",
-                None,
-            ),
-            make_capability(
-                "semantic.diagnostics",
-                "semantic",
-                "Return deterministic workspace diagnostics when a provider is available.",
-                empty.clone(),
-                result.clone(),
-                "read workspace diagnostics",
-                true,
-                true,
-                true,
-                false,
-                "none",
-                "bounded diagnostics",
-                "bounded provider timeout",
-                vec![json!({})],
-                false,
-                false,
-                "semantic-provider",
-                "UNKNOWN",
-                Some("provider not probed"),
-            ),
-            make_capability(
-                "structure.search",
-                "structure",
-                "Search source using the structural adapter.",
-                object_schema(
-                    json!({"pattern": {"type": "string", "minLength": 1}}),
-                    &["pattern"],
-                ),
-                result.clone(),
-                "read workspace source",
-                true,
-                true,
-                true,
-                false,
-                "none",
-                "bounded matches",
-                "bounded adapter timeout",
-                vec![json!({"pattern": "fn $NAME($$$ARGS) { $$$BODY }"})],
-                true,
-                true,
-                "ast-grep",
-                "OBSERVED",
-                None,
-            ),
-            make_capability(
-                "execution.run",
-                "execution",
-                "Run an explicitly supplied argv under an execution contract.",
-                object_schema(
-                    json!({"argv": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"type": "string"}}}),
-                    &["argv"],
-                ),
-                result.clone(),
-                "spawn process",
-                false,
-                false,
-                false,
-                false,
-                "Tethers admission",
-                "bounded output and timeout",
-                "caller supplied timeout",
-                vec![json!({"argv": ["cargo", "check"]})],
-                true,
-                false,
-                "execution-engine",
-                "OBSERVED",
-                Some("Tethers capability not admitted"),
-            ),
-            make_capability(
-                "mutation.threadmoth",
-                "mutation",
-                "Apply a deterministic ThreadMoth mutation.",
-                object_schema(
-                    json!({"plan": {"type": "string", "minLength": 1}}),
-                    &["plan"],
-                ),
-                result.clone(),
-                "mutate workspace",
-                false,
-                false,
-                true,
-                false,
-                "Tethers admission",
-                "bounded diff and artifact evidence",
-                "bounded mutation timeout",
-                vec![json!({"plan": "threadmoth://plan/example"})],
-                true,
-                false,
-                "threadmoth",
-                "OBSERVED",
-                Some("Tethers capability not admitted"),
-            ),
-            make_capability(
-                "filesystem.read",
-                "filesystem",
-                "Read bounded workspace data.",
-                object_schema(
-                    json!({"path": {"type": "string", "minLength": 1}}),
-                    &["path"],
-                ),
-                result.clone(),
-                "read filesystem",
-                true,
-                true,
-                true,
-                false,
-                "none",
-                "bounded bytes or artifact reference",
-                "bounded filesystem read",
-                vec![json!({"path": "src/lib.rs"})],
-                true,
-                true,
-                "filesystem",
-                "OBSERVED",
-                None,
-            ),
-            make_capability(
-                "filesystem.write",
-                "filesystem",
-                "Write workspace data when separately admitted by Tethers.",
-                object_schema(
-                    json!({"path": {"type": "string", "minLength": 1}, "content": {"type": "string"}}),
-                    &["path", "content"],
-                ),
-                result,
-                "write filesystem",
-                false,
-                false,
-                true,
-                false,
-                "Tethers admission",
-                "bounded content",
-                "bounded filesystem write",
-                vec![json!({"path": "src/lib.rs", "content": "..."})],
-                true,
-                false,
-                "filesystem",
-                "UNKNOWN",
-                Some("Tethers capability not admitted"),
-            ),
-        ],
-        recipes: vec!["investigate-failure".into(), "safe-mutation".into()],
+        capability_definitions,
+        recipe_definitions,
     }
+}
+
+pub fn unknown_context() -> MachineContext {
+    let capability_statuses = contract()
+        .capability_definitions
+        .into_iter()
+        .map(|definition| CapabilityStatus {
+            id: definition.id,
+            availability: AvailabilityState::Unknown,
+            admission: AdmissionState::Unknown,
+            provider: "not-probed".into(),
+            assurance: "UNKNOWN".into(),
+            reason: Some("runtime status not probed during discovery".into()),
+        })
+        .collect();
+    MachineContext {
+        context_generation: None,
+        generation_status: "unavailable".into(),
+        capability_statuses,
+    }
+}
+
+pub fn context_with_generation(generation: Option<i64>) -> MachineContext {
+    let mut context = unknown_context();
+    context.context_generation = generation;
+    context.generation_status = if generation.is_some() {
+        "known".into()
+    } else {
+        "unavailable".into()
+    };
+    context
+}
+
+pub fn project(contract: &MachineContract, context: &MachineContext) -> Vec<CapabilityProjection> {
+    contract
+        .capability_definitions
+        .iter()
+        .filter_map(|definition| {
+            context
+                .capability_statuses
+                .iter()
+                .find(|status| status.id == definition.id)
+                .map(|status| CapabilityProjection {
+                    definition: definition.clone(),
+                    status: status.clone(),
+                })
+        })
+        .collect()
 }
 
 pub fn canonical_json<T: Serialize>(value: &T) -> String {
     serde_json::to_string(value).expect("machine contract is serializable")
 }
-
-pub fn contract_digest() -> String {
+pub fn contract_digest_of(contract: &MachineContract) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(canonical_json(&contract()).as_bytes());
+    hasher.update(canonical_json(contract).as_bytes());
     format!("sha256:{}", hex::encode(hasher.finalize()))
 }
-
-pub fn capability(id: &str) -> Option<CapabilityEntry> {
-    contract()
-        .capabilities
-        .into_iter()
-        .find(|entry| entry.definition.id == id)
+pub fn contract_digest() -> String {
+    contract_digest_of(&contract())
 }
-
-pub fn recipe(name: &str) -> Option<Value> {
-    match name {
-        "investigate-failure" => Some(json!({
-            "name": name,
-            "steps": ["filesystem.read", "semantic.diagnostics", "semantic.definition"],
-            "advisory": true
-        })),
-        "safe-mutation" => Some(json!({
-            "name": name,
-            "steps": ["structure.search", "mutation.threadmoth", "execution.run"],
-            "advisory": true
-        })),
-        _ => None,
-    }
+pub fn capability(id: &str) -> Option<CapabilityDefinition> {
+    contract()
+        .capability_definitions
+        .into_iter()
+        .find(|definition| definition.id == id)
+}
+pub fn recipe(name: &str) -> Option<RecipeDefinition> {
+    contract()
+        .recipe_definitions
+        .into_iter()
+        .find(|recipe| recipe.id == name)
 }
 
 #[cfg(test)]
@@ -354,22 +394,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn digest_is_stable_and_runtime_independent() {
-        assert_eq!(contract_digest(), contract_digest());
-        assert!(contract_digest().starts_with("sha256:"));
+    fn static_digest_ignores_runtime_status() {
+        let digest = contract_digest();
+        let mut context = unknown_context();
+        context.capability_statuses[0].availability = AvailabilityState::Available;
+        context.capability_statuses[0].admission = AdmissionState::Admitted;
+        assert_eq!(digest, contract_digest());
+        assert_eq!(
+            project(&contract(), &context)[0].status.availability,
+            AvailabilityState::Available
+        );
     }
 
     #[test]
-    fn every_recipe_references_a_capability() {
+    fn static_digest_changes_when_definition_changes() {
+        let mut changed = contract();
+        changed.capability_definitions[0]
+            .summary
+            .push_str(" (changed)");
+        assert_ne!(contract_digest(), contract_digest_of(&changed));
+    }
+
+    #[test]
+    fn definitions_are_unique_bounded_and_typed() {
         let c = contract();
-        for recipe_name in c.recipes {
-            let recipe = recipe(&recipe_name).expect("built-in recipe exists");
-            for step in recipe["steps"].as_array().unwrap() {
-                let step_id = step.as_str().expect("recipe step is a string");
+        let mut ids = std::collections::HashSet::new();
+        for definition in &c.capability_definitions {
+            assert!(ids.insert(&definition.id));
+            assert!(!definition.group.is_empty());
+            assert!(!definition.examples.is_empty() && definition.examples.len() <= 2);
+            assert!(
+                definition.input_schema["$schema"]
+                    .as_str()
+                    .unwrap()
+                    .contains("2020-12")
+            );
+        }
+    }
+
+    #[test]
+    fn every_recipe_step_resolves() {
+        let c = contract();
+        for recipe in &c.recipe_definitions {
+            for step in &recipe.steps {
                 assert!(
-                    c.capabilities
+                    c.capability_definitions
                         .iter()
-                        .any(|entry| entry.definition.id == step_id)
+                        .any(|d| d.id == step.capability_id)
                 );
             }
         }
