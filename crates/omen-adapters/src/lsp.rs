@@ -19,6 +19,27 @@ pub const DEFAULT_MAX_LSP_MESSAGE_BYTES: usize = 16 * 1024 * 1024; // 16 MiB har
 
 type PendingRequestMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, CoreError>>>>>;
 
+fn initialize_supports_workspace_symbol_scope_kind_filtering(result: &Value) -> bool {
+    result
+        .get("capabilities")
+        .and_then(|capabilities| capabilities.get("experimental"))
+        .and_then(|experimental| experimental.get("workspaceSymbolScopeKindFiltering"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn workspace_symbol_all_params(query: &str, filtered_search_supported: bool) -> Value {
+    if filtered_search_supported {
+        json!({
+            "query": query,
+            "searchScope": "workspace",
+            "searchKind": "allSymbols"
+        })
+    } else {
+        json!({ "query": format!("{query}#") })
+    }
+}
+
 /// Real JSON-RPC stdio LSP client with request correlation, bounded timeouts, and cancellation.
 pub struct LspClient {
     child: Option<Child>,
@@ -30,6 +51,7 @@ pub struct LspClient {
     workspace_root: PathBuf,
     provider_id: SemanticProviderId,
     generation: SemanticGeneration,
+    workspace_symbol_scope_kind_filtering: bool,
 }
 
 impl LspClient {
@@ -153,6 +175,7 @@ impl LspClient {
             workspace_root,
             provider_id,
             generation: SemanticGeneration::new(1, 1),
+            workspace_symbol_scope_kind_filtering: false,
         })
     }
 
@@ -288,23 +311,22 @@ impl LspClient {
             }
         });
 
-        self.send_request("initialize", params, timeout_duration)
+        let initialize_result = self
+            .send_request("initialize", params, timeout_duration)
             .await?;
+        self.workspace_symbol_scope_kind_filtering =
+            initialize_supports_workspace_symbol_scope_kind_filtering(&initialize_result);
         self.send_notification("initialized", json!({})).await?;
         Ok(())
     }
 
-    pub async fn workspace_symbol(
+    async fn workspace_symbol_with_params(
         &mut self,
-        query: &str,
+        params: Value,
         timeout_duration: Duration,
     ) -> Result<Vec<SymbolRecord>, CoreError> {
         let res = self
-            .send_request(
-                "workspace/symbol",
-                json!({ "query": query }),
-                timeout_duration,
-            )
+            .send_request("workspace/symbol", params, timeout_duration)
             .await?;
 
         let mut symbols = Vec::new();
@@ -316,6 +338,28 @@ impl LspClient {
             }
         }
         Ok(symbols)
+    }
+
+    pub async fn workspace_symbol(
+        &mut self,
+        query: &str,
+        timeout_duration: Duration,
+    ) -> Result<Vec<SymbolRecord>, CoreError> {
+        self.workspace_symbol_with_params(json!({ "query": query }), timeout_duration)
+            .await
+    }
+
+    pub async fn workspace_symbol_all(
+        &mut self,
+        query: &str,
+        timeout_duration: Duration,
+    ) -> Result<Vec<SymbolRecord>, CoreError> {
+        let params = workspace_symbol_all_params(
+            query,
+            self.workspace_symbol_scope_kind_filtering,
+        );
+        self.workspace_symbol_with_params(params, timeout_duration)
+            .await
     }
 
     pub async fn did_open_file(&mut self, file: &str) -> Result<(), CoreError> {
@@ -719,6 +763,7 @@ pub struct RustAnalyzerProvider {
     id: SemanticProviderId,
     workspace_root: PathBuf,
     binary_path: Option<PathBuf>,
+    binary_args: Vec<String>,
     client: Arc<tokio::sync::Mutex<Option<LspClient>>>,
 }
 
@@ -730,6 +775,7 @@ impl RustAnalyzerProvider {
             id,
             workspace_root,
             binary_path,
+            binary_args: Vec::new(),
             client: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
@@ -740,6 +786,23 @@ impl RustAnalyzerProvider {
             id,
             workspace_root,
             binary_path: Some(binary),
+            binary_args: Vec::new(),
+            client: Arc::new(tokio::sync::Mutex::new(None)),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn with_binary_args(
+        workspace_root: PathBuf,
+        binary: PathBuf,
+        binary_args: Vec<String>,
+    ) -> Self {
+        let id = SemanticProviderId::new("rust-analyzer").unwrap();
+        Self {
+            id,
+            workspace_root,
+            binary_path: Some(binary),
+            binary_args,
             client: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
@@ -760,8 +823,13 @@ impl RustAnalyzerProvider {
                     "rust-analyzer binary not found".into(),
                 ));
             };
-            let mut client =
-                LspClient::spawn(bin, &[], self.workspace_root.clone(), self.id.clone()).await?;
+            let mut client = LspClient::spawn(
+                bin,
+                &self.binary_args,
+                self.workspace_root.clone(),
+                self.id.clone(),
+            )
+            .await?;
             client.initialize(DEFAULT_LSP_TIMEOUT).await?;
             *guard = Some(client);
         }
@@ -811,7 +879,7 @@ impl SemanticProvider for RustAnalyzerProvider {
                 }
             };
             if let Some(client) = guard.as_mut() {
-                match client.workspace_symbol(query, DEFAULT_LSP_TIMEOUT).await {
+                match client.workspace_symbol_all(query, DEFAULT_LSP_TIMEOUT).await {
                     Ok(res) => Ok(res),
                     Err(e) => {
                         tracing::warn!("LSP symbol search error: {e}");
@@ -864,7 +932,7 @@ impl SemanticProvider for RustAnalyzerProvider {
                     }
 
                     // Fall back to workspace symbol search if exact line/col not given
-                    match client.workspace_symbol(symbol, DEFAULT_LSP_TIMEOUT).await {
+                    match client.workspace_symbol_all(symbol, DEFAULT_LSP_TIMEOUT).await {
                         Ok(syms) => {
                             let exact: Vec<_> =
                                 syms.into_iter().filter(|s| s.name == symbol).collect();
@@ -915,7 +983,7 @@ impl SemanticProvider for RustAnalyzerProvider {
                     }
                 } else {
                     // Look up definition first to get exact location
-                    match client.workspace_symbol(symbol, DEFAULT_LSP_TIMEOUT).await {
+                    match client.workspace_symbol_all(symbol, DEFAULT_LSP_TIMEOUT).await {
                         Ok(syms) => {
                             let exact: Vec<_> =
                                 syms.into_iter().filter(|s| s.name == symbol).collect();
@@ -970,5 +1038,46 @@ impl SemanticProvider for RustAnalyzerProvider {
                 Ok(Vec::new())
             }
         })
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_rust_analyzer_workspace_symbol_filtering_capability() {
+        let supported = json!({
+            "capabilities": {
+                "experimental": {
+                    "workspaceSymbolScopeKindFiltering": true
+                }
+            }
+        });
+        let unsupported = json!({ "capabilities": { "experimental": {} } });
+
+        assert!(initialize_supports_workspace_symbol_scope_kind_filtering(&supported));
+        assert!(!initialize_supports_workspace_symbol_scope_kind_filtering(&unsupported));
+    }
+
+    #[test]
+    fn all_symbol_query_uses_filtered_extension_when_supported() {
+        assert_eq!(
+            workspace_symbol_all_params("refresh_token", true),
+            json!({
+                "query": "refresh_token",
+                "searchScope": "workspace",
+                "searchKind": "allSymbols"
+            })
+        );
+    }
+
+    #[test]
+    fn all_symbol_query_uses_documented_hash_fallback_when_extension_is_unavailable() {
+        assert_eq!(
+            workspace_symbol_all_params("refresh_token", false),
+            json!({ "query": "refresh_token#" })
+        );
     }
 }
