@@ -7,7 +7,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub const DEFAULT_SEMANTIC_TIMEOUT: Duration = Duration::from_millis(3000);
+/// Live providers may need to start a process, initialize, become ready, and
+/// then answer the request. This must cover the rust-analyzer readiness and
+/// request bounds without making indexed/structural providers slower.
+pub const DEFAULT_LIVE_SEMANTIC_TIMEOUT: Duration = Duration::from_millis(15000);
 pub const DEFAULT_RESULT_LIMIT: usize = 50;
+
+fn provider_timeout(kind: ProviderKind, explicit: Option<Duration>) -> Duration {
+    explicit.unwrap_or(match kind {
+        ProviderKind::Live => DEFAULT_LIVE_SEMANTIC_TIMEOUT,
+        ProviderKind::Indexed | ProviderKind::Structural | ProviderKind::Ecosystem => {
+            DEFAULT_SEMANTIC_TIMEOUT
+        }
+    })
+}
 
 /// Central registry managing semantic providers and deterministic routing.
 pub struct SemanticProviderRegistry {
@@ -92,6 +105,7 @@ impl SemanticProviderRegistry {
             if !p.capabilities().symbol_search {
                 continue;
             }
+            let timeout_duration = provider_timeout(p.kind(), timeout);
             let records = tokio::time::timeout(timeout_duration, p.symbol_search(query, limit))
                 .await
                 .map_err(|_| {
@@ -165,6 +179,7 @@ impl SemanticProviderRegistry {
             if !p.capabilities().definition {
                 continue;
             }
+            let timeout_duration = provider_timeout(p.kind(), timeout);
             let res = tokio::time::timeout(
                 timeout_duration,
                 p.symbol_definition(symbol, file, line, col),
@@ -276,6 +291,7 @@ impl SemanticProviderRegistry {
             if !p.capabilities().references {
                 continue;
             }
+            let timeout_duration = provider_timeout(p.kind(), timeout);
             let res = tokio::time::timeout(
                 timeout_duration,
                 p.symbol_references(symbol, file, line, col, limit),
@@ -417,7 +433,6 @@ impl SemanticProviderRegistry {
         &self,
         timeout: Option<Duration>,
     ) -> Result<Vec<SemanticDiagnostic>, CoreError> {
-        let timeout_duration = timeout.unwrap_or(DEFAULT_SEMANTIC_TIMEOUT);
         let mut all_diags = Vec::new();
 
         for p in self
@@ -425,7 +440,8 @@ impl SemanticProviderRegistry {
             .iter()
             .filter(|p| p.is_available() && p.capabilities().diagnostics)
         {
-            if let Ok(Ok(diags)) = tokio::time::timeout(timeout_duration, p.diagnostics()).await {
+            let provider_timeout = provider_timeout(p.kind(), timeout);
+            if let Ok(Ok(diags)) = tokio::time::timeout(provider_timeout, p.diagnostics()).await {
                 all_diags.extend(diags);
             }
         }
@@ -483,5 +499,39 @@ impl SemanticProviderRegistry {
         } else {
             Vec::new()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_provider_default_budget_covers_readiness_and_request_bounds() {
+        assert!(DEFAULT_LIVE_SEMANTIC_TIMEOUT >= Duration::from_secs(8 + 5));
+        assert!(DEFAULT_LIVE_SEMANTIC_TIMEOUT <= Duration::from_secs(30));
+    }
+
+    #[test]
+    fn non_live_provider_default_remains_short_and_bounded() {
+        assert_eq!(DEFAULT_SEMANTIC_TIMEOUT, Duration::from_secs(3));
+        assert!(DEFAULT_SEMANTIC_TIMEOUT < DEFAULT_LIVE_SEMANTIC_TIMEOUT);
+    }
+
+    #[test]
+    fn explicit_timeout_is_selected_over_live_default() {
+        let explicit = Duration::from_millis(17);
+        assert_eq!(
+            provider_timeout(ProviderKind::Live, Some(explicit)),
+            explicit
+        );
+        assert_eq!(
+            provider_timeout(ProviderKind::Live, None),
+            DEFAULT_LIVE_SEMANTIC_TIMEOUT
+        );
+        assert_eq!(
+            provider_timeout(ProviderKind::Indexed, None),
+            DEFAULT_SEMANTIC_TIMEOUT
+        );
     }
 }

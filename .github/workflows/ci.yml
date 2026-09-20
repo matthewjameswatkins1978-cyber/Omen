@@ -68,7 +68,7 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup show active-toolchain || rustup toolchain install 1.98.1 --profile minimal
+          rustup toolchain install 1.98.1 --profile minimal --component rust-analyzer
           rustup default 1.98.1
 
       - name: Install ripgrep (Linux)
@@ -80,3 +80,9 @@ jobs:
 
       - name: Run Workspace Tests
         run: cargo test --workspace --all-targets
+
+      - name: Run Windows rust-analyzer cold-start acceptance proof
+        if: runner.os == 'Windows'
+        env:
+          OMEN_REQUIRE_SEMANTIC_EXTERNAL_PROOFS: "1"
+        run: cargo test -p omen-cli --test semantic_environment_proofs test_proof_c_real_lsp_symbol_definition_and_references -- --exact --nocapture
