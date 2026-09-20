@@ -520,3 +520,78 @@ async fn call_semantic_mcp_tool(server: &McpServer, name: &str, arguments: Value
     assert_ne!(result.is_error, Some(true), "{name} returned tool error");
     serde_json::from_str(&result.content[0].text).unwrap()
 }
+
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mcp_public_semantic_surface_finds_rust_function_through_adapter() {
+    run_with_test_timeout(
+        "test_mcp_public_semantic_surface_finds_rust_function_through_adapter",
+        INTEGRATION_TIMEOUT,
+        |_ctx| async move {
+            let temp = tempdir().unwrap();
+            fs::create_dir_all(temp.path().join("src")).unwrap();
+            fs::write(
+                temp.path().join("Cargo.toml"),
+                "[package]\nname = \"omen-mcp-semantic-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .unwrap();
+            fs::write(
+                temp.path().join("src/lib.rs"),
+                "pub fn refresh_token() -> &'static str { \"token\" }\n\npub fn caller() -> &'static str { refresh_token() }\n",
+            )
+            .unwrap();
+
+            let mut registry = SemanticProviderRegistry::new(temp.path().to_path_buf());
+            registry.register(Arc::new(RustAnalyzerProvider::with_binary_args(
+                temp.path().to_path_buf(),
+                semantic_gremlin_exe(),
+                vec!["--lsp-mode".into(), "semantic-filtered".into()],
+            )));
+            let server = McpServer::with_semantic_registry(
+                temp.path().to_path_buf(),
+                None,
+                Arc::new(registry),
+            );
+
+            let search = call_semantic_mcp_tool(
+                &server,
+                "omen_symbol_search",
+                json!({"query":"refresh_token"}),
+            )
+            .await;
+            let search = search.as_array().expect("symbol search must return an array");
+            assert!(
+                search.iter().any(|symbol| {
+                    symbol["name"] == "refresh_token" && symbol["kind"] == "function"
+                }),
+                "public MCP search must expose refresh_token as a function"
+            );
+
+            let definition = call_semantic_mcp_tool(
+                &server,
+                "omen_symbol_definition",
+                json!({"symbol":"refresh_token"}),
+            )
+            .await;
+            assert_eq!(definition["resolved"]["file"], "src/lib.rs");
+            assert_eq!(definition["resolved"]["provider"], "rust-analyzer");
+
+            let references = call_semantic_mcp_tool(
+                &server,
+                "omen_symbol_references",
+                json!({"symbol":"refresh_token"}),
+            )
+            .await;
+            let references = references["resolved"]
+                .as_array()
+                .expect("public references must resolve");
+            assert!(
+                references.iter().any(|reference| {
+                    reference["location"]["range"]["start_line"] == 2
+                }),
+                "public references must include the known fixture call site"
+            );
+        },
+    )
+    .await;
+}
