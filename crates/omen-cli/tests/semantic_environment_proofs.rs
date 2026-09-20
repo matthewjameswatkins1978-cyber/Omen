@@ -9,8 +9,63 @@ use omen_interactive::completion::{CompletionContext, HotSemanticIndex, OmenComp
 use omen_semantic::types::{lsp_utf16_to_utf8_col, utf8_to_lsp_utf16_col};
 use omen_semantic::{ProviderKind, SemanticGeneration, SemanticProvider, SemanticWitness};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+const STATUS_NOT_EXECUTED: u8 = 0;
+const STATUS_PASS: u8 = 1;
+
+static AST_GREP_STATUS: AtomicU8 = AtomicU8::new(STATUS_NOT_EXECUTED);
+static THREADMOTH_STATUS: AtomicU8 = AtomicU8::new(STATUS_NOT_EXECUTED);
+static RUST_ANALYZER_STATUS: AtomicU8 = AtomicU8::new(STATUS_NOT_EXECUTED);
+static SCIP_STATUS: AtomicU8 = AtomicU8::new(STATUS_NOT_EXECUTED);
+
+fn is_external_acceptance_enabled() -> bool {
+    std::env::var("OMEN_REQUIRE_SEMANTIC_EXTERNAL_PROOFS").as_deref() == Ok("1")
+}
+
+fn record_proof_status(tool_name: &str, passed: bool) {
+    let val = if passed {
+        STATUS_PASS
+    } else {
+        STATUS_NOT_EXECUTED
+    };
+    match tool_name {
+        "ast-grep" => AST_GREP_STATUS.store(val, Ordering::SeqCst),
+        "threadmoth" => THREADMOTH_STATUS.store(val, Ordering::SeqCst),
+        "rust-analyzer" => RUST_ANALYZER_STATUS.store(val, Ordering::SeqCst),
+        "scip" => SCIP_STATUS.store(val, Ordering::SeqCst),
+        _ => {}
+    }
+}
+
+fn emit_external_proofs_summary() {
+    let ag = if AST_GREP_STATUS.load(Ordering::SeqCst) == STATUS_PASS {
+        "PASS"
+    } else {
+        "NOT EXECUTED"
+    };
+    let tm = if THREADMOTH_STATUS.load(Ordering::SeqCst) == STATUS_PASS {
+        "PASS"
+    } else {
+        "NOT EXECUTED"
+    };
+    let ra = if RUST_ANALYZER_STATUS.load(Ordering::SeqCst) == STATUS_PASS {
+        "PASS"
+    } else {
+        "NOT EXECUTED"
+    };
+    let sc = if SCIP_STATUS.load(Ordering::SeqCst) == STATUS_PASS {
+        "PASS"
+    } else {
+        "NOT EXECUTED"
+    };
+
+    println!(
+        "SEMANTIC EXTERNAL PROOFS:\n  ast-grep: [{ag}]\n  threadmoth: [{tm}]\n  rust-analyzer: [{ra}]\n  scip: [{sc}]"
+    );
+}
 
 fn gremlin_exe() -> PathBuf {
     let mut path = std::env::current_exe().expect("failed to get current_exe");
@@ -51,17 +106,37 @@ fn gremlin_exe() -> PathBuf {
 }
 
 /// Enforces the requirement that external tools must be present when OMEN_REQUIRE_SEMANTIC_EXTERNAL_PROOFS=1.
-/// Otherwise, gracefully skips external execution on environments without them.
+/// In normal portable CI (OMEN_REQUIRE_SEMANTIC_EXTERNAL_PROOFS!=1), external tools like rust-analyzer
+/// are never executed opportunistically merely because they exist on PATH, avoiding external startup/indexing latency.
 fn require_external_proof(tool_name: &str, is_available: bool) -> bool {
-    if !is_available {
-        if std::env::var("OMEN_REQUIRE_SEMANTIC_EXTERNAL_PROOFS").as_deref() == Ok("1") {
-            panic!(
-                "OMEN_REQUIRE_SEMANTIC_EXTERNAL_PROOFS=1 but external tool '{tool_name}' was not found on PATH or doctor failed"
+    let required = is_external_acceptance_enabled();
+    if !required {
+        // Normal portable CI:
+        // Rule 1: Normal portable CI must never opportunistically run the real rust-analyzer acceptance proof.
+        if tool_name == "rust-analyzer" {
+            record_proof_status(tool_name, false);
+            emit_external_proofs_summary();
+            eprintln!(
+                "SKIPPED / NOT EXECUTED: '{tool_name}' real acceptance proof requires OMEN_REQUIRE_SEMANTIC_EXTERNAL_PROOFS=1"
             );
-        } else {
-            eprintln!("SKIPPED: external tool '{tool_name}' is not available on PATH");
             return false;
         }
+
+        // For other external tools in normal CI, do not execute if unavailable on PATH
+        if !is_available {
+            record_proof_status(tool_name, false);
+            emit_external_proofs_summary();
+            eprintln!(
+                "SKIPPED / NOT EXECUTED: '{tool_name}' is not available on PATH (set OMEN_REQUIRE_SEMANTIC_EXTERNAL_PROOFS=1 to require)"
+            );
+            return false;
+        }
+    } else if !is_available {
+        // Rule 2: Dedicated external semantic acceptance must require the real tools.
+        // When OMEN_REQUIRE_SEMANTIC_EXTERNAL_PROOFS=1, missing any required tool is a HARD FAILURE.
+        panic!(
+            "OMEN_REQUIRE_SEMANTIC_EXTERNAL_PROOFS=1 but required external tool '{tool_name}' was not found on PATH or doctor failed"
+        );
     }
     true
 }
@@ -141,6 +216,9 @@ fn refresh_token() -> bool {
 
         // Consequential truth: structural matches != text occurrences
         assert_ne!(structural_matches.len(), occurrences);
+
+        record_proof_status("ast-grep", true);
+        emit_external_proofs_summary();
     })
     .await;
 }
@@ -214,6 +292,10 @@ async fn test_proof_b_structural_rewrite_routes_through_threadmoth() {
         let mutated_bytes = std::fs::read_to_string(&file_path).unwrap();
         assert!(mutated_bytes.contains("new_calculator"));
         assert!(!mutated_bytes.contains("old_calculator"));
+
+        record_proof_status("ast-grep", true);
+        record_proof_status("threadmoth", true);
+        emit_external_proofs_summary();
     })
     .await;
 }
@@ -223,6 +305,11 @@ async fn test_proof_b_structural_rewrite_routes_through_threadmoth() {
 // =============================================================================
 #[tokio::test]
 async fn test_proof_c_real_lsp_symbol_definition_and_references() {
+    if !is_external_acceptance_enabled() {
+        require_external_proof("rust-analyzer", false);
+        return;
+    }
+
     run_with_watchdog("test_proof_c", Duration::from_secs(25), async {
         let temp_dir = tempfile::tempdir().unwrap();
         let src_dir = temp_dir.path().join("src");
@@ -316,6 +403,9 @@ pub fn validate_session(token: &SessionToken) -> bool {
             assert_eq!(r.location.file, "src/lib.rs");
             assert_eq!(r.location.provider.as_str(), "rust-analyzer");
         }
+
+        record_proof_status("rust-analyzer", true);
+        emit_external_proofs_summary();
     })
     .await;
 }
@@ -531,6 +621,9 @@ async fn test_proof_e_scip_symbol_query_and_stale_index_detection() {
             !stale_def.is_resolved(),
             "Stale lookup result must never report Resolved"
         );
+
+        record_proof_status("scip", true);
+        emit_external_proofs_summary();
     })
     .await;
 }
@@ -920,12 +1013,17 @@ edition = "2021"
 "#;
         std::fs::write(src_dir.join("lib.rs"), lib_code).unwrap();
 
-        // Verify that get_workspace_semantic_registry registers RustAnalyzerProvider if on PATH
+        // Verify that get_workspace_semantic_registry registers providers for workspace
         let reg = omen_adapters::get_workspace_semantic_registry(temp_dir.path());
-        let has_ra = reg
-            .list_providers()
-            .iter()
-            .any(|p| p.0.as_str() == "rust-analyzer");
+        let providers = reg.list_providers();
+        assert!(
+            providers
+                .iter()
+                .any(|p| p.0.as_str().contains("cargo") || p.1.contains("cargo")),
+            "Product registry must register cargo provider for Rust crate workspace"
+        );
+
+        let has_ra = providers.iter().any(|p| p.0.as_str() == "rust-analyzer");
 
         if !require_external_proof("rust-analyzer", has_ra) {
             return;
@@ -1003,6 +1101,9 @@ edition = "2021"
             output.references.iter().any(|r| r.contains("SessionToken")),
             "Product lane response must emit @symbol://SessionToken reference"
         );
+
+        record_proof_status("rust-analyzer", true);
+        emit_external_proofs_summary();
     })
     .await;
 }
