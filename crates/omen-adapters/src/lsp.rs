@@ -12,12 +12,57 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
 pub const DEFAULT_LSP_TIMEOUT: Duration = Duration::from_millis(5000);
+pub const DEFAULT_LSP_READINESS_TIMEOUT: Duration = Duration::from_secs(8);
 pub const DEFAULT_MAX_LSP_MESSAGE_BYTES: usize = 16 * 1024 * 1024; // 16 MiB hard-cap
 
 type PendingRequestMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, CoreError>>>>>;
+
+const MAX_SERVER_STATUS_TEXT_CHARS: usize = 512;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspServerStatus {
+    pub health: Option<String>,
+    pub quiescent: Option<bool>,
+    pub message: Option<String>,
+}
+
+fn bounded_status_text(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(|text| text.chars().take(MAX_SERVER_STATUS_TEXT_CHARS).collect())
+}
+
+fn parse_server_status(params: &Value) -> LspServerStatus {
+    LspServerStatus {
+        health: bounded_status_text(params.get("health")),
+        quiescent: params.get("quiescent").and_then(Value::as_bool),
+        message: bounded_status_text(params.get("message")),
+    }
+}
+
+fn format_readiness_evidence(
+    status: Option<&LspServerStatus>,
+    deadline: Duration,
+    reason: &str,
+) -> String {
+    let health = status
+        .and_then(|s| s.health.as_deref())
+        .unwrap_or("unknown");
+    let quiescent = status
+        .and_then(|s| s.quiescent)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let message = status
+        .and_then(|s| s.message.as_deref())
+        .unwrap_or("unknown");
+    format!(
+        "provider=rust-analyzer phase=readiness.wait health={health} quiescent={quiescent} message={message:?} deadline_ms={} reason={reason}",
+        deadline.as_millis()
+    )
+}
 
 fn initialize_supports_workspace_symbol_scope_kind_filtering(result: &Value) -> bool {
     result
@@ -52,6 +97,7 @@ pub struct LspClient {
     provider_id: SemanticProviderId,
     generation: SemanticGeneration,
     workspace_symbol_scope_kind_filtering: bool,
+    server_status: watch::Receiver<Option<LspServerStatus>>,
 }
 
 impl LspClient {
@@ -90,6 +136,7 @@ impl LspClient {
         let diagnostics_clone = diagnostics_by_file.clone();
         let root_clone = workspace_root.clone();
         let prov_id_clone = provider_id.clone();
+        let (server_status_tx, server_status_rx) = watch::channel(None);
 
         // Background reader reading Content-Length framed JSON-RPC messages
         let reader_task = tokio::spawn(async move {
@@ -158,6 +205,10 @@ impl LspClient {
                                     &prov_id_clone,
                                     &diagnostics_clone,
                                 );
+                            } else if method == "experimental/serverStatus"
+                                && let Some(params) = val.get("params")
+                            {
+                                let _ = server_status_tx.send(Some(parse_server_status(params)));
                             }
                         }
                     }
@@ -176,6 +227,7 @@ impl LspClient {
             provider_id,
             generation: SemanticGeneration::new(1, 1),
             workspace_symbol_scope_kind_filtering: false,
+            server_status: server_status_rx,
         })
     }
 
@@ -284,6 +336,15 @@ impl LspClient {
     }
 
     pub async fn initialize(&mut self, timeout_duration: Duration) -> Result<(), CoreError> {
+        self.initialize_with_readiness_timeout(timeout_duration, DEFAULT_LSP_READINESS_TIMEOUT)
+            .await
+    }
+
+    pub async fn initialize_with_readiness_timeout(
+        &mut self,
+        timeout_duration: Duration,
+        readiness_timeout: Duration,
+    ) -> Result<(), CoreError> {
         let root_uri = format!(
             "file:///{}",
             self.workspace_root
@@ -307,6 +368,9 @@ impl LspClient {
                     "definition": { "dynamicRegistration": false },
                     "references": { "dynamicRegistration": false },
                     "publishDiagnostics": { "relatedInformation": true }
+                },
+                "experimental": {
+                    "serverStatusNotification": true
                 }
             }
         });
@@ -317,7 +381,56 @@ impl LspClient {
         self.workspace_symbol_scope_kind_filtering =
             initialize_supports_workspace_symbol_scope_kind_filtering(&initialize_result);
         self.send_notification("initialized", json!({})).await?;
-        Ok(())
+        self.wait_for_readiness(readiness_timeout).await
+    }
+
+    fn latest_server_status(&self) -> Option<LspServerStatus> {
+        self.server_status.borrow().clone()
+    }
+
+    async fn wait_for_readiness(&mut self, deadline: Duration) -> Result<(), CoreError> {
+        let deadline_at = tokio::time::Instant::now() + deadline;
+        loop {
+            if self
+                .server_status
+                .borrow()
+                .as_ref()
+                .and_then(|status| status.quiescent)
+                == Some(true)
+            {
+                return Ok(());
+            }
+
+            let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                let status = self.latest_server_status();
+                return Err(CoreError::ExecutionFailed(format_readiness_evidence(
+                    status.as_ref(),
+                    deadline,
+                    "deadline_exceeded",
+                )));
+            }
+
+            match tokio::time::timeout(remaining, self.server_status.changed()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    let status = self.latest_server_status();
+                    return Err(CoreError::ExecutionFailed(format_readiness_evidence(
+                        status.as_ref(),
+                        deadline,
+                        "server_status_channel_closed",
+                    )));
+                }
+                Err(_) => {
+                    let status = self.latest_server_status();
+                    return Err(CoreError::ExecutionFailed(format_readiness_evidence(
+                        status.as_ref(),
+                        deadline,
+                        "deadline_exceeded",
+                    )));
+                }
+            }
+        }
     }
 
     async fn workspace_symbol_with_params(
@@ -761,6 +874,7 @@ pub struct RustAnalyzerProvider {
     workspace_root: PathBuf,
     binary_path: Option<PathBuf>,
     binary_args: Vec<String>,
+    readiness_timeout: Duration,
     client: Arc<tokio::sync::Mutex<Option<LspClient>>>,
 }
 
@@ -773,6 +887,7 @@ impl RustAnalyzerProvider {
             workspace_root,
             binary_path,
             binary_args: Vec::new(),
+            readiness_timeout: DEFAULT_LSP_READINESS_TIMEOUT,
             client: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
@@ -784,6 +899,7 @@ impl RustAnalyzerProvider {
             workspace_root,
             binary_path: Some(binary),
             binary_args: Vec::new(),
+            readiness_timeout: DEFAULT_LSP_READINESS_TIMEOUT,
             client: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
@@ -794,12 +910,28 @@ impl RustAnalyzerProvider {
         binary: PathBuf,
         binary_args: Vec<String>,
     ) -> Self {
+        Self::with_binary_args_and_readiness_timeout(
+            workspace_root,
+            binary,
+            binary_args,
+            DEFAULT_LSP_READINESS_TIMEOUT,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn with_binary_args_and_readiness_timeout(
+        workspace_root: PathBuf,
+        binary: PathBuf,
+        binary_args: Vec<String>,
+        readiness_timeout: Duration,
+    ) -> Self {
         let id = SemanticProviderId::new("rust-analyzer").unwrap();
         Self {
             id,
             workspace_root,
             binary_path: Some(binary),
             binary_args,
+            readiness_timeout,
             client: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
@@ -827,10 +959,17 @@ impl RustAnalyzerProvider {
                 self.id.clone(),
             )
             .await?;
-            client.initialize(DEFAULT_LSP_TIMEOUT).await?;
+            client
+                .initialize_with_readiness_timeout(DEFAULT_LSP_TIMEOUT, self.readiness_timeout)
+                .await?;
             *guard = Some(client);
         }
         Ok(guard)
+    }
+
+    pub async fn latest_server_status(&self) -> Option<LspServerStatus> {
+        let guard = self.client.lock().await;
+        guard.as_ref().and_then(LspClient::latest_server_status)
     }
 }
 
@@ -870,10 +1009,7 @@ impl SemanticProvider for RustAnalyzerProvider {
         Box::pin(async move {
             let mut guard = match self.get_or_start_client().await {
                 Ok(g) => g,
-                Err(e) => {
-                    tracing::warn!("Failed to start rust-analyzer: {e}");
-                    return Ok(Vec::new());
-                }
+                Err(e) => return Err(e),
             };
             if let Some(client) = guard.as_mut() {
                 match client
@@ -881,13 +1017,12 @@ impl SemanticProvider for RustAnalyzerProvider {
                     .await
                 {
                     Ok(res) => Ok(res),
-                    Err(e) => {
-                        tracing::warn!("LSP symbol search error: {e}");
-                        Ok(Vec::new())
-                    }
+                    Err(e) => Err(e),
                 }
             } else {
-                Ok(Vec::new())
+                Err(CoreError::ExecutionFailed(
+                    "provider=rust-analyzer phase=client.state client_missing".into(),
+                ))
             }
         })
     }
@@ -902,19 +1037,13 @@ impl SemanticProvider for RustAnalyzerProvider {
         Box::pin(async move {
             let mut guard = match self.get_or_start_client().await {
                 Ok(g) => g,
-                Err(e) => {
-                    tracing::warn!("Failed to start rust-analyzer: {e}");
-                    return Ok(SemanticLookupResult::Unsupported);
-                }
+                Err(e) => return Err(e),
             };
             if let Some(client) = guard.as_mut() {
                 if let (Some(f), Some(l), Some(c)) = (file, line, col) {
                     match client.definition(f, l, c, DEFAULT_LSP_TIMEOUT).await {
                         Ok(res) => Ok(res),
-                        Err(e) => {
-                            tracing::warn!("LSP definition error: {e}");
-                            Ok(SemanticLookupResult::NotFound)
-                        }
+                        Err(e) => Err(e),
                     }
                 } else {
                     // Open files in src/ so rust-analyzer indexes them immediately
@@ -947,14 +1076,13 @@ impl SemanticProvider for RustAnalyzerProvider {
                                 Ok(SemanticLookupResult::Ambiguous(exact))
                             }
                         }
-                        Err(e) => {
-                            tracing::warn!("LSP workspace symbol error: {e}");
-                            Ok(SemanticLookupResult::NotFound)
-                        }
+                        Err(e) => Err(e),
                     }
                 }
             } else {
-                Ok(SemanticLookupResult::Unsupported)
+                Err(CoreError::ExecutionFailed(
+                    "provider=rust-analyzer phase=client.state client_missing".into(),
+                ))
             }
         })
     }
@@ -970,19 +1098,13 @@ impl SemanticProvider for RustAnalyzerProvider {
         Box::pin(async move {
             let mut guard = match self.get_or_start_client().await {
                 Ok(g) => g,
-                Err(e) => {
-                    tracing::warn!("Failed to start rust-analyzer: {e}");
-                    return Ok(SemanticLookupResult::Unsupported);
-                }
+                Err(e) => return Err(e),
             };
             if let Some(client) = guard.as_mut() {
                 if let (Some(f), Some(l), Some(c)) = (file, line, col) {
                     match client.references(f, l, c, limit, DEFAULT_LSP_TIMEOUT).await {
                         Ok(res) => Ok(res),
-                        Err(e) => {
-                            tracing::warn!("LSP references error: {e}");
-                            Ok(SemanticLookupResult::NotFound)
-                        }
+                        Err(e) => Err(e),
                     }
                 } else {
                     // Look up definition first to get exact location
@@ -1008,23 +1130,19 @@ impl SemanticProvider for RustAnalyzerProvider {
                                     .await
                                 {
                                     Ok(res) => Ok(res),
-                                    Err(e) => {
-                                        tracing::warn!("LSP references error: {e}");
-                                        Ok(SemanticLookupResult::NotFound)
-                                    }
+                                    Err(e) => Err(e),
                                 }
                             } else {
                                 Ok(SemanticLookupResult::Ambiguous(exact))
                             }
                         }
-                        Err(e) => {
-                            tracing::warn!("LSP workspace symbol error: {e}");
-                            Ok(SemanticLookupResult::NotFound)
-                        }
+                        Err(e) => Err(e),
                     }
                 }
             } else {
-                Ok(SemanticLookupResult::Unsupported)
+                Err(CoreError::ExecutionFailed(
+                    "provider=rust-analyzer phase=client.state client_missing".into(),
+                ))
             }
         })
     }
@@ -1034,14 +1152,15 @@ impl SemanticProvider for RustAnalyzerProvider {
             let guard = match self.get_or_start_client().await {
                 Ok(g) => g,
                 Err(e) => {
-                    tracing::warn!("Failed to start rust-analyzer for diagnostics: {e}");
-                    return Ok(Vec::new());
+                    return Err(e);
                 }
             };
             if let Some(client) = guard.as_ref() {
                 Ok(client.get_diagnostics(None))
             } else {
-                Ok(Vec::new())
+                Err(CoreError::ExecutionFailed(
+                    "provider=rust-analyzer phase=client.state client_missing".into(),
+                ))
             }
         })
     }

@@ -13,6 +13,10 @@ pub enum HostileLspMode {
     HugeResponse,
     Flood,
     ExitMid,
+    ReadySequence,
+    NeverQuiescent,
+    WarningReady,
+    ExitBeforeReady,
 }
 
 impl HostileLspMode {
@@ -27,6 +31,10 @@ impl HostileLspMode {
             Self::HugeResponse => "huge-response",
             Self::Flood => "flood",
             Self::ExitMid => "exit-mid",
+            Self::ReadySequence => "ready-sequence",
+            Self::NeverQuiescent => "never-quiescent",
+            Self::WarningReady => "warning-ready",
+            Self::ExitBeforeReady => "exit-before-ready",
         }
     }
 }

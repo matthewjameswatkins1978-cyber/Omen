@@ -259,7 +259,37 @@ fn run_hostile_lsp(mode: &str) {
                     write_response(&resp);
                 }
             },
-            "initialized" => {}
+            "initialized" => match mode {
+                "never-quiescent" => {
+                    write_response(
+                        r#"{"jsonrpc":"2.0","method":"experimental/serverStatus","params":{"health":"ok","quiescent":false,"message":"indexing"}}"#,
+                    );
+                }
+                "warning-ready" => {
+                    write_response(
+                        r#"{"jsonrpc":"2.0","method":"experimental/serverStatus","params":{"health":"warning","quiescent":false,"message":"background diagnostics incomplete"}}"#,
+                    );
+                    write_response(
+                        r#"{"jsonrpc":"2.0","method":"experimental/serverStatus","params":{"health":"warning","quiescent":true,"message":"usable with warning"}}"#,
+                    );
+                }
+                "exit-before-ready" => {
+                    std::process::exit(1);
+                }
+                "ready-sequence" => {
+                    write_response(
+                        r#"{"jsonrpc":"2.0","method":"experimental/serverStatus","params":{"health":"ok","quiescent":false,"message":"indexing"}}"#,
+                    );
+                    write_response(
+                        r#"{"jsonrpc":"2.0","method":"experimental/serverStatus","params":{"health":"ok","quiescent":true,"message":"ready"}}"#,
+                    );
+                }
+                _ => {
+                    write_response(
+                        r#"{"jsonrpc":"2.0","method":"experimental/serverStatus","params":{"health":"ok","quiescent":true,"message":"ready"}}"#,
+                    );
+                }
+            },
             "textDocument/didOpen" => {}
             "shutdown" => {
                 let resp = format!(
@@ -308,7 +338,8 @@ fn run_hostile_lsp(mode: &str) {
                     "exit-mid" => {
                         std::process::exit(1);
                     }
-                    "semantic-filtered" | "semantic-fallback" => {
+                    "semantic-filtered" | "semantic-fallback" | "ready-sequence"
+                    | "never-quiescent" | "warning-ready" | "exit-before-ready" => {
                         let params = val.get("params").cloned().unwrap_or_default();
                         match method {
                             "workspace/symbol" => {

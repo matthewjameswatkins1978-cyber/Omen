@@ -92,10 +92,16 @@ impl SemanticProviderRegistry {
             if !p.capabilities().symbol_search {
                 continue;
             }
-            if let Ok(Ok(records)) =
-                tokio::time::timeout(timeout_duration, p.symbol_search(query, limit)).await
-                && !records.is_empty()
-            {
+            let records = tokio::time::timeout(timeout_duration, p.symbol_search(query, limit))
+                .await
+                .map_err(|_| {
+                    CoreError::ExecutionFailed(format!(
+                        "Semantic provider '{}' timed out during symbol search for '{}'",
+                        p.name(),
+                        query
+                    ))
+                })??;
+            if !records.is_empty() {
                 let witnesses = self.extract_witnesses(&records);
                 self.cache.insert_symbols(
                     query,

@@ -4,6 +4,7 @@ use omen_adapters::{
 };
 use omen_semantic::{ProviderKind, SemanticLookupResult, SemanticProvider, SymbolKind};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[test]
 fn test_npm_semantic_provider_parse() {
@@ -321,4 +322,83 @@ async fn rust_analyzer_all_symbol_lookup_uses_hash_fallback_without_extension() 
         definition.is_resolved(),
         "documented rust-analyzer # fallback must remain internal and resolve functions"
     );
+}
+
+#[tokio::test]
+async fn rust_analyzer_readiness_waits_for_quiescent_status() {
+    let temp = rust_semantic_fixture();
+    let provider = RustAnalyzerProvider::with_binary_args_and_readiness_timeout(
+        temp.path().to_path_buf(),
+        gremlin_exe(),
+        vec!["--lsp-mode".into(), "ready-sequence".into()],
+        Duration::from_millis(500),
+    );
+
+    let symbols = provider.symbol_search("refresh_token", 10).await.unwrap();
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0].name, "refresh_token");
+}
+
+#[tokio::test]
+async fn rust_analyzer_readiness_timeout_is_explicit_and_not_not_found() {
+    let temp = rust_semantic_fixture();
+    let provider = RustAnalyzerProvider::with_binary_args_and_readiness_timeout(
+        temp.path().to_path_buf(),
+        gremlin_exe(),
+        vec!["--lsp-mode".into(), "never-quiescent".into()],
+        Duration::from_millis(100),
+    );
+
+    let error = provider
+        .symbol_search("refresh_token", 10)
+        .await
+        .expect_err("never-quiescent provider must fail readiness");
+    let text = error.to_string();
+    assert!(text.contains("provider=rust-analyzer"));
+    assert!(text.contains("phase=readiness.wait"));
+    assert!(text.contains("health=ok"));
+    assert!(text.contains("quiescent=false"));
+    assert!(text.contains("deadline_ms=100"));
+}
+
+#[tokio::test]
+async fn rust_analyzer_warning_status_can_be_ready_and_is_preserved() {
+    let temp = rust_semantic_fixture();
+    let provider = RustAnalyzerProvider::with_binary_args_and_readiness_timeout(
+        temp.path().to_path_buf(),
+        gremlin_exe(),
+        vec!["--lsp-mode".into(), "warning-ready".into()],
+        Duration::from_millis(500),
+    );
+
+    let symbols = provider.symbol_search("refresh_token", 10).await.unwrap();
+    assert_eq!(symbols.len(), 1);
+    let status = provider
+        .latest_server_status()
+        .await
+        .expect("latest server status must be retained");
+    assert_eq!(status.health.as_deref(), Some("warning"));
+    assert_eq!(status.quiescent, Some(true));
+    assert_eq!(status.message.as_deref(), Some("usable with warning"));
+}
+
+#[tokio::test]
+async fn rust_analyzer_exit_before_readiness_is_distinct_from_not_found() {
+    let temp = rust_semantic_fixture();
+    let provider = RustAnalyzerProvider::with_binary_args_and_readiness_timeout(
+        temp.path().to_path_buf(),
+        gremlin_exe(),
+        vec!["--lsp-mode".into(), "exit-before-ready".into()],
+        Duration::from_millis(500),
+    );
+
+    let error = provider
+        .symbol_search("refresh_token", 10)
+        .await
+        .expect_err("provider exit before readiness must fail");
+    let text = error.to_string();
+    assert!(text.contains("provider=rust-analyzer"));
+    assert!(text.contains("phase=readiness.wait"));
+    assert!(text.contains("reason=server_status_channel_closed"));
+    assert!(!text.contains("not_found"));
 }
