@@ -349,8 +349,7 @@ pub struct SessionToken;
         .expect("real rust-analyzer function symbol search must succeed");
         assert!(
             symbols.iter().any(|symbol| {
-                symbol.name == "refresh_token"
-                    && symbol.kind == omen_semantic::SymbolKind::Function
+                symbol.name == "refresh_token" && symbol.kind == omen_semantic::SymbolKind::Function
             }),
             "real rust-analyzer all-symbol search must return refresh_token"
         );
@@ -384,7 +383,9 @@ pub struct SessionToken;
             .as_resolved()
             .expect("real rust-analyzer refresh_token references must resolve");
         assert!(
-            references.iter().any(|reference| reference.location.range.start_line == 5),
+            references
+                .iter()
+                .any(|reference| reference.location.range.start_line == 5),
             "real rust-analyzer references must include the fixture caller"
         );
 
