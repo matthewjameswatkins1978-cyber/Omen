@@ -118,7 +118,7 @@ impl PtySessionManager {
     pub async fn read_output(
         &self,
         session_id_str: &str,
-        _offset: usize,
+        offset: usize,
     ) -> Result<(Vec<u8>, usize, PtyState), LocalIpcError> {
         let session = self.get(session_id_str).await?;
         let mut handle = session.handle.lock().await;
@@ -129,10 +129,9 @@ impl PtySessionManager {
             *state = PtyState::Exited;
         }
 
-        let output = handle
-            .read_output()
+        let (output, total) = handle
+            .read_output_from(offset)
             .map_err(|e| LocalIpcError::InternalRuntimeError(e.to_string()))?;
-        let total = output.len();
         let current_state = *session.state.read().await;
 
         Ok((output, total, current_state))

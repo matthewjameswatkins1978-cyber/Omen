@@ -26,7 +26,10 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_JobObjects",
     "Win32_System_Threading",
     "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_Pipes",
+    "Win32_Storage_FileSystem",
 ] }
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1.0", features = ["process", "fs"] }
+rustix = { version = "1.0", features = ["process", "fs", "pty", "termios"] }

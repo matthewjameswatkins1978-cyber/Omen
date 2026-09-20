@@ -4,12 +4,12 @@
 
 In compliance with Rule 7 of machine reasoning ("Platform truthfulness: If a platform cannot enforce a constraint, it reports OBSERVED or UNSUPPORTED. It never fakes ENFORCED"):
 
-| Platform / Backend | Backend ID | Process Tree Termination | Filesystem Isolation | Network Isolation | Memory Limits |
+| Platform / Backend | Backend ID | Process Tree Termination (Descendants) | Symlink Escape Prevention | Filesystem Isolation | Network Isolation |
 |---|---|---|---|---|---|
-| **Windows Native** | `backend://native` | **ENFORCED** (Job Object `KILL_ON_JOB_CLOSE`) | **OBSERVED** (standard ACLs) | **OBSERVED** | **ENFORCED** (Job Object limits) |
-| **Linux Native** | `backend://native` | **ENFORCED** (POSIX process groups / pidfd) | **ENFORCED** (Landlock LSM where available) | **OBSERVED** / **ENFORCED** (namespaces) | **ENFORCED** (cgroups v2 where available) |
-| **macOS Native** | `backend://native` | **ENFORCED** (POSIX process groups) | **OBSERVED** / **MEDIATED** (sandbox-exec) | **OBSERVED** | **OBSERVED** |
-| **Windows WSL** | `backend://wsl` | **MEDIATED** (WSL init / process tree) | **MEDIATED** (Linux VFS inside VM) | **MEDIATED** (Virtual switch) | **MEDIATED** (WSL VM memory cap) |
+| **Windows Native** | `backend://native` | **ENFORCED** (Win32 Job Object `KILL_ON_JOB_CLOSE`) | **ENFORCED** (Path canonicalization & prefix lock) | **OBSERVED** (NTFS ACLs) | **OBSERVED** |
+| **Linux Native** | `backend://native` | **BEST_EFFORT** (POSIX `setpgid` / `killpg` without cgroups v2) | **ENFORCED** (Realpath & prefix check) | **OBSERVED** (Linux VFS) | **OBSERVED** |
+| **macOS Native** | `backend://native` | **BEST_EFFORT** (POSIX `setpgid` / `killpg`) | **ENFORCED** (Realpath & prefix check) | **OBSERVED** | **OBSERVED** |
+| **Windows WSL** | `backend://wsl` | **MEDIATED** (WSL2 hypervisor boundary) | **ENFORCED** (Canonical prefix check) | **MEDIATED** (WSL2 ext4 VFS) | **MEDIATED** (Hyper-V virtual switch) |
 
 ---
 

@@ -92,6 +92,7 @@ pub trait PtyExecutionHandle: Send {
     fn pid(&self) -> Option<u32>;
     fn write_input(&mut self, data: &[u8]) -> Result<(), CoreError>;
     fn read_output(&mut self) -> Result<Vec<u8>, CoreError>;
+    fn read_output_from(&mut self, offset: usize) -> Result<(Vec<u8>, usize), CoreError>;
     fn resize(&mut self, rows: u16, cols: u16) -> Result<(), CoreError>;
     fn terminate(&mut self) -> Result<(), CoreError>;
     fn try_wait(&mut self) -> Result<Option<ProcessExit>, CoreError>;
@@ -258,8 +259,16 @@ impl ExecutionHandle for NativeExecutionHandle {
                 )
             };
 
-            let stdout_all = stdout_task.await.unwrap_or_default();
-            let stderr_all = stderr_task.await.unwrap_or_default();
+            let stdout_all = tokio::time::timeout(Duration::from_millis(500), stdout_task)
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or_default();
+            let stderr_all = tokio::time::timeout(Duration::from_millis(500), stderr_task)
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or_default();
 
             Ok((wait_res.0, wait_res.1, stdout_all, stderr_all))
         })
@@ -292,33 +301,25 @@ impl ExecutionBackend for NativeExecutionBackend {
             filesystem: EnforcementLevel::Observed,
             network: EnforcementLevel::Observed,
             descendants: EnforcementLevel::Enforced, // Windows Job Objects guarantee descendant termination
-            symlink_escape: EnforcementLevel::Prevented,
+            symlink_escape: EnforcementLevel::Enforced,
             pty: true,
         };
 
         #[cfg(target_os = "linux")]
-        let capabilities = {
-            let cgroups_available =
-                std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists();
-            BackendCapabilities {
-                filesystem: EnforcementLevel::Observed,
-                network: EnforcementLevel::Observed,
-                descendants: if cgroups_available {
-                    EnforcementLevel::Enforced
-                } else {
-                    EnforcementLevel::Observed
-                },
-                symlink_escape: EnforcementLevel::Prevented,
-                pty: true,
-            }
+        let capabilities = BackendCapabilities {
+            filesystem: EnforcementLevel::Observed,
+            network: EnforcementLevel::Observed,
+            descendants: EnforcementLevel::BestEffort,
+            symlink_escape: EnforcementLevel::Enforced,
+            pty: true,
         };
 
         #[cfg(not(any(windows, target_os = "linux")))]
         let capabilities = BackendCapabilities {
             filesystem: EnforcementLevel::Observed,
             network: EnforcementLevel::Observed,
-            descendants: EnforcementLevel::Observed,
-            symlink_escape: EnforcementLevel::Observed,
+            descendants: EnforcementLevel::BestEffort,
+            symlink_escape: EnforcementLevel::Enforced,
             pty: true,
         };
 
@@ -371,6 +372,9 @@ impl ExecutionBackend for NativeExecutionBackend {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
+        #[cfg(unix)]
+        cmd.process_group(0);
+
         #[cfg(windows)]
         let job_guard = crate::platform::windows::JobObjectGuard::new().map_err(|e| {
             CoreError::ExecutionFailed(format!("Job object initialization error: {e}"))
@@ -384,7 +388,10 @@ impl ExecutionBackend for NativeExecutionBackend {
 
         #[cfg(windows)]
         if let Some(p) = pid {
-            let _ = job_guard.assign_pid(p);
+            job_guard.assign_pid(p).map_err(|e| {
+                let _ = child.start_kill();
+                CoreError::ExecutionFailed(format!("Failed to assign PID {p} to Job Object: {e}"))
+            })?;
         }
 
         // Write stdin payload and stdin secrets
@@ -426,49 +433,8 @@ impl ExecutionBackend for NativeExecutionBackend {
         &self,
         req: &PtyExecutionRequest,
     ) -> Result<Box<dyn PtyExecutionHandle>, CoreError> {
-        if req.argv.is_empty() {
-            return Err(CoreError::ExecutionFailed("Argv cannot be empty".into()));
-        }
-
-        let mut cmd = tokio::process::Command::new(&req.argv[0]);
-        if req.argv.len() > 1 {
-            cmd.args(&req.argv[1..]);
-        }
-        cmd.current_dir(&req.cwd);
-
-        for (k, v) in &req.env {
-            cmd.env(k, v);
-        }
-
-        cmd.stdin(std::process::Stdio::piped());
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-
-        #[cfg(windows)]
-        let job_guard = crate::platform::windows::JobObjectGuard::new().map_err(|e| {
-            CoreError::ExecutionFailed(format!("Job object initialization error: {e}"))
-        })?;
-
-        let child = cmd.spawn().map_err(|e| {
-            CoreError::ExecutionFailed(format!(
-                "PTY process spawn failed for '{}': {e}",
-                req.argv[0]
-            ))
-        })?;
-
-        #[cfg(windows)]
-        if let Some(p) = child.id() {
-            let _ = job_guard.assign_pid(p);
-        }
-
-        Ok(Box::new(NativePtyHandle::new(
-            req.session_id.clone(),
-            child,
-            #[cfg(windows)]
-            Some(job_guard),
-            req.rows,
-            req.cols,
-        )))
+        let handle = NativePtyHandle::spawn(req)?;
+        Ok(Box::new(handle))
     }
 }
 
@@ -497,15 +463,38 @@ impl WslExecutionBackend {
     pub fn is_available() -> bool {
         #[cfg(windows)]
         {
-            // Probe wsl.exe -e true to confirm that WSL2 and an installed Linux distribution are runnable
-            std::process::Command::new("wsl.exe")
+            // Probe wsl.exe -e true with a hard 1500ms deadline, killing child on timeout to prevent hanging.
+            let mut child = match std::process::Command::new("wsl.exe")
                 .arg("-e")
                 .arg("true")
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
+                .spawn()
+            {
+                Ok(c) => c,
+                Err(_) => return false,
+            };
+
+            let start = std::time::Instant::now();
+            let deadline = std::time::Duration::from_millis(6000);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => return status.success(),
+                    Ok(None) => {
+                        if start.elapsed() >= deadline {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            return false;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    Err(_) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return false;
+                    }
+                }
+            }
         }
         #[cfg(not(windows))]
         {
@@ -542,9 +531,9 @@ impl ExecutionBackend for WslExecutionBackend {
             availability,
             capabilities: BackendCapabilities {
                 filesystem: EnforcementLevel::Mediated,
-                network: EnforcementLevel::Observed,
-                descendants: EnforcementLevel::Enforced,
-                symlink_escape: EnforcementLevel::Prevented,
+                network: EnforcementLevel::Mediated,
+                descendants: EnforcementLevel::Mediated,
+                symlink_escape: EnforcementLevel::Enforced,
                 pty: true,
             },
         }

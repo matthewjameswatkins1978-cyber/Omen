@@ -10,11 +10,21 @@ use std::time::Duration;
 pub const DEFAULT_INLINE_BUDGET: usize = 8192;
 
 /// A secret injected into an execution request with a strict injection contract.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ExecutionSecret {
     pub name: String,
     pub value: String,
     pub contract: SecretInjectionContract,
+}
+
+impl std::fmt::Debug for ExecutionSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecutionSecret")
+            .field("name", &self.name)
+            .field("value", &"[REDACTED]")
+            .field("contract", &self.contract)
+            .finish()
+    }
 }
 
 impl ExecutionSecret {
@@ -88,6 +98,16 @@ pub struct ExecutionOutput {
     pub stdout_all: Vec<u8>,
     pub stderr_all: Vec<u8>,
     pub duration_ms: u64,
+}
+
+impl ExecutionOutput {
+    pub fn stdout_sanitized(&self) -> String {
+        crate::pty::sanitize_terminal_escapes(&self.stdout_bounded)
+    }
+
+    pub fn stderr_sanitized(&self) -> String {
+        crate::pty::sanitize_terminal_escapes(&self.stderr_bounded)
+    }
 }
 
 pub struct ProcessSupervisor {
@@ -253,6 +273,20 @@ mod tests {
         assert_eq!(
             String::from_utf8(redacted).unwrap(),
             "LOG: token=[REDACTED:token] in stream"
+        );
+    }
+
+    #[test]
+    fn test_secret_debug_redaction() {
+        let secret = ExecutionSecret::env("API_KEY", "super_secret_cleartext_value_12345");
+        let debug_str = format!("{secret:?}");
+        assert!(
+            !debug_str.contains("super_secret_cleartext_value_12345"),
+            "Debug string leaked secret!"
+        );
+        assert!(
+            debug_str.contains("[REDACTED]"),
+            "Debug string missing [REDACTED]!"
         );
     }
 }

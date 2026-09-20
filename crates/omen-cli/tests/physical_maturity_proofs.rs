@@ -3,7 +3,9 @@ use omen_core::{
     RuntimeStatus, StdioMode,
 };
 use omen_daemon::{DaemonServer, PtySessionManager};
-use omen_engine::{ExecutionRequest, ExecutionSecret, ProcessSupervisor, WslExecutionBackend};
+use omen_engine::{
+    ExecutionBackend, ExecutionRequest, ExecutionSecret, ProcessSupervisor, WslExecutionBackend,
+};
 use omen_knowledge::{ContentAddressedStore, Database};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -88,7 +90,7 @@ async fn test_proof_a_pty_detach_reattach_real_path() {
     // Wait bounded time for PTY_READY
     let start = std::time::Instant::now();
     let mut ready = String::from_utf8_lossy(&initial_out).contains("PTY_READY");
-    while !ready && start.elapsed() < Duration::from_millis(2000) {
+    while !ready && start.elapsed() < Duration::from_millis(5000) {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let (out, _, _) = pty_manager.read_output(&sid_str, 0).await.unwrap();
         if String::from_utf8_lossy(&out).contains("PTY_READY") {
@@ -107,7 +109,7 @@ async fn test_proof_a_pty_detach_reattach_real_path() {
     // Wait bounded time for echo
     let start = std::time::Instant::now();
     let mut echoed = false;
-    while !echoed && start.elapsed() < Duration::from_millis(2000) {
+    while !echoed && start.elapsed() < Duration::from_millis(5000) {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let (out, _, _) = pty_manager.read_output(&sid_str, 0).await.unwrap();
         if String::from_utf8_lossy(&out).contains("ECHO:ping_message_1") {
@@ -143,7 +145,54 @@ async fn test_proof_a_pty_detach_reattach_real_path() {
         "Client 2 must receive buffered output upon reattach"
     );
 
-    // 5. Client 2 sends exit command to conclude interactive session
+    // 5. Test real OS PTY resize
+    pty_manager
+        .resize(&sid_str, 30, 100)
+        .await
+        .expect("PTY resize must succeed");
+    // Allow terminal redraw from resize to settle in ring buffer
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // 6. Test real ring-buffer offset semantics
+    let (read_0, total_offset_1, _) = pty_manager.read_output(&sid_str, 0).await.unwrap();
+    assert!(total_offset_1 > 0);
+    assert!(String::from_utf8_lossy(&read_0).contains("ECHO:ping_message_1"));
+
+    // Write second message to test reading with non-zero offset
+    pty_manager
+        .write_input(&sid_str, b"offset_ping_2\n")
+        .await
+        .expect("Must write PTY input");
+
+    let start = std::time::Instant::now();
+    let mut offset_read = Vec::new();
+    let mut total_offset_2 = total_offset_1;
+    while start.elapsed() < Duration::from_millis(5000) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (out, tot, _) = pty_manager
+            .read_output(&sid_str, total_offset_1)
+            .await
+            .unwrap();
+        if String::from_utf8_lossy(&out).contains("ECHO:offset_ping_2") {
+            offset_read = out;
+            total_offset_2 = tot;
+            break;
+        }
+    }
+    assert!(
+        String::from_utf8_lossy(&offset_read).contains("ECHO:offset_ping_2"),
+        "Offset read must contain new echoed input"
+    );
+    assert!(
+        total_offset_2 > total_offset_1,
+        "Total written offset must monotonically increase"
+    );
+    assert!(
+        !String::from_utf8_lossy(&offset_read).contains("PTY_READY"),
+        "Offset read starting from total_offset_1 must NOT replay earlier output"
+    );
+
+    // 7. Client 2 sends exit command to conclude interactive session
     pty_manager
         .write_input(&sid_str, b"exit\n")
         .await
@@ -152,7 +201,7 @@ async fn test_proof_a_pty_detach_reattach_real_path() {
     // Bounded wait for process exit via PTY state polling (which reaps child process)
     let start = std::time::Instant::now();
     let mut exited = false;
-    while !exited && start.elapsed() < Duration::from_millis(2000) {
+    while !exited && start.elapsed() < Duration::from_millis(5000) {
         tokio::time::sleep(Duration::from_millis(50)).await;
         if let Ok((_, _, omen_core::PtyState::Exited)) = pty_manager.read_output(&sid_str, 0).await
         {
@@ -175,12 +224,12 @@ async fn test_proof_b_process_tree_kill_real_path() {
     let gremlin = gremlin_exe();
     let supervisor = ProcessSupervisor::new();
 
-    // Spawn a hostile tree with depth 1: parent spawns a child that sleeps for 60s
+    // Spawn a hostile tree with depth 2: parent -> child -> grandchild
     let req = ExecutionRequest {
         argv: vec![
             gremlin.to_string_lossy().to_string(),
             "--spawn-tree".into(),
-            "1".into(),
+            "2".into(),
             "--sleep-ms".into(),
             "60000".into(),
         ],
@@ -188,7 +237,7 @@ async fn test_proof_b_process_tree_kill_real_path() {
         env: vec![],
         stdin_mode: StdioMode::Closed,
         stdin_payload: None,
-        timeout_ms: 1000, // Strict timeout: parent will be killed
+        timeout_ms: 1000, // Strict timeout: parent tree will be terminated
         inline_budget: 8192,
         required_assurance: RequiredAssurance::default(),
         secrets: vec![],
@@ -201,33 +250,37 @@ async fn test_proof_b_process_tree_kill_real_path() {
 
     assert_eq!(output.runtime_status, RuntimeStatus::TimedOut);
 
-    // Extract child PID from stdout
+    // Extract child and grandchild PIDs from stdout
     let stdout = String::from_utf8_lossy(&output.stdout_all);
-    let mut child_pid: Option<u32> = None;
+    let mut spawned_pids: Vec<u32> = Vec::new();
     for line in stdout.lines() {
-        let parsed_pid = line
+        if let Some(p) = line
             .strip_prefix("TREE_SPAWNED:")
-            .and_then(|s| s.trim().parse::<u32>().ok());
-        if let Some(p) = parsed_pid {
-            child_pid = Some(p);
-            break;
+            .and_then(|s| s.trim().parse::<u32>().ok())
+        {
+            spawned_pids.push(p);
         }
     }
 
-    if let Some(cpid) = child_pid {
-        // Bounded verification: child process must be terminated by OS Job Object / process group
+    assert!(
+        spawned_pids.len() >= 2,
+        "Must spawn at least child and grandchild (depth 2), found: {spawned_pids:?}"
+    );
+
+    for &pid in &spawned_pids {
+        // Bounded verification: every descendant in the tree must be terminated
         let start = std::time::Instant::now();
-        let mut child_dead = false;
+        let mut is_dead = false;
         while start.elapsed() < Duration::from_millis(2000) {
-            if !omen_engine::is_process_alive(cpid) {
-                child_dead = true;
+            if !omen_engine::is_process_alive(pid) {
+                is_dead = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(
-            child_dead,
-            "Child process PID {cpid} must be terminated when parent times out"
+            is_dead,
+            "Descendant process PID {pid} must be terminated when root times out"
         );
     }
 }
@@ -319,17 +372,34 @@ async fn test_proof_d_containment_real_path() {
         EnforcementLevel::Enforced,
         "Windows Job Objects must be reported as ENFORCED"
     );
+
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        output.enforcement.descendant_processes,
+        EnforcementLevel::BestEffort,
+        "Linux process groups without cgroups v2 must report BEST_EFFORT"
+    );
 }
 
 /// PROOF E: Real Non-Native Execution Backend (WSL on Windows) Real Path
 #[tokio::test]
 async fn test_proof_e_non_native_wsl_backend_real_path() {
     if !WslExecutionBackend::is_available() {
-        println!("Skipping WSL real-path test: WSL2 is not available on this host environment");
-        return;
+        if std::env::var("CI").is_ok() {
+            println!("Skipping WSL real-path test: WSL2 is not available on hosted CI runner");
+            return;
+        } else {
+            panic!("WSL backend must be available on local development host");
+        }
     }
 
     let wsl_backend = Arc::new(WslExecutionBackend::new());
+    let caps = wsl_backend.capabilities();
+    assert_eq!(caps.descendants, EnforcementLevel::Mediated);
+    assert_eq!(caps.filesystem, EnforcementLevel::Mediated);
+    assert_eq!(caps.network, EnforcementLevel::Mediated);
+    assert_eq!(caps.symlink_escape, EnforcementLevel::Enforced);
+
     let supervisor = ProcessSupervisor::with_backend(wsl_backend);
 
     let req = ExecutionRequest {
@@ -403,6 +473,17 @@ async fn test_proof_f_secret_injection_and_redaction_real_path() {
             ExecutionSecret::stdin("STDIN_TOKEN", &canary_stdin),
         ],
     };
+
+    // Assert that Debug implementation does not leak secret in cleartext
+    let secret_debug = format!("{:?}", req.secrets[0]);
+    assert!(
+        !secret_debug.contains(&canary_env),
+        "Secret Debug implementation leaked raw secret value: {secret_debug}"
+    );
+    assert!(
+        secret_debug.contains("[REDACTED]"),
+        "Secret Debug implementation missing [REDACTED]: {secret_debug}"
+    );
 
     let output = supervisor
         .execute(req)

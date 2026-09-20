@@ -88,7 +88,7 @@ impl TryFrom<ExecutionResultWire> for ExecutionResult {
                 "OBSERVED" => Ok(EnforcementLevel::Observed),
                 "BEST_EFFORT" => Ok(EnforcementLevel::BestEffort),
                 "UNSUPPORTED" => Ok(EnforcementLevel::Unsupported),
-                "PREVENTED" => Ok(EnforcementLevel::Prevented),
+                "PREVENTED" => Ok(EnforcementLevel::Enforced),
                 other => Err(CoreError::SchemaViolation(format!(
                     "Invalid enforcement level '{other}'"
                 ))),

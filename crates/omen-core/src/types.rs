@@ -29,6 +29,7 @@ pub enum ValidityState {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum EnforcementLevel {
     /// The OS/runtime will deny the prohibited action independent of Omen's continued cooperation.
+    #[serde(alias = "PREVENTED")]
     Enforced,
     /// The action must pass through a controller/broker that can deny it, but the process is not completely confined against alternate paths.
     Mediated,
@@ -38,24 +39,18 @@ pub enum EnforcementLevel {
     BestEffort,
     /// No meaningful mechanism exists in the active backend.
     Unsupported,
-    /// Deprecated legacy outcome variant from 0.2-0.5; canonicalized to Enforced.
-    #[serde(alias = "PREVENTED")]
-    Prevented,
 }
 
 impl EnforcementLevel {
-    /// Maps legacy levels to canonical 0.6 assurance levels.
+    /// Canonical assurance level.
     pub fn canonicalize(self) -> Self {
-        match self {
-            Self::Prevented => Self::Enforced,
-            other => other,
-        }
+        self
     }
 
     /// Converts enforcement level to an overall Assurance level.
     pub fn to_assurance(self) -> Assurance {
         match self {
-            Self::Enforced | Self::Prevented => Assurance::Enforced,
+            Self::Enforced => Assurance::Enforced,
             Self::Mediated => Assurance::Verified,
             Self::Observed | Self::BestEffort => Assurance::Observed,
             Self::Unsupported => Assurance::Unknown,

@@ -1008,10 +1008,8 @@ impl WorkspaceState {
 
                     let exit_code = output.process_exit.code;
                     let duration_ms = output.duration_ms;
-                    let stdout_preview =
-                        String::from_utf8_lossy(&output.stdout_bounded).to_string();
-                    let stderr_preview =
-                        String::from_utf8_lossy(&output.stderr_bounded).to_string();
+                    let stdout_preview = output.stdout_sanitized();
+                    let stderr_preview = output.stderr_sanitized();
 
                     // Record history with the same canonical execution_id
                     let _ = this
