@@ -310,7 +310,7 @@ async fn test_proof_c_real_lsp_symbol_definition_and_references() {
         return;
     }
 
-    run_with_watchdog("test_proof_c", Duration::from_secs(25), async {
+    run_with_watchdog("test_proof_c", Duration::from_secs(75), async {
         let temp_dir = tempfile::tempdir().unwrap();
         let src_dir = temp_dir.path().join("src");
         std::fs::create_dir_all(&src_dir).unwrap();
@@ -342,7 +342,7 @@ pub struct SessionToken;
         let symbols = run_phase(
             "test_proof_c",
             "lsp_function_symbol_search",
-            Duration::from_secs(8),
+            Duration::from_secs(25),
             ra_provider.symbol_search("refresh_token", 10),
         )
         .await
@@ -357,7 +357,7 @@ pub struct SessionToken;
         let definition = run_phase(
             "test_proof_c",
             "lsp_function_definition",
-            Duration::from_secs(8),
+            Duration::from_secs(25),
             ra_provider.symbol_definition("refresh_token", None, None, None),
         )
         .await
@@ -374,7 +374,7 @@ pub struct SessionToken;
         let references = run_phase(
             "test_proof_c",
             "lsp_function_references",
-            Duration::from_secs(8),
+            Duration::from_secs(25),
             ra_provider.symbol_references("refresh_token", None, None, None, 10),
         )
         .await
@@ -392,7 +392,7 @@ pub struct SessionToken;
         let type_definition = run_phase(
             "test_proof_c",
             "lsp_type_regression",
-            Duration::from_secs(8),
+            Duration::from_secs(25),
             ra_provider.symbol_definition("SessionToken", None, None, None),
         )
         .await

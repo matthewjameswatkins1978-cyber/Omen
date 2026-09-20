@@ -15,7 +15,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::{oneshot, watch};
 
 pub const DEFAULT_LSP_TIMEOUT: Duration = Duration::from_millis(5000);
-pub const DEFAULT_LSP_READINESS_TIMEOUT: Duration = Duration::from_secs(8);
+pub const DEFAULT_LSP_READINESS_TIMEOUT: Duration = Duration::from_secs(15);
 pub const DEFAULT_MAX_LSP_MESSAGE_BYTES: usize = 16 * 1024 * 1024; // 16 MiB hard-cap
 
 type PendingRequestMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, CoreError>>>>>;
