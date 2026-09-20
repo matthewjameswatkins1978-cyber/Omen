@@ -299,24 +299,23 @@ async fn test_proof_d_containment_real_path() {
 
     // On Windows, Job Objects guarantee descendant cleanup (ENFORCED),
     // but filesystem and network are observed (never falsely claimed as ENFORCED).
+    assert_eq!(
+        output.enforcement.network,
+        EnforcementLevel::Observed,
+        "Network without sandbox must report OBSERVED"
+    );
+    assert_eq!(
+        output.enforcement.filesystem,
+        EnforcementLevel::Observed,
+        "Filesystem without container/sandbox must report OBSERVED"
+    );
+
     #[cfg(windows)]
-    {
-        assert_eq!(
-            output.enforcement.descendant_processes,
-            EnforcementLevel::Enforced,
-            "Windows Job Objects must be reported as ENFORCED"
-        );
-        assert_eq!(
-            output.enforcement.network,
-            EnforcementLevel::Observed,
-            "Network without sandbox must report OBSERVED"
-        );
-        assert_eq!(
-            output.enforcement.filesystem,
-            EnforcementLevel::Observed,
-            "Filesystem without container/sandbox must report OBSERVED"
-        );
-    }
+    assert_eq!(
+        output.enforcement.descendant_processes,
+        EnforcementLevel::Enforced,
+        "Windows Job Objects must be reported as ENFORCED"
+    );
 }
 
 /// PROOF E: Real Non-Native Execution Backend (WSL on Windows) Real Path
