@@ -1,3 +1,4 @@
+use crate::appearance::Theme;
 use crate::terminal::TerminalCapabilities;
 use nu_ansi_term::{Color, Style};
 
@@ -19,18 +20,52 @@ pub struct ColorRoles {
 
 impl ColorRoles {
     pub fn for_caps(caps: &TerminalCapabilities) -> Self {
+        Self::for_theme(caps, Theme::Omen)
+    }
+
+    pub fn for_theme(caps: &TerminalCapabilities, theme: Theme) -> Self {
         if !caps.has_color {
             return Self::plain();
         }
 
+        let (path, branch, symbol, success, warning) = match theme {
+            Theme::Omen => (
+                Color::Cyan,
+                Color::Purple,
+                Color::Green,
+                Color::Green,
+                Color::Yellow,
+            ),
+            Theme::Phosphor => (
+                Color::Green,
+                Color::LightGreen,
+                Color::Green,
+                Color::Green,
+                Color::Yellow,
+            ),
+            Theme::Amber => (
+                Color::Yellow,
+                Color::LightYellow,
+                Color::Yellow,
+                Color::Yellow,
+                Color::LightYellow,
+            ),
+            Theme::Ice => (
+                Color::Cyan,
+                Color::White,
+                Color::LightCyan,
+                Color::LightCyan,
+                Color::Yellow,
+            ),
+        };
         Self {
             normal: Style::new(),
             subtle: Style::new().fg(Color::DarkGray),
-            prompt_path: Style::new().fg(Color::Cyan).bold(),
-            prompt_branch: Style::new().fg(Color::Purple),
-            prompt_symbol: Style::new().fg(Color::Green),
-            success: Style::new().fg(Color::Green),
-            warning: Style::new().fg(Color::Yellow),
+            prompt_path: Style::new().fg(path).bold(),
+            prompt_branch: Style::new().fg(branch),
+            prompt_symbol: Style::new().fg(symbol),
+            success: Style::new().fg(success),
+            warning: Style::new().fg(warning),
             error: Style::new().fg(Color::Red).bold(),
             reference: Style::new().fg(Color::Blue),
             suggestion: Style::new().fg(Color::DarkGray),

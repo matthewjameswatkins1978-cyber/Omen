@@ -3,7 +3,7 @@ use crate::prompt_adapter::OmenPrompt;
 use omen_core::{CoreError, InteractiveSessionId, ProcessExit, RequiredAssurance, StdioMode};
 use omen_engine::{ExecutionRequest, ProcessSupervisor};
 use omen_knowledge::Database;
-use omen_ui::TerminalCapabilities;
+use omen_ui::{HumanSettings, TerminalCapabilities};
 use reedline::{DefaultValidator, MenuBuilder, Reedline, Signal};
 use std::path::PathBuf;
 
@@ -21,6 +21,7 @@ pub struct InteractiveSession {
     pub agent_provider: Option<std::sync::Arc<dyn omen_agent::AgentProvider>>,
     pub agent_registry: std::sync::Arc<omen_agent::ProviderRegistry>,
     pub backend_registry: std::sync::Arc<omen_engine::BackendRegistry>,
+    pub human_settings: HumanSettings,
 }
 
 pub fn block_on_async<F>(future: F) -> F::Output
@@ -183,7 +184,9 @@ impl InteractiveSession {
             agent_provider,
             agent_registry,
             backend_registry,
+            human_settings: HumanSettings::default(),
         };
+        sess.prompt.apply_settings(sess.human_settings.clone());
         sess.update_prompt_state();
         Ok(sess)
     }
@@ -212,6 +215,13 @@ impl InteractiveSession {
 
     /// Runs the interactive REPL loop.
     pub fn run_loop(&mut self) -> Result<(), CoreError> {
+        self.ensure_first_run()?;
+        if self.caps.is_interactive {
+            let startup = omen_ui::appearance::startup_message(&self.human_settings, &self.caps);
+            if !startup.is_empty() {
+                print!("{startup}");
+            }
+        }
         let completer = std::sync::Arc::new(std::sync::Mutex::new(
             crate::completion::OmenCompleter::new(self.comp_ctx.clone()),
         ));
@@ -251,7 +261,12 @@ impl InteractiveSession {
                     }
 
                     if let Err(e) = self.dispatch_input(trimmed) {
-                        eprintln!("Error: {e}");
+                        let roles =
+                            omen_ui::ColorRoles::for_theme(&self.caps, self.human_settings.theme);
+                        eprintln!(
+                            "{}",
+                            omen_ui::DiagnosticRenderer::render_human_error(&e, &roles)
+                        );
                     }
                 }
                 Ok(Signal::CtrlC) => {
@@ -269,6 +284,34 @@ impl InteractiveSession {
             }
         }
 
+        Ok(())
+    }
+
+    fn ensure_first_run(&mut self) -> Result<(), CoreError> {
+        let Some(path) = HumanSettings::default_path() else {
+            return Ok(());
+        };
+        let configured = HumanSettings::load(&path)
+            .map_err(|error| CoreError::Internal(format!("human settings load failed: {error}")))?;
+        if let Some(settings) = configured {
+            self.human_settings = settings;
+            self.prompt.apply_settings(self.human_settings.clone());
+            return Ok(());
+        }
+        if !self.caps.is_interactive {
+            return Ok(());
+        }
+
+        let theme =
+            omen_ui::appearance::run_appearance_chooser(self.human_settings.theme, &self.caps)
+                .map_err(|error| {
+                    CoreError::Internal(format!("appearance chooser failed: {error}"))
+                })?;
+        self.human_settings.theme = theme;
+        self.human_settings
+            .save(&path)
+            .map_err(|error| CoreError::Internal(format!("human settings save failed: {error}")))?;
+        self.prompt.apply_settings(self.human_settings.clone());
         Ok(())
     }
 

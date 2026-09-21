@@ -5,6 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod perf;
 mod preview;
 
 #[derive(Parser)]
@@ -24,6 +25,8 @@ enum Commands {
     Verify,
     /// Run Omen 0.3 performance benchmarks
     Bench,
+    /// Run the 0.9-B.1 product and harness-tax audit
+    Perf(perf::PerfArgs),
     /// Build, install, and prove an immutable preview candidate
     Preview(preview::PreviewArgs),
 }
@@ -132,6 +135,7 @@ fn main() {
         Commands::Bench => {
             run_benchmarks();
         }
+        Commands::Perf(args) => perf::run(args, &project_root()),
         Commands::Preview(args) => preview::run(args, &project_root()),
     }
 }

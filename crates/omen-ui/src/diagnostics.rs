@@ -1,5 +1,5 @@
 use crate::color::ColorRoles;
-use omen_core::ValidityState;
+use omen_core::{CoreError, OmenError, ValidityState};
 use omen_knowledge::{ExecutionRecord, FactProvenance};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,6 +17,30 @@ pub enum DiagnosticLevel {
 pub struct DiagnosticRenderer;
 
 impl DiagnosticRenderer {
+    pub fn render_human_error(error: &CoreError, roles: &ColorRoles) -> String {
+        let envelope = OmenError::from_core(error);
+        let remedy = match envelope.code.as_str() {
+            "PLAN_CHANGED" => "Plan again before executing.",
+            "PROVIDER_FAILURE" => {
+                "Semantic analysis is unavailable; retry when the provider is ready."
+            }
+            "TIMED_OUT" | "TIMEOUT" => {
+                "The bounded operation timed out; inspect its evidence before retrying."
+            }
+            "AUTHORITY_REQUIRED" => {
+                "Obtain the required authority, then retry the exact operation."
+            }
+            _ => "Inspect the structured result for the next available action.",
+        };
+        format!(
+            "{} {}\n{}\n{}",
+            roles.prompt_symbol.paint("\\O/"),
+            roles.error.paint(envelope.code.as_str()),
+            roles.normal.paint(&envelope.message),
+            roles.subtle.paint(remedy),
+        )
+    }
+
     pub fn render_execution(
         record: &ExecutionRecord,
         level: DiagnosticLevel,

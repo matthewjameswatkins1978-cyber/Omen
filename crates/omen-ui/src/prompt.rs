@@ -1,3 +1,4 @@
+use crate::appearance::{PromptDensity, Theme};
 use crate::color::ColorRoles;
 use crate::terminal::TerminalCapabilities;
 use std::path::Path;
@@ -10,6 +11,8 @@ pub struct PromptState {
     pub dirty_facts_count: usize,
     pub has_failure: bool,
     pub mode_indicator: Option<String>,
+    pub theme: Theme,
+    pub density: PromptDensity,
 }
 
 impl PromptState {
@@ -26,6 +29,8 @@ impl PromptState {
             dirty_facts_count,
             has_failure,
             mode_indicator: None,
+            theme: Theme::default(),
+            density: PromptDensity::Normal,
         }
     }
 
@@ -44,13 +49,35 @@ impl PromptState {
         }
         path_str
     }
+
+    pub fn with_theme(mut self, theme: Theme) -> Self {
+        self.theme = theme;
+        self
+    }
+
+    pub fn with_density(mut self, density: PromptDensity) -> Self {
+        self.density = density;
+        self
+    }
 }
 
 pub struct PromptRenderer;
 
 impl PromptRenderer {
     pub fn render(state: &PromptState, caps: &TerminalCapabilities) -> String {
-        let colors = ColorRoles::for_caps(caps);
+        let colors = ColorRoles::for_theme(caps, state.theme);
+
+        if state.density == PromptDensity::Compact {
+            let p_start = crate::blocks::SemanticBlock::osc133_prompt_start(caps);
+            let c_start = crate::blocks::SemanticBlock::osc133_command_start(caps);
+            let prompt_text = if caps.has_unicode {
+                "\\O/ ›"
+            } else {
+                "\\O/ >"
+            };
+            let prompt_sym = colors.prompt_symbol.paint(prompt_text);
+            return format!("{p_start}{prompt_sym} {c_start}");
+        }
 
         let path_part = colors.prompt_path.paint(&state.cwd_display);
 
@@ -82,7 +109,12 @@ impl PromptRenderer {
 
         // Header line: path branch status
         // Prompt line: [mode] >
-        let prompt_sym = colors.prompt_symbol.paint(">");
+        let prompt_text = if caps.has_unicode {
+            "\\O/ ›"
+        } else {
+            "\\O/ >"
+        };
+        let prompt_sym = colors.prompt_symbol.paint(prompt_text);
         let p_start = crate::blocks::SemanticBlock::osc133_prompt_start(caps);
         let c_start = crate::blocks::SemanticBlock::osc133_command_start(caps);
 

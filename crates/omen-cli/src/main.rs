@@ -1,4 +1,5 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap_complete::{Shell, generate};
 use omen_adapters::{DefaultCapabilityExecutor, execute_plan, get_workspace_semantic_registry};
 use omen_atlas::{RuntimeProfile, ToolValidator};
 use omen_core::composition::{self, OmenWorkspaceConfig};
@@ -44,6 +45,8 @@ struct Cli {
 enum Commands {
     /// Bootstrap an unfamiliar client with the bounded machine contract.
     Orient(OrientArgs),
+    /// Generate shell completion for the CLI command tree.
+    Completion { shell: Shell },
     /// List the static capability catalogue, optionally filtered by group.
     Capabilities { group: Option<String> },
     /// Inspect environment and health
@@ -394,6 +397,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let machine_context = machine_contract::context_with_generation(context_generation);
 
     match cli.command {
+        Some(Commands::Completion { shell }) => {
+            let mut command = Cli::command();
+            generate(shell, &mut command, "omen", &mut std::io::stdout());
+            return Ok(());
+        }
         Some(Commands::Orient(args)) => {
             let digest = machine_contract::contract_digest();
             if let Some(previous) = args.since {

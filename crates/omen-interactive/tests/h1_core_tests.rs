@@ -34,7 +34,7 @@ fn test_prompt_rendering_levels() {
     let rendered_clean = PromptRenderer::render(&clean_state, &caps_color);
     assert!(rendered_clean.contains("main"));
     assert!(rendered_clean.contains("✓"));
-    assert!(rendered_clean.contains(">"));
+    assert!(rendered_clean.contains("›"));
 
     // 2. Dirty facts prompt
     let dirty_state = PromptState::new(temp.path(), Some("main".into()), 3, false);

@@ -1,4 +1,4 @@
-use omen_ui::{PromptRenderer, PromptState, TerminalCapabilities};
+use omen_ui::{HumanSettings, PromptRenderer, PromptState, TerminalCapabilities};
 use reedline::Prompt;
 use std::borrow::Cow;
 use std::path::PathBuf;
@@ -10,6 +10,7 @@ pub struct OmenPrompt {
     has_failure: bool,
     caps: TerminalCapabilities,
     mode_indicator: Option<String>,
+    settings: HumanSettings,
 }
 
 impl OmenPrompt {
@@ -27,6 +28,7 @@ impl OmenPrompt {
             has_failure,
             caps,
             mode_indicator: None,
+            settings: HumanSettings::default(),
         }
     }
 
@@ -59,6 +61,10 @@ impl OmenPrompt {
     pub fn mode_indicator(&self) -> Option<&str> {
         self.mode_indicator.as_deref()
     }
+
+    pub fn apply_settings(&mut self, settings: HumanSettings) {
+        self.settings = settings;
+    }
 }
 
 impl Prompt for OmenPrompt {
@@ -72,6 +78,9 @@ impl Prompt for OmenPrompt {
         if let Some(ref ind) = self.mode_indicator {
             state = state.with_mode_indicator(ind.clone());
         }
+        state = state
+            .with_theme(self.settings.theme)
+            .with_density(self.settings.density);
         let rendered = PromptRenderer::render(&state, &self.caps);
         Cow::Owned(rendered)
     }

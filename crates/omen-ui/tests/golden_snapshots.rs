@@ -1,8 +1,8 @@
 use omen_core::{Assurance, ExecutionId, InteractiveSessionId, ResourceUri, ValidityState};
 use omen_knowledge::{DependencyRecord, ExecutionRecord, FactProvenance, FactRecord};
 use omen_ui::{
-    ColorRoles, DiagnosticLevel, DiagnosticRenderer, PromptRenderer, PromptState, SemanticBlock,
-    TerminalCapabilities,
+    ColorRoles, DiagnosticLevel, DiagnosticRenderer, PromptDensity, PromptRenderer, PromptState,
+    SemanticBlock, TerminalCapabilities, Theme,
 };
 use std::path::PathBuf;
 
@@ -12,7 +12,7 @@ fn test_golden_prompt_dumb_terminal() {
     let state_clean = PromptState::new(&PathBuf::from("/workspace/omen"), None, 0, false);
     let rendered_clean = PromptRenderer::render(&state_clean, &caps);
 
-    assert_eq!(rendered_clean, "/workspace/omen ok\n> ");
+    assert_eq!(rendered_clean, "/workspace/omen ok\n\\O/ > ");
 
     let state_dirty = PromptState::new(
         &PathBuf::from("/workspace/omen"),
@@ -21,11 +21,14 @@ fn test_golden_prompt_dumb_terminal() {
         false,
     );
     let rendered_dirty = PromptRenderer::render(&state_dirty, &caps);
-    assert_eq!(rendered_dirty, "/workspace/omen  feature/h11 ! 3 dirty\n> ");
+    assert_eq!(
+        rendered_dirty,
+        "/workspace/omen  feature/h11 ! 3 dirty\n\\O/ > "
+    );
 
     let state_fail = PromptState::new(&PathBuf::from("/workspace/omen"), None, 0, true);
     let rendered_fail = PromptRenderer::render(&state_fail, &caps);
-    assert_eq!(rendered_fail, "/workspace/omen X\n> ");
+    assert_eq!(rendered_fail, "/workspace/omen X\n\\O/ > ");
 }
 
 #[test]
@@ -51,6 +54,15 @@ fn test_golden_prompt_rich_terminal_osc133() {
     assert!(rendered.contains("✓"));
     assert!(rendered.contains("/repo"));
     assert!(rendered.contains("main"));
+}
+
+#[test]
+fn test_compact_prompt_is_stable_and_theme_is_presentation_only() {
+    let caps = TerminalCapabilities::dumb();
+    let state = PromptState::new(&PathBuf::from("/repo"), Some("main".into()), 0, false)
+        .with_density(PromptDensity::Compact)
+        .with_theme(Theme::Amber);
+    assert_eq!(PromptRenderer::render(&state, &caps), "\\O/ > ");
 }
 
 #[test]
@@ -124,6 +136,19 @@ fn test_golden_diagnostics_levels() {
     assert!(l3.contains("\"execution_id\": \"exec-golden-1\""));
     assert!(l3.contains("\"exit_code\": 0"));
     assert!(l3.contains("\"duration_ms\": 215"));
+}
+
+#[test]
+fn test_human_error_is_concise_and_keeps_machine_code() {
+    let roles = ColorRoles::plain();
+    let error = omen_core::CoreError::ExecutionFailedCode {
+        code: omen_core::ErrorCode::PlanChanged,
+        message: "project changed after planning".into(),
+    };
+    let rendered = DiagnosticRenderer::render_human_error(&error, &roles);
+    assert!(rendered.contains("\\O/ PLAN_CHANGED"));
+    assert!(rendered.contains("project changed after planning"));
+    assert!(rendered.contains("Plan again before executing"));
 }
 
 #[test]
