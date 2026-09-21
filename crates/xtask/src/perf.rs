@@ -286,7 +286,8 @@ fn system_memory_bytes() -> Option<u64> {
             .find(|line| line.starts_with("MemTotal:"))?
             .split_whitespace()
             .nth(1)?
-            .parse::<u64>()?;
+            .parse::<u64>()
+            .ok()?;
         Some(kib * 1024)
     }
     #[cfg(not(any(windows, target_os = "linux")))]
