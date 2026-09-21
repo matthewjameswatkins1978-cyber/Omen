@@ -5,6 +5,12 @@ on:
     branches: [ main, feature/* ]
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      target_sha:
+        description: "Exact product source commit to build and test"
+        required: true
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -16,6 +22,25 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.target_sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Verify exact product source
+        shell: pwsh
+        env:
+          REQUESTED_PRODUCT_SHA: ${{ inputs.target_sha || github.sha }}
+        run: |
+          $requested = $env:REQUESTED_PRODUCT_SHA.Trim().ToLowerInvariant()
+          if ($requested -notmatch '^[0-9a-f]{40}$') { throw "target_sha must be a full 40-character commit SHA" }
+          $resolved = (git rev-parse "$requested^{commit}").Trim().ToLowerInvariant()
+          $checkedOut = (git rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($resolved -ne $requested -or $checkedOut -ne $requested) {
+            throw "EXACT_SHA_GUARD_FAILED: requested=$requested resolved=$resolved checked_out=$checkedOut"
+          }
+          "OMEN_REQUESTED_PRODUCT_SHA=$requested" >> $env:GITHUB_ENV
+          "OMEN_CHECKED_OUT_PRODUCT_SHA=$checkedOut" >> $env:GITHUB_ENV
+          "EXACT_SHA_GUARD: PASS ($checkedOut)"
       
       - name: Install Rust toolchain
         run: |
@@ -53,6 +78,25 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.target_sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Verify exact product source
+        shell: pwsh
+        env:
+          REQUESTED_PRODUCT_SHA: ${{ inputs.target_sha || github.sha }}
+        run: |
+          $requested = $env:REQUESTED_PRODUCT_SHA.Trim().ToLowerInvariant()
+          if ($requested -notmatch '^[0-9a-f]{40}$') { throw "target_sha must be a full 40-character commit SHA" }
+          $resolved = (git rev-parse "$requested^{commit}").Trim().ToLowerInvariant()
+          $checkedOut = (git rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($resolved -ne $requested -or $checkedOut -ne $requested) {
+            throw "EXACT_SHA_GUARD_FAILED: requested=$requested resolved=$resolved checked_out=$checkedOut"
+          }
+          "OMEN_REQUESTED_PRODUCT_SHA=$requested" >> $env:GITHUB_ENV
+          "OMEN_CHECKED_OUT_PRODUCT_SHA=$checkedOut" >> $env:GITHUB_ENV
+          "EXACT_SHA_GUARD: PASS ($checkedOut)"
 
       - name: Install Rust toolchain and rust-analyzer
         run: |
@@ -75,6 +119,25 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.target_sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Verify exact product source
+        shell: pwsh
+        env:
+          REQUESTED_PRODUCT_SHA: ${{ inputs.target_sha || github.sha }}
+        run: |
+          $requested = $env:REQUESTED_PRODUCT_SHA.Trim().ToLowerInvariant()
+          if ($requested -notmatch '^[0-9a-f]{40}$') { throw "target_sha must be a full 40-character commit SHA" }
+          $resolved = (git rev-parse "$requested^{commit}").Trim().ToLowerInvariant()
+          $checkedOut = (git rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($resolved -ne $requested -or $checkedOut -ne $requested) {
+            throw "EXACT_SHA_GUARD_FAILED: requested=$requested resolved=$resolved checked_out=$checkedOut"
+          }
+          "OMEN_REQUESTED_PRODUCT_SHA=$requested" >> $env:GITHUB_ENV
+          "OMEN_CHECKED_OUT_PRODUCT_SHA=$checkedOut" >> $env:GITHUB_ENV
+          "EXACT_SHA_GUARD: PASS ($checkedOut)"
 
       - name: Install Rust toolchain
         run: |
@@ -112,14 +175,65 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.target_sha || github.sha }}
+          fetch-depth: 0
+      - name: Verify exact product source
+        shell: pwsh
+        env:
+          REQUESTED_PRODUCT_SHA: ${{ inputs.target_sha || github.sha }}
+        run: |
+          $requested = $env:REQUESTED_PRODUCT_SHA.Trim().ToLowerInvariant()
+          if ($requested -notmatch '^[0-9a-f]{40}$') { throw "target_sha must be a full 40-character commit SHA" }
+          $resolved = (git rev-parse "$requested^{commit}").Trim().ToLowerInvariant()
+          $checkedOut = (git rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($resolved -ne $requested -or $checkedOut -ne $requested) {
+            throw "EXACT_SHA_GUARD_FAILED: requested=$requested resolved=$resolved checked_out=$checkedOut"
+          }
+          "OMEN_REQUESTED_PRODUCT_SHA=$requested" >> $env:GITHUB_ENV
+          "OMEN_CHECKED_OUT_PRODUCT_SHA=$checkedOut" >> $env:GITHUB_ENV
+          "EXACT_SHA_GUARD: PASS ($checkedOut)"
       - name: Install Rust toolchain
         run: |
           rustup toolchain install 1.98.1 --profile minimal
           rustup default 1.98.1
       - name: Build exact Windows candidate
         run: cargo run --package xtask -- preview package --ci-run-id ${{ github.run_id }}
+      - name: Emit exact-SHA provenance
+        shell: pwsh
+        env:
+          CONTROL_PLANE_SHA: ${{ github.sha }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zipPath = (Get-ChildItem -LiteralPath work -Filter 'omen-*-windows-x86_64.zip' -File | Select-Object -First 1).FullName
+          $zip = [IO.Compression.ZipFile]::OpenRead($zipPath)
+          try {
+            $entry = $zip.GetEntry('manifest.json')
+            $reader = [IO.StreamReader]::new($entry.Open())
+            try { $manifest = $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose() }
+          } finally { $zip.Dispose() }
+          if ($manifest.git_sha.ToLowerInvariant() -ne $env:OMEN_REQUESTED_PRODUCT_SHA.ToLowerInvariant() -or
+              $manifest.git_sha.ToLowerInvariant() -ne $env:OMEN_CHECKED_OUT_PRODUCT_SHA.ToLowerInvariant()) {
+            throw "EXACT_SHA_GUARD_FAILED: manifest embedded SHA does not match requested/checked-out product SHA"
+          }
+          [ordered]@{
+            workflow = 'CI'
+            control_plane_sha = $env:CONTROL_PLANE_SHA
+            workflow_run_id = [int64]$env:WORKFLOW_RUN_ID
+            requested_product_sha = $env:OMEN_REQUESTED_PRODUCT_SHA
+            checked_out_product_sha = $env:OMEN_CHECKED_OUT_PRODUCT_SHA
+            embedded_git_sha = $manifest.git_sha
+            runtime_version = $manifest.preview_version
+            artifact_name = (Split-Path -Leaf $zipPath)
+            binary_sha256 = $manifest.binary_sha256
+            package_sha256 = $manifest.package_sha256
+          } | ConvertTo-Json | Set-Content -Encoding utf8 work/provenance.json
+          Get-Content work/provenance.json
       - name: Upload Windows candidate
         uses: actions/upload-artifact@v4
         with:
           name: omen-preview-candidate-windows-x86_64
-          path: work/omen-*-windows-x86_64.zip
+          path: |
+            work/omen-*-windows-x86_64.zip
+            work/provenance.json
