@@ -156,7 +156,15 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 }
 
 fn path_key(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
+    let key = path.to_string_lossy().replace('\\', "/");
+    #[cfg(windows)]
+    {
+        key.strip_prefix("//?/").unwrap_or(&key).to_owned()
+    }
+    #[cfg(not(windows))]
+    {
+        key
+    }
 }
 
 fn workspace_relative_path(path: &Path, workspace_root: &Path) -> Option<PathBuf> {
