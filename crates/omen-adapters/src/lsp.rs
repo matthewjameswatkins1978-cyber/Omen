@@ -759,6 +759,7 @@ fn uri_to_rel_path(uri: &str, workspace_root: &Path) -> String {
         // contract workspace-relative in that case.
         let path_text = path_part.replace('\\', "/");
         let root_text = workspace_root.to_string_lossy().replace('\\', "/");
+        let root_text = root_text.strip_prefix("//?/").unwrap_or(&root_text);
         let path_lower = path_text.to_ascii_lowercase();
         let root_lower = root_text.trim_end_matches('/').to_ascii_lowercase();
         if path_lower.starts_with(&(root_lower.clone() + "/")) {
@@ -1247,6 +1248,16 @@ mod tests {
     #[test]
     fn uri_to_relative_file_handles_case_insensitive_windows_drive_letters() {
         let root = PathBuf::from(r"C:\workspace\fixture");
+        assert_eq!(
+            uri_to_rel_path("file:///c:/workspace/fixture/src/lib.rs", &root),
+            "src/lib.rs"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn uri_to_relative_file_handles_canonical_windows_workspace_prefix() {
+        let root = PathBuf::from(r"\\?\C:\workspace\fixture");
         assert_eq!(
             uri_to_rel_path("file:///c:/workspace/fixture/src/lib.rs", &root),
             "src/lib.rs"
