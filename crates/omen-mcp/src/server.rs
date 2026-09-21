@@ -398,7 +398,13 @@ impl McpServer {
             "capability_groups": groups,
             "references": ["@last", "@failed"],
             "recipes": contract.recipe_definitions.iter().map(|recipe| &recipe.id).collect::<Vec<_>>(),
-            "next": ["capabilities", "history", "describe <capability>", "recipe <recipe>", "context"]
+            "next": ["capabilities", "history", "describe <capability>", "recipe <recipe>", "context"],
+            "next_actions": [
+                {"operation":"capabilities","cli":"capabilities [group] --machine","mcp_tool":"omen_capabilities","purpose":"select a relevant capability from the compact catalogue"},
+                {"operation":"describe","cli":"describe <capability> --machine","mcp_tool":"omen_describe","purpose":"load one capability's operational schema and constraints"},
+                {"operation":"recipe","cli":"how <recipe> --machine","mcp_tool":"omen_recipe","purpose":"follow a short advisory multi-step path"},
+                {"operation":"context","cli":"context --machine","mcp_tool":"omen_context","purpose":"refresh dynamic workspace/session state"}
+            ]
         })).unwrap())
     }
 
@@ -406,12 +412,17 @@ impl McpServer {
         let group = args.get("group").and_then(Value::as_str);
         let contract = machine_contract::contract();
         let context = self.machine_context();
-        let capabilities: Vec<_> = machine_contract::project(&contract, &context)
+        let capabilities: Vec<_> = machine_contract::catalogue(&contract, &context)
             .into_iter()
-            .filter(|entry| group.is_none_or(|wanted| entry.definition.group == wanted))
+            .filter(|entry| group.is_none_or(|wanted| entry.group == wanted))
             .collect();
         CallToolResult::text(
-            serde_json::to_string_pretty(&json!({"capabilities": capabilities})).unwrap(),
+            serde_json::to_string_pretty(&json!({
+                "contract_version": machine_contract::CONTRACT_VERSION,
+                "contract_digest": machine_contract::contract_digest(),
+                "capabilities": capabilities
+            }))
+            .unwrap(),
         )
     }
 
@@ -434,13 +445,20 @@ impl McpServer {
             .into_iter()
             .find(|status| status.id == id)
             .unwrap();
-        CallToolResult::text(
-            serde_json::to_string_pretty(&machine_contract::CapabilityProjection {
-                definition,
-                status,
-            })
-            .unwrap(),
-        )
+        let projection = machine_contract::CapabilityProjection { definition, status };
+        let mut doc = serde_json::to_value(projection).unwrap();
+        if let Some(object) = doc.as_object_mut() {
+            object.insert(
+                "contract_version".into(),
+                json!(machine_contract::CONTRACT_VERSION),
+            );
+            object.insert(
+                "contract_digest".into(),
+                json!(machine_contract::contract_digest()),
+            );
+            object.insert("describe_ref".into(), json!(id));
+        }
+        CallToolResult::text(serde_json::to_string_pretty(&doc).unwrap())
     }
 
     async fn tool_recipe(&self, args: &Value) -> CallToolResult {

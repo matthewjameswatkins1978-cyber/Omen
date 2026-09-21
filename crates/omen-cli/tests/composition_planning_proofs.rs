@@ -68,6 +68,13 @@ fn machine_discovery_path_is_cold_start_learnable() {
     assert!(ok);
     assert_eq!(orient["contract_version"], "0.8");
     assert!(orient["next"].as_array().unwrap().len() >= 3);
+    assert!(
+        orient["next_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|action| { action["cli"].is_string() && action["mcp_tool"].is_string() })
+    );
 
     let (ok, capabilities) = run(
         workspace.path(),
@@ -76,10 +83,10 @@ fn machine_discovery_path_is_cold_start_learnable() {
     );
     assert!(ok);
     assert_eq!(capabilities["capabilities"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        capabilities["capabilities"][0]["definition"]["id"],
-        "mutation.threadmoth"
-    );
+    assert_eq!(capabilities["capabilities"][0]["id"], "mutation.threadmoth");
+    assert!(capabilities["capabilities"][0]["describe_ref"].is_string());
+    assert!(capabilities["capabilities"][0]["summary"].is_string());
+    assert!(capabilities["capabilities"][0]["input_schema"].is_null());
 
     let (ok, described) = run(
         workspace.path(),
@@ -88,6 +95,7 @@ fn machine_discovery_path_is_cold_start_learnable() {
     );
     assert!(ok);
     assert_eq!(described["definition"]["authority"], "Tethers admission");
+    assert_eq!(described["describe_ref"], "mutation.threadmoth");
 
     let (ok, recipe) = run(
         workspace.path(),
@@ -97,9 +105,29 @@ fn machine_discovery_path_is_cold_start_learnable() {
     assert!(ok);
     assert_eq!(recipe["id"], "safe-mutation");
 
+    let (ok, find_symbol) = run(
+        workspace.path(),
+        &state_home,
+        &["how", "find-symbol", "--machine"],
+    );
+    assert!(ok);
+    assert_eq!(
+        find_symbol["steps"][0]["capability_id"],
+        "semantic.definition"
+    );
+
     let (ok, context) = run(workspace.path(), &state_home, &["context", "--machine"]);
     assert!(ok);
     assert_eq!(context["delta"], "CURRENT_SNAPSHOT");
+
+    let (ok, error) = run(
+        workspace.path(),
+        &state_home,
+        &["describe", "missing.capability", "--machine"],
+    );
+    assert!(!ok);
+    assert_eq!(error["code"], "CAPABILITY_NOT_FOUND");
+    assert_eq!(error["schema_version"], 1);
 }
 
 #[test]

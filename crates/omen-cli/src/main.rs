@@ -439,7 +439,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "capability_groups": capability_groups,
                 "references": ["@last", "@failed"],
                 "recipes": machine_contract::contract().recipe_definitions.iter().map(|recipe| &recipe.id).collect::<Vec<_>>(),
-                "next": ["capabilities", "history", "describe <capability>", "how <recipe>", "context --since <generation>"]
+                "next": ["capabilities", "history", "describe <capability>", "how <recipe>", "context --since <generation>"],
+                "next_actions": [
+                    {"operation":"capabilities","cli":"capabilities [group] --machine","mcp_tool":"omen_capabilities","purpose":"select a relevant capability from the compact catalogue"},
+                    {"operation":"describe","cli":"describe <capability> --machine","mcp_tool":"omen_describe","purpose":"load one capability's operational schema and constraints"},
+                    {"operation":"recipe","cli":"how <recipe> --machine","mcp_tool":"omen_recipe","purpose":"follow a short advisory multi-step path"},
+                    {"operation":"context","cli":"context --machine","mcp_tool":"omen_context","purpose":"refresh dynamic workspace/session state"}
+                ]
             });
             if json_mode {
                 println!("{}", serde_json::to_string_pretty(&doc)?);
@@ -454,19 +460,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(Commands::Capabilities { group }) => {
             let contract = machine_contract::contract();
-            let entries: Vec<CapabilityProjection> =
-                machine_contract::project(&contract, &machine_context)
-                    .into_iter()
-                    .filter(|entry| group.as_deref().is_none_or(|g| entry.definition.group == g))
-                    .collect();
+            let entries: Vec<_> = machine_contract::catalogue(&contract, &machine_context)
+                .into_iter()
+                .filter(|entry| group.as_deref().is_none_or(|g| entry.group == g))
+                .collect();
             if json_mode {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({"capabilities": entries}))?
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "contract_version": machine_contract::CONTRACT_VERSION,
+                        "contract_digest": machine_contract::contract_digest(),
+                        "capabilities": entries
+                    }))?
                 );
             } else {
                 for entry in entries {
-                    println!("{} — {}", entry.definition.id, entry.definition.summary);
+                    println!(
+                        "{} — {} ({:?})",
+                        entry.id, entry.summary, entry.availability
+                    );
                 }
             }
         }
@@ -505,7 +517,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .expect("every static capability has a runtime overlay");
                         let entry = CapabilityProjection { definition, status };
                         if json_mode {
-                            println!("{}", serde_json::to_string_pretty(&entry)?);
+                            let mut doc = serde_json::to_value(&entry)?;
+                            if let Some(object) = doc.as_object_mut() {
+                                object.insert(
+                                    "contract_version".into(),
+                                    serde_json::json!(machine_contract::CONTRACT_VERSION),
+                                );
+                                object.insert(
+                                    "contract_digest".into(),
+                                    serde_json::json!(machine_contract::contract_digest()),
+                                );
+                                object.insert("describe_ref".into(), serde_json::json!(id));
+                            }
+                            println!("{}", serde_json::to_string_pretty(&doc)?);
                         } else {
                             println!("{}: {}", entry.definition.id, entry.definition.summary);
                             println!("Effect: {:?}", entry.definition.effect_class);
@@ -516,9 +540,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     None => {
-                        let err = serde_json::json!({"error":"CAPABILITY_NOT_FOUND","operation":id,"state_changed":false,"retryable":false,"next_actions":["capabilities"]});
                         if json_mode {
-                            println!("{}", serde_json::to_string_pretty(&err)?);
+                            let mut error = OmenError::from_code(
+                                ErrorCode::CapabilityNotFound,
+                                format!("capability '{id}' does not exist"),
+                            );
+                            error.details = serde_json::json!({
+                                "capability_id": id,
+                                "next_actions": ["capabilities"]
+                            });
+                            println!("{}", serde_json::to_string_pretty(&error)?);
                         } else {
                             eprintln!("Capability not found: {id}");
                         }
@@ -569,9 +600,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             None => {
-                let err = serde_json::json!({"error":"RECIPE_NOT_FOUND","operation":recipe,"state_changed":false,"retryable":false,"next_actions":["orient"]});
                 if json_mode {
-                    println!("{}", serde_json::to_string_pretty(&err)?);
+                    let mut error = OmenError::from_code(
+                        ErrorCode::RecipeNotFound,
+                        format!("recipe '{recipe}' does not exist"),
+                    );
+                    error.details = serde_json::json!({
+                        "recipe_id": recipe,
+                        "next_actions": ["orient"]
+                    });
+                    println!("{}", serde_json::to_string_pretty(&error)?);
                 } else {
                     eprintln!("Recipe not found: {recipe}");
                 }

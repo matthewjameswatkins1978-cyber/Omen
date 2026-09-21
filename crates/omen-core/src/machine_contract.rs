@@ -83,6 +83,22 @@ pub struct CapabilityProjection {
     pub status: CapabilityStatus,
 }
 
+/// The compact static-plus-runtime entry returned by broad discovery.
+/// Detailed schemas remain behind `describe_ref`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapabilityCatalogueEntry {
+    pub id: String,
+    pub group: String,
+    pub summary: String,
+    pub availability: AvailabilityState,
+    pub admission: AdmissionState,
+    pub provider: String,
+    pub reason: Option<String>,
+    /// The stable capability id accepted by `describe` / `omen_describe`.
+    pub describe_ref: String,
+    pub related_capabilities: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RecipeStep {
     pub capability_id: String,
@@ -350,7 +366,7 @@ pub fn contract() -> MachineContract {
             examples: vec![json!({"action_id":"inspect-auth"})],
         },
     ];
-    let recipe_definitions = vec![
+    let mut recipe_definitions = vec![
         RecipeDefinition {
             id: "investigate-failure".into(),
             summary: "Inspect a failure using bounded evidence before interpreting it.".into(),
@@ -396,6 +412,72 @@ pub fn contract() -> MachineContract {
             ],
         },
     ];
+    recipe_definitions.extend([
+        RecipeDefinition {
+            id: "find-symbol".into(),
+            summary: "Search, resolve, and inspect references for a known symbol.".into(),
+            steps: vec![
+                RecipeStep {
+                    capability_id: "semantic.definition".into(),
+                    purpose: "resolve the exact symbol definition".into(),
+                },
+                RecipeStep {
+                    capability_id: "semantic.references".into(),
+                    purpose: "retrieve bounded references after identity is known".into(),
+                },
+            ],
+            advisory: true,
+            notes: vec!["Provider availability is reported in each capability projection.".into()],
+        },
+        RecipeDefinition {
+            id: "execute-and-inspect".into(),
+            summary: "Execute a bounded command, then inspect its recorded evidence.".into(),
+            steps: vec![
+                RecipeStep {
+                    capability_id: "execution.run".into(),
+                    purpose: "run the explicitly supplied argv under current authority".into(),
+                },
+                RecipeStep {
+                    capability_id: "history.query".into(),
+                    purpose: "retrieve the durable execution record and artifact references".into(),
+                },
+            ],
+            advisory: true,
+            notes: vec![
+                "Execution requires current external authority; the recipe grants none.".into(),
+            ],
+        },
+        RecipeDefinition {
+            id: "inspect-history".into(),
+            summary: "Query bounded durable history and follow recorded evidence.".into(),
+            steps: vec![RecipeStep {
+                capability_id: "history.query".into(),
+                purpose: "query the current or session-scoped execution history".into(),
+            }],
+            advisory: true,
+            notes: vec!["History is Omen evidence, not a complete OS audit log.".into()],
+        },
+        RecipeDefinition {
+            id: "plan-action".into(),
+            summary: "Discover an action, inspect it, and build a deterministic read-only plan."
+                .into(),
+            steps: vec![
+                RecipeStep {
+                    capability_id: "composition.plan".into(),
+                    purpose: "validate the named action and compute its plan digest".into(),
+                },
+                RecipeStep {
+                    capability_id: "composition.run".into(),
+                    purpose: "execute only after the plan and current authority are rechecked"
+                        .into(),
+                },
+            ],
+            advisory: true,
+            notes: vec![
+                "Planning is read-only; execution is a separate consequential operation.".into(),
+            ],
+        },
+    ]);
     MachineContract {
         contract_version: CONTRACT_VERSION.into(),
         capability_definitions,
@@ -447,6 +529,39 @@ pub fn project(contract: &MachineContract, context: &MachineContext) -> Vec<Capa
                     definition: definition.clone(),
                     status: status.clone(),
                 })
+        })
+        .collect()
+}
+
+pub fn catalogue(
+    contract: &MachineContract,
+    context: &MachineContext,
+) -> Vec<CapabilityCatalogueEntry> {
+    contract
+        .capability_definitions
+        .iter()
+        .filter_map(|definition| {
+            let status = context
+                .capability_statuses
+                .iter()
+                .find(|status| status.id == definition.id)?;
+            let related_capabilities = contract
+                .capability_definitions
+                .iter()
+                .filter(|other| other.group == definition.group && other.id != definition.id)
+                .map(|other| other.id.clone())
+                .collect();
+            Some(CapabilityCatalogueEntry {
+                id: definition.id.clone(),
+                group: definition.group.clone(),
+                summary: definition.summary.clone(),
+                availability: status.availability,
+                admission: status.admission,
+                provider: status.provider.clone(),
+                reason: status.reason.clone(),
+                describe_ref: definition.id.clone(),
+                related_capabilities,
+            })
         })
         .collect()
 }

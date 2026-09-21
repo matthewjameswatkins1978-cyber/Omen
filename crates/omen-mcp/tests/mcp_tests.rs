@@ -209,14 +209,21 @@ input = { symbol = { kind = "literal", value = "SessionToken" } }
                     .unwrap()
                     .starts_with("sha256:")
             );
+            assert!(
+                orient["next_actions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|action| { action["cli"].is_string() && action["mcp_tool"].is_string() })
+            );
 
             let capabilities =
                 call(&server, "omen_capabilities", json!({"group":"mutation"})).await;
             assert_eq!(capabilities["capabilities"].as_array().unwrap().len(), 1);
-            assert_eq!(
-                capabilities["capabilities"][0]["definition"]["id"],
-                "mutation.threadmoth"
-            );
+            assert_eq!(capabilities["capabilities"][0]["id"], "mutation.threadmoth");
+            assert!(capabilities["capabilities"][0]["describe_ref"].is_string());
+            assert!(capabilities["capabilities"][0]["summary"].is_string());
+            assert!(capabilities["capabilities"][0]["input_schema"].is_null());
 
             let described = call(
                 &server,
@@ -225,6 +232,7 @@ input = { symbol = { kind = "literal", value = "SessionToken" } }
             )
             .await;
             assert_eq!(described["definition"]["authority"], "Tethers admission");
+            assert_eq!(described["describe_ref"], "mutation.threadmoth");
             assert!(described["status"]["availability"].is_string());
 
             let recipe = call(&server, "omen_recipe", json!({"recipe_id":"safe-mutation"})).await;
