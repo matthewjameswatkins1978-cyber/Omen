@@ -870,19 +870,21 @@ async fn test_mcp_public_semantic_surface_finds_rust_function_through_adapter() 
             assert_eq!(definition["resolved"]["file"], "src/lib.rs");
             assert_eq!(definition["resolved"]["provider"], "rust-analyzer");
 
-            let mut equivalent_hints = vec![
+            let equivalent_hints = vec![
                 "src/lib.rs".to_string(),
                 "src\\lib.rs".to_string(),
                 "./src/lib.rs".to_string(),
             ];
             #[cfg(windows)]
-            {
+            let equivalent_hints = {
+                let mut equivalent_hints = equivalent_hints;
                 let absolute = temp.path().join("src/lib.rs");
                 let absolute = absolute.to_string_lossy().replace('\\', "/");
                 equivalent_hints.push(absolute.clone());
                 equivalent_hints.push(format!("\\\\?\\{}", absolute));
                 equivalent_hints.push(format!("file:///{}", absolute));
-            }
+                equivalent_hints
+            };
             for file in equivalent_hints {
                 let resolved = call_semantic_mcp_tool(
                     &server,
