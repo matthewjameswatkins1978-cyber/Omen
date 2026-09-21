@@ -5,6 +5,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod preview;
+
 #[derive(Parser)]
 #[command(name = "xtask", about = "Omen repository automation")]
 struct Cli {
@@ -22,6 +24,8 @@ enum Commands {
     Verify,
     /// Run Omen 0.3 performance benchmarks
     Bench,
+    /// Build, install, and prove an immutable preview candidate
+    Preview(preview::PreviewArgs),
 }
 
 fn project_root() -> PathBuf {
@@ -128,6 +132,7 @@ fn main() {
         Commands::Bench => {
             run_benchmarks();
         }
+        Commands::Preview(args) => preview::run(args, &project_root()),
     }
 }
 
