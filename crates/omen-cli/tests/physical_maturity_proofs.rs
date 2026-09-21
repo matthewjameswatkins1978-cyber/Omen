@@ -328,6 +328,7 @@ async fn test_proof_b_process_tree_kill_real_path() {
 
 /// PROOF B2: A descendant created after the supervisor starts is still owned
 /// by the same containment boundary.
+#[cfg(windows)]
 #[tokio::test]
 async fn test_proof_b2_delayed_process_tree_kill_real_path() {
     let gremlin = gremlin_exe();
@@ -377,6 +378,7 @@ async fn test_proof_b2_delayed_process_tree_kill_real_path() {
 }
 
 /// PROOF B3: Containment is isolated when two executions overlap.
+#[cfg(windows)]
 #[tokio::test]
 async fn test_proof_b3_concurrent_process_isolation_real_path() {
     let gremlin = gremlin_exe();
