@@ -1,3 +1,5 @@
+use omen_core::composition::StateChange;
+use omen_core::{CoreError, ErrorCategory, ErrorCode, OmenError, Retryability};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -157,6 +159,8 @@ pub struct CallToolResult {
     pub content: Vec<ContentItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_error: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<OmenError>,
 }
 
 impl CallToolResult {
@@ -167,17 +171,38 @@ impl CallToolResult {
                 text: text.into(),
             }],
             is_error: None,
+            error: None,
         }
     }
 
     pub fn error(text: impl Into<String>) -> Self {
+        Self::domain_error(OmenError::new(
+            ErrorCode::InvalidMcpRequest,
+            text,
+            ErrorCategory::Protocol,
+            StateChange::No,
+            Retryability::Never,
+        ))
+    }
+
+    pub fn domain_error(error: OmenError) -> Self {
+        let message = error.message.clone();
         Self {
             content: vec![ContentItem {
                 content_type: "text".to_string(),
-                text: text.into(),
+                text: message,
             }],
             is_error: Some(true),
+            error: Some(error),
         }
+    }
+
+    pub fn coded_error(code: ErrorCode, message: impl Into<String>) -> Self {
+        Self::domain_error(OmenError::from_code(code, message))
+    }
+
+    pub fn core_error(error: &CoreError) -> Self {
+        Self::domain_error(OmenError::from_core(error))
     }
 }
 

@@ -117,7 +117,7 @@ fn strict_config_rejects_unknown_fields_and_unknown_capabilities() {
         &["action", "list", "--machine"],
     );
     assert!(!ok);
-    assert_eq!(error["error"], "OMEN_CONFIG_INVALID");
+    assert_eq!(error["error"]["code"], "OMEN_CONFIG_INVALID");
 
     fs::write(
         workspace.path().join("Omen.toml"),
@@ -130,7 +130,7 @@ fn strict_config_rejects_unknown_fields_and_unknown_capabilities() {
         &["action", "plan", "inspect-auth", "--machine"],
     );
     assert!(!ok);
-    assert_eq!(error["error"], "UNKNOWN_CAPABILITY");
+    assert_eq!(error["error"]["code"], "UNKNOWN_CAPABILITY");
 }
 
 #[test]
@@ -145,7 +145,7 @@ fn wrong_literal_type_refuses_before_any_execution() {
         &["action", "plan", "inspect-auth", "--machine"],
     );
     assert!(!ok);
-    assert_eq!(error["error"], "TYPE_MISMATCH");
+    assert_eq!(error["error"]["code"], "TYPE_MISMATCH");
 }
 
 #[test]
@@ -250,7 +250,7 @@ fn config_bounds_version_and_authority_looking_fields_refuse() {
         &["action", "list", "--machine"],
     );
     assert!(!ok);
-    assert_eq!(error["error"], "OMEN_CONFIG_INVALID");
+    assert_eq!(error["error"]["code"], "OMEN_CONFIG_INVALID");
 
     fs::write(
         workspace.path().join("Omen.toml"),
@@ -263,7 +263,7 @@ fn config_bounds_version_and_authority_looking_fields_refuse() {
         &["action", "list", "--machine"],
     );
     assert!(!ok);
-    assert_eq!(error["error"], "OMEN_CONFIG_INVALID");
+    assert_eq!(error["error"]["code"], "OMEN_CONFIG_INVALID");
 
     fs::write(
         workspace.path().join("Omen.toml"),
@@ -276,7 +276,7 @@ fn config_bounds_version_and_authority_looking_fields_refuse() {
         &["action", "list", "--machine"],
     );
     assert!(!ok);
-    assert_eq!(error["error"], "OMEN_CONFIG_TOO_LARGE");
+    assert_eq!(error["error"]["code"], "OMEN_CONFIG_TOO_LARGE");
 }
 
 #[cfg(windows)]
@@ -300,5 +300,5 @@ fn escaping_omen_config_symlink_refuses() {
         &["action", "list", "--machine"],
     );
     assert!(!ok);
-    assert_eq!(error["error"], "OMEN_CONFIG_PATH_ESCAPE");
+    assert_eq!(error["error"]["code"], "OMEN_CONFIG_PATH_ESCAPE");
 }

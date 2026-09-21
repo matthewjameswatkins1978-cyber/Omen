@@ -145,18 +145,18 @@ impl ProcessSupervisor {
         if let Some(expected) = expected_argv
             && expected != contract.intent.args.as_slice()
         {
-            return Err(CoreError::ExecutionFailed(
-                "AUTHORITY_CONTRACT_MISMATCH: contract argv does not exactly match resolved inputs"
-                    .into(),
-            ));
+            return Err(CoreError::ExecutionFailedCode {
+                code: omen_core::ErrorCode::AuthorityContractMismatch,
+                message: "contract argv does not exactly match resolved inputs".into(),
+            });
         }
         if contract.constraints.network_denied
             && self.backend().capabilities().network != omen_core::EnforcementLevel::Enforced
         {
-            return Err(CoreError::ExecutionFailed(
-                "NETWORK_CONSTRAINT_UNENFORCEABLE: active backend cannot enforce network denial"
-                    .into(),
-            ));
+            return Err(CoreError::ExecutionFailedCode {
+                code: omen_core::ErrorCode::NetworkConstraintUnenforceable,
+                message: "active backend cannot enforce network denial".into(),
+            });
         }
         if !contract.leases.is_empty() {
             return Err(CoreError::ExecutionFailed(

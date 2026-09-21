@@ -9,6 +9,7 @@ use crate::machine_contract::{
     MachineContract, NetworkEffect, Reversibility,
 };
 use crate::{EnforcementReport, ProcessExit};
+use crate::{ErrorCode, OmenError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -123,10 +124,36 @@ pub enum StateChange {
     Possible,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ActionExecutionError {
     pub code: String,
     pub message: String,
+}
+
+impl Serialize for ActionExecutionError {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("ActionExecutionError", 3)?;
+        state.serialize_field("code", &self.code)?;
+        state.serialize_field("message", &self.message)?;
+        state.serialize_field("error", &self.omen_error())?;
+        state.end()
+    }
+}
+
+impl ActionExecutionError {
+    /// Project the legacy action error into the canonical public envelope.
+    /// The code field is already machine data; only the human message remains
+    /// prose and is never parsed for semantics.
+    pub fn omen_error(&self) -> OmenError {
+        OmenError::from_code(
+            ErrorCode::parse(&self.code).unwrap_or(ErrorCode::Internal),
+            self.message.clone(),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -181,6 +208,15 @@ pub struct PlanValidationError {
     pub message: String,
     pub step_id: Option<String>,
     pub field: Option<String>,
+}
+
+impl PlanValidationError {
+    pub fn omen_error(&self) -> OmenError {
+        OmenError::from_code(
+            ErrorCode::parse(&self.code).unwrap_or(ErrorCode::Internal),
+            self.message.clone(),
+        )
+    }
 }
 
 impl std::fmt::Display for PlanValidationError {

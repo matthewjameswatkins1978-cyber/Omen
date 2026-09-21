@@ -666,13 +666,10 @@ fn merge_change(a: StateChange, b: StateChange) -> StateChange {
     }
 }
 fn core_error(error: omen_core::CoreError) -> ActionExecutionError {
+    // The core error code is authoritative.  Never infer machine semantics
+    // by parsing the human-facing Display string.
+    let code = error.code().as_str().to_string();
     let message = error.to_string();
-    let code = message
-        .strip_prefix("Execution failed: ")
-        .and_then(|rest| rest.split(':').next())
-        .or_else(|| message.split(':').next())
-        .unwrap_or("CAPABILITY_EXECUTION_FAILED")
-        .to_string();
     ActionExecutionError { code, message }
 }
 

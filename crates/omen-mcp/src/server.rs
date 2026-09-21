@@ -355,7 +355,10 @@ impl McpServer {
             "omen_symbol_references" => self.tool_symbol_references(&arguments).await,
             "omen_structure_search" => self.tool_structure_search(&arguments).await,
             "omen_package_query" => self.tool_package_query(&arguments).await,
-            other => CallToolResult::error(format!("Unknown tool: '{other}'")),
+            other => CallToolResult::coded_error(
+                omen_core::ErrorCode::InvalidMcpRequest,
+                format!("Unknown tool: '{other}'"),
+            ),
         };
 
         JsonRpcResponse::success(id, serde_json::to_value(result).unwrap())
@@ -411,12 +414,16 @@ impl McpServer {
 
     async fn tool_describe(&self, args: &Value) -> CallToolResult {
         let Some(id) = args.get("capability_id").and_then(Value::as_str) else {
-            return CallToolResult::error("Missing 'capability_id'");
+            return CallToolResult::coded_error(
+                omen_core::ErrorCode::InvalidMcpRequest,
+                "Missing 'capability_id'",
+            );
         };
         let Some(definition) = machine_contract::capability(id) else {
-            return CallToolResult::error(serde_json::to_string(&json!({
-                "error":"CAPABILITY_NOT_FOUND", "operation":id, "next_actions":["omen_capabilities"]
-            })).unwrap());
+            return CallToolResult::coded_error(
+                omen_core::ErrorCode::CapabilityNotFound,
+                format!("capability '{id}' does not exist"),
+            );
         };
         let context = self.machine_context();
         let status = context
@@ -435,15 +442,16 @@ impl McpServer {
 
     async fn tool_recipe(&self, args: &Value) -> CallToolResult {
         let Some(id) = args.get("recipe_id").and_then(Value::as_str) else {
-            return CallToolResult::error("Missing 'recipe_id'");
+            return CallToolResult::coded_error(
+                omen_core::ErrorCode::InvalidMcpRequest,
+                "Missing 'recipe_id'",
+            );
         };
         match machine_contract::recipe(id) {
             Some(recipe) => CallToolResult::text(serde_json::to_string_pretty(&recipe).unwrap()),
-            None => CallToolResult::error(
-                serde_json::to_string(&json!({
-                    "error":"RECIPE_NOT_FOUND", "operation":id, "next_actions":["omen_orient"]
-                }))
-                .unwrap(),
+            None => CallToolResult::coded_error(
+                omen_core::ErrorCode::RecipeNotFound,
+                format!("recipe '{id}' does not exist"),
             ),
         }
     }
@@ -494,29 +502,42 @@ impl McpServer {
                 "project":config.project.as_ref().and_then(|project| project.name.clone()),
                 "actions":config.actions.iter().map(|(id, action)| json!({"action_id":id,"description":action.description,"step_count":action.steps.len()})).collect::<Vec<_>>()
             })).unwrap()),
-            Err(error) => CallToolResult::error(error),
+            Err(error) => CallToolResult::coded_error(
+                omen_core::ErrorCode::ConfigInvalid,
+                error,
+            ),
         }
     }
 
     async fn tool_action_show(&self, args: &Value) -> CallToolResult {
         let Some(id) = args.get("action_id").and_then(Value::as_str) else {
-            return CallToolResult::error("Missing 'action_id'");
+            return CallToolResult::coded_error(
+                omen_core::ErrorCode::InvalidMcpRequest,
+                "Missing 'action_id'",
+            );
         };
         match self.load_action_config() {
             Ok(Some(config)) => match config.actions.get(id) {
                 Some(action) => CallToolResult::text(serde_json::to_string_pretty(action).unwrap()),
-                None => {
-                    CallToolResult::error(format!("ACTION_NOT_FOUND: action '{id}' does not exist"))
-                }
+                None => CallToolResult::coded_error(
+                    omen_core::ErrorCode::ActionNotFound,
+                    format!("action '{id}' does not exist"),
+                ),
             },
-            Ok(None) => CallToolResult::error("ACTION_NOT_FOUND: Omen.toml is not present"),
-            Err(error) => CallToolResult::error(error),
+            Ok(None) => CallToolResult::coded_error(
+                omen_core::ErrorCode::ActionNotFound,
+                "Omen.toml is not present",
+            ),
+            Err(error) => CallToolResult::coded_error(omen_core::ErrorCode::ConfigInvalid, error),
         }
     }
 
     async fn tool_action_plan(&self, args: &Value) -> CallToolResult {
         let Some(id) = args.get("action_id").and_then(Value::as_str) else {
-            return CallToolResult::error("Missing 'action_id'");
+            return CallToolResult::coded_error(
+                omen_core::ErrorCode::InvalidMcpRequest,
+                "Missing 'action_id'",
+            );
         };
         match self.load_action_config() {
             Ok(Some(config)) => match composition::plan_action(
@@ -526,10 +547,13 @@ impl McpServer {
                 &self.machine_context(),
             ) {
                 Ok(plan) => CallToolResult::text(serde_json::to_string_pretty(&plan).unwrap()),
-                Err(error) => CallToolResult::error(error.to_string()),
+                Err(error) => CallToolResult::domain_error(error.omen_error()),
             },
-            Ok(None) => CallToolResult::error("ACTION_NOT_FOUND: Omen.toml is not present"),
-            Err(error) => CallToolResult::error(error),
+            Ok(None) => CallToolResult::coded_error(
+                omen_core::ErrorCode::ActionNotFound,
+                "Omen.toml is not present",
+            ),
+            Err(error) => CallToolResult::coded_error(omen_core::ErrorCode::ConfigInvalid, error),
         }
     }
 
@@ -882,7 +906,7 @@ impl McpServer {
                     )
                 }
             }
-            Err(e) => CallToolResult::error(format!("Symbol search failed: {e}")),
+            Err(e) => CallToolResult::core_error(&e),
         }
     }
 
@@ -900,7 +924,7 @@ impl McpServer {
         let reg = self.build_registry();
         match reg.find_definition(symbol, file, line, col, None).await {
             Ok(res) => CallToolResult::text(serde_json::to_string_pretty(&res).unwrap()),
-            Err(e) => CallToolResult::error(format!("Symbol definition lookup failed: {e}")),
+            Err(e) => CallToolResult::core_error(&e),
         }
     }
 
@@ -925,7 +949,7 @@ impl McpServer {
             .await
         {
             Ok(res) => CallToolResult::text(serde_json::to_string_pretty(&res).unwrap()),
-            Err(e) => CallToolResult::error(format!("Symbol references lookup failed: {e}")),
+            Err(e) => CallToolResult::core_error(&e),
         }
     }
 

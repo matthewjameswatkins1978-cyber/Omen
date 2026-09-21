@@ -8,7 +8,10 @@ pub mod model;
 pub mod resource;
 pub mod types;
 
-pub use error::{CoreError, ErrorCode};
+pub use error::{
+    CoreError, ERROR_SCHEMA_VERSION, ErrorCategory, ErrorCode, ErrorEvidence, OmenError,
+    Retryability,
+};
 pub use id::{
     ActionId, ArtifactId, BackendId, ExecutionId, FactId, InteractiveSessionId, OperationId,
     ProcessId, PtySessionId, ResourceId, RuntimeLeaseId, SemanticProviderId, SymbolId, ToolId,

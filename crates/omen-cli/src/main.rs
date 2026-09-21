@@ -4,7 +4,8 @@ use omen_atlas::{RuntimeProfile, ToolValidator};
 use omen_core::composition::{self, OmenWorkspaceConfig};
 use omen_core::machine_contract::{self, CapabilityProjection};
 use omen_core::{
-    ActionId, CoreError, ExecutionContract, RequiredAssurance, ResourceUri, StdioMode,
+    ActionId, CoreError, ErrorCode, ExecutionContract, OmenError, RequiredAssurance, ResourceUri,
+    StdioMode,
 };
 use omen_engine::{ExecutionRequest, ProcessSupervisor};
 use omen_knowledge::{
@@ -180,10 +181,14 @@ fn load_omen_config(workspace: &Path) -> Result<Option<OmenWorkspaceConfig>, Con
 }
 
 fn print_composition_error(error: impl std::fmt::Display, code: &str) {
-    println!(
-        "{}",
-        serde_json::json!({"error":code,"message":error.to_string(),"state_changed":false,"retryable":false,"next_actions":["action","show"]})
+    let mut envelope = OmenError::from_code(
+        ErrorCode::parse(code).unwrap_or(ErrorCode::Internal),
+        error.to_string(),
     );
+    if ErrorCode::parse(code).is_none() {
+        envelope.details = serde_json::json!({"legacy_code": code});
+    }
+    println!("{}", serde_json::json!({"ok":false,"error":envelope}));
 }
 
 fn bundled_tool_profile(tool_id: &str) -> Result<RuntimeProfile, CoreError> {
@@ -704,10 +709,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     };
                     if plan.plan_digest != expect_plan {
-                        println!(
-                            "{}",
-                            serde_json::json!({"error":"PLAN_CHANGED","expected_plan_digest":expect_plan,"actual_plan_digest":plan.plan_digest,"message":"the current plan differs from --expect-plan; run action plan again","state_changed":false,"retryable":false,"next_actions":["action plan"]})
+                        let mut error = OmenError::from_code(
+                            ErrorCode::PlanChanged,
+                            "the current plan differs from --expect-plan; run action plan again",
                         );
+                        error.details = serde_json::json!({
+                            "expected_plan_digest": expect_plan,
+                            "actual_plan_digest": plan.plan_digest,
+                        });
+                        println!("{}", serde_json::json!({"ok":false,"error":error}));
                         std::process::exit(2);
                     }
                     let authorities = match load_execution_contracts(&execution_contract) {

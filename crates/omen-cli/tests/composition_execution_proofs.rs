@@ -88,7 +88,7 @@ fn real_cli_plan_digest_authority_and_execution_proof() {
         ],
     );
     assert!(!ok);
-    assert_eq!(missing["error"], "AUTHORITY_REQUIRED");
+    assert_eq!(missing["error"]["code"], "AUTHORITY_REQUIRED");
 
     let mismatch_path = workspace.path().join("mismatch.json");
     contract(
@@ -192,9 +192,19 @@ fn stale_plan_refuses_before_authority_or_spawn() {
         ],
     );
     assert!(!ok);
-    assert_eq!(error["error"], "PLAN_CHANGED");
-    assert!(error["expected_plan_digest"].as_str().is_some(), "{error}");
-    assert!(error["actual_plan_digest"].as_str().is_some(), "{error}");
+    assert_eq!(error["error"]["code"], "PLAN_CHANGED");
+    assert!(
+        error["error"]["details"]["expected_plan_digest"]
+            .as_str()
+            .is_some(),
+        "{error}"
+    );
+    assert!(
+        error["error"]["details"]["actual_plan_digest"]
+            .as_str()
+            .is_some(),
+        "{error}"
+    );
 }
 
 #[test]
