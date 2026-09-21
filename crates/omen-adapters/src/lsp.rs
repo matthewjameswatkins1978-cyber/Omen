@@ -639,12 +639,19 @@ impl LspClient {
     }
 
     fn to_file_uri(&self, rel_path: &str) -> String {
-        let full = self.workspace_root.join(rel_path);
-        let path_str = full.to_string_lossy().replace('\\', "/");
-        let path_str = path_str.trim_start_matches('/');
-        format!("file:///{path_str}")
+        file_uri_from_root(&self.workspace_root, rel_path)
     }
+}
 
+fn file_uri_from_root(workspace_root: &Path, rel_path: &str) -> String {
+    let full = workspace_root.join(rel_path);
+    let path_str = full.to_string_lossy().replace('\\', "/");
+    let path_str = path_str.strip_prefix("//?/").unwrap_or(&path_str);
+    let path_str = path_str.trim_start_matches('/');
+    format!("file:///{path_str}")
+}
+
+impl LspClient {
     fn parse_location(&self, val: &Value) -> Option<SourceLocation> {
         let uri_str = val.get("uri").or_else(|| val.get("targetUri"))?.as_str()?;
         let range_val = val.get("range").or_else(|| val.get("targetRange"))?;
@@ -1261,6 +1268,15 @@ mod tests {
         assert_eq!(
             uri_to_rel_path("file:///c:/workspace/fixture/src/lib.rs", &root),
             "src/lib.rs"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn file_uri_from_root_handles_canonical_windows_workspace_prefix() {
+        assert_eq!(
+            file_uri_from_root(Path::new(r"\\?\C:\workspace\fixture"), "src/lib.rs"),
+            "file:///C:/workspace/fixture/src/lib.rs"
         );
     }
 }
