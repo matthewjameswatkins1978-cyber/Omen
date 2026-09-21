@@ -193,7 +193,10 @@ fn payload_digest(binary: &str, fixtures: &std::collections::BTreeMap<String, St
 fn preview_version(root: &Path) -> Result<String, String> {
     let text = fs::read_to_string(root.join("Cargo.toml")).map_err(|e| e.to_string())?;
     text.lines()
-        .find(|l| l.starts_with("version = \"0.8.0-preview."))
+        .find(|l| {
+            l.starts_with("version = \"0.8.0-preview.")
+                || l.starts_with("version = \"0.9.0-preview.")
+        })
         .and_then(|l| l.split('"').nth(1))
         .map(str::to_string)
         .ok_or_else(|| fail("OMEN_PREVIEW_VERSION_INVALID", "workspace version missing"))
@@ -201,6 +204,7 @@ fn preview_version(root: &Path) -> Result<String, String> {
 fn parse_preview(v: &str) -> Result<u32, String> {
     let n = v
         .strip_prefix("0.8.0-preview.")
+        .or_else(|| v.strip_prefix("0.9.0-preview."))
         .ok_or_else(|| fail("OMEN_PREVIEW_VERSION_INVALID", v))?;
     n.parse()
         .map_err(|_| fail("OMEN_PREVIEW_VERSION_INVALID", v))
@@ -438,7 +442,13 @@ fn bump(root: &Path, to: Option<String>) -> Result<(), String> {
         ));
     }
     let old = preview_version(root)?;
-    let next = to.unwrap_or_else(|| format!("0.8.0-preview.{}", parse_preview(&old).unwrap() + 1));
+    let next = to.unwrap_or_else(|| {
+        let base = old
+            .split_once("-preview.")
+            .map(|(base, _)| base)
+            .unwrap_or("0.9.0");
+        format!("{base}-preview.{}", parse_preview(&old).unwrap() + 1)
+    });
     parse_preview(&next)?;
     let text = fs::read_to_string(root.join("Cargo.toml")).map_err(|e| e.to_string())?;
     let replaced = text.replace(&old, &next);
@@ -1113,6 +1123,7 @@ mod tests {
     #[test]
     fn version_increment_is_deterministic() {
         assert_eq!(parse_preview("0.8.0-preview.3").unwrap() + 1, 4);
+        assert_eq!(parse_preview("0.9.0-preview.1").unwrap(), 1);
     }
     #[test]
     fn malformed_version_refused() {
