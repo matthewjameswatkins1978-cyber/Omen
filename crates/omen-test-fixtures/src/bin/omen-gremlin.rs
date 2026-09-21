@@ -36,6 +36,9 @@ struct GremlinArgs {
     spawn_tree: Option<usize>,
 
     #[arg(long)]
+    spawn_tree_delay_ms: Option<u64>,
+
+    #[arg(long)]
     pty_echo: bool,
 
     #[arg(long)]
@@ -132,6 +135,9 @@ fn main() {
     }
 
     if let Some(depth) = args.spawn_tree {
+        if let Some(delay_ms) = args.spawn_tree_delay_ms {
+            thread::sleep(Duration::from_millis(delay_ms));
+        }
         if depth == 0 {
             // Leaf node
         } else {

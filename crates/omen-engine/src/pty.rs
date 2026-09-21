@@ -262,9 +262,10 @@ impl NativePtyHandle {
         };
         use windows_sys::Win32::System::Pipes::CreatePipe;
         use windows_sys::Win32::System::Threading::{
-            CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
-            EXTENDED_STARTUPINFO_PRESENT, InitializeProcThreadAttributeList,
-            LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION,
+            CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
+            DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
+            InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+            PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, ResumeThread,
             STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute,
         };
 
@@ -389,7 +390,7 @@ impl NativePtyHandle {
             (block.as_mut_ptr() as *mut std::ffi::c_void, block)
         };
 
-        let dw_flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT;
+        let dw_flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED;
 
         let job_guard = crate::platform::windows::JobObjectGuard::new().map_err(|e| {
             unsafe {
@@ -444,6 +445,21 @@ impl NativePtyHandle {
             }
             return Err(CoreError::ExecutionFailed(format!(
                 "Failed to assign PTY PID to Job Object: {e}"
+            )));
+        }
+
+        if unsafe { ResumeThread(pi.hThread) } == u32::MAX {
+            unsafe {
+                windows_sys::Win32::System::Threading::TerminateProcess(pi.hProcess, 1);
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+                ClosePseudoConsole(hpcon);
+                CloseHandle(in_write);
+                CloseHandle(out_read);
+            }
+            return Err(CoreError::ExecutionFailed(format!(
+                "Failed to resume contained PTY PID {} after Job Object assignment",
+                pi.dwProcessId
             )));
         }
 

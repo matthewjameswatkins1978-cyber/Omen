@@ -1,12 +1,17 @@
 use std::mem::size_of;
 use std::ptr;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject,
 };
-use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_ALL_ACCESS};
+use windows_sys::Win32::System::Threading::{
+    OpenProcess, OpenThread, PROCESS_ALL_ACCESS, ResumeThread, THREAD_SUSPEND_RESUME,
+};
 
 pub struct JobObjectGuard {
     handle: HANDLE,
@@ -63,6 +68,54 @@ impl JobObjectGuard {
         unsafe {
             TerminateJobObject(self.handle, exit_code);
         }
+    }
+
+    /// Resume the suspended primary thread only after the process is in the Job Object.
+    ///
+    /// The process is created with CREATE_SUSPENDED, so no child code can run while
+    /// this bounded thread lookup establishes the final creation barrier.
+    pub fn resume_primary_thread(&self, pid: u32) -> Result<(), String> {
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(format!(
+                "Failed to snapshot threads for suspended process PID {pid}"
+            ));
+        }
+
+        let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
+        entry.dwSize = size_of::<THREADENTRY32>() as u32;
+        let mut found = None;
+        let first_ok = unsafe { Thread32First(snapshot, &mut entry) } != 0;
+        if first_ok {
+            loop {
+                if entry.th32OwnerProcessID == pid {
+                    found = Some(entry.th32ThreadID);
+                    break;
+                }
+                if unsafe { Thread32Next(snapshot, &mut entry) } == 0 {
+                    break;
+                }
+            }
+        }
+        unsafe { CloseHandle(snapshot) };
+
+        let thread_id = found.ok_or_else(|| {
+            format!("Failed to locate primary thread for suspended process PID {pid}")
+        })?;
+        let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, thread_id) };
+        if thread.is_null() || thread == INVALID_HANDLE_VALUE {
+            return Err(format!(
+                "Failed to open primary thread {thread_id} for process PID {pid}"
+            ));
+        }
+        let result = unsafe { ResumeThread(thread) };
+        unsafe { CloseHandle(thread) };
+        if result == u32::MAX {
+            return Err(format!(
+                "Failed to resume primary thread {thread_id} for process PID {pid}"
+            ));
+        }
+        Ok(())
     }
 }
 

@@ -326,6 +326,107 @@ async fn test_proof_b_process_tree_kill_real_path() {
     }
 }
 
+/// PROOF B2: A descendant created after the supervisor starts is still owned
+/// by the same containment boundary.
+#[tokio::test]
+async fn test_proof_b2_delayed_process_tree_kill_real_path() {
+    let gremlin = gremlin_exe();
+    let supervisor = ProcessSupervisor::new();
+    let req = ExecutionRequest {
+        argv: vec![
+            gremlin.to_string_lossy().to_string(),
+            "--spawn-tree".into(),
+            "1".into(),
+            "--spawn-tree-delay-ms".into(),
+            "100".into(),
+            "--sleep-ms".into(),
+            "60000".into(),
+        ],
+        cwd: std::env::current_dir().unwrap(),
+        env: vec![],
+        stdin_mode: StdioMode::Closed,
+        stdin_payload: None,
+        timeout_ms: 1000,
+        inline_budget: 8192,
+        required_assurance: RequiredAssurance::default(),
+        secrets: vec![],
+    };
+
+    let output = supervisor
+        .execute(req)
+        .await
+        .expect("delayed tree must run to timeout");
+    assert_eq!(output.runtime_status, RuntimeStatus::TimedOut);
+
+    let spawned_pid = String::from_utf8_lossy(&output.stdout_all)
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("TREE_SPAWNED:")
+                .and_then(|pid| pid.parse::<u32>().ok())
+        })
+        .expect("delayed child PID must be reported");
+
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_millis(2000) {
+        if !omen_engine::is_process_alive(spawned_pid) {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("delayed descendant process PID {spawned_pid} survived timeout");
+}
+
+/// PROOF B3: Containment is isolated when two executions overlap.
+#[tokio::test]
+async fn test_proof_b3_concurrent_process_isolation_real_path() {
+    let gremlin = gremlin_exe();
+    let supervisor = ProcessSupervisor::new();
+    let timed_out = ExecutionRequest {
+        argv: vec![
+            gremlin.to_string_lossy().to_string(),
+            "--spawn-tree".into(),
+            "1".into(),
+            "--sleep-ms".into(),
+            "60000".into(),
+        ],
+        cwd: std::env::current_dir().unwrap(),
+        env: vec![],
+        stdin_mode: StdioMode::Closed,
+        stdin_payload: None,
+        timeout_ms: 1000,
+        inline_budget: 8192,
+        required_assurance: RequiredAssurance::default(),
+        secrets: vec![],
+    };
+    let completes = ExecutionRequest {
+        argv: vec![
+            gremlin.to_string_lossy().to_string(),
+            "--stdout".into(),
+            "survivor".into(),
+        ],
+        cwd: std::env::current_dir().unwrap(),
+        env: vec![],
+        stdin_mode: StdioMode::Closed,
+        stdin_payload: None,
+        timeout_ms: 5000,
+        inline_budget: 8192,
+        required_assurance: RequiredAssurance::default(),
+        secrets: vec![],
+    };
+
+    let (timed_out_result, completed_result) =
+        tokio::join!(supervisor.execute(timed_out), supervisor.execute(completes));
+    assert_eq!(
+        timed_out_result
+            .expect("timed-out execution must return")
+            .runtime_status,
+        RuntimeStatus::TimedOut
+    );
+    let completed = completed_result.expect("concurrent execution must return");
+    assert_eq!(completed.runtime_status, RuntimeStatus::Completed);
+    assert!(String::from_utf8_lossy(&completed.stdout_all).contains("survivor"));
+}
+
 /// PROOF C: Fail-Closed Assurance Refusal Before Spawn Real Path
 #[tokio::test]
 async fn test_proof_c_assurance_refusal_real_path() {

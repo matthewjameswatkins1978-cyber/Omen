@@ -376,6 +376,9 @@ impl ExecutionBackend for NativeExecutionBackend {
         cmd.process_group(0);
 
         #[cfg(windows)]
+        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
+
+        #[cfg(windows)]
         let job_guard = crate::platform::windows::JobObjectGuard::new().map_err(|e| {
             CoreError::ExecutionFailed(format!("Job object initialization error: {e}"))
         })?;
@@ -391,6 +394,12 @@ impl ExecutionBackend for NativeExecutionBackend {
             job_guard.assign_pid(p).map_err(|e| {
                 let _ = child.start_kill();
                 CoreError::ExecutionFailed(format!("Failed to assign PID {p} to Job Object: {e}"))
+            })?;
+            job_guard.resume_primary_thread(p).map_err(|e| {
+                let _ = child.start_kill();
+                CoreError::ExecutionFailed(format!(
+                    "Failed to resume contained PID {p} after Job Object assignment: {e}"
+                ))
             })?;
         }
 
