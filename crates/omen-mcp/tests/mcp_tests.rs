@@ -36,13 +36,13 @@ async fn test_mcp_initialize_and_protocol_version() {
             assert_eq!(result.protocol_version, "2024-11-05");
             assert_eq!(result.server_info.name, "omen-mcp");
 
-            // 2. Incompatible protocol version rejection
+            // 2. Malformed protocol version is distinct from negotiation.
             let bad_req = JsonRpcRequest {
                 jsonrpc: "2.0".into(),
                 id: Some(json!(2)),
                 method: "initialize".into(),
                 params: Some(json!({
-                    "protocolVersion": "9999-99-99"
+                    "protocolVersion": "not-a-version"
                 })),
             };
             let bad_resp = server.handle_request(bad_req).await;
@@ -51,8 +51,22 @@ async fn test_mcp_initialize_and_protocol_version() {
                 "Incompatible version must be rejected"
             );
             let err = bad_resp.error.unwrap();
-            assert_eq!(err.code, -32002);
-            assert!(err.message.contains("Unsupported MCP protocol version"));
+            assert_eq!(err.code, -32602);
+            assert!(err.message.contains("Invalid MCP protocol version"));
+
+            // 3. A valid but unsupported revision is counter-offered, not
+            // classified as malformed input.
+            let future_req = JsonRpcRequest {
+                jsonrpc: "2.0".into(),
+                id: Some(json!(3)),
+                method: "initialize".into(),
+                params: Some(json!({"protocolVersion": "2027-01-01"})),
+            };
+            let future_resp = server.handle_request(future_req).await;
+            assert!(future_resp.error.is_none());
+            let future_result: InitializeResult =
+                serde_json::from_value(future_resp.result.unwrap()).unwrap();
+            assert_eq!(future_result.protocol_version, LATEST_MCP_PROTOCOL_VERSION);
         },
     )
     .await;
@@ -453,6 +467,88 @@ async fn test_mcp_persistent_notification_does_not_emit_response() {
                 "omen_symbol_references",
             ] {
                 assert!(names.contains(&name), "missing {name}");
+            }
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mcp_persistent_handshake_supported_versions() {
+    run_with_test_timeout(
+        "test_mcp_persistent_handshake_supported_versions",
+        UNIT_TIMEOUT,
+        |_ctx| async move {
+            for version in SUPPORTED_MCP_HANDSHAKE_VERSIONS {
+                let temp = tempdir().unwrap();
+                let server = McpServer::new(temp.path().to_path_buf(), None);
+                let (client_read, server_write) = tokio::io::duplex(65536);
+                let (server_read, mut client_write) = tokio::io::duplex(65536);
+
+                tokio::spawn(async move {
+                    let _ = server.run_stream(server_read, server_write).await;
+                });
+                let mut client_lines = BufReader::new(client_read).lines();
+
+                client_write
+                    .write_all(
+                        serde_json::to_string(&json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "initialize",
+                            "params": {"protocolVersion": version}
+                        }))
+                        .unwrap()
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                client_write.write_all(b"\n").await.unwrap();
+                client_write.flush().await.unwrap();
+
+                let initialize = client_lines.next_line().await.unwrap().unwrap();
+                let initialize_value: Value = serde_json::from_str(&initialize).unwrap();
+                assert_eq!(initialize_value["id"], 1);
+                assert_eq!(initialize_value["result"]["protocolVersion"], *version);
+
+                client_write
+                    .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+                    .await
+                    .unwrap();
+                client_write.flush().await.unwrap();
+                assert!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_millis(100),
+                        client_lines.next_line()
+                    )
+                    .await
+                    .is_err(),
+                    "notifications must not produce a response for {version}"
+                );
+
+                client_write
+                    .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n")
+                    .await
+                    .unwrap();
+                client_write.flush().await.unwrap();
+                let tools = client_lines.next_line().await.unwrap().unwrap();
+                let tools_value: Value = serde_json::from_str(&tools).unwrap();
+                assert_eq!(tools_value["id"], 2);
+                for name in [
+                    "omen_orient",
+                    "omen_symbol_search",
+                    "omen_symbol_definition",
+                    "omen_symbol_references",
+                ] {
+                    assert!(
+                        tools_value["result"]["tools"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|tool| tool["name"] == name),
+                        "missing {name} for {version}"
+                    );
+                }
             }
         },
     )

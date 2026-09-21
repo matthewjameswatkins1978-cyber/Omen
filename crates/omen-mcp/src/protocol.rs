@@ -1,7 +1,51 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const LATEST_MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+/// Handshake-era revisions that Omen can truthfully speak with its current
+/// initialize/tools/resources subset.  The 2026 stateless lifecycle is
+/// intentionally not part of this authority.
+pub const SUPPORTED_MCP_HANDSHAKE_VERSIONS: &[&str] =
+    &["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
+
+pub const LATEST_MCP_PROTOCOL_VERSION: &str = "2025-11-25";
+
+pub fn is_supported_mcp_handshake_version(version: &str) -> bool {
+    SUPPORTED_MCP_HANDSHAKE_VERSIONS.contains(&version)
+}
+
+/// MCP handshake versions use date-shaped identifiers.  Keep malformed
+/// values distinct from valid-but-unsupported revisions so initialization can
+/// perform protocol negotiation rather than treating every mismatch as bad
+/// input.
+pub fn is_valid_mcp_handshake_version(version: &str) -> bool {
+    let bytes = version.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return false;
+    }
+    if !bytes
+        .iter()
+        .enumerate()
+        .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
+    {
+        return false;
+    }
+
+    let month = version[5..7].parse::<u8>().ok();
+    let day = version[8..10].parse::<u8>().ok();
+    matches!((month, day), (Some(month), Some(day)) if (1..=12).contains(&month) && (1..=31).contains(&day))
+}
+
+pub fn negotiate_mcp_handshake_version(offered: &str) -> &'static str {
+    if is_supported_mcp_handshake_version(offered) {
+        SUPPORTED_MCP_HANDSHAKE_VERSIONS
+            .iter()
+            .copied()
+            .find(|version| *version == offered)
+            .expect("supported MCP version must be in the authority list")
+    } else {
+        LATEST_MCP_PROTOCOL_VERSION
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JsonRpcRequest {

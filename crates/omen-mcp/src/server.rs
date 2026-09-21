@@ -64,23 +64,26 @@ impl McpServer {
     }
 
     async fn handle_initialize(&self, id: Option<Value>, params: Option<Value>) -> JsonRpcResponse {
-        if let Some(p) = params
-            && let Some(ver) = p.get("protocolVersion").and_then(|v| v.as_str())
+        let offered_version = params
+            .as_ref()
+            .and_then(|params| params.get("protocolVersion"))
+            .and_then(Value::as_str);
+        if let Some(offered) = offered_version
+            && !is_valid_mcp_handshake_version(offered)
         {
-            // Section 18: No silent reinterpretation of incompatible requests
-            if ver != LATEST_MCP_PROTOCOL_VERSION && ver != "2024-10-07" {
-                return JsonRpcResponse::error(
-                    id,
-                    -32002,
-                    format!(
-                        "Unsupported MCP protocol version: '{ver}', expected '{LATEST_MCP_PROTOCOL_VERSION}'"
-                    ),
-                );
-            }
+            return JsonRpcResponse::error(
+                id,
+                -32602,
+                format!("Invalid MCP protocol version: '{offered}'"),
+            );
         }
+        let protocol_version = offered_version
+            .map(negotiate_mcp_handshake_version)
+            .unwrap_or(LATEST_MCP_PROTOCOL_VERSION)
+            .to_string();
 
         let result = InitializeResult {
-            protocol_version: LATEST_MCP_PROTOCOL_VERSION.to_string(),
+            protocol_version,
             capabilities: ServerCapabilities {
                 tools: Some(ToolsCapability {
                     list_changed: Some(false),
