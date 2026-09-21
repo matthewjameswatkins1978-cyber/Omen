@@ -13,7 +13,8 @@ pub use registry::{
     DependencyRecord, FactProvenance, FactRecord, FactRegistry, PublishFactRequest,
 };
 pub use workspace::{
-    CANONICAL_DB_FILE_NAME, RequestReceiptRecord, ServiceRecord, WorkspacePersistence,
-    WorkspaceRecord, canonical_workspace_db_path, canonical_workspace_db_path_readonly,
-    deterministic_workspace_id, resolve_workspace_dir, workspace_state_dir_path,
+    CANONICAL_DB_FILE_NAME, LOCAL_EXECUTION_STATUS_FILE_NAME, RequestReceiptRecord, ServiceRecord,
+    WorkspacePersistence, WorkspaceRecord, canonical_workspace_db_path,
+    canonical_workspace_db_path_readonly, deterministic_workspace_id, local_execution_status_path,
+    resolve_workspace_dir, workspace_state_dir_path,
 };

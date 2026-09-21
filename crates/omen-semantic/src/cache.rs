@@ -84,8 +84,8 @@ impl<T: Clone> CachedEntry<T> {
 #[derive(Debug, Default, Clone)]
 pub struct SemanticCache {
     symbols: Arc<Mutex<HashMap<String, CachedEntry<Vec<SymbolRecord>>>>>,
-    definitions: Arc<Mutex<HashMap<String, CachedEntry<SourceLocation>>>>,
-    references: Arc<Mutex<HashMap<String, CachedEntry<Vec<ReferenceRecord>>>>>,
+    definitions: Arc<Mutex<HashMap<SemanticTargetKey, CachedEntry<SourceLocation>>>>,
+    references: Arc<Mutex<HashMap<SemanticTargetKey, CachedEntry<Vec<ReferenceRecord>>>>>,
     workspace_root: PathBuf,
 }
 
@@ -120,44 +120,44 @@ impl SemanticCache {
         Some((entry.value.clone(), validity))
     }
 
-    pub fn insert_definition(
+    pub fn insert_definition<K: Into<SemanticTargetKey>>(
         &self,
-        symbol: &str,
+        key: K,
         loc: SourceLocation,
         witnesses: Vec<SemanticWitness>,
         generation: SemanticGeneration,
     ) {
         let entry = CachedEntry::new(loc, witnesses, generation);
-        self.definitions
-            .lock()
-            .unwrap()
-            .insert(symbol.to_string(), entry);
+        self.definitions.lock().unwrap().insert(key.into(), entry);
     }
 
-    pub fn get_definition(&self, symbol: &str) -> Option<(SourceLocation, ValidityState)> {
+    pub fn get_definition<K: Into<SemanticTargetKey>>(
+        &self,
+        key: K,
+    ) -> Option<(SourceLocation, ValidityState)> {
         let mut map = self.definitions.lock().unwrap();
-        let entry = map.get_mut(symbol)?;
+        let entry = map.get_mut(&key.into())?;
         let validity = entry.check_validity(&self.workspace_root);
         Some((entry.value.clone(), validity))
     }
 
-    pub fn insert_references(
+    pub fn insert_references<K: Into<SemanticTargetKey>>(
         &self,
-        symbol: &str,
+        key: K,
         refs: Vec<ReferenceRecord>,
         witnesses: Vec<SemanticWitness>,
         generation: SemanticGeneration,
     ) {
         let entry = CachedEntry::new(refs, witnesses, generation);
-        self.references
-            .lock()
-            .unwrap()
-            .insert(symbol.to_string(), entry);
+        self.references.lock().unwrap().insert(key.into(), entry);
     }
 
-    pub fn get_references(&self, symbol: &str) -> Option<(Vec<ReferenceRecord>, ValidityState)> {
+    pub fn get_references<K: Into<SemanticTargetKey>>(
+        &self,
+        key: K,
+    ) -> Option<(Vec<ReferenceRecord>, ValidityState)> {
         let mut map = self.references.lock().unwrap();
-        let entry = map.get_mut(symbol)?;
+        let entry = map.get_mut(&key.into())?;
         let validity = entry.check_validity(&self.workspace_root);
         Some((entry.value.clone(), validity))
     }

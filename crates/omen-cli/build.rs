@@ -3,6 +3,9 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/refs/heads");
+    for profile in ["cargo", "git", "ripgrep", "threadmoth"] {
+        println!("cargo:rerun-if-changed=../../profiles/{profile}.toml");
+    }
 
     let output = Command::new("git")
         .args(["rev-parse", "HEAD"])

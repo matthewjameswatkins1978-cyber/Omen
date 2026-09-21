@@ -1,5 +1,5 @@
 use clap::Parser;
-use omen_mcp::McpServer;
+use omen_mcp::{McpServer, validate_workspace};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -19,10 +19,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ws_path = cli
         .workspace
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let ws_path = validate_workspace(&ws_path)?;
 
     let client = omen_client::OmenClient::connect_default(None).await.ok();
     if let Some(ref c) = client {
-        let path_str = ws_path.canonicalize().unwrap_or_else(|_| ws_path.clone());
+        let path_str = ws_path.clone();
         let _ = c
             .attach_workspace(path_str.to_string_lossy().to_string())
             .await;

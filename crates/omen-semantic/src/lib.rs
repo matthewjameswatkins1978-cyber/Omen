@@ -13,6 +13,6 @@ pub use registry::{
 };
 pub use types::{
     DiagnosticSeverity, PackageDependency, PackageRecord, ReferenceRecord, SemanticDiagnostic,
-    SemanticGeneration, SourceLocation, SourceRange, StructuralMatch, SymbolKind, SymbolRecord,
-    TargetRecord, TaskRecord,
+    SemanticGeneration, SemanticHint, SemanticTargetKey, SourceLocation, SourceRange,
+    StructuralMatch, SymbolKind, SymbolRecord, TargetRecord, TaskRecord,
 };

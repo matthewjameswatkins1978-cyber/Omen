@@ -1,6 +1,6 @@
 use omen_adapters::RustAnalyzerProvider;
-use omen_mcp::McpServer;
 use omen_mcp::protocol::*;
+use omen_mcp::{McpServer, validate_workspace};
 use omen_semantic::SemanticProviderRegistry;
 use omen_test_fixtures::{INTEGRATION_TIMEOUT, UNIT_TIMEOUT, run_with_test_timeout};
 use serde_json::{Value, json};
@@ -9,6 +9,51 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::tempdir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+#[test]
+fn test_workspace_validation_rejects_missing_and_files() {
+    let temp = tempdir().unwrap();
+    let valid = validate_workspace(temp.path()).unwrap();
+    assert!(valid.is_absolute());
+
+    let file = temp.path().join("not-a-workspace");
+    fs::write(&file, "file").unwrap();
+    let file_error = validate_workspace(&file).unwrap_err();
+    assert!(file_error.starts_with("WORKSPACE_NOT_FOUND"));
+
+    let missing = temp.path().join("missing");
+    let missing_error = validate_workspace(&missing).unwrap_err();
+    assert!(missing_error.starts_with("WORKSPACE_NOT_FOUND"));
+}
+
+#[tokio::test]
+async fn test_history_reports_unjournalled_local_execution_truthfully() {
+    let temp = tempdir().unwrap();
+    fs::create_dir_all(
+        omen_knowledge::local_execution_status_path(temp.path())
+            .parent()
+            .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        omen_knowledge::local_execution_status_path(temp.path()),
+        r#"{"history_status":"UNJOURNALED_LOCAL_EXECUTION","command":["cargo","check"]}"#,
+    )
+    .unwrap();
+    let server = McpServer::new(temp.path().to_path_buf(), None);
+    let result = server
+        .handle_request(JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(1)),
+            method: "tools/call".into(),
+            params: Some(json!({"name":"omen_history_query","arguments":{}})),
+        })
+        .await;
+    let call: CallToolResult = serde_json::from_value(result.result.unwrap()).unwrap();
+    let value: Value = serde_json::from_str(&call.content[0].text).unwrap();
+    assert_eq!(value["history_status"], "UNJOURNALED_LOCAL_EXECUTION");
+    assert!(value["history"].is_null());
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_initialize_and_protocol_version() {
@@ -692,6 +737,23 @@ async fn call_semantic_mcp_tool(server: &McpServer, name: &str, arguments: Value
     assert_ne!(result.is_error, Some(true), "{name} returned tool error");
     serde_json::from_str(&result.content[0].text).unwrap()
 }
+
+async fn call_semantic_mcp_tool_result(
+    server: &McpServer,
+    name: &str,
+    arguments: Value,
+) -> CallToolResult {
+    let response = server
+        .handle_request(JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(name)),
+            method: "tools/call".into(),
+            params: Some(json!({"name": name, "arguments": arguments})),
+        })
+        .await;
+    assert!(response.error.is_none(), "{name} returned RPC error");
+    serde_json::from_value(response.result.unwrap()).unwrap()
+}
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_public_semantic_surface_finds_rust_function_through_adapter() {
     run_with_test_timeout(
@@ -761,6 +823,32 @@ async fn test_mcp_public_semantic_surface_finds_rust_function_through_adapter() 
                 }),
                 "public references must include the known fixture call site"
             );
+
+            let false_definition = call_semantic_mcp_tool(
+                &server,
+                "omen_symbol_definition",
+                json!({"symbol":"nonexistent_fake_symbol","file":"src/lib.rs","line":0,"col":7}),
+            )
+            .await;
+            assert_ne!(false_definition["resolved"]["file"], "src/lib.rs");
+
+            let false_references = call_semantic_mcp_tool_result(
+                &server,
+                "omen_symbol_references",
+                json!({"symbol":"refresh_token","file":"src/lib.rs","line":4,"col":7}),
+            )
+            .await;
+            assert_eq!(false_references.is_error, Some(true));
+            assert!(false_references.content[0].text.contains("SEMANTIC_HINT_MISMATCH"));
+
+            let partial_hint = call_semantic_mcp_tool_result(
+                &server,
+                "omen_symbol_definition",
+                json!({"symbol":"refresh_token","file":"src/lib.rs","line":0}),
+            )
+            .await;
+            assert_eq!(partial_hint.is_error, Some(true));
+            assert!(partial_hint.content[0].text.contains("SEMANTIC_HINT_INCOMPLETE"));
         },
     )
     .await;

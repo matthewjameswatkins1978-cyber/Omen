@@ -47,6 +47,7 @@ pub fn workspace_state_dir_path(root: &Path) -> PathBuf {
 
 /// Canonical database file name used by all Omen runtimes for a workspace.
 pub const CANONICAL_DB_FILE_NAME: &str = "state.sqlite";
+pub const LOCAL_EXECUTION_STATUS_FILE_NAME: &str = "local-execution-status.json";
 
 /// Resolves the canonical database file path for a workspace.
 pub fn canonical_workspace_db_path(root: &Path) -> PathBuf {
@@ -56,6 +57,12 @@ pub fn canonical_workspace_db_path(root: &Path) -> PathBuf {
 /// Computes the canonical database path without creating state.
 pub fn canonical_workspace_db_path_readonly(root: &Path) -> PathBuf {
     workspace_state_dir_path(root).join(CANONICAL_DB_FILE_NAME)
+}
+
+/// Marker for direct local execution, which is intentionally outside durable
+/// daemon history but must not be mistaken for "nothing executed".
+pub fn local_execution_status_path(root: &Path) -> PathBuf {
+    workspace_state_dir_path(root).join(LOCAL_EXECUTION_STATUS_FILE_NAME)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

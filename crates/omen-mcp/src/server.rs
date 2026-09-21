@@ -3,13 +3,31 @@ use omen_client::OmenClient;
 use omen_core::{InteractiveSessionId, composition, machine_contract};
 use omen_knowledge::{
     ContentAddressedStore, Database, FactRegistry, canonical_workspace_db_path,
-    canonical_workspace_db_path_readonly, resolve_workspace_dir,
+    canonical_workspace_db_path_readonly, local_execution_status_path, resolve_workspace_dir,
 };
 use omen_semantic::SemanticProviderRegistry;
 use serde_json::{Value, json};
 use std::fs;
 use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+/// Validate and canonicalise the workspace before any MCP protocol is served.
+pub fn validate_workspace(path: &std::path::Path) -> Result<PathBuf, String> {
+    let metadata =
+        fs::metadata(path).map_err(|e| format!("WORKSPACE_NOT_FOUND: {} ({e})", path.display()))?;
+    if !metadata.is_dir() {
+        return Err(format!(
+            "WORKSPACE_NOT_FOUND: workspace is not a directory: {}",
+            path.display()
+        ));
+    }
+    path.canonicalize().map_err(|e| {
+        format!(
+            "WORKSPACE_NOT_FOUND: cannot canonicalise {} ({e})",
+            path.display()
+        )
+    })
+}
 
 pub struct McpServer {
     workspace_path: PathBuf,
@@ -245,7 +263,7 @@ impl McpServer {
             },
             ToolDefinition {
                 name: "omen_symbol_definition".into(),
-                description: "Find exact definition location for a symbol across workspace providers.".into(),
+                description: "Find the exact definition for the required symbol. Optional file/line/col hints must be complete together and only disambiguate or validate that symbol; they never override it.".into(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["symbol"],
@@ -259,7 +277,7 @@ impl McpServer {
             },
             ToolDefinition {
                 name: "omen_symbol_references".into(),
-                description: "Find call sites and references to a symbol across workspace providers.".into(),
+                description: "Find references for the required symbol. Optional file/line/col hints must be complete together and only disambiguate or validate that symbol; they never override it.".into(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["symbol"],
@@ -710,12 +728,20 @@ impl McpServer {
             if all {
                 let records = omen_knowledge::ExecutionHistory::list_all_executions(&db, 20)
                     .unwrap_or_default();
-                CallToolResult::text(serde_json::to_string_pretty(&records).unwrap())
+                if records.is_empty() {
+                    local_history_result(&self.workspace_path, records)
+                } else {
+                    CallToolResult::text(serde_json::to_string_pretty(&records).unwrap())
+                }
             } else {
                 let sid = InteractiveSessionId::new(&self.session_id).unwrap();
                 let last = omen_knowledge::ExecutionHistory::get_last_execution(&db, &sid)
                     .unwrap_or_default();
-                CallToolResult::text(serde_json::to_string_pretty(&last).unwrap())
+                if last.is_none() {
+                    local_history_result(&self.workspace_path, last)
+                } else {
+                    CallToolResult::text(serde_json::to_string_pretty(&last).unwrap())
+                }
             }
         } else {
             CallToolResult::error("Failed to open canonical workspace database")
@@ -1055,5 +1081,26 @@ impl McpServer {
     pub async fn run_stdio(&self) -> Result<(), Box<dyn std::error::Error>> {
         self.run_stream(tokio::io::stdin(), tokio::io::stdout())
             .await
+    }
+}
+
+fn local_history_result<T: serde::Serialize>(
+    workspace: &std::path::Path,
+    history: T,
+) -> CallToolResult {
+    let marker = fs::read_to_string(local_execution_status_path(workspace))
+        .ok()
+        .and_then(|content| serde_json::from_str::<Value>(&content).ok());
+    if let Some(marker) = marker {
+        CallToolResult::text(
+            serde_json::to_string_pretty(&json!({
+                "history": history,
+                "history_status": "UNJOURNALED_LOCAL_EXECUTION",
+                "local_execution": marker
+            }))
+            .unwrap(),
+        )
+    } else {
+        CallToolResult::text(serde_json::to_string_pretty(&history).unwrap())
     }
 }

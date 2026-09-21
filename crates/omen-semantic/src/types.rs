@@ -113,6 +113,65 @@ pub struct SourceLocation {
     pub generation: SemanticGeneration,
 }
 
+/// A caller's optional coordinate evidence. Coordinates disambiguate a
+/// requested symbol; they never replace the requested symbol identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SemanticHint {
+    pub file: String,
+    pub line: usize,
+    pub col: usize,
+}
+
+/// Canonical identity used by definition/reference resolution and caches.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SemanticTargetKey {
+    pub symbol: String,
+    pub file: Option<String>,
+    pub start_line: Option<usize>,
+    pub start_col: Option<usize>,
+    pub provider: Option<SemanticProviderId>,
+}
+
+impl SemanticTargetKey {
+    pub fn symbol_only(symbol: impl Into<String>) -> Self {
+        Self {
+            symbol: symbol.into(),
+            file: None,
+            start_line: None,
+            start_col: None,
+            provider: None,
+        }
+    }
+
+    pub fn from_location(symbol: impl Into<String>, location: &SourceLocation) -> Self {
+        Self {
+            symbol: symbol.into(),
+            file: Some(location.file.clone()),
+            start_line: Some(location.range.start_line),
+            start_col: Some(location.range.start_col),
+            provider: Some(location.provider.clone()),
+        }
+    }
+}
+
+impl From<&str> for SemanticTargetKey {
+    fn from(value: &str) -> Self {
+        Self::symbol_only(value)
+    }
+}
+
+impl From<String> for SemanticTargetKey {
+    fn from(value: String) -> Self {
+        Self::symbol_only(value)
+    }
+}
+
+impl From<&SemanticTargetKey> for SemanticTargetKey {
+    fn from(value: &SemanticTargetKey) -> Self {
+        value.clone()
+    }
+}
+
 impl SourceLocation {
     pub fn new(
         file: impl Into<String>,

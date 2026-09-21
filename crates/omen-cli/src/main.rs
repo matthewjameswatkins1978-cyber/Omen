@@ -186,6 +186,33 @@ fn print_composition_error(error: impl std::fmt::Display, code: &str) {
     );
 }
 
+fn bundled_tool_profile(tool_id: &str) -> Result<RuntimeProfile, CoreError> {
+    let content = match tool_id {
+        "cargo" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../profiles/cargo.toml"
+        )),
+        "git" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../profiles/git.toml"
+        )),
+        "ripgrep" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../profiles/ripgrep.toml"
+        )),
+        "threadmoth" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../profiles/threadmoth.toml"
+        )),
+        other => {
+            return Err(CoreError::NotFound(format!(
+                "Unknown tool profile '{other}'"
+            )));
+        }
+    };
+    RuntimeProfile::from_toml_str(content)
+}
+
 fn load_execution_contracts(
     bindings: &[String],
 ) -> Result<std::collections::BTreeMap<String, ExecutionContract>, ConfigLoadError> {
@@ -755,8 +782,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             ToolSubcommands::Inspect { tool_id } => {
-                let profile_path = Path::new("profiles").join(format!("{tool_id}.toml"));
-                let prof = RuntimeProfile::from_file(&profile_path);
+                let prof = bundled_tool_profile(&tool_id);
                 match prof {
                     Ok(p) => {
                         if json_mode {
@@ -774,8 +800,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             ToolSubcommands::Validate { tool_id } => {
-                let profile_path = Path::new("profiles").join(format!("{tool_id}.toml"));
-                let prof = RuntimeProfile::from_file(&profile_path)?;
+                let prof = bundled_tool_profile(&tool_id)?;
                 let binary_path =
                     omen_atlas::find_binary_on_path(&prof.binary_name).ok_or_else(|| {
                         CoreError::NotFound(format!(
@@ -903,9 +928,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
 
+                let command = exec_args.argv.clone();
                 let req = ExecutionRequest {
-                    argv: exec_args.argv,
-                    cwd: ws_root,
+                    argv: command.clone(),
+                    cwd: ws_root.clone(),
                     env: vec![],
                     stdin_mode: StdioMode::Closed,
                     stdin_payload: None,
@@ -922,6 +948,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "text/plain",
                     "omen://execution/direct",
                     omen_core::RetentionClass::Referenced,
+                )?;
+
+                std::fs::write(
+                    omen_knowledge::local_execution_status_path(&ws_root),
+                    serde_json::to_vec_pretty(&serde_json::json!({
+                        "history_status": "UNJOURNALED_LOCAL_EXECUTION",
+                        "command": command,
+                        "exit_code": output.process_exit.code,
+                        "runtime_status": format!("{:?}", output.runtime_status),
+                        "recorded_at_unix_seconds": std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|duration| duration.as_secs())
+                            .unwrap_or_default()
+                    }))?,
                 )?;
 
                 if json_mode {
@@ -1206,9 +1246,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         Some(Commands::Mcp(mcp_args)) => {
             let ws = mcp_args.workspace.unwrap_or(ws_root);
+            let ws = omen_mcp::validate_workspace(&ws)
+                .map_err(|message| std::io::Error::new(std::io::ErrorKind::NotFound, message))?;
             let client = omen_client::OmenClient::connect_default(None).await.ok();
             if let Some(ref c) = client {
-                let path_str = ws.canonicalize().unwrap_or_else(|_| ws.clone());
+                let path_str = ws.clone();
                 let _ = c
                     .attach_workspace(path_str.to_string_lossy().to_string())
                     .await;

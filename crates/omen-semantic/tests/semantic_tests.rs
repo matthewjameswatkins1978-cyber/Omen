@@ -194,3 +194,64 @@ async fn test_ambiguous_symbol_resolution_never_collapses() {
         other => panic!("Expected Ambiguous result, got {:?}", other),
     }
 }
+
+#[test]
+fn semantic_cache_isolates_same_named_targets_in_both_orders() {
+    let tmp = tempdir().unwrap();
+    let cache = SemanticCache::new(tmp.path().to_path_buf());
+    let provider = SemanticProviderId::new("lsp").unwrap();
+    let generation = SemanticGeneration::new(1, 1);
+    let location_a = SourceLocation::new(
+        "src/a.rs",
+        SourceRange::point(2, 4),
+        provider.clone(),
+        generation.clone(),
+    );
+    let location_b =
+        SourceLocation::new("src/b.rs", SourceRange::point(8, 4), provider, generation);
+    let key_a = SemanticTargetKey::from_location("process", &location_a);
+    let key_b = SemanticTargetKey::from_location("process", &location_b);
+    cache.insert_definition(
+        &key_a,
+        location_a.clone(),
+        vec![],
+        location_a.generation.clone(),
+    );
+    cache.insert_definition(
+        &key_b,
+        location_b.clone(),
+        vec![],
+        location_b.generation.clone(),
+    );
+    assert_eq!(cache.get_definition(&key_a).unwrap().0, location_a);
+    assert_eq!(cache.get_definition(&key_b).unwrap().0, location_b);
+
+    let refs_a = vec![ReferenceRecord {
+        symbol_id: SymbolId::new("a_ref").unwrap(),
+        location: location_a.clone(),
+        is_definition: false,
+        is_write: false,
+        snippet: None,
+    }];
+    let refs_b = vec![ReferenceRecord {
+        symbol_id: SymbolId::new("b_ref").unwrap(),
+        location: location_b.clone(),
+        is_definition: false,
+        is_write: false,
+        snippet: None,
+    }];
+    cache.insert_references(
+        &key_b,
+        refs_b.clone(),
+        vec![],
+        location_b.generation.clone(),
+    );
+    cache.insert_references(
+        &key_a,
+        refs_a.clone(),
+        vec![],
+        location_a.generation.clone(),
+    );
+    assert_eq!(cache.get_references(&key_a).unwrap().0, refs_a);
+    assert_eq!(cache.get_references(&key_b).unwrap().0, refs_b);
+}
