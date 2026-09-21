@@ -94,6 +94,7 @@ async fn test_tethers_contract_boundary_execution() {
     let result_wire = ExecutionResultWire {
         schema_version: SCHEMA_VERSION_RESULT.to_string(),
         execution_id: contract.execution_id.to_string(),
+        external_reference: None,
         action_id: ActionId::new("act-1234567890ab").unwrap().to_string(),
         runtime_status: "COMPLETED".to_string(),
         process_exit: omen_schema::ProcessExitWire {
@@ -116,7 +117,7 @@ async fn test_tethers_contract_boundary_execution() {
     // Serialize to JSON and verify structure conforms to wire schema
     let serialized_result =
         serde_json::to_string_pretty(&result_wire).expect("Should serialize result wire");
-    assert!(serialized_result.contains("omen.result/0.2"));
+    assert!(serialized_result.contains("omen.result/0.3"));
     assert!(serialized_result.contains("exec-7f8e9d0a1b2c"));
     assert!(serialized_result.contains("artifact://"));
 

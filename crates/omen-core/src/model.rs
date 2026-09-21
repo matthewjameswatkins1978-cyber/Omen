@@ -119,6 +119,9 @@ pub struct EnforcementReport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionResult {
     pub execution_id: ExecutionId,
+    /// Identity supplied by an upstream authority or caller, when present.
+    /// This never names Omen's physical execution record.
+    pub external_reference: Option<String>,
     pub action_id: ActionId,
     pub runtime_status: RuntimeStatus,
     pub process_exit: ProcessExit,

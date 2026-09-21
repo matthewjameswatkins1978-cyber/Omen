@@ -406,6 +406,11 @@ impl DaemonServer {
                 timeout_ms,
                 consequential_request_id,
             } => {
+                if let Some(ref request_id) = consequential_request_id
+                    && let Err(message) = validate_consequential_request_id(request_id)
+                {
+                    return IpcResponse::err(req_id, LocalIpcError::MalformedRequest(message));
+                }
                 let current = attached_workspace.read().await;
                 match &*current {
                     Some(ws) => {
@@ -602,5 +607,35 @@ impl DaemonServer {
             Ok(payload) => IpcResponse::ok(req_id, payload),
             Err(error) => IpcResponse::err(req_id, error),
         }
+    }
+}
+
+const MAX_CONSEQUENTIAL_REQUEST_ID_BYTES: usize = 256;
+
+fn validate_consequential_request_id(value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err("consequential_request_id cannot be empty".into());
+    }
+    if value.len() > MAX_CONSEQUENTIAL_REQUEST_ID_BYTES {
+        return Err(format!(
+            "consequential_request_id exceeds {MAX_CONSEQUENTIAL_REQUEST_ID_BYTES} bytes"
+        ));
+    }
+    if value.chars().any(char::is_control) {
+        return Err("consequential_request_id contains control characters".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::validate_consequential_request_id;
+
+    #[test]
+    fn request_id_validation_is_bounded_and_machine_safe() {
+        assert!(validate_consequential_request_id("req-1").is_ok());
+        assert!(validate_consequential_request_id("").is_err());
+        assert!(validate_consequential_request_id("req\n1").is_err());
+        assert!(validate_consequential_request_id(&"x".repeat(257)).is_err());
     }
 }

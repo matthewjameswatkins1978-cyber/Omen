@@ -77,6 +77,15 @@ impl InteractiveSessionId {
     }
 }
 
+impl ExecutionId {
+    /// Mints the opaque canonical identity for one physical Omen execution.
+    /// Callers may supply request or external-reference values, but they never
+    /// choose this identity.
+    pub fn generate() -> Self {
+        Self(format!("exec_{}", uuid::Uuid::new_v4()))
+    }
+}
+
 impl PtySessionId {
     /// Generates a genuinely unique opaque PTY session ID using UUID v4.
     pub fn generate() -> Self {

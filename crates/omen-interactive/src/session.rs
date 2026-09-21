@@ -5,7 +5,6 @@ use omen_engine::{ExecutionRequest, ProcessSupervisor};
 use omen_knowledge::Database;
 use omen_ui::TerminalCapabilities;
 use reedline::{DefaultValidator, MenuBuilder, Reedline, Signal};
-use sha2::Digest;
 use std::path::PathBuf;
 
 pub struct InteractiveSession {
@@ -485,17 +484,7 @@ impl InteractiveSession {
                         }
                     } else if let Some(db_ref) = &mut self.db {
                         let now = chrono::Utc::now().to_rfc3339();
-                        let exec_id = omen_core::ExecutionId::new(format!(
-                            "exec-{}",
-                            &hex::encode(sha2::Sha256::digest(
-                                format!(
-                                    "{}-{:?}",
-                                    resolved_argv.join(" "),
-                                    std::time::SystemTime::now()
-                                )
-                                .as_bytes()
-                            ))[..12]
-                        ))?;
+                        let exec_id = omen_core::ExecutionId::generate();
                         let exec_rec = omen_knowledge::ExecutionRecord {
                             execution_id: exec_id,
                             session_id: self.session_id.clone(),
@@ -600,17 +589,7 @@ impl InteractiveSession {
                     )
                 );
 
-                let exec_id = omen_core::ExecutionId::new(format!(
-                    "exec-{}",
-                    &hex::encode(sha2::Sha256::digest(
-                        format!(
-                            "{}-{:?}",
-                            resolved_argv.join(" "),
-                            std::time::SystemTime::now()
-                        )
-                        .as_bytes()
-                    ))[..12]
-                ))?;
+                let exec_id = omen_core::ExecutionId::generate();
 
                 // Compute CAS artifacts and record execution in subordinate physical history
                 let cas_dir =
@@ -960,12 +939,7 @@ impl InteractiveSession {
             )
         );
 
-        let exec_id = omen_core::ExecutionId::new(format!(
-            "exec-{}",
-            &hex::encode(sha2::Sha256::digest(
-                format!("{}-{:?}", full_argv.join(" "), std::time::SystemTime::now()).as_bytes()
-            ))[..12]
-        ))?;
+        let exec_id = omen_core::ExecutionId::generate();
 
         let cas_dir = omen_knowledge::resolve_workspace_dir(&self.workspace_root).join("cas");
         let cas = omen_knowledge::ContentAddressedStore::new(cas_dir);

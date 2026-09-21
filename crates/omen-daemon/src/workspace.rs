@@ -782,7 +782,7 @@ impl WorkspaceState {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn record_history_with_id(
+    async fn record_history_with_id(
         &self,
         custom_execution_id: Option<ExecutionId>,
         session_id: &str,
@@ -796,8 +796,8 @@ impl WorkspaceState {
             let s = id.to_string();
             (id, s)
         } else {
-            let s = format!("exec_{}", uuid::Uuid::new_v4());
-            let id = ExecutionId::new(&s)?;
+            let id = ExecutionId::generate();
+            let s = id.to_string();
             (id, s)
         };
         let session_id_typed = InteractiveSessionId::new(session_id)?;
@@ -915,9 +915,8 @@ impl WorkspaceState {
             };
         }
 
-        let exec_id_str = format!("exec_{}", uuid::Uuid::new_v4());
-        let execution_id = ExecutionId::new(&exec_id_str)
-            .map_err(|e| LocalIpcError::InternalRuntimeError(e.to_string()))?;
+        let execution_id = ExecutionId::generate();
+        let exec_id_str = execution_id.to_string();
 
         // 4. Mark Running in SQLite receipt with the canonical execution_id
         self.record_request_receipt(dedup_id, Some(&exec_id_str), "Running")

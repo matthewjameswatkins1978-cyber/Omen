@@ -997,7 +997,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )?;
 
                 let result = omen_core::ExecutionResult {
-                    execution_id: contract.execution_id.clone(),
+                    execution_id: omen_core::ExecutionId::generate(),
+                    external_reference: Some(contract.execution_id.to_string()),
                     action_id: ActionId::new("act-execution-result").unwrap(),
                     runtime_status: output.runtime_status,
                     process_exit: output.process_exit.clone(),

@@ -187,7 +187,7 @@ impl McpServer {
             },
             ToolDefinition {
                 name: "omen_execute".into(),
-                description: "Submit execution through Omen shared daemon broker. Executes physical work and records structured evidence.".into(),
+                description: "Submit execution through Omen shared daemon broker. Omen mints execution_id; physical work and structured evidence are recorded.".into(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["argv"],
@@ -202,12 +202,12 @@ impl McpServer {
             },
             ToolDefinition {
                 name: "omen_execution_status".into(),
-                description: "Query status of an execution by consequential request receipt ID or execution ID.".into(),
+                description: "Query status by the bounded consequential request idempotency key; the result returns Omen's canonical execution_id.".into(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["request_id"],
                     "properties": {
-                        "request_id": { "type": "string", "description": "Consequential request ID" }
+                        "request_id": { "type": "string", "maxLength": 256, "description": "Caller-owned idempotency key, not an Omen execution_id" }
                     }
                 }),
             },
@@ -712,7 +712,7 @@ impl McpServer {
                     };
 
                     let out = json!({
-                        "execution_id": format!("exec-local-{}", &uuid::Uuid::new_v4().to_string()[..8]),
+                        "execution_id": omen_core::ExecutionId::generate(),
                         "runtime_status": output.runtime_status,
                         "exit_code": output.process_exit.code,
                         "duration_ms": output.duration_ms,

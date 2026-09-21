@@ -5,7 +5,7 @@ use omen_core::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION_RESULT: &str = "omen.result/0.2";
+pub const SCHEMA_VERSION_RESULT: &str = "omen.result/0.3";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(deny_unknown_fields)]
@@ -30,6 +30,8 @@ pub struct EnforcementReportWire {
 pub struct ExecutionResultWire {
     pub schema_version: String,
     pub execution_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_reference: Option<String>,
     pub action_id: String,
     pub runtime_status: String,
     pub process_exit: ProcessExitWire,
@@ -114,6 +116,7 @@ impl TryFrom<ExecutionResultWire> for ExecutionResult {
 
         Ok(ExecutionResult {
             execution_id,
+            external_reference: wire.external_reference,
             action_id,
             runtime_status,
             process_exit: ProcessExit {
@@ -135,6 +138,7 @@ impl From<&ExecutionResult> for ExecutionResultWire {
         Self {
             schema_version: SCHEMA_VERSION_RESULT.into(),
             execution_id: domain.execution_id.as_str().into(),
+            external_reference: domain.external_reference.clone(),
             action_id: domain.action_id.as_str().into(),
             runtime_status: format!("{:?}", domain.runtime_status).to_uppercase(),
             process_exit: ProcessExitWire {

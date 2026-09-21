@@ -58,6 +58,7 @@ fn roundtrip_execution_contract() {
 fn roundtrip_execution_result() {
     let result = ExecutionResult {
         execution_id: ExecutionId::new("tethers://exec/01K9F82A").unwrap(),
+        external_reference: None,
         action_id: ActionId::new("omen://action/01K9F82B").unwrap(),
         runtime_status: RuntimeStatus::Completed,
         process_exit: ProcessExit {

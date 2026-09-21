@@ -247,7 +247,7 @@ pub fn contract() -> MachineContract {
         CapabilityDefinition {
             id: "execution.run".into(),
             group: "execution".into(),
-            summary: "Run an explicitly supplied argv under an execution contract.".into(),
+            summary: "Run an explicitly supplied argv under an execution contract; Omen mints the physical execution_id.".into(),
             input_schema: object_schema(
                 json!({"argv":{"type":"array","minItems":1,"maxItems":64,"items":{"type":"string"}}}),
                 &["argv"],
@@ -260,7 +260,7 @@ pub fn contract() -> MachineContract {
             authority: "Tethers admission".into(),
             bounds: "bounded output and timeout".into(),
             timeout: "caller supplied timeout".into(),
-            examples: vec![json!({"argv":["cargo","check"]})],
+            examples: vec![json!({"argv":["cargo","check"],"result_identity":"Omen-generated execution_id; upstream references remain external_reference"})],
         },
         CapabilityDefinition {
             id: "mutation.threadmoth".into(),
