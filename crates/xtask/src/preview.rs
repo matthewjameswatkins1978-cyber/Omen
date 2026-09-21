@@ -821,7 +821,7 @@ fn prove(_root: &Path, mcp_protocol: &str) -> Result<(), String> {
     let definition_json: serde_json::Value = serde_json::from_str(&definition_text)
         .map_err(|e| fail("OMEN_SEMANTIC_PROOF_FAILED", e))?;
     if definition_json
-        .pointer("/resolved/file")
+        .pointer("/data/resolved/file")
         .and_then(|v| v.as_str())
         != Some("src/lib.rs")
     {
@@ -833,11 +833,11 @@ fn prove(_root: &Path, mcp_protocol: &str) -> Result<(), String> {
     let references_json: serde_json::Value = serde_json::from_str(&references_text)
         .map_err(|e| fail("OMEN_SEMANTIC_PROOF_FAILED", e))?;
     let definition_line = definition_json
-        .pointer("/resolved/range/start_line")
+        .pointer("/data/resolved/range/start_line")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
     if !references_json
-        .pointer("/resolved")
+        .pointer("/data/references")
         .and_then(|v| v.as_array())
         .map(|a| {
             a.iter().any(|r| {
