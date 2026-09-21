@@ -955,3 +955,155 @@ async fn test_mcp_public_semantic_surface_finds_rust_function_through_adapter() 
     )
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mcp_semantic_coverage_preserves_unsupported_targets() {
+    run_with_test_timeout(
+        "test_mcp_semantic_coverage_preserves_unsupported_targets",
+        INTEGRATION_TIMEOUT,
+        |_ctx| async move {
+            let supported = tempdir().unwrap();
+            fs::create_dir_all(supported.path().join("src")).unwrap();
+            fs::write(
+                supported.path().join("Cargo.toml"),
+                "[package]\nname = \"omen-mcp-supported\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .unwrap();
+            fs::write(
+                supported.path().join("src/lib.rs"),
+                "pub fn supported_symbol() -> &'static str { \"ok\" }\n",
+            )
+            .unwrap();
+
+            let mut supported_registry = SemanticProviderRegistry::new(supported.path().into());
+            supported_registry.register(Arc::new(RustAnalyzerProvider::with_binary_args(
+                supported.path().into(),
+                semantic_gremlin_exe(),
+                vec!["--lsp-mode".into(), "semantic-filtered".into()],
+            )));
+            let supported_server = McpServer::with_semantic_registry(
+                supported.path().into(),
+                None,
+                Arc::new(supported_registry),
+            );
+            let absent = call_semantic_mcp_tool(
+                &supported_server,
+                "omen_symbol_search",
+                json!({"query":"definitely_absent_symbol"}),
+            )
+            .await;
+            assert!(absent.is_array(), "supported-only search must remain an array");
+            assert!(absent.as_array().unwrap().is_empty());
+
+            let mixed = tempdir().unwrap();
+            fs::create_dir_all(mixed.path().join("src")).unwrap();
+            fs::write(
+                mixed.path().join("Cargo.toml"),
+                "[package]\nname = \"omen-mcp-mixed\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .unwrap();
+            fs::write(mixed.path().join("src/lib.rs"), "pub fn supported_symbol() {}\n").unwrap();
+            fs::write(
+                mixed.path().join("src/unsupported.xyz"),
+                "DEFINE FUNCTION xyz_function() { return 42; }\n",
+            )
+            .unwrap();
+
+            let mut mixed_registry = SemanticProviderRegistry::new(mixed.path().into());
+            mixed_registry.register(Arc::new(RustAnalyzerProvider::with_binary_args(
+                mixed.path().into(),
+                semantic_gremlin_exe(),
+                vec!["--lsp-mode".into(), "semantic-filtered".into()],
+            )));
+            let mixed_server = McpServer::with_semantic_registry(
+                mixed.path().into(),
+                None,
+                Arc::new(mixed_registry),
+            );
+
+            let search = call_semantic_mcp_tool(
+                &mixed_server,
+                "omen_symbol_search",
+                json!({"query":"xyz_function"}),
+            )
+            .await;
+            assert_eq!(search["matches"], json!([]));
+            assert_eq!(search["coverage"], "partial_supported_resources");
+            assert!(search["unsupported_resource_count"].as_u64().unwrap() >= 1);
+
+            for tool in ["omen_symbol_definition", "omen_symbol_references"] {
+                let result = call_semantic_mcp_tool(
+                    &mixed_server,
+                    tool,
+                    json!({"symbol":"xyz_function","file":"src/unsupported.xyz","line":0,"col":0}),
+                )
+                .await;
+                assert_eq!(result, json!("unsupported"), "{tool} must preserve UNSUPPORTED");
+            }
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mcp_provider_failure_does_not_become_not_found_and_recovers() {
+    run_with_test_timeout(
+        "test_mcp_provider_failure_does_not_become_not_found_and_recovers",
+        INTEGRATION_TIMEOUT,
+        |_ctx| async move {
+            let temp = tempdir().unwrap();
+            fs::create_dir_all(temp.path().join("src")).unwrap();
+            fs::write(
+                temp.path().join("Cargo.toml"),
+                "[package]\nname = \"omen-mcp-provider-failure\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .unwrap();
+            fs::write(
+                temp.path().join("src/lib.rs"),
+                "pub fn refresh_token() -> &'static str { \"token\" }\n",
+            )
+            .unwrap();
+
+            let mut failed_registry = SemanticProviderRegistry::new(temp.path().into());
+            failed_registry.register(Arc::new(RustAnalyzerProvider::with_binary_args(
+                temp.path().into(),
+                semantic_gremlin_exe(),
+                vec!["--lsp-mode".into(), "exit-before-ready".into()],
+            )));
+            let failed_server = McpServer::with_semantic_registry(
+                temp.path().into(),
+                None,
+                Arc::new(failed_registry),
+            );
+            let failure = call_semantic_mcp_tool_result(
+                &failed_server,
+                "omen_symbol_definition",
+                json!({"symbol":"refresh_token"}),
+            )
+            .await;
+            assert_eq!(failure.is_error, Some(true));
+            assert!(failure.content[0].text.contains("provider"));
+            assert!(!failure.content[0].text.contains("not_found"));
+
+            let mut recovered_registry = SemanticProviderRegistry::new(temp.path().into());
+            recovered_registry.register(Arc::new(RustAnalyzerProvider::with_binary_args(
+                temp.path().into(),
+                semantic_gremlin_exe(),
+                vec!["--lsp-mode".into(), "semantic-filtered".into()],
+            )));
+            let recovered_server = McpServer::with_semantic_registry(
+                temp.path().into(),
+                None,
+                Arc::new(recovered_registry),
+            );
+            let recovered = call_semantic_mcp_tool(
+                &recovered_server,
+                "omen_symbol_definition",
+                json!({"symbol":"refresh_token"}),
+            )
+            .await;
+            assert_eq!(recovered["resolved"]["file"], "src/lib.rs");
+        },
+    )
+    .await;
+}

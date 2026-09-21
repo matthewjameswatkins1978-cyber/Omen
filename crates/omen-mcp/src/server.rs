@@ -867,7 +867,21 @@ impl McpServer {
             .map(|n| n as usize);
         let reg = self.build_registry();
         match reg.symbol_search(query, limit, None).await {
-            Ok(symbols) => CallToolResult::text(serde_json::to_string_pretty(&symbols).unwrap()),
+            Ok(symbols) => {
+                let coverage = reg.workspace_coverage();
+                if coverage.unsupported_resource_count == 0 {
+                    CallToolResult::text(serde_json::to_string_pretty(&symbols).unwrap())
+                } else {
+                    CallToolResult::text(
+                        serde_json::to_string_pretty(&json!({
+                            "matches": symbols,
+                            "coverage": coverage.mode,
+                            "unsupported_resource_count": coverage.unsupported_resource_count,
+                        }))
+                        .unwrap(),
+                    )
+                }
+            }
             Err(e) => CallToolResult::error(format!("Symbol search failed: {e}")),
         }
     }

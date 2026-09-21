@@ -9,7 +9,7 @@ pub use provider::{
 };
 pub use registry::{
     DEFAULT_LIVE_SEMANTIC_TIMEOUT, DEFAULT_RESULT_LIMIT, DEFAULT_SEMANTIC_TIMEOUT,
-    SemanticProviderRegistry,
+    SemanticProviderRegistry, WorkspaceCoverage,
 };
 pub use types::{
     DiagnosticSeverity, PackageDependency, PackageRecord, ReferenceRecord, SemanticDiagnostic,

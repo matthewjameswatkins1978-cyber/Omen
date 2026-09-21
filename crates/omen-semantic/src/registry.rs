@@ -13,6 +13,12 @@ pub const DEFAULT_SEMANTIC_TIMEOUT: Duration = Duration::from_millis(3000);
 pub const DEFAULT_LIVE_SEMANTIC_TIMEOUT: Duration = Duration::from_millis(40000);
 pub const DEFAULT_RESULT_LIMIT: usize = 50;
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkspaceCoverage {
+    pub mode: String,
+    pub unsupported_resource_count: usize,
+}
+
 fn provider_timeout(kind: ProviderKind, explicit: Option<Duration>) -> Duration {
     explicit.unwrap_or(match kind {
         ProviderKind::Live => DEFAULT_LIVE_SEMANTIC_TIMEOUT,
@@ -28,6 +34,40 @@ pub struct SemanticProviderRegistry {
     cache: SemanticCache,
     workspace_root: PathBuf,
     workspace_generation: std::sync::atomic::AtomicU64,
+    coverage_cache: std::sync::Mutex<Option<WorkspaceCoverage>>,
+}
+
+fn is_source_like_file(path: &Path) -> bool {
+    let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    !matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "toml" | "json" | "lock" | "md" | "txt" | "yaml" | "yml" | "xml" | "csv"
+    )
+}
+
+fn collect_source_like_files(root: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            if matches!(
+                path.file_name().and_then(|name| name.to_str()),
+                Some(".git" | "target" | "node_modules" | ".omen")
+            ) {
+                continue;
+            }
+            collect_source_like_files(&path, files);
+        } else if file_type.is_file() && is_source_like_file(&path) {
+            files.push(path);
+        }
+    }
 }
 
 fn validate_hint(
@@ -132,6 +172,7 @@ impl SemanticProviderRegistry {
             cache,
             workspace_root,
             workspace_generation: std::sync::atomic::AtomicU64::new(1),
+            coverage_cache: std::sync::Mutex::new(None),
         }
     }
 
@@ -162,6 +203,9 @@ impl SemanticProviderRegistry {
     }
 
     pub fn bump_workspace_generation(&self) -> u64 {
+        if let Ok(mut coverage) = self.coverage_cache.lock() {
+            *coverage = None;
+        }
         self.workspace_generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             + 1
@@ -172,6 +216,75 @@ impl SemanticProviderRegistry {
             .workspace_generation
             .load(std::sync::atomic::Ordering::SeqCst);
         SemanticGeneration::new(generation, 1)
+    }
+
+    pub fn workspace_coverage(&self) -> WorkspaceCoverage {
+        if let Ok(coverage) = self.coverage_cache.lock()
+            && let Some(coverage) = coverage.as_ref()
+        {
+            return coverage.clone();
+        }
+        let mut files = Vec::new();
+        collect_source_like_files(&self.workspace_root, &mut files);
+        let unsupported_resource_count = files
+            .iter()
+            .filter(|path| {
+                let resource = path
+                    .strip_prefix(&self.workspace_root)
+                    .unwrap_or(path)
+                    .to_string_lossy();
+                !self.providers.iter().any(|provider| {
+                    provider.capabilities().symbol_search
+                        && provider.is_available()
+                        && provider.supports_resource(&resource)
+                })
+            })
+            .count();
+        let coverage = WorkspaceCoverage {
+            mode: if unsupported_resource_count == 0 {
+                "complete_supported_resources".into()
+            } else {
+                "partial_supported_resources".into()
+            },
+            unsupported_resource_count,
+        };
+        if let Ok(mut cached) = self.coverage_cache.lock() {
+            *cached = Some(coverage.clone());
+        }
+        coverage
+    }
+
+    fn explicit_target_support(
+        &self,
+        hint: Option<&SemanticHint>,
+        operation: &str,
+    ) -> Result<bool, CoreError> {
+        let Some(hint) = hint else {
+            return Ok(true);
+        };
+        if self.providers.iter().any(|provider| {
+            provider.is_available()
+                && provider.supports_resource(&hint.file)
+                && match operation {
+                    "definition" => provider.capabilities().definition,
+                    "references" => provider.capabilities().references,
+                    _ => false,
+                }
+        }) {
+            return Ok(true);
+        }
+        let extension = Path::new(&hint.file)
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if extension == "rs" {
+            return Err(CoreError::ExecutionFailed(format!(
+                "SEMANTIC_PROVIDER_UNAVAILABLE: no available provider supports {operation} for '{}'",
+                hint.file
+            )));
+        }
+        Ok(false)
     }
 
     /// Searches for symbols across active providers following hierarchy:
@@ -260,6 +373,9 @@ impl SemanticProviderRegistry {
     ) -> Result<SemanticLookupResult<SourceLocation>, CoreError> {
         let timeout_duration = timeout.unwrap_or(DEFAULT_SEMANTIC_TIMEOUT);
         let hint = validate_hint(&self.workspace_root, file, line, col)?;
+        if hint.is_some() && !self.explicit_target_support(hint.as_ref(), "definition")? {
+            return Ok(SemanticLookupResult::Unsupported);
+        }
 
         // 1. Try Live LSP
         for p in self
@@ -379,6 +495,9 @@ impl SemanticProviderRegistry {
         let limit = limit.unwrap_or(DEFAULT_RESULT_LIMIT);
         let timeout_duration = timeout.unwrap_or(DEFAULT_SEMANTIC_TIMEOUT);
         let hint = validate_hint(&self.workspace_root, file, line, col)?;
+        if hint.is_some() && !self.explicit_target_support(hint.as_ref(), "references")? {
+            return Ok(SemanticLookupResult::Unsupported);
+        }
 
         // 1. Try Live LSP
         for p in self

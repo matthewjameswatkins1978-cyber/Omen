@@ -97,6 +97,14 @@ pub trait SemanticProvider: Send + Sync {
     fn capabilities(&self) -> ProviderCapabilities;
     fn is_available(&self) -> bool;
 
+    /// Whether this provider can answer semantic questions for a resource.
+    ///
+    /// Providers that do not expose a language/resource boundary leave this
+    /// false so the registry cannot turn an unsupported target into NOT_FOUND.
+    fn supports_resource(&self, _resource: &str) -> bool {
+        false
+    }
+
     fn symbol_search<'a>(
         &'a self,
         _query: &'a str,

@@ -236,6 +236,13 @@ impl SemanticProvider for ScipProvider {
         self.index_path.exists()
     }
 
+    fn supports_resource(&self, resource: &str) -> bool {
+        std::path::Path::new(resource)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("rs"))
+    }
+
     fn symbol_search<'a>(
         &'a self,
         query: &'a str,
