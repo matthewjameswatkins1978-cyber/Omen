@@ -130,6 +130,12 @@ async fn test_cache_and_witness_invalidation() {
     // 3. Subsequent lookup: witness hash changed -> transitions to DIRTY
     let (_, validity_after) = cache.get_symbols("refresh_token").unwrap();
     assert_eq!(validity_after, ValidityState::Dirty);
+
+    // Deletion is a consequential mutation too: a cached symbol may not
+    // remain CURRENT merely because its witness disappeared.
+    fs::remove_file(&auth_file).unwrap();
+    let (_, validity_after_delete) = cache.get_symbols("refresh_token").unwrap();
+    assert_eq!(validity_after_delete, ValidityState::Dirty);
 }
 
 #[tokio::test]

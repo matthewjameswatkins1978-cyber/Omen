@@ -5,6 +5,7 @@ use omen_semantic::provider::{
 };
 use omen_semantic::types::*;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -88,6 +89,41 @@ fn workspace_symbol_all_params(query: &str, filtered_search_supported: bool) -> 
     }
 }
 
+fn scan_rust_files(root: &Path) -> HashMap<String, String> {
+    fn visit(root: &Path, dir: &Path, files: &mut HashMap<String, String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                visit(root, &path, files);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let Ok(relative) = path.strip_prefix(root) else {
+                continue;
+            };
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            let mut hasher = Sha256::new();
+            hasher.update(bytes);
+            files.insert(relative, hex::encode(hasher.finalize()));
+        }
+    }
+
+    let mut files = HashMap::new();
+    let source = root.join("src");
+    if source.exists() {
+        visit(root, &source, &mut files);
+    }
+    files
+}
+
 /// Real JSON-RPC stdio LSP client with request correlation, bounded timeouts, and cancellation.
 pub struct LspClient {
     child: Option<Child>,
@@ -101,6 +137,7 @@ pub struct LspClient {
     generation: SemanticGeneration,
     workspace_symbol_scope_kind_filtering: bool,
     server_status: watch::Receiver<Option<LspServerStatus>>,
+    known_rust_files: HashMap<String, String>,
 }
 
 impl LspClient {
@@ -231,6 +268,7 @@ impl LspClient {
             generation: SemanticGeneration::new(1, 1),
             workspace_symbol_scope_kind_filtering: false,
             server_status: server_status_rx,
+            known_rust_files: HashMap::new(),
         })
     }
 
@@ -384,11 +422,20 @@ impl LspClient {
         self.workspace_symbol_scope_kind_filtering =
             initialize_supports_workspace_symbol_scope_kind_filtering(&initialize_result);
         self.send_notification("initialized", json!({})).await?;
-        self.wait_for_readiness(readiness_timeout).await
+        self.wait_for_readiness(readiness_timeout).await?;
+        self.known_rust_files = scan_rust_files(&self.workspace_root);
+        Ok(())
     }
 
     fn latest_server_status(&self) -> Option<LspServerStatus> {
         self.server_status.borrow().clone()
+    }
+
+    fn has_deleted_workspace_files(&self) -> bool {
+        let current = scan_rust_files(&self.workspace_root);
+        self.known_rust_files
+            .keys()
+            .any(|path| !current.contains_key(path))
     }
 
     async fn wait_for_readiness(&mut self, deadline: Duration) -> Result<(), CoreError> {
@@ -470,9 +517,70 @@ impl LspClient {
         query: &str,
         timeout_duration: Duration,
     ) -> Result<Vec<SymbolRecord>, CoreError> {
+        self.synchronize_workspace_files().await?;
         let params = workspace_symbol_all_params(query, self.workspace_symbol_scope_kind_filtering);
         self.workspace_symbol_with_params(params, timeout_duration)
             .await
+    }
+
+    async fn synchronize_workspace_files(&mut self) -> Result<(), CoreError> {
+        let current = scan_rust_files(&self.workspace_root);
+        let deleted: Vec<String> = self
+            .known_rust_files
+            .keys()
+            .filter(|path| !current.contains_key(*path))
+            .cloned()
+            .collect();
+
+        if !deleted.is_empty() {
+            let files = deleted
+                .iter()
+                .map(|path| json!({ "uri": self.to_file_uri(path) }))
+                .collect::<Vec<_>>();
+            self.send_notification("workspace/didDeleteFiles", json!({ "files": files }))
+                .await?;
+        }
+
+        let added: Vec<String> = current
+            .keys()
+            .filter(|path| !self.known_rust_files.contains_key(*path))
+            .cloned()
+            .collect();
+        if !added.is_empty() {
+            let files = added
+                .iter()
+                .map(|path| json!({ "uri": self.to_file_uri(path) }))
+                .collect::<Vec<_>>();
+            self.send_notification("workspace/didCreateFiles", json!({ "files": files }))
+                .await?;
+        }
+
+        let changed: Vec<String> = current
+            .keys()
+            .filter(|path| {
+                self.known_rust_files
+                    .get(*path)
+                    .is_some_and(|previous| previous != current.get(*path).unwrap())
+            })
+            .cloned()
+            .collect();
+        for path in changed {
+            if let Ok(text) = std::fs::read_to_string(self.workspace_root.join(&path)) {
+                self.send_notification(
+                    "textDocument/didChange",
+                    json!({
+                        "textDocument": { "uri": self.to_file_uri(&path), "version": 2 },
+                        "contentChanges": [{ "text": text }]
+                    }),
+                )
+                .await?;
+            }
+        }
+        for path in added {
+            self.did_open_file(&path).await?;
+        }
+        self.known_rust_files = current;
+        Ok(())
     }
 
     pub async fn did_open_file(&mut self, file: &str) -> Result<(), CoreError> {
@@ -1010,6 +1118,24 @@ impl RustAnalyzerProvider {
         Ok(guard)
     }
 
+    async fn get_or_refresh_client(
+        &self,
+    ) -> Result<tokio::sync::MutexGuard<'_, Option<LspClient>>, CoreError> {
+        let mut guard = self.get_or_start_client().await?;
+        if guard
+            .as_ref()
+            .is_some_and(LspClient::has_deleted_workspace_files)
+        {
+            // rust-analyzer can retain deleted workspace symbols after an
+            // external deletion. Replace only this provider session so the
+            // next query starts from current filesystem truth.
+            guard.take();
+            drop(guard);
+            return self.get_or_start_client().await;
+        }
+        Ok(guard)
+    }
+
     pub async fn latest_server_status(&self) -> Option<LspServerStatus> {
         let guard = self.client.lock().await;
         guard.as_ref().and_then(LspClient::latest_server_status)
@@ -1050,7 +1176,7 @@ impl SemanticProvider for RustAnalyzerProvider {
         _limit: usize,
     ) -> BoxFuture<'a, Result<Vec<SymbolRecord>, CoreError>> {
         Box::pin(async move {
-            let mut guard = match self.get_or_start_client().await {
+            let mut guard = match self.get_or_refresh_client().await {
                 Ok(g) => g,
                 Err(e) => return Err(e),
             };
@@ -1078,7 +1204,7 @@ impl SemanticProvider for RustAnalyzerProvider {
         col: Option<usize>,
     ) -> BoxFuture<'a, Result<SemanticLookupResult<SourceLocation>, CoreError>> {
         Box::pin(async move {
-            let mut guard = match self.get_or_start_client().await {
+            let mut guard = match self.get_or_refresh_client().await {
                 Ok(g) => g,
                 Err(e) => return Err(e),
             };
@@ -1139,7 +1265,7 @@ impl SemanticProvider for RustAnalyzerProvider {
         limit: usize,
     ) -> BoxFuture<'a, Result<SemanticLookupResult<Vec<ReferenceRecord>>, CoreError>> {
         Box::pin(async move {
-            let mut guard = match self.get_or_start_client().await {
+            let mut guard = match self.get_or_refresh_client().await {
                 Ok(g) => g,
                 Err(e) => return Err(e),
             };

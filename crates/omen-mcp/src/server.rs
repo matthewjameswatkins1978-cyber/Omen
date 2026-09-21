@@ -616,6 +616,7 @@ impl McpServer {
                 Ok(summary) => {
                     let out = json!({
                         "execution_id": summary.execution_id,
+                        "runtime_status": summary.runtime_status,
                         "exit_code": summary.exit_code,
                         "duration_ms": summary.duration_ms,
                         "stdout_preview": summary.stdout_preview,
@@ -685,8 +686,9 @@ impl McpServer {
 
                     let out = json!({
                         "execution_id": format!("exec-local-{}", &uuid::Uuid::new_v4().to_string()[..8]),
-                        "exit_code": output.process_exit.code.unwrap_or(0),
-                        "duration_ms": 0,
+                        "runtime_status": output.runtime_status,
+                        "exit_code": output.process_exit.code,
+                        "duration_ms": output.duration_ms,
                         "stdout_preview": String::from_utf8_lossy(&output.stdout_bounded).to_string(),
                         "stderr_preview": String::from_utf8_lossy(&output.stderr_bounded).to_string(),
                         "stdout_artifact": stdout_artifact,

@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::mpsc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const CONTRACT_VERSION: &str = "0.8";
@@ -328,20 +328,7 @@ fn mcp_send(
         }
     }
 }
-fn mcp_probe(
-    binary: &Path,
-    fixture: &Path,
-    mcp_protocol: &str,
-) -> Result<
-    (
-        serde_json::Value,
-        serde_json::Value,
-        serde_json::Value,
-        serde_json::Value,
-        serde_json::Value,
-    ),
-    String,
-> {
+fn mcp_probe(binary: &Path, fixture: &Path, mcp_protocol: &str) -> Result<McpProbeResult, String> {
     let mut child = Command::new(binary)
         .args([
             "mcp",
@@ -381,23 +368,38 @@ fn mcp_probe(
         serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
         2,
     )?;
+    let started = Instant::now();
     let search = mcp_send(
         &mut p,
         serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"omen_symbol_search","arguments":{"query":"refresh_token","limit":50}}}),
         3,
     )?;
+    let search_ms = started.elapsed().as_millis();
+    let started = Instant::now();
     let definition = mcp_send(
         &mut p,
         serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"omen_symbol_definition","arguments":{"symbol":"refresh_token"}}}),
         4,
     )?;
+    let definition_ms = started.elapsed().as_millis();
+    let started = Instant::now();
     let references = mcp_send(
         &mut p,
         serde_json::json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"omen_symbol_references","arguments":{"symbol":"refresh_token","limit":50}}}),
         5,
     )?;
+    let references_ms = started.elapsed().as_millis();
     let _ = p.child.kill();
-    Ok((init, list, search, definition, references))
+    Ok(McpProbeResult {
+        initialize: init,
+        tools: list,
+        search,
+        definition,
+        references,
+        search_ms,
+        definition_ms,
+        references_ms,
+    })
 }
 fn mcp_text(response: &serde_json::Value) -> String {
     response
@@ -535,6 +537,18 @@ fn package(root: &Path, ci_run_id: Option<u64>, artifact_id: Option<u64>) -> Res
     Ok(())
 }
 
+#[derive(Debug, Serialize)]
+struct McpProbeResult {
+    initialize: serde_json::Value,
+    tools: serde_json::Value,
+    search: serde_json::Value,
+    definition: serde_json::Value,
+    references: serde_json::Value,
+    search_ms: u128,
+    definition_ms: u128,
+    references_ms: u128,
+}
+
 fn target_triple() -> Result<String, String> {
     let output = Command::new("rustc")
         .args(["-vV"])
@@ -666,6 +680,7 @@ fn prove(_root: &Path, mcp_protocol: &str) -> Result<(), String> {
     }
     let fixture = installed_fixture();
     let before = fixture_hashes_at(&fixture)?;
+    let started = Instant::now();
     let orient = run_capture(
         &binary,
         &[
@@ -678,6 +693,7 @@ fn prove(_root: &Path, mcp_protocol: &str) -> Result<(), String> {
         ],
         None,
     )?;
+    let orient_cold_ms = started.elapsed().as_millis();
     if !orient.status.success() {
         return Err(fail("OMEN_MCP_PROOF_FAILED", "installed orient failed"));
     }
@@ -688,6 +704,57 @@ fn prove(_root: &Path, mcp_protocol: &str) -> Result<(), String> {
             "OMEN_MCP_PROOF_FAILED",
             "installed contract version mismatch",
         ));
+    }
+    let started = Instant::now();
+    let orient_warm = run_capture(
+        &binary,
+        &[
+            "orient",
+            "--machine",
+            "--workspace",
+            fixture
+                .to_str()
+                .ok_or_else(|| fail("OMEN_MCP_PROOF_FAILED", "fixture path is not UTF-8"))?,
+        ],
+        None,
+    )?;
+    let orient_warm_ms = started.elapsed().as_millis();
+    if !orient_warm.status.success() {
+        return Err(fail("OMEN_MCP_PROOF_FAILED", "warm orient failed"));
+    }
+    let started = Instant::now();
+    let context = run_capture(
+        &binary,
+        &[
+            "context",
+            "--machine",
+            "--workspace",
+            fixture
+                .to_str()
+                .ok_or_else(|| fail("OMEN_MCP_PROOF_FAILED", "fixture path is not UTF-8"))?,
+        ],
+        None,
+    )?;
+    let context_cold_ms = started.elapsed().as_millis();
+    if !context.status.success() {
+        return Err(fail("OMEN_MCP_PROOF_FAILED", "cold context failed"));
+    }
+    let started = Instant::now();
+    let context_warm = run_capture(
+        &binary,
+        &[
+            "context",
+            "--machine",
+            "--workspace",
+            fixture
+                .to_str()
+                .ok_or_else(|| fail("OMEN_MCP_PROOF_FAILED", "fixture path is not UTF-8"))?,
+        ],
+        None,
+    )?;
+    let context_warm_ms = started.elapsed().as_millis();
+    if !context_warm.status.success() {
+        return Err(fail("OMEN_MCP_PROOF_FAILED", "warm context failed"));
     }
     let verification_target = install_root().join("evidence").join("proof-target");
     fs::create_dir_all(&verification_target).map_err(|e| e.to_string())?;
@@ -709,15 +776,15 @@ fn prove(_root: &Path, mcp_protocol: &str) -> Result<(), String> {
             String::from_utf8_lossy(&cargo.stderr),
         ));
     }
-    let (initialize, tools, search, definition, references) =
-        mcp_probe(&binary, &fixture, mcp_protocol)?;
+    let mcp = mcp_probe(&binary, &fixture, mcp_protocol)?;
     let required = [
         "omen_orient",
         "omen_symbol_search",
         "omen_symbol_definition",
         "omen_symbol_references",
     ];
-    let names = tools
+    let names = mcp
+        .tools
         .pointer("/result/tools")
         .and_then(|v| v.as_array())
         .map(|a| {
@@ -732,9 +799,9 @@ fn prove(_root: &Path, mcp_protocol: &str) -> Result<(), String> {
             "required tool missing from tools/list",
         ));
     }
-    let search_text = serde_json::to_string(&search).unwrap();
-    let definition_text = mcp_text(&definition);
-    let references_text = mcp_text(&references);
+    let search_text = serde_json::to_string(&mcp.search).unwrap();
+    let definition_text = mcp_text(&mcp.definition);
+    let references_text = mcp_text(&mcp.references);
     if !search_text.contains("refresh_token") {
         return Err(fail(
             "OMEN_SEMANTIC_PROOF_FAILED",
@@ -779,6 +846,20 @@ fn prove(_root: &Path, mcp_protocol: &str) -> Result<(), String> {
         ));
     }
     let after = fixture_hashes_at(&fixture)?;
+    let efficiency = serde_json::json!({
+        "orient_cold_ms": orient_cold_ms,
+        "orient_warm_ms": orient_warm_ms,
+        "context_cold_ms": context_cold_ms,
+        "context_warm_ms": context_warm_ms,
+        "symbol_search_ms": mcp.search_ms,
+        "definition_ms": mcp.definition_ms,
+        "references_ms": mcp.references_ms,
+        "provider_starts": 1,
+        "discovery_calls_before_semantic": 1,
+        "representative_response_bytes": serde_json::to_vec(&mcp.search).unwrap().len()
+            + serde_json::to_vec(&mcp.definition).unwrap().len()
+            + serde_json::to_vec(&mcp.references).unwrap().len(),
+    });
     let changed = before
         .iter()
         .filter(|(k, v)| after.get(*k) != Some(v))
@@ -799,7 +880,7 @@ fn prove(_root: &Path, mcp_protocol: &str) -> Result<(), String> {
     s.last_proof = Some(p.clone());
     write_state(&s)?;
     fs::create_dir_all(install_root().join("evidence")).map_err(|e| e.to_string())?;
-    fs::write(proof_path(),serde_json::to_vec_pretty(&serde_json::json!({"schema_version":1,"manifest":m,"identity":"PASS","orient":orient_json,"initialize":initialize,"tools":tools,"semantic_search":search,"semantic_definition":definition,"semantic_references":references,"fixture":{"changed_files":changed},"readiness":{"local_proof_pass":true,"ready_for_ci":true,"ready_for_external_trial":ready},"proof":p})).unwrap()).map_err(|e|e.to_string())?;
+    fs::write(proof_path(),serde_json::to_vec_pretty(&serde_json::json!({"schema_version":1,"manifest":m,"identity":"PASS","orient":orient_json,"initialize":mcp.initialize,"tools":mcp.tools,"semantic_search":mcp.search,"semantic_definition":mcp.definition,"semantic_references":mcp.references,"efficiency":efficiency,"fixture":{"changed_files":changed},"readiness":{"local_proof_pass":true,"ready_for_ci":true,"ready_for_external_trial":ready},"proof":p})).unwrap()).map_err(|e|e.to_string())?;
     println!(
         "LOCAL_PROOF_PASS: YES\nREADY_FOR_CI: YES\nREADY_FOR_EXTERNAL_TRIAL: {}\nchanged_files: 0",
         if ready { "YES" } else { "NO" }

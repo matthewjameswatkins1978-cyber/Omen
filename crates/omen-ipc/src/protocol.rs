@@ -307,6 +307,7 @@ pub struct PtySessionInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExecutionResultSummary {
     pub execution_id: String,
+    pub runtime_status: omen_core::RuntimeStatus,
     pub exit_code: Option<i32>,
     pub duration_ms: u64,
     pub stdout_preview: String,

@@ -443,6 +443,68 @@ async fn test_mcp_execute_and_read_cas_artifact_proof_d() {
     .await;
 }
 
+#[tokio::test]
+async fn test_mcp_execute_preserves_timeout_and_nullable_exit_code() {
+    let temp = tempdir().unwrap();
+    let server = McpServer::new(temp.path().to_path_buf(), None);
+    let request = JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(json!(91)),
+        method: "tools/call".into(),
+        params: Some(json!({
+            "name": "omen_execute",
+            "arguments": {
+                "argv": [semantic_gremlin_exe(), "--sleep-ms", "1000"],
+                "cwd": temp.path().to_string_lossy(),
+                "timeout_ms": 20
+            }
+        })),
+    };
+
+    let response = server.handle_request(request).await;
+    assert!(response.error.is_none());
+    let result: CallToolResult = serde_json::from_value(response.result.unwrap()).unwrap();
+    assert_ne!(result.is_error, Some(true));
+    let value: Value = serde_json::from_str(&result.content[0].text).unwrap();
+    assert_eq!(value["runtime_status"], "TIMED_OUT");
+    assert!(value["exit_code"].is_null());
+}
+
+#[tokio::test]
+async fn test_mcp_execution_result_preserves_nonzero_and_spawn_failure_identity() {
+    let temp = tempdir().unwrap();
+    let server = McpServer::new(temp.path().to_path_buf(), None);
+    let cwd = temp.path().to_string_lossy().to_string();
+    let server_ref = &server;
+
+    let call = |argv: Value| {
+        let cwd = cwd.clone();
+        async move {
+            let response = server_ref
+                .handle_request(JsonRpcRequest {
+                    jsonrpc: "2.0".into(),
+                    id: Some(json!(92)),
+                    method: "tools/call".into(),
+                    params: Some(json!({
+                        "name": "omen_execute",
+                        "arguments": {"argv": argv, "cwd": cwd}
+                    })),
+                })
+                .await;
+            serde_json::from_value::<CallToolResult>(response.result.unwrap()).unwrap()
+        }
+    };
+
+    let nonzero_result = call(json!([semantic_gremlin_exe(), "--exit", "7"])).await;
+    let nonzero: Value = serde_json::from_str(&nonzero_result.content[0].text).unwrap();
+    assert_eq!(nonzero["runtime_status"], "COMPLETED");
+    assert_eq!(nonzero["exit_code"], 7);
+
+    let failed = call(json!(["definitely-not-an-omen-executable"])).await;
+    assert_eq!(failed.is_error, Some(true));
+    assert!(failed.content[0].text.contains("Local execution error"));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_persistent_notification_does_not_emit_response() {
     run_with_test_timeout(
@@ -808,6 +870,29 @@ async fn test_mcp_public_semantic_surface_finds_rust_function_through_adapter() 
             assert_eq!(definition["resolved"]["file"], "src/lib.rs");
             assert_eq!(definition["resolved"]["provider"], "rust-analyzer");
 
+            let mut equivalent_hints = vec![
+                "src/lib.rs".to_string(),
+                "src\\lib.rs".to_string(),
+                "./src/lib.rs".to_string(),
+            ];
+            #[cfg(windows)]
+            {
+                let absolute = temp.path().join("src/lib.rs");
+                let absolute = absolute.to_string_lossy().replace('\\', "/");
+                equivalent_hints.push(absolute.clone());
+                equivalent_hints.push(format!("\\\\?\\{}", absolute));
+                equivalent_hints.push(format!("file:///{}", absolute));
+            }
+            for file in equivalent_hints {
+                let resolved = call_semantic_mcp_tool(
+                    &server,
+                    "omen_symbol_definition",
+                    json!({"symbol":"refresh_token","file":file,"line":0,"col":7}),
+                )
+                .await;
+                assert_eq!(resolved["resolved"]["file"], "src/lib.rs", "hint={file}");
+            }
+
             let references = call_semantic_mcp_tool(
                 &server,
                 "omen_symbol_references",
@@ -840,6 +925,21 @@ async fn test_mcp_public_semantic_surface_finds_rust_function_through_adapter() 
             .await;
             assert_eq!(false_references.is_error, Some(true));
             assert!(false_references.content[0].text.contains("SEMANTIC_HINT_MISMATCH"));
+
+            for file in [
+                "src/lib.rs".to_string(),
+                "src\\lib.rs".to_string(),
+                "./src/lib.rs".to_string(),
+            ] {
+                let mismatch = call_semantic_mcp_tool_result(
+                    &server,
+                    "omen_symbol_references",
+                    json!({"symbol":"refresh_token","file":file,"line":4,"col":7}),
+                )
+                .await;
+                assert_eq!(mismatch.is_error, Some(true));
+                assert!(mismatch.content[0].text.contains("SEMANTIC_HINT_MISMATCH"));
+            }
 
             let partial_hint = call_semantic_mcp_tool_result(
                 &server,

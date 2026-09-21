@@ -31,6 +31,7 @@ pub struct SemanticProviderRegistry {
 }
 
 fn validate_hint(
+    workspace_root: &Path,
     file: Option<&str>,
     line: Option<usize>,
     col: Option<usize>,
@@ -38,7 +39,7 @@ fn validate_hint(
     match (file, line, col) {
         (None, None, None) => Ok(None),
         (Some(file), Some(line), Some(col)) => Ok(Some(SemanticHint {
-            file: file.replace('\\', "/").trim_start_matches("./").to_owned(),
+            file: canonical_semantic_path(workspace_root, file)?,
             line,
             col,
         })),
@@ -51,6 +52,76 @@ fn validate_hint(
 fn location_matches_hint(location: &SourceLocation, hint: &SemanticHint) -> bool {
     location.file.replace('\\', "/").trim_start_matches("./") == hint.file
         && location.range.contains(hint.line, hint.col)
+}
+
+fn percent_decode_file_uri(path: &str) -> Result<String, CoreError> {
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return Err(CoreError::SchemaViolation(
+                    "SEMANTIC_HINT_MISMATCH: malformed file URI".into(),
+                ));
+            }
+            let hex = &path[index + 1..index + 3];
+            let value = u8::from_str_radix(hex, 16).map_err(|_| {
+                CoreError::SchemaViolation("SEMANTIC_HINT_MISMATCH: malformed file URI".into())
+            })?;
+            out.push(value);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|_| {
+        CoreError::SchemaViolation("SEMANTIC_HINT_MISMATCH: file URI is not UTF-8".into())
+    })
+}
+
+fn canonical_semantic_path(workspace_root: &Path, input: &str) -> Result<String, CoreError> {
+    let mut path = if let Some(uri_path) = input.strip_prefix("file:///") {
+        let decoded = percent_decode_file_uri(uri_path)?;
+        #[cfg(windows)]
+        {
+            PathBuf::from(decoded.replace('/', "\\"))
+        }
+        #[cfg(not(windows))]
+        {
+            PathBuf::from(format!("/{decoded}"))
+        }
+    } else if input.contains("://") {
+        return Err(CoreError::SchemaViolation(
+            "SEMANTIC_HINT_MISMATCH: unsupported location URI scheme".into(),
+        ));
+    } else {
+        PathBuf::from(input.replace('\\', "/"))
+    };
+
+    if let Some(verbatim) = path
+        .to_str()
+        .and_then(|value| value.strip_prefix("\\\\?\\"))
+    {
+        path = PathBuf::from(verbatim);
+    }
+
+    let root = workspace_root.canonicalize().map_err(|_| {
+        CoreError::SchemaViolation("SEMANTIC_HINT_MISMATCH: workspace is unavailable".into())
+    })?;
+    let candidate = if path.is_absolute() {
+        path
+    } else {
+        workspace_root.join(path)
+    };
+    let candidate = candidate.canonicalize().map_err(|_| {
+        CoreError::SchemaViolation("SEMANTIC_HINT_MISMATCH: location is unavailable".into())
+    })?;
+    let relative = candidate.strip_prefix(&root).map_err(|_| {
+        CoreError::SchemaViolation("SEMANTIC_HINT_MISMATCH: location escapes workspace".into())
+    })?;
+    Ok(relative.to_string_lossy().replace('\\', "/"))
 }
 
 impl SemanticProviderRegistry {
@@ -188,7 +259,7 @@ impl SemanticProviderRegistry {
         timeout: Option<Duration>,
     ) -> Result<SemanticLookupResult<SourceLocation>, CoreError> {
         let timeout_duration = timeout.unwrap_or(DEFAULT_SEMANTIC_TIMEOUT);
-        let hint = validate_hint(file, line, col)?;
+        let hint = validate_hint(&self.workspace_root, file, line, col)?;
 
         // 1. Try Live LSP
         for p in self
@@ -307,7 +378,7 @@ impl SemanticProviderRegistry {
     ) -> Result<SemanticLookupResult<Vec<ReferenceRecord>>, CoreError> {
         let limit = limit.unwrap_or(DEFAULT_RESULT_LIMIT);
         let timeout_duration = timeout.unwrap_or(DEFAULT_SEMANTIC_TIMEOUT);
-        let hint = validate_hint(file, line, col)?;
+        let hint = validate_hint(&self.workspace_root, file, line, col)?;
 
         // 1. Try Live LSP
         for p in self

@@ -877,6 +877,7 @@ impl WorkspaceState {
                 {
                     let summary = ExecutionResultSummary {
                         execution_id: exec_id,
+                        runtime_status: omen_core::RuntimeStatus::Completed,
                         exit_code: rec.exit_code,
                         duration_ms: rec.duration_ms.unwrap_or(0) as u64,
                         stdout_preview: rec.command.clone(),
@@ -1030,6 +1031,7 @@ impl WorkspaceState {
 
                     let summary = ExecutionResultSummary {
                         execution_id: exec_id_str,
+                        runtime_status: output.runtime_status,
                         exit_code,
                         duration_ms,
                         stdout_preview,

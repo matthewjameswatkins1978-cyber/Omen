@@ -8,6 +8,7 @@ use omen_interactive::AiLaneDispatcher;
 use omen_interactive::completion::{CompletionContext, HotSemanticIndex, OmenCompleter};
 use omen_semantic::types::{lsp_utf16_to_utf8_col, utf8_to_lsp_utf16_col};
 use omen_semantic::{ProviderKind, SemanticGeneration, SemanticProvider, SemanticWitness};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
@@ -400,6 +401,39 @@ pub struct SessionToken;
         assert!(
             type_definition.is_resolved(),
             "all-symbol function repair must not regress ordinary type lookup"
+        );
+
+        // Bat Test 2 deletion replay: a warm provider must not retain a
+        // symbol after the source file that defined it is removed.
+        let bat_signal = src_dir.join("bat_signal.rs");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(src_dir.join("lib.rs"))
+            .unwrap()
+            .write_all(b"\npub mod bat_signal;\n")
+            .unwrap();
+        std::fs::write(&bat_signal, "pub fn BatSignal() {}\n").unwrap();
+        let added = run_phase(
+            "test_proof_c",
+            "warm_add_symbol",
+            Duration::from_secs(25),
+            ra_provider.symbol_search("BatSignal", 10),
+        )
+        .await
+        .expect("warm provider must observe externally added symbol");
+        assert!(added.iter().any(|symbol| symbol.name == "BatSignal"));
+        std::fs::remove_file(&bat_signal).unwrap();
+        let deleted = run_phase(
+            "test_proof_c",
+            "warm_delete_symbol",
+            Duration::from_secs(25),
+            ra_provider.symbol_search("BatSignal", 10),
+        )
+        .await
+        .expect("warm provider deletion reconciliation must remain authoritative");
+        assert!(
+            deleted.iter().all(|symbol| symbol.name != "BatSignal"),
+            "deleted symbol must not survive in warm semantic session"
         );
 
         record_proof_status("rust-analyzer", true);
