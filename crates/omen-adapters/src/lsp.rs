@@ -752,11 +752,6 @@ impl LspClient {
 }
 
 fn file_uri_from_root(workspace_root: &Path, rel_path: &str) -> String {
-    if let Ok(authority) = ResourceAuthority::new(workspace_root)
-        && let Ok(uri) = authority.to_file_uri(rel_path)
-    {
-        return uri;
-    }
     let full = workspace_root.join(rel_path);
     let path_str = full.to_string_lossy().replace('\\', "/");
     let path_str = path_str.strip_prefix("//?/").unwrap_or(&path_str);
