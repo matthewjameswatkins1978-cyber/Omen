@@ -1,7 +1,7 @@
 use crate::cache::{SemanticCache, SemanticWitness};
 use crate::provider::{ProviderKind, SemanticLookupResult, SemanticProvider};
 use crate::types::*;
-use omen_core::{CoreError, SemanticProviderId};
+use omen_core::{CoreError, ErrorCode, SemanticProviderId};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -83,9 +83,11 @@ fn validate_hint(
             line,
             col,
         })),
-        _ => Err(CoreError::SchemaViolation(
-            "SEMANTIC_HINT_INCOMPLETE: file, line, and col must be supplied together".into(),
-        )),
+        _ => Err(CoreError::ExecutionFailedCode {
+            code: ErrorCode::SemanticHintMismatch,
+            message: "SEMANTIC_HINT_INCOMPLETE: file, line, and col must be supplied together"
+                .into(),
+        }),
     }
 }
 
@@ -101,14 +103,17 @@ fn percent_decode_file_uri(path: &str) -> Result<String, CoreError> {
     while index < bytes.len() {
         if bytes[index] == b'%' {
             if index + 2 >= bytes.len() {
-                return Err(CoreError::SchemaViolation(
-                    "SEMANTIC_HINT_MISMATCH: malformed file URI".into(),
-                ));
+                return Err(CoreError::ExecutionFailedCode {
+                    code: ErrorCode::SemanticHintMismatch,
+                    message: "SEMANTIC_HINT_MISMATCH: malformed file URI".into(),
+                });
             }
             let hex = &path[index + 1..index + 3];
-            let value = u8::from_str_radix(hex, 16).map_err(|_| {
-                CoreError::SchemaViolation("SEMANTIC_HINT_MISMATCH: malformed file URI".into())
-            })?;
+            let value =
+                u8::from_str_radix(hex, 16).map_err(|_| CoreError::ExecutionFailedCode {
+                    code: ErrorCode::SemanticHintMismatch,
+                    message: "SEMANTIC_HINT_MISMATCH: malformed file URI".into(),
+                })?;
             out.push(value);
             index += 3;
         } else {
@@ -116,8 +121,9 @@ fn percent_decode_file_uri(path: &str) -> Result<String, CoreError> {
             index += 1;
         }
     }
-    String::from_utf8(out).map_err(|_| {
-        CoreError::SchemaViolation("SEMANTIC_HINT_MISMATCH: file URI is not UTF-8".into())
+    String::from_utf8(out).map_err(|_| CoreError::ExecutionFailedCode {
+        code: ErrorCode::SemanticHintMismatch,
+        message: "SEMANTIC_HINT_MISMATCH: file URI is not UTF-8".into(),
     })
 }
 
@@ -133,9 +139,10 @@ fn canonical_semantic_path(workspace_root: &Path, input: &str) -> Result<String,
             PathBuf::from(format!("/{decoded}"))
         }
     } else if input.contains("://") {
-        return Err(CoreError::SchemaViolation(
-            "SEMANTIC_HINT_MISMATCH: unsupported location URI scheme".into(),
-        ));
+        return Err(CoreError::ExecutionFailedCode {
+            code: ErrorCode::SemanticHintMismatch,
+            message: "SEMANTIC_HINT_MISMATCH: unsupported location URI scheme".into(),
+        });
     } else {
         PathBuf::from(input.replace('\\', "/"))
     };
@@ -147,20 +154,29 @@ fn canonical_semantic_path(workspace_root: &Path, input: &str) -> Result<String,
         path = PathBuf::from(verbatim);
     }
 
-    let root = workspace_root.canonicalize().map_err(|_| {
-        CoreError::SchemaViolation("SEMANTIC_HINT_MISMATCH: workspace is unavailable".into())
-    })?;
+    let root = workspace_root
+        .canonicalize()
+        .map_err(|_| CoreError::ExecutionFailedCode {
+            code: ErrorCode::SemanticHintMismatch,
+            message: "SEMANTIC_HINT_MISMATCH: workspace is unavailable".into(),
+        })?;
     let candidate = if path.is_absolute() {
         path
     } else {
         workspace_root.join(path)
     };
-    let candidate = candidate.canonicalize().map_err(|_| {
-        CoreError::SchemaViolation("SEMANTIC_HINT_MISMATCH: location is unavailable".into())
-    })?;
-    let relative = candidate.strip_prefix(&root).map_err(|_| {
-        CoreError::SchemaViolation("SEMANTIC_HINT_MISMATCH: location escapes workspace".into())
-    })?;
+    let candidate = candidate
+        .canonicalize()
+        .map_err(|_| CoreError::ExecutionFailedCode {
+            code: ErrorCode::SemanticHintMismatch,
+            message: "SEMANTIC_HINT_MISMATCH: location is unavailable".into(),
+        })?;
+    let relative = candidate
+        .strip_prefix(&root)
+        .map_err(|_| CoreError::ExecutionFailedCode {
+            code: ErrorCode::SemanticHintMismatch,
+            message: "SEMANTIC_HINT_MISMATCH: location escapes workspace".into(),
+        })?;
     Ok(relative.to_string_lossy().replace('\\', "/"))
 }
 
@@ -254,6 +270,164 @@ impl SemanticProviderRegistry {
         coverage
     }
 
+    fn semantic_coverage(&self) -> SemanticCoverage {
+        match self.workspace_coverage().mode.as_str() {
+            "complete_supported_resources" => SemanticCoverage::Complete,
+            "partial_supported_resources" => SemanticCoverage::Partial,
+            _ => SemanticCoverage::None,
+        }
+    }
+
+    fn provider_error(operation: &str, error: CoreError) -> CoreError {
+        CoreError::ExecutionFailedCode {
+            code: ErrorCode::ProviderFailure,
+            message: format!("provider failure during {operation}: {error}"),
+        }
+    }
+
+    fn unsupported_error(operation: &str) -> CoreError {
+        CoreError::ExecutionFailedCode {
+            code: ErrorCode::Unsupported,
+            message: format!(
+                "semantic operation '{operation}' is unsupported for the requested target"
+            ),
+        }
+    }
+
+    /// Canonical workspace-wide symbol-search result. The raw provider vector
+    /// remains available internally, but public projections consume this type.
+    pub async fn semantic_search(
+        &self,
+        query: &str,
+        limit: Option<usize>,
+        timeout: Option<Duration>,
+    ) -> Result<SemanticResult<SemanticSearchData>, CoreError> {
+        let matches = self.symbol_search(query, limit, timeout).await?;
+        let outcome = if matches.is_empty() {
+            SemanticOutcome::NotFound
+        } else {
+            SemanticOutcome::Found
+        };
+        Ok(SemanticResult {
+            schema_version: SEMANTIC_RESULT_SCHEMA_VERSION,
+            operation: SemanticOperation::SymbolSearch,
+            outcome,
+            coverage: self.semantic_coverage(),
+            generation: self.current_generation(),
+            data: SemanticSearchData { matches },
+        })
+    }
+
+    /// Canonical targeted definition result. Unsupported targets and provider
+    /// failures are domain errors, never a not-found observation.
+    pub async fn semantic_definition(
+        &self,
+        symbol: &str,
+        file: Option<&str>,
+        line: Option<usize>,
+        col: Option<usize>,
+        timeout: Option<Duration>,
+    ) -> Result<SemanticResult<SemanticDefinitionData>, CoreError> {
+        let result = self
+            .find_definition(symbol, file, line, col, timeout)
+            .await?;
+        let (outcome, data) = match result {
+            SemanticLookupResult::Resolved(location) => (
+                SemanticOutcome::Found,
+                SemanticDefinitionData {
+                    resolved: Some(location),
+                    candidates: Vec::new(),
+                },
+            ),
+            SemanticLookupResult::Ambiguous(candidates) => (
+                SemanticOutcome::Ambiguous,
+                SemanticDefinitionData {
+                    resolved: None,
+                    candidates,
+                },
+            ),
+            SemanticLookupResult::NotFound => (
+                SemanticOutcome::NotFound,
+                SemanticDefinitionData {
+                    resolved: None,
+                    candidates: Vec::new(),
+                },
+            ),
+            SemanticLookupResult::Unsupported => {
+                return Err(Self::unsupported_error("definition"));
+            }
+            SemanticLookupResult::Stale(_) => {
+                return Err(CoreError::ExecutionFailedCode {
+                    code: ErrorCode::SemanticHintMismatch,
+                    message: format!("stale semantic definition for '{symbol}'"),
+                });
+            }
+        };
+        Ok(SemanticResult {
+            schema_version: SEMANTIC_RESULT_SCHEMA_VERSION,
+            operation: SemanticOperation::Definition,
+            outcome,
+            coverage: self.semantic_coverage(),
+            generation: self.current_generation(),
+            data,
+        })
+    }
+
+    /// Canonical targeted references result with typed operation data.
+    pub async fn semantic_references(
+        &self,
+        symbol: &str,
+        file: Option<&str>,
+        line: Option<usize>,
+        col: Option<usize>,
+        limit: Option<usize>,
+        timeout: Option<Duration>,
+    ) -> Result<SemanticResult<SemanticReferencesData>, CoreError> {
+        let result = self
+            .find_references(symbol, file, line, col, limit, timeout)
+            .await?;
+        let (outcome, data) = match result {
+            SemanticLookupResult::Resolved(references) => (
+                SemanticOutcome::Found,
+                SemanticReferencesData {
+                    references,
+                    candidates: Vec::new(),
+                },
+            ),
+            SemanticLookupResult::Ambiguous(candidates) => (
+                SemanticOutcome::Ambiguous,
+                SemanticReferencesData {
+                    references: Vec::new(),
+                    candidates,
+                },
+            ),
+            SemanticLookupResult::NotFound => (
+                SemanticOutcome::NotFound,
+                SemanticReferencesData {
+                    references: Vec::new(),
+                    candidates: Vec::new(),
+                },
+            ),
+            SemanticLookupResult::Unsupported => {
+                return Err(Self::unsupported_error("references"));
+            }
+            SemanticLookupResult::Stale(_) => {
+                return Err(CoreError::ExecutionFailedCode {
+                    code: ErrorCode::SemanticHintMismatch,
+                    message: format!("stale semantic references for '{symbol}'"),
+                });
+            }
+        };
+        Ok(SemanticResult {
+            schema_version: SEMANTIC_RESULT_SCHEMA_VERSION,
+            operation: SemanticOperation::References,
+            outcome,
+            coverage: self.semantic_coverage(),
+            generation: self.current_generation(),
+            data,
+        })
+    }
+
     fn explicit_target_support(
         &self,
         hint: Option<&SemanticHint>,
@@ -279,10 +453,13 @@ impl SemanticProviderRegistry {
             .unwrap_or("")
             .to_ascii_lowercase();
         if extension == "rs" {
-            return Err(CoreError::ExecutionFailed(format!(
-                "SEMANTIC_PROVIDER_UNAVAILABLE: no available provider supports {operation} for '{}'",
-                hint.file
-            )));
+            return Err(CoreError::ExecutionFailedCode {
+                code: ErrorCode::ProviderFailure,
+                message: format!(
+                    "SEMANTIC_PROVIDER_UNAVAILABLE: no available provider supports {operation} for '{}'",
+                    hint.file
+                ),
+            });
         }
         Ok(false)
     }
@@ -315,13 +492,15 @@ impl SemanticProviderRegistry {
             let timeout_duration = provider_timeout(p.kind(), timeout);
             let records = tokio::time::timeout(timeout_duration, p.symbol_search(query, limit))
                 .await
-                .map_err(|_| {
-                    CoreError::ExecutionFailed(format!(
+                .map_err(|_| CoreError::ExecutionFailedCode {
+                    code: ErrorCode::Timeout,
+                    message: format!(
                         "Semantic provider '{}' timed out during symbol search for '{}'",
                         p.name(),
                         query
-                    ))
-                })??;
+                    ),
+                })?
+                .map_err(|error| Self::provider_error("symbol_search", error))?;
             if !records.is_empty() {
                 let witnesses = self.extract_witnesses(&records);
                 self.cache.insert_symbols(
@@ -343,10 +522,18 @@ impl SemanticProviderRegistry {
             if !p.capabilities().symbol_search {
                 continue;
             }
-            if let Ok(Ok(records)) =
-                tokio::time::timeout(timeout_duration, p.symbol_search(query, limit)).await
-                && !records.is_empty()
-            {
+            let records = tokio::time::timeout(timeout_duration, p.symbol_search(query, limit))
+                .await
+                .map_err(|_| CoreError::ExecutionFailedCode {
+                    code: ErrorCode::Timeout,
+                    message: format!(
+                        "Semantic provider '{}' timed out during symbol search for '{}'",
+                        p.name(),
+                        query
+                    ),
+                })?
+                .map_err(|error| Self::provider_error("symbol_search", error))?;
+            if !records.is_empty() {
                 let witnesses = self.extract_witnesses(&records);
                 self.cache.insert_symbols(
                     query,
@@ -392,13 +579,15 @@ impl SemanticProviderRegistry {
                 p.symbol_definition(symbol, None, None, None),
             )
             .await
-            .map_err(|_| {
-                CoreError::ExecutionFailed(format!(
+            .map_err(|_| CoreError::ExecutionFailedCode {
+                code: ErrorCode::Timeout,
+                message: format!(
                     "Semantic provider '{}' timed out during definition lookup for '{}'",
                     p.name(),
                     symbol
-                ))
-            })??;
+                ),
+            })?
+            .map_err(|error| Self::provider_error("definition", error))?;
 
             match resolve_target(symbol, hint.as_ref(), res)? {
                 SemanticLookupResult::Resolved(loc) => {
@@ -442,13 +631,15 @@ impl SemanticProviderRegistry {
                 p.symbol_definition(symbol, None, None, None),
             )
             .await
-            .map_err(|_| {
-                CoreError::ExecutionFailed(format!(
+            .map_err(|_| CoreError::ExecutionFailedCode {
+                code: ErrorCode::Timeout,
+                message: format!(
                     "Semantic provider '{}' timed out during definition lookup for '{}'",
                     p.name(),
                     symbol
-                ))
-            })??;
+                ),
+            })?
+            .map_err(|error| Self::provider_error("definition", error))?;
 
             match resolve_target(symbol, hint.as_ref(), res)? {
                 SemanticLookupResult::Resolved(loc) => {
@@ -514,13 +705,15 @@ impl SemanticProviderRegistry {
                 p.symbol_definition(symbol, None, None, None),
             )
             .await
-            .map_err(|_| {
-                CoreError::ExecutionFailed(format!(
+            .map_err(|_| CoreError::ExecutionFailedCode {
+                code: ErrorCode::Timeout,
+                message: format!(
                     "Semantic provider '{}' timed out during references lookup for '{}'",
                     p.name(),
                     symbol
-                ))
-            })??;
+                ),
+            })?
+            .map_err(|error| Self::provider_error("references", error))?;
 
             let target = match resolve_target(symbol, hint.as_ref(), res)? {
                 SemanticLookupResult::Resolved(location) => location,
@@ -551,13 +744,15 @@ impl SemanticProviderRegistry {
                 ),
             )
             .await
-            .map_err(|_| {
-                CoreError::ExecutionFailed(format!(
+            .map_err(|_| CoreError::ExecutionFailedCode {
+                code: ErrorCode::Timeout,
+                message: format!(
                     "Semantic provider '{}' timed out during references lookup for '{}'",
                     p.name(),
                     symbol
-                ))
-            })??;
+                ),
+            })?
+            .map_err(|error| Self::provider_error("references", error))?;
             match res {
                 SemanticLookupResult::Resolved(refs) => {
                     let witnesses = self.extract_ref_witnesses(&refs);
@@ -594,13 +789,15 @@ impl SemanticProviderRegistry {
                 p.symbol_definition(symbol, None, None, None),
             )
             .await
-            .map_err(|_| {
-                CoreError::ExecutionFailed(format!(
+            .map_err(|_| CoreError::ExecutionFailedCode {
+                code: ErrorCode::Timeout,
+                message: format!(
                     "Semantic provider '{}' timed out during references lookup for '{}'",
                     p.name(),
                     symbol
-                ))
-            })??;
+                ),
+            })?
+            .map_err(|error| Self::provider_error("references", error))?;
 
             let target = match resolve_target(symbol, hint.as_ref(), res)? {
                 SemanticLookupResult::Resolved(location) => location,
@@ -631,13 +828,15 @@ impl SemanticProviderRegistry {
                 ),
             )
             .await
-            .map_err(|_| {
-                CoreError::ExecutionFailed(format!(
+            .map_err(|_| CoreError::ExecutionFailedCode {
+                code: ErrorCode::Timeout,
+                message: format!(
                     "Semantic provider '{}' timed out during references lookup for '{}'",
                     p.name(),
                     symbol
-                ))
-            })??;
+                ),
+            })?
+            .map_err(|error| Self::provider_error("references", error))?;
             match res {
                 SemanticLookupResult::Resolved(refs) => {
                     let witnesses = self.extract_ref_witnesses(&refs);
@@ -799,9 +998,12 @@ fn resolve_target(
     match result {
         SemanticLookupResult::Resolved(location) => {
             if hint.is_some_and(|hint| !location_matches_hint(&location, hint)) {
-                return Err(CoreError::SchemaViolation(format!(
-                    "SEMANTIC_HINT_MISMATCH: coordinates do not identify requested symbol '{symbol}'"
-                )));
+                return Err(CoreError::ExecutionFailedCode {
+                    code: ErrorCode::SemanticHintMismatch,
+                    message: format!(
+                        "SEMANTIC_HINT_MISMATCH: coordinates do not identify requested symbol '{symbol}'"
+                    ),
+                });
             }
             Ok(SemanticLookupResult::Resolved(location))
         }
@@ -813,9 +1015,12 @@ fn resolve_target(
                     .collect();
                 return match matches.as_slice() {
                     [candidate] => Ok(SemanticLookupResult::Resolved(candidate.location.clone())),
-                    [] => Err(CoreError::SchemaViolation(format!(
-                        "SEMANTIC_HINT_MISMATCH: coordinates do not identify requested symbol '{symbol}'"
-                    ))),
+                    [] => Err(CoreError::ExecutionFailedCode {
+                        code: ErrorCode::SemanticHintMismatch,
+                        message: format!(
+                            "SEMANTIC_HINT_MISMATCH: coordinates do not identify requested symbol '{symbol}'"
+                        ),
+                    }),
                     _ => Ok(SemanticLookupResult::Ambiguous(matches)),
                 };
             }

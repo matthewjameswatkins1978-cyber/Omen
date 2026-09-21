@@ -12,7 +12,9 @@ pub use registry::{
     SemanticProviderRegistry, WorkspaceCoverage,
 };
 pub use types::{
-    DiagnosticSeverity, PackageDependency, PackageRecord, ReferenceRecord, SemanticDiagnostic,
-    SemanticGeneration, SemanticHint, SemanticTargetKey, SourceLocation, SourceRange,
+    DiagnosticSeverity, PackageDependency, PackageRecord, ReferenceRecord,
+    SEMANTIC_RESULT_SCHEMA_VERSION, SemanticCoverage, SemanticDefinitionData, SemanticDiagnostic,
+    SemanticGeneration, SemanticHint, SemanticOperation, SemanticOutcome, SemanticReferencesData,
+    SemanticResult, SemanticSearchData, SemanticTargetKey, SourceLocation, SourceRange,
     StructuralMatch, SymbolKind, SymbolRecord, TargetRecord, TaskRecord,
 };

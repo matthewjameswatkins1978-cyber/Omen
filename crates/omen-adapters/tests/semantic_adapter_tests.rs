@@ -1,9 +1,16 @@
 use omen_adapters::{
-    CargoSemanticProvider, GoSemanticProvider, NpmSemanticProvider, PythonUvSemanticProvider,
-    RustAnalyzerProvider, ScipProvider,
+    CapabilityExecutor, CapabilityRequest, CargoSemanticProvider, DefaultCapabilityExecutor,
+    GoSemanticProvider, NpmSemanticProvider, PythonUvSemanticProvider, RustAnalyzerProvider,
+    ScipProvider,
 };
-use omen_semantic::{ProviderKind, SemanticLookupResult, SemanticProvider, SymbolKind};
+use omen_engine::ProcessSupervisor;
+use omen_semantic::{
+    ProviderKind, SemanticLookupResult, SemanticProvider, SemanticProviderRegistry, SymbolKind,
+};
+use serde_json::json;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 #[test]
@@ -401,4 +408,36 @@ async fn rust_analyzer_exit_before_readiness_is_distinct_from_not_found() {
     assert!(text.contains("phase=readiness.wait"));
     assert!(text.contains("reason=server_status_channel_closed"));
     assert!(!text.contains("not_found"));
+}
+
+#[tokio::test]
+async fn composition_definition_projects_the_canonical_semantic_result() {
+    let temp = rust_semantic_fixture();
+    let mut registry = SemanticProviderRegistry::new(temp.path().to_path_buf());
+    registry.register(Arc::new(gremlin_provider(temp.path(), "semantic-filtered")));
+    let registry = Arc::new(registry);
+
+    let direct = registry
+        .semantic_definition("refresh_token", None, None, None, None)
+        .await
+        .unwrap();
+    let direct_json = serde_json::to_value(&direct).unwrap();
+
+    let executor = DefaultCapabilityExecutor::new(
+        temp.path().to_path_buf(),
+        registry,
+        ProcessSupervisor::new(),
+    );
+    let mut inputs = BTreeMap::new();
+    inputs.insert("symbol".to_string(), json!("refresh_token"));
+    let composed = executor
+        .execute(CapabilityRequest {
+            capability_id: "semantic.definition",
+            inputs: &inputs,
+            authority: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(composed.output, direct_json);
 }

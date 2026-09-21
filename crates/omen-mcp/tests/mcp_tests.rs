@@ -853,7 +853,11 @@ async fn test_mcp_public_semantic_surface_finds_rust_function_through_adapter() 
                 json!({"query":"refresh_token"}),
             )
             .await;
-            let search = search.as_array().expect("symbol search must return an array");
+            assert_eq!(search["operation"], "symbol_search");
+            assert_eq!(search["outcome"], "FOUND");
+            let search = search["data"]["matches"]
+                .as_array()
+                .expect("symbol search must return typed matches");
             assert!(
                 search.iter().any(|symbol| {
                     symbol["name"] == "refresh_token" && symbol["kind"] == "function"
@@ -867,8 +871,10 @@ async fn test_mcp_public_semantic_surface_finds_rust_function_through_adapter() 
                 json!({"symbol":"refresh_token"}),
             )
             .await;
-            assert_eq!(definition["resolved"]["file"], "src/lib.rs");
-            assert_eq!(definition["resolved"]["provider"], "rust-analyzer");
+            assert_eq!(definition["operation"], "definition");
+            assert_eq!(definition["outcome"], "FOUND");
+            assert_eq!(definition["data"]["resolved"]["file"], "src/lib.rs");
+            assert_eq!(definition["data"]["resolved"]["provider"], "rust-analyzer");
 
             let equivalent_hints = vec![
                 "src/lib.rs".to_string(),
@@ -892,7 +898,7 @@ async fn test_mcp_public_semantic_surface_finds_rust_function_through_adapter() 
                     json!({"symbol":"refresh_token","file":file,"line":0,"col":7}),
                 )
                 .await;
-                assert_eq!(resolved["resolved"]["file"], "src/lib.rs", "hint={file}");
+                assert_eq!(resolved["data"]["resolved"]["file"], "src/lib.rs", "hint={file}");
             }
 
             let references = call_semantic_mcp_tool(
@@ -901,7 +907,7 @@ async fn test_mcp_public_semantic_surface_finds_rust_function_through_adapter() 
                 json!({"symbol":"refresh_token"}),
             )
             .await;
-            let references = references["resolved"]
+            let references = references["data"]["references"]
                 .as_array()
                 .expect("public references must resolve");
             assert!(
@@ -917,7 +923,8 @@ async fn test_mcp_public_semantic_surface_finds_rust_function_through_adapter() 
                 json!({"symbol":"nonexistent_fake_symbol","file":"src/lib.rs","line":0,"col":7}),
             )
             .await;
-            assert_ne!(false_definition["resolved"]["file"], "src/lib.rs");
+            assert_eq!(false_definition["outcome"], "NOT_FOUND");
+            assert!(false_definition["data"]["resolved"].is_null());
 
             let false_references = call_semantic_mcp_tool_result(
                 &server,
@@ -926,6 +933,10 @@ async fn test_mcp_public_semantic_surface_finds_rust_function_through_adapter() 
             )
             .await;
             assert_eq!(false_references.is_error, Some(true));
+            assert_eq!(
+                false_references.error.as_ref().unwrap().code,
+                omen_core::ErrorCode::SemanticHintMismatch
+            );
             assert!(false_references.content[0].text.contains("SEMANTIC_HINT_MISMATCH"));
 
             for file in [
@@ -940,6 +951,10 @@ async fn test_mcp_public_semantic_surface_finds_rust_function_through_adapter() 
                 )
                 .await;
                 assert_eq!(mismatch.is_error, Some(true));
+                assert_eq!(
+                    mismatch.error.as_ref().unwrap().code,
+                    omen_core::ErrorCode::SemanticHintMismatch
+                );
                 assert!(mismatch.content[0].text.contains("SEMANTIC_HINT_MISMATCH"));
             }
 
@@ -992,8 +1007,8 @@ async fn test_mcp_semantic_coverage_preserves_unsupported_targets() {
                 json!({"query":"definitely_absent_symbol"}),
             )
             .await;
-            assert!(absent.is_array(), "supported-only search must remain an array");
-            assert!(absent.as_array().unwrap().is_empty());
+            assert_eq!(absent["outcome"], "NOT_FOUND");
+            assert_eq!(absent["data"]["matches"], json!([]));
 
             let mixed = tempdir().unwrap();
             fs::create_dir_all(mixed.path().join("src")).unwrap();
@@ -1027,18 +1042,18 @@ async fn test_mcp_semantic_coverage_preserves_unsupported_targets() {
                 json!({"query":"xyz_function"}),
             )
             .await;
-            assert_eq!(search["matches"], json!([]));
-            assert_eq!(search["coverage"], "partial_supported_resources");
-            assert!(search["unsupported_resource_count"].as_u64().unwrap() >= 1);
+            assert_eq!(search["outcome"], "NOT_FOUND");
+            assert_eq!(search["data"]["matches"], json!([]));
+            assert_eq!(search["coverage"], "PARTIAL");
 
             for tool in ["omen_symbol_definition", "omen_symbol_references"] {
-                let result = call_semantic_mcp_tool(
+                let result = call_semantic_mcp_tool_result(
                     &mixed_server,
                     tool,
                     json!({"symbol":"xyz_function","file":"src/unsupported.xyz","line":0,"col":0}),
                 )
                 .await;
-                assert_eq!(result, json!("unsupported"), "{tool} must preserve UNSUPPORTED");
+                assert_eq!(result.error.unwrap().code, omen_core::ErrorCode::Unsupported);
             }
         },
     )
@@ -1082,6 +1097,10 @@ async fn test_mcp_provider_failure_does_not_become_not_found_and_recovers() {
             )
             .await;
             assert_eq!(failure.is_error, Some(true));
+            assert_eq!(
+                failure.error.as_ref().unwrap().code,
+                omen_core::ErrorCode::ProviderFailure
+            );
             assert!(failure.content[0].text.contains("provider"));
             assert!(!failure.content[0].text.contains("not_found"));
 
@@ -1102,7 +1121,7 @@ async fn test_mcp_provider_failure_does_not_become_not_found_and_recovers() {
                 json!({"symbol":"refresh_token"}),
             )
             .await;
-            assert_eq!(recovered["resolved"]["file"], "src/lib.rs");
+            assert_eq!(recovered["data"]["resolved"]["file"], "src/lib.rs");
         },
     )
     .await;

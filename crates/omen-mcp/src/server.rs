@@ -890,22 +890,8 @@ impl McpServer {
             .and_then(|v| v.as_u64())
             .map(|n| n as usize);
         let reg = self.build_registry();
-        match reg.symbol_search(query, limit, None).await {
-            Ok(symbols) => {
-                let coverage = reg.workspace_coverage();
-                if coverage.unsupported_resource_count == 0 {
-                    CallToolResult::text(serde_json::to_string_pretty(&symbols).unwrap())
-                } else {
-                    CallToolResult::text(
-                        serde_json::to_string_pretty(&json!({
-                            "matches": symbols,
-                            "coverage": coverage.mode,
-                            "unsupported_resource_count": coverage.unsupported_resource_count,
-                        }))
-                        .unwrap(),
-                    )
-                }
-            }
+        match reg.semantic_search(query, limit, None).await {
+            Ok(result) => CallToolResult::text(serde_json::to_string_pretty(&result).unwrap()),
             Err(e) => CallToolResult::core_error(&e),
         }
     }
@@ -922,8 +908,8 @@ impl McpServer {
             .map(|n| n as usize);
         let col = args.get("col").and_then(|v| v.as_u64()).map(|n| n as usize);
         let reg = self.build_registry();
-        match reg.find_definition(symbol, file, line, col, None).await {
-            Ok(res) => CallToolResult::text(serde_json::to_string_pretty(&res).unwrap()),
+        match reg.semantic_definition(symbol, file, line, col, None).await {
+            Ok(result) => CallToolResult::text(serde_json::to_string_pretty(&result).unwrap()),
             Err(e) => CallToolResult::core_error(&e),
         }
     }
@@ -945,10 +931,10 @@ impl McpServer {
             .map(|n| n as usize);
         let reg = self.build_registry();
         match reg
-            .find_references(symbol, file, line, col, limit, None)
+            .semantic_references(symbol, file, line, col, limit, None)
             .await
         {
-            Ok(res) => CallToolResult::text(serde_json::to_string_pretty(&res).unwrap()),
+            Ok(result) => CallToolResult::text(serde_json::to_string_pretty(&result).unwrap()),
             Err(e) => CallToolResult::core_error(&e),
         }
     }

@@ -3,6 +3,62 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 
+pub const SEMANTIC_RESULT_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticOperation {
+    SymbolSearch,
+    Definition,
+    References,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SemanticOutcome {
+    Found,
+    NotFound,
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SemanticCoverage {
+    Complete,
+    Partial,
+    None,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticSearchData {
+    pub matches: Vec<SymbolRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticDefinitionData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved: Option<SourceLocation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<SymbolRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticReferencesData {
+    pub references: Vec<ReferenceRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<SymbolRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticResult<T> {
+    pub schema_version: u32,
+    pub operation: SemanticOperation,
+    pub outcome: SemanticOutcome,
+    pub coverage: SemanticCoverage,
+    pub generation: SemanticGeneration,
+    pub data: T,
+}
+
 /// 0-indexed internal source range with 1-indexed human display representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SourceRange {

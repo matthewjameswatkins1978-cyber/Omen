@@ -5,7 +5,7 @@ use omen_core::composition::{
 use omen_core::{ExecutionContract, ProcessExit};
 use omen_engine::ProcessSupervisor;
 use omen_knowledge::{ContentAddressedStore, Database};
-use omen_semantic::{SemanticLookupResult, SemanticProviderRegistry};
+use omen_semantic::SemanticProviderRegistry;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -126,11 +126,14 @@ impl DefaultCapabilityExecutor {
                 let symbol = Self::string_input(request.inputs, "symbol")?;
                 let result = self
                     .semantic_registry
-                    .find_definition(&symbol, None, None, None, None)
+                    .semantic_definition(&symbol, None, None, None, None)
                     .await
                     .map_err(core_error)?;
                 Ok(CapabilityExecutionResult {
-                    output: semantic_output(result),
+                    output: serde_json::to_value(result).map_err(|error| ActionExecutionError {
+                        code: "CAPABILITY_OUTPUT_SCHEMA_VIOLATION".into(),
+                        message: error.to_string(),
+                    })?,
                     artifacts: vec![],
                     process_exit: None,
                     enforcement: None,
@@ -141,11 +144,14 @@ impl DefaultCapabilityExecutor {
                 let symbol = Self::string_input(request.inputs, "symbol")?;
                 let result = self
                     .semantic_registry
-                    .find_references(&symbol, None, None, None, None, None)
+                    .semantic_references(&symbol, None, None, None, None, None)
                     .await
                     .map_err(core_error)?;
                 Ok(CapabilityExecutionResult {
-                    output: semantic_output(result),
+                    output: serde_json::to_value(result).map_err(|error| ActionExecutionError {
+                        code: "CAPABILITY_OUTPUT_SCHEMA_VIOLATION".into(),
+                        message: error.to_string(),
+                    })?,
                     artifacts: vec![],
                     process_exit: None,
                     enforcement: None,
@@ -575,16 +581,6 @@ fn resolve_inputs(
         resolved.insert(field.clone(), value);
     }
     Ok(resolved)
-}
-
-fn semantic_output<T: serde::Serialize>(result: SemanticLookupResult<T>) -> Value {
-    match result {
-        SemanticLookupResult::Resolved(value) => json!({"status":"resolved","results":[value]}),
-        SemanticLookupResult::Ambiguous(values) => json!({"status":"ambiguous","results":values}),
-        SemanticLookupResult::Stale(value) => json!({"status":"stale","results":[value]}),
-        SemanticLookupResult::NotFound => json!({"status":"not_found","results":[]}),
-        SemanticLookupResult::Unsupported => json!({"status":"unsupported","results":[]}),
-    }
 }
 
 fn is_refusal_code(code: &str) -> bool {
