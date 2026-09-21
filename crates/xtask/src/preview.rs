@@ -46,8 +46,14 @@ pub enum PreviewCommand {
         #[arg(long)]
         artifact: Option<PathBuf>,
     },
-    Prove,
-    Cycle,
+    Prove {
+        #[arg(long, default_value = "2024-11-05")]
+        mcp_protocol: String,
+    },
+    Cycle {
+        #[arg(long, default_value = "2024-11-05")]
+        mcp_protocol: String,
+    },
     Rollback,
     Promote {
         #[arg(long)]
@@ -114,8 +120,8 @@ pub fn run(args: PreviewArgs, root: &Path) {
             artifact_id,
         } => package(root, ci_run_id, artifact_id),
         PreviewCommand::Install { artifact } => install(root, artifact),
-        PreviewCommand::Prove => prove(root),
-        PreviewCommand::Cycle => cycle(root),
+        PreviewCommand::Prove { mcp_protocol } => prove(root, &mcp_protocol),
+        PreviewCommand::Cycle { mcp_protocol } => cycle(root, &mcp_protocol),
         PreviewCommand::Rollback => rollback(root),
         PreviewCommand::Promote { expect_sha } => promote(root, &expect_sha),
     };
@@ -325,6 +331,7 @@ fn mcp_send(
 fn mcp_probe(
     binary: &Path,
     fixture: &Path,
+    mcp_protocol: &str,
 ) -> Result<
     (
         serde_json::Value,
@@ -360,7 +367,7 @@ fn mcp_probe(
     let mut p = McpProbe { child, stdin, rx };
     let init = mcp_send(
         &mut p,
-        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"omen-preview-conveyor","version":"0.1"}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":mcp_protocol,"capabilities":{},"clientInfo":{"name":"omen-preview-conveyor","version":"0.1"}}}),
         1,
     )?;
     p.stdin
@@ -471,7 +478,7 @@ fn package(root: &Path, ci_run_id: Option<u64>, artifact_id: Option<u64>) -> Res
         preview_version: version.clone(),
         git_sha: sha,
         contract_version: CONTRACT_VERSION.into(),
-        target: std::env::consts::ARCH.into(),
+        target: target_triple()?,
         profile: "release".into(),
         binary_sha256: bin_hash.clone(),
         package_sha256: payload_digest(&bin_hash, &fixture_files),
@@ -526,6 +533,24 @@ fn package(root: &Path, ci_run_id: Option<u64>, artifact_id: Option<u64>) -> Res
         }
     );
     Ok(())
+}
+
+fn target_triple() -> Result<String, String> {
+    let output = Command::new("rustc")
+        .args(["-vV"])
+        .output()
+        .map_err(|e| fail("OMEN_PREVIEW_TARGET_UNKNOWN", e))?;
+    if !output.status.success() {
+        return Err(fail(
+            "OMEN_PREVIEW_TARGET_UNKNOWN",
+            String::from_utf8_lossy(&output.stderr),
+        ));
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .map(str::to_owned)
+        .ok_or_else(|| fail("OMEN_PREVIEW_TARGET_UNKNOWN", "rustc host triple missing"))
 }
 
 fn install(_root: &Path, artifact: Option<PathBuf>) -> Result<(), String> {
@@ -623,7 +648,7 @@ fn install(_root: &Path, artifact: Option<PathBuf>) -> Result<(), String> {
     Ok(())
 }
 
-fn prove(_root: &Path) -> Result<(), String> {
+fn prove(_root: &Path, mcp_protocol: &str) -> Result<(), String> {
     let mut s = read_state();
     let m = s
         .active
@@ -684,7 +709,8 @@ fn prove(_root: &Path) -> Result<(), String> {
             String::from_utf8_lossy(&cargo.stderr),
         ));
     }
-    let (initialize, tools, search, definition, references) = mcp_probe(&binary, &fixture)?;
+    let (initialize, tools, search, definition, references) =
+        mcp_probe(&binary, &fixture, mcp_protocol)?;
     let required = [
         "omen_orient",
         "omen_symbol_search",
@@ -780,7 +806,7 @@ fn prove(_root: &Path) -> Result<(), String> {
     );
     Ok(())
 }
-fn cycle(root: &Path) -> Result<(), String> {
+fn cycle(root: &Path, mcp_protocol: &str) -> Result<(), String> {
     command_output(root, "gh", &["--version"])?;
     command_output(root, "gh", &["auth", "status"])?;
     let sha = git(root, &["rev-parse", "HEAD"])?;
@@ -873,7 +899,7 @@ fn cycle(root: &Path) -> Result<(), String> {
     let mut state = read_state();
     state.ci_green = true;
     write_state(&state)?;
-    prove(root)
+    prove(root, mcp_protocol)
 }
 fn walk_zip(dir: &Path) -> Option<PathBuf> {
     for e in fs::read_dir(dir).ok()? {
