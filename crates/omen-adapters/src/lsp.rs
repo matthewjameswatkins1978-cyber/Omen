@@ -1,5 +1,5 @@
 use omen_atlas::find_binary_on_path;
-use omen_core::{CoreError, ResourceUri, SemanticProviderId, SymbolId};
+use omen_core::{CoreError, ResourceAuthority, ResourceUri, SemanticProviderId, SymbolId};
 use omen_semantic::provider::{
     BoxFuture, ProviderCapabilities, ProviderKind, SemanticLookupResult, SemanticProvider,
 };
@@ -752,6 +752,11 @@ impl LspClient {
 }
 
 fn file_uri_from_root(workspace_root: &Path, rel_path: &str) -> String {
+    if let Ok(authority) = ResourceAuthority::new(workspace_root)
+        && let Ok(uri) = authority.to_file_uri(rel_path)
+    {
+        return uri;
+    }
     let full = workspace_root.join(rel_path);
     let path_str = full.to_string_lossy().replace('\\', "/");
     let path_str = path_str.strip_prefix("//?/").unwrap_or(&path_str);
@@ -855,6 +860,11 @@ impl LspClient {
 }
 
 fn uri_to_rel_path(uri: &str, workspace_root: &Path) -> String {
+    if let Ok(authority) = ResourceAuthority::new(workspace_root)
+        && let Ok(relative) = authority.workspace_relative(uri)
+    {
+        return relative;
+    }
     let path_part = uri.strip_prefix("file:///").unwrap_or(uri);
     // `to_file_uri` omits the leading slash when constructing a Unix URI, so
     // restore it before comparing the URI path with the absolute workspace

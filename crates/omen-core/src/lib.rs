@@ -6,6 +6,7 @@ pub mod id;
 pub mod machine_contract;
 pub mod model;
 pub mod resource;
+pub mod resource_identity;
 pub mod types;
 
 pub use error::{
@@ -22,6 +23,9 @@ pub use model::{
     SecretHandle, StdioConfig,
 };
 pub use resource::{ResourceKind, ResourceUri};
+pub use resource_identity::{
+    CanonicalResource, NormalizedResource, PresentedResource, ResourceAuthority,
+};
 pub use types::{
     Assurance, BlobState, EnforcementLevel, ExecutionClass, LeaseRights, PtyState, RetentionClass,
     RuntimeLeaseState, SecretInjectionContract, StdioMode, ValidityState,
