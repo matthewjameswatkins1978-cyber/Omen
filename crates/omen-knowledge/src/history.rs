@@ -1,7 +1,220 @@
 use chrono::Utc;
+use omen_core::composition::StateChange;
 use omen_core::{CoreError, ExecutionId, FactId, InteractiveSessionId, ResourceUri};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+pub const DEFAULT_HISTORY_LIMIT: usize = 20;
+pub const MAX_HISTORY_LIMIT: usize = 100;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HistoryQuery {
+    pub all_sessions: bool,
+    pub session_id: Option<InteractiveSessionId>,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HistoryStatus {
+    Completed,
+    Failed,
+    Refused,
+    TimedOut,
+    Partial,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HistoryEntry {
+    pub sequence: i64,
+    pub execution_id: ExecutionId,
+    pub session_id: InteractiveSessionId,
+    pub command: String,
+    pub status: HistoryStatus,
+    pub recorded_at: String,
+    pub duration_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_changed: Option<StateChange>,
+    pub evidence: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HistoryResult {
+    pub schema_version: u32,
+    pub entries: Vec<HistoryEntry>,
+    pub limit: usize,
+    pub all_sessions: bool,
+    pub ordering: String,
+    pub pagination: String,
+}
+
+const HISTORY_SCHEMA_VERSION: u32 = 1;
+
+pub fn query_history(
+    db: &crate::db::Database,
+    query: &HistoryQuery,
+) -> Result<HistoryResult, CoreError> {
+    if query.limit == 0 || query.limit > MAX_HISTORY_LIMIT {
+        return Err(CoreError::ExecutionFailedCode {
+            code: omen_core::ErrorCode::SchemaViolation,
+            message: format!("history limit must be between 1 and {MAX_HISTORY_LIMIT}"),
+        });
+    }
+    if !query.all_sessions && query.session_id.is_none() {
+        return Err(CoreError::ExecutionFailedCode {
+            code: omen_core::ErrorCode::SchemaViolation,
+            message: "current-session history requires a session_id".into(),
+        });
+    }
+
+    let sql = if query.all_sessions {
+        "SELECT rowid, execution_id, session_id, command, exit_code, duration_ms, stdout_artifact, stderr_artifact, envelope_json, created_at FROM execution_history ORDER BY rowid DESC LIMIT ?1"
+    } else {
+        "SELECT rowid, execution_id, session_id, command, exit_code, duration_ms, stdout_artifact, stderr_artifact, envelope_json, created_at FROM execution_history WHERE session_id = ?1 ORDER BY rowid DESC LIMIT ?2"
+    };
+    let mut stmt = db
+        .conn()
+        .prepare(sql)
+        .map_err(|e| CoreError::ExecutionFailedCode {
+            code: omen_core::ErrorCode::PersistenceFailure,
+            message: format!("failed to prepare history query: {e}"),
+        })?;
+
+    let rows = if query.all_sessions {
+        stmt.query_map(params![query.limit as i64], history_entry_from_row)
+            .map_err(|e| CoreError::ExecutionFailedCode {
+                code: omen_core::ErrorCode::PersistenceFailure,
+                message: format!("failed to query history: {e}"),
+            })?
+            .collect::<Result<Vec<_>, _>>()
+    } else {
+        stmt.query_map(
+            params![
+                query.session_id.as_ref().unwrap().as_str(),
+                query.limit as i64
+            ],
+            history_entry_from_row,
+        )
+        .map_err(|e| CoreError::ExecutionFailedCode {
+            code: omen_core::ErrorCode::PersistenceFailure,
+            message: format!("failed to query history: {e}"),
+        })?
+        .collect::<Result<Vec<_>, _>>()
+    };
+    let entries = rows.map_err(|e| CoreError::ExecutionFailedCode {
+        code: omen_core::ErrorCode::PersistenceFailure,
+        message: format!("failed to decode history: {e}"),
+    })?;
+
+    Ok(HistoryResult {
+        schema_version: HISTORY_SCHEMA_VERSION,
+        entries,
+        limit: query.limit,
+        all_sessions: query.all_sessions,
+        ordering: "sqlite_rowid_desc".into(),
+        pagination: "none_bounded_limit".into(),
+    })
+}
+
+fn history_entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEntry> {
+    let envelope_json: Option<String> = row.get(8)?;
+    let envelope = envelope_json
+        .as_deref()
+        .and_then(|text| serde_json::from_str::<Value>(text).ok());
+    let exit_code: Option<i32> = row.get(4)?;
+    let status = envelope
+        .as_ref()
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+        .and_then(parse_history_status)
+        .unwrap_or(match exit_code {
+            Some(0) => HistoryStatus::Completed,
+            Some(_) => HistoryStatus::Failed,
+            None => HistoryStatus::Unknown,
+        });
+    let state_changed = envelope
+        .as_ref()
+        .and_then(|value| value.get("state_changed"))
+        .and_then(Value::as_str)
+        .and_then(parse_state_change);
+    let mut evidence = Vec::new();
+    for index in [6, 7] {
+        if let Some(uri) = row.get::<_, Option<String>>(index)? {
+            evidence.push(uri);
+        }
+    }
+    if let Some(uri) = envelope
+        .as_ref()
+        .and_then(|value| value.get("evidence_artifact"))
+        .and_then(Value::as_str)
+    {
+        evidence.push(uri.into());
+    }
+    if let Some(artifacts) = envelope
+        .as_ref()
+        .and_then(|value| value.get("artifacts"))
+        .and_then(Value::as_array)
+    {
+        evidence.extend(
+            artifacts
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned),
+        );
+    }
+    evidence.sort();
+    evidence.dedup();
+
+    Ok(HistoryEntry {
+        sequence: row.get(0)?,
+        execution_id: ExecutionId::new(row.get::<_, String>(1)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                1,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        session_id: InteractiveSessionId::new(row.get::<_, String>(2)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                2,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        command: row.get(3)?,
+        status,
+        recorded_at: row.get(9)?,
+        duration_ms: row.get(5)?,
+        state_changed,
+        evidence,
+        error: envelope.and_then(|value| value.get("error").cloned()),
+    })
+}
+
+fn parse_history_status(value: &str) -> Option<HistoryStatus> {
+    match value {
+        "COMPLETED" | "Completed" => Some(HistoryStatus::Completed),
+        "FAILED" | "Failed" => Some(HistoryStatus::Failed),
+        "REFUSED" | "Refused" => Some(HistoryStatus::Refused),
+        "TIMED_OUT" | "TimedOut" => Some(HistoryStatus::TimedOut),
+        "PARTIAL" | "Partial" => Some(HistoryStatus::Partial),
+        "UNKNOWN" | "Unknown" => Some(HistoryStatus::Unknown),
+        _ => None,
+    }
+}
+
+fn parse_state_change(value: &str) -> Option<StateChange> {
+    match value {
+        "NO" | "No" => Some(StateChange::No),
+        "YES" | "Yes" => Some(StateChange::Yes),
+        "POSSIBLE" | "Possible" => Some(StateChange::Possible),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InteractiveSessionRecord {

@@ -123,6 +123,27 @@ fn result_schema() -> Value {
     )
 }
 
+fn history_schema() -> Value {
+    object_schema(
+        json!({
+            "schema_version": {"type":"integer"},
+            "entries": {"type":"array","maxItems":100},
+            "limit": {"type":"integer","minimum":1,"maximum":100},
+            "all_sessions": {"type":"boolean"},
+            "ordering": {"type":"string"},
+            "pagination": {"type":"string"}
+        }),
+        &[
+            "schema_version",
+            "entries",
+            "limit",
+            "all_sessions",
+            "ordering",
+            "pagination",
+        ],
+    )
+}
+
 pub fn contract() -> MachineContract {
     let empty = object_schema(json!({}), &[]);
     let result = result_schema();
@@ -200,6 +221,28 @@ pub fn contract() -> MachineContract {
             bounds: "bounded matches".into(),
             timeout: "bounded adapter timeout".into(),
             examples: vec![json!({"pattern":"fn $NAME($$$ARGS) { $$$BODY }"})],
+        },
+        CapabilityDefinition {
+            id: "history.query".into(),
+            group: "history".into(),
+            summary: "Query bounded durable Omen execution history.".into(),
+            input_schema: object_schema(
+                json!({
+                    "all_sessions":{"type":"boolean","default":true},
+                    "session_id":{"type":"string"},
+                    "limit":{"type":"integer","minimum":1,"maximum":100,"default":20}
+                }),
+                &[],
+            ),
+            output_schema: history_schema(),
+            effect_class: EffectClass::Read,
+            network_effect: NetworkEffect::None,
+            reversibility: Reversibility::NotApplicable,
+            idempotent: true,
+            authority: "durable Omen execution history".into(),
+            bounds: "default 20 entries; maximum 100".into(),
+            timeout: "bounded local database query".into(),
+            examples: vec![json!({"limit":20})],
         },
         CapabilityDefinition {
             id: "execution.run".into(),

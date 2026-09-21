@@ -52,7 +52,7 @@ async fn test_history_reports_unjournalled_local_execution_truthfully() {
     let call: CallToolResult = serde_json::from_value(result.result.unwrap()).unwrap();
     let value: Value = serde_json::from_str(&call.content[0].text).unwrap();
     assert_eq!(value["history_status"], "UNJOURNALED_LOCAL_EXECUTION");
-    assert!(value["history"].is_null());
+    assert_eq!(value["history"]["entries"].as_array().unwrap().len(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]

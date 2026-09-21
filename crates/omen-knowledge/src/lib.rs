@@ -8,7 +8,10 @@ pub mod workspace;
 
 pub use cas::{ArtifactMetadata, ContentAddressedStore, GcReport};
 pub use db::Database;
-pub use history::{ExecutionHistory, ExecutionRecord, InteractiveSessionRecord};
+pub use history::{
+    DEFAULT_HISTORY_LIMIT, ExecutionHistory, ExecutionRecord, HistoryEntry, HistoryQuery,
+    HistoryResult, HistoryStatus, InteractiveSessionRecord, MAX_HISTORY_LIMIT, query_history,
+};
 pub use registry::{
     DependencyRecord, FactProvenance, FactRecord, FactRegistry, PublishFactRequest,
 };

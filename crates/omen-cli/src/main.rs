@@ -9,8 +9,8 @@ use omen_core::{
 };
 use omen_engine::{ExecutionRequest, ProcessSupervisor};
 use omen_knowledge::{
-    ContentAddressedStore, Database, FactRegistry, canonical_workspace_db_path_readonly,
-    workspace_state_dir_path,
+    ContentAddressedStore, DEFAULT_HISTORY_LIMIT, Database, FactRegistry, HistoryQuery,
+    canonical_workspace_db_path_readonly, query_history, workspace_state_dir_path,
 };
 use omen_schema::{ExecutionContractWire, ExecutionResultWire};
 use std::collections::BTreeSet;
@@ -63,6 +63,8 @@ enum Commands {
     Tool(ToolArgs),
     /// Fact query and provenance
     Fact(FactArgs),
+    /// Query bounded durable execution history.
+    History(HistoryArgs),
     /// Execute an argv or contract
     Exec(ExecArgs),
     /// CAS artifact inspection and retrieval
@@ -86,6 +88,19 @@ struct OrientArgs {
     /// Compare the cached static contract digest without returning the full map.
     #[arg(long)]
     since: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct HistoryArgs {
+    /// Return only entries for the supplied interactive session.
+    #[arg(long)]
+    session_id: Option<String>,
+    /// Query the current session instead of all sessions.
+    #[arg(long)]
+    current_session: bool,
+    /// Maximum number of entries to return (1-100).
+    #[arg(long, default_value_t = DEFAULT_HISTORY_LIMIT)]
+    limit: usize,
 }
 
 #[derive(Args, Debug)]
@@ -416,7 +431,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "capability_groups": capability_groups,
                 "references": ["@last", "@failed"],
                 "recipes": machine_contract::contract().recipe_definitions.iter().map(|recipe| &recipe.id).collect::<Vec<_>>(),
-                "next": ["capabilities", "describe <capability>", "how <recipe>", "context --since <generation>"]
+                "next": ["capabilities", "history", "describe <capability>", "how <recipe>", "context --since <generation>"]
             });
             if json_mode {
                 println!("{}", serde_json::to_string_pretty(&doc)?);
@@ -570,6 +585,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             println!("{}", serde_json::to_string_pretty(&doc)?);
+        }
+        Some(Commands::History(args)) => {
+            let session_id = match args.session_id {
+                Some(value) => match omen_core::InteractiveSessionId::new(value) {
+                    Ok(id) => Some(id),
+                    Err(error) => {
+                        let core = omen_core::CoreError::InvalidId(error.to_string());
+                        if json_mode {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&OmenError::from_core(&core))?
+                            );
+                        } else {
+                            eprintln!("History query failed: {core}");
+                        }
+                        std::process::exit(2);
+                    }
+                },
+                None => None,
+            };
+            let all_sessions = !args.current_session && session_id.is_none();
+            let query = HistoryQuery {
+                all_sessions,
+                session_id,
+                limit: args.limit,
+            };
+            let result = match Database::open_read_only(&db_path)
+                .map_err(|error| omen_core::CoreError::ExecutionFailedCode {
+                    code: ErrorCode::PersistenceFailure,
+                    message: format!("failed to open canonical history database: {error}"),
+                })
+                .and_then(|db| query_history(&db, &query))
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    if json_mode {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&OmenError::from_core(&error))?
+                        );
+                    } else {
+                        eprintln!("History query failed: {error}");
+                    }
+                    std::process::exit(2);
+                }
+            };
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else if result.entries.is_empty() {
+                println!("No durable execution history recorded.");
+            } else {
+                println!(
+                    "TIME                         STATUS      ID                 ACTION / COMMAND"
+                );
+                for entry in result.entries {
+                    println!(
+                        "{:<28} {:<11} {:<18} {}",
+                        entry.recorded_at,
+                        serde_json::to_string(&entry.status)?.trim_matches('"'),
+                        entry.execution_id,
+                        entry.command
+                    );
+                }
+            }
         }
         Some(Commands::Action(action_args)) => {
             let loaded = match load_omen_config(&ws_root) {

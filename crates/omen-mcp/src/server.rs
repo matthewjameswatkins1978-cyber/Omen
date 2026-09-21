@@ -2,8 +2,9 @@ use crate::protocol::*;
 use omen_client::OmenClient;
 use omen_core::{InteractiveSessionId, composition, machine_contract};
 use omen_knowledge::{
-    ContentAddressedStore, Database, FactRegistry, canonical_workspace_db_path,
-    canonical_workspace_db_path_readonly, local_execution_status_path, resolve_workspace_dir,
+    ContentAddressedStore, DEFAULT_HISTORY_LIMIT, Database, FactRegistry, HistoryQuery,
+    MAX_HISTORY_LIMIT, canonical_workspace_db_path, canonical_workspace_db_path_readonly,
+    local_execution_status_path, query_history, resolve_workspace_dir,
 };
 use omen_semantic::SemanticProviderRegistry;
 use serde_json::{Value, json};
@@ -212,11 +213,13 @@ impl McpServer {
             },
             ToolDefinition {
                 name: "omen_history_query".into(),
-                description: "Query subordinate physical execution history.".into(),
+                description: "Query bounded durable Omen execution history; this is evidence recorded by Omen, not a complete OS or shell audit log.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
-                        "all_sessions": { "type": "boolean", "description": "Whether to query all sessions or only current session" }
+                        "all_sessions": { "type": "boolean", "default": true, "description": "Whether to query all sessions or only the current MCP session" },
+                        "session_id": { "type": "string", "description": "Session identity when all_sessions is false" },
+                        "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20, "description": "Bounded maximum number of entries" }
                     }
                 }),
             },
@@ -395,7 +398,7 @@ impl McpServer {
             "capability_groups": groups,
             "references": ["@last", "@failed"],
             "recipes": contract.recipe_definitions.iter().map(|recipe| &recipe.id).collect::<Vec<_>>(),
-            "next": ["capabilities", "describe <capability>", "recipe <recipe>", "context"]
+            "next": ["capabilities", "history", "describe <capability>", "recipe <recipe>", "context"]
         })).unwrap())
     }
 
@@ -747,30 +750,74 @@ impl McpServer {
         let all = args
             .get("all_sessions")
             .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+            .unwrap_or(true);
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .unwrap_or(DEFAULT_HISTORY_LIMIT);
+        let session_id = match args.get("session_id").and_then(Value::as_str) {
+            Some(value) => match InteractiveSessionId::new(value) {
+                Ok(id) => Some(id),
+                Err(error) => {
+                    return CallToolResult::coded_error(
+                        omen_core::ErrorCode::InvalidId,
+                        error.to_string(),
+                    );
+                }
+            },
+            None if !all => match InteractiveSessionId::new(&self.session_id) {
+                Ok(id) => Some(id),
+                Err(error) => {
+                    return CallToolResult::coded_error(
+                        omen_core::ErrorCode::InvalidId,
+                        error.to_string(),
+                    );
+                }
+            },
+            None => None,
+        };
+        if limit == 0 || limit > MAX_HISTORY_LIMIT {
+            return CallToolResult::coded_error(
+                omen_core::ErrorCode::SchemaViolation,
+                format!("history limit must be between 1 and {MAX_HISTORY_LIMIT}"),
+            );
+        }
+        let query = HistoryQuery {
+            all_sessions: all,
+            session_id,
+            limit,
+        };
         let db_path = canonical_workspace_db_path(&self.workspace_path);
 
-        if let Ok(db) = Database::open(&db_path) {
-            if all {
-                let records = omen_knowledge::ExecutionHistory::list_all_executions(&db, 20)
-                    .unwrap_or_default();
-                if records.is_empty() {
-                    local_history_result(&self.workspace_path, records)
+        match Database::open_read_only(&db_path)
+            .map_err(|error| omen_core::CoreError::ExecutionFailedCode {
+                code: omen_core::ErrorCode::PersistenceFailure,
+                message: format!("failed to open canonical history database: {error}"),
+            })
+            .and_then(|db| query_history(&db, &query))
+        {
+            Ok(result) if result.entries.is_empty() => {
+                local_history_result(&self.workspace_path, result)
+            }
+            Ok(result) => CallToolResult::text(serde_json::to_string_pretty(&result).unwrap()),
+            Err(error) => {
+                if local_execution_status_path(&self.workspace_path).exists() {
+                    local_history_result(
+                        &self.workspace_path,
+                        omen_knowledge::HistoryResult {
+                            schema_version: 1,
+                            entries: Vec::new(),
+                            limit: query.limit,
+                            all_sessions: query.all_sessions,
+                            ordering: "sqlite_rowid_desc".into(),
+                            pagination: "none_bounded_limit".into(),
+                        },
+                    )
                 } else {
-                    CallToolResult::text(serde_json::to_string_pretty(&records).unwrap())
-                }
-            } else {
-                let sid = InteractiveSessionId::new(&self.session_id).unwrap();
-                let last = omen_knowledge::ExecutionHistory::get_last_execution(&db, &sid)
-                    .unwrap_or_default();
-                if last.is_none() {
-                    local_history_result(&self.workspace_path, last)
-                } else {
-                    CallToolResult::text(serde_json::to_string_pretty(&last).unwrap())
+                    CallToolResult::domain_error(omen_core::OmenError::from_core(&error))
                 }
             }
-        } else {
-            CallToolResult::error("Failed to open canonical workspace database")
         }
     }
 
