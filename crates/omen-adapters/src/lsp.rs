@@ -752,6 +752,22 @@ fn uri_to_rel_path(uri: &str, workspace_root: &Path) -> String {
     let path = Path::new(&path_part);
     if let Ok(rel) = path.strip_prefix(workspace_root) {
         rel.to_string_lossy().replace('\\', "/")
+    } else if cfg!(windows) {
+        // Windows drive letters are case-insensitive, but Path::strip_prefix
+        // compares them textually. rust-analyzer may emit `file:///c:/...`
+        // while the process workspace is `C:\\...`; keep the public semantic
+        // contract workspace-relative in that case.
+        let path_text = path_part.replace('\\', "/");
+        let root_text = workspace_root.to_string_lossy().replace('\\', "/");
+        let path_lower = path_text.to_ascii_lowercase();
+        let root_lower = root_text.trim_end_matches('/').to_ascii_lowercase();
+        if path_lower.starts_with(&(root_lower.clone() + "/")) {
+            path_text[root_lower.len() + 1..].to_owned()
+        } else if path_lower == root_lower {
+            String::new()
+        } else {
+            path_text
+        }
     } else {
         let relative_candidate = path_part.trim_start_matches('/');
         if cfg!(unix)
@@ -1224,6 +1240,16 @@ mod tests {
         assert_eq!(
             workspace_symbol_all_params("refresh_token", false),
             json!({ "query": "refresh_token#" })
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn uri_to_relative_file_handles_case_insensitive_windows_drive_letters() {
+        let root = PathBuf::from(r"C:\workspace\fixture");
+        assert_eq!(
+            uri_to_rel_path("file:///c:/workspace/fixture/src/lib.rs", &root),
+            "src/lib.rs"
         );
     }
 }
