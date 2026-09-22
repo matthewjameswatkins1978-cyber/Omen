@@ -682,10 +682,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(2);
                 }
             };
+            let local_execution = if result.entries.is_empty() {
+                std::fs::read_to_string(omen_knowledge::local_execution_status_path(&ws_root))
+                    .ok()
+                    .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+            } else {
+                None
+            };
             if json_mode {
-                println!("{}", serde_json::to_string_pretty(&result)?);
+                if let Some(marker) = local_execution {
+                    let doc = serde_json::json!({
+                        "history": result,
+                        "history_status": "UNJOURNALED_LOCAL_EXECUTION",
+                        "local_execution": marker
+                    });
+                    println!("{}", serde_json::to_string_pretty(&doc)?);
+                } else {
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                }
             } else if result.entries.is_empty() {
                 println!("No durable execution history recorded.");
+                if let Some(marker) = local_execution {
+                    println!("Local execution status: UNJOURNALED_LOCAL_EXECUTION");
+                    if let Some(execution_id) = marker.get("execution_id").and_then(|v| v.as_str()) {
+                        println!("Last local execution: {execution_id}");
+                    }
+                    if let Some(command) = marker.get("command") {
+                        println!("Command: {command}");
+                    }
+                }
             } else {
                 println!(
                     "TIME                         STATUS      ID                 ACTION / COMMAND"
