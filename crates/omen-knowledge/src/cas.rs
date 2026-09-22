@@ -1,5 +1,5 @@
 use chrono::Utc;
-use omen_core::{BlobState, CoreError, ResourceUri, RetentionClass};
+use omen_core::{BlobState, CoreError, ResourceKind, ResourceUri, RetentionClass};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -22,6 +22,24 @@ pub struct ArtifactMetadata {
 
 pub struct ContentAddressedStore {
     root: PathBuf,
+}
+
+fn normalize_artifact_digest(reference: &str) -> Result<String, CoreError> {
+    let trimmed = reference.trim();
+    let uri = if trimmed.contains("://") {
+        ResourceUri::parse(trimmed)?
+    } else {
+        ResourceUri::parse(&format!("artifact://sha256/{trimmed}"))?
+    };
+    if uri.kind() != ResourceKind::Artifact {
+        return Err(CoreError::InvalidUri(format!(
+            "Expected an artifact resource or SHA-256 digest, got '{reference}'"
+        )));
+    }
+    uri.path()
+        .strip_prefix("sha256/")
+        .map(str::to_owned)
+        .ok_or_else(|| CoreError::InvalidUri(format!("Invalid artifact reference: '{reference}'")))
 }
 
 impl ContentAddressedStore {
@@ -99,6 +117,7 @@ impl ContentAddressedStore {
         db: &crate::db::Database,
         digest: &str,
     ) -> Result<ArtifactMetadata, CoreError> {
+        let digest = normalize_artifact_digest(digest)?;
         let mut stmt = db
             .conn()
             .prepare(
@@ -107,7 +126,7 @@ impl ContentAddressedStore {
             .map_err(|e| CoreError::Internal(format!("Failed to prepare inspect query: {e}")))?;
 
         let metadata = stmt
-            .query_row(params![digest], |row| {
+            .query_row(params![&digest], |row| {
                 let d: String = row.get(0)?;
                 let s: i64 = row.get(1)?;
                 let mt: String = row.get(2)?;
@@ -172,6 +191,7 @@ impl ContentAddressedStore {
             )));
         }
 
+        let digest = &meta.digest;
         let blob_path = self.blob_path(digest);
         let mut file = fs::File::open(&blob_path)
             .map_err(|e| CoreError::Internal(format!("Failed to open artifact file: {e}")))?;
