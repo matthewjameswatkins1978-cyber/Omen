@@ -25,12 +25,20 @@ The long-term goal is for command, capability, error and schema reference materi
 ## Architecture and evidence
 
 Developer architecture and milestone evidence remain in the existing docs tree:
-
 - ARCHITECTURE.md
 - ROADMAP.md
 - ROAD_TO_1_0.md
 - TETHERS_BOUNDARY.md
 - evidence/
+
+## Python SDK
+
+The official Python interface (`omen-shell`, import `omen_shell`)
+is documented in:
+
+- python/OMEN-SHELL.md — installation, APIs, errors, testing harness
+- python/PUBLIC-API.md — frozen public surface
+- python/MCP-SURFACE.md — the Omen machine surface the SDK is built on
 
 ## Documentation status
 
