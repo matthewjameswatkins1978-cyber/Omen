@@ -13,11 +13,14 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// User-facing Luna preset identity (registry-facing; not the transport name).
 pub const OPENAI_LUNA_PROVIDER_ID: &str = "openai-luna";
-pub const OPENAI_LUNA_DEFAULT_MODEL: &str = "gpt-6-luna";
+/// Current Omen OpenAI Platform project policy preset.
+pub const OPENAI_LUNA_MODEL: &str = "gpt-6-luna";
 pub const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
 pub const OPENAI_RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
 pub const OPENAI_DEFAULT_REASONING_EFFORT: &str = "medium";
+pub const OPENAI_DEFAULT_MAX_OUTPUT_TOKENS: u32 = 800;
 const MAX_CONTEXT_JSON_BYTES: usize = 48 * 1024;
 const MAX_MESSAGE_CHARS: usize = 8_000;
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
@@ -29,7 +32,12 @@ pub fn openai_credential_source() -> String {
     format!("environment:{OPENAI_API_KEY_ENV}")
 }
 
-/// Truthful availability: credential present and non-empty.
+/// Reads the API key from the process environment when present and non-empty.
+///
+/// Credential presence only proves the provider is locally configured enough
+/// to attempt use. It does not prove the key is valid, that the project is
+/// entitled to a model, or that the network is reachable. Runtime HTTP truth
+/// remains authoritative for those outcomes.
 pub fn openai_api_key_from_env() -> Option<String> {
     match std::env::var(OPENAI_API_KEY_ENV) {
         Ok(k) if !k.trim().is_empty() => Some(k),
@@ -37,7 +45,7 @@ pub fn openai_api_key_from_env() -> Option<String> {
     }
 }
 
-/// Builds the registry descriptor without exposing credentials.
+/// Builds the Luna preset registry descriptor without exposing credentials.
 pub fn openai_luna_descriptor(model: impl Into<String>, available: bool) -> ProviderDescriptor {
     ProviderDescriptor {
         id: OPENAI_LUNA_PROVIDER_ID.into(),
@@ -52,6 +60,7 @@ pub fn openai_luna_descriptor(model: impl Into<String>, available: bool) -> Prov
             "proposal".into(),
             "tool-proposal".into(),
         ],
+        // Locally configured enough to attempt use; remote entitlement is not claimed.
         is_available: available,
     }
 }
@@ -153,23 +162,32 @@ impl HttpPost for UreqHttpPost {
     }
 }
 
-/// Configuration for the OpenAI Responses transport.
+/// Model-neutral configuration for the OpenAI Responses transport.
 #[derive(Debug, Clone)]
-pub struct OpenAiLunaConfig {
+pub struct OpenAiResponsesConfig {
     pub model: String,
     pub responses_url: String,
     pub reasoning_effort: Option<String>,
     pub timeout: Duration,
+    pub max_output_tokens: u32,
 }
 
-impl Default for OpenAiLunaConfig {
-    fn default() -> Self {
+impl OpenAiResponsesConfig {
+    /// Neutral default: standard endpoint, default effort/timeout/budget.
+    /// Callers supply an explicit model for any concrete preset.
+    pub fn new(model: impl Into<String>) -> Self {
         Self {
-            model: OPENAI_LUNA_DEFAULT_MODEL.to_string(),
+            model: model.into(),
             responses_url: OPENAI_RESPONSES_URL.to_string(),
             reasoning_effort: Some(OPENAI_DEFAULT_REASONING_EFFORT.to_string()),
             timeout: DEFAULT_AGENT_TIMEOUT,
+            max_output_tokens: OPENAI_DEFAULT_MAX_OUTPUT_TOKENS,
         }
+    }
+
+    /// Current Omen Luna preset over the same transport.
+    pub fn luna_preset() -> Self {
+        Self::new(OPENAI_LUNA_MODEL)
     }
 }
 
@@ -191,6 +209,13 @@ struct ResponsesApiEnvelope {
     status: Option<String>,
     output: Option<Vec<Value>>,
     error: Option<Value>,
+    incomplete_details: Option<IncompleteDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IncompleteDetails {
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -217,6 +242,8 @@ pub enum OpenAiFailureClass {
     Timeout,
     MalformedResponse,
     UnsupportedFeature,
+    /// Responses HTTP 200 body was not a completed AgentResponse.
+    IncompleteResponse,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,6 +283,10 @@ impl OpenAiFailure {
             },
             OpenAiFailureClass::MalformedResponse => AgentError::Rejected(format!(
                 "provider '{provider}' returned a malformed structured response: {}",
+                self.message
+            )),
+            OpenAiFailureClass::IncompleteResponse => AgentError::Rejected(format!(
+                "provider '{provider}' response not completed: {}",
                 self.message
             )),
             OpenAiFailureClass::ProviderFailure => {
@@ -346,59 +377,152 @@ fn parse_error_message(body: &str) -> Option<String> {
     Some(parsed.error.message)
 }
 
-/// OpenAI Responses AgentProvider for GPT-6 Luna.
+fn incomplete_failure(message: String) -> OpenAiFailure {
+    OpenAiFailure {
+        class: OpenAiFailureClass::IncompleteResponse,
+        message,
+        retry_after_secs: None,
+    }
+}
+
+/// Enforce Responses status truth: only `completed` may become an AgentResponse.
+fn ensure_completed_status(envelope: &ResponsesApiEnvelope) -> Result<(), OpenAiFailure> {
+    let Some(status) = envelope.status.as_deref() else {
+        return Err(incomplete_failure("missing response status".into()));
+    };
+
+    match status {
+        "completed" => Ok(()),
+        "incomplete" => {
+            let reason = envelope
+                .incomplete_details
+                .as_ref()
+                .and_then(|d| d.reason.clone())
+                .unwrap_or_else(|| "unknown".into());
+            Err(incomplete_failure(format!(
+                "status=incomplete reason={reason}"
+            )))
+        }
+        "failed" => {
+            let detail = extract_error_detail(envelope.error.as_ref())
+                .unwrap_or_else(|| "provider reported failed".into());
+            Err(incomplete_failure(format!("status=failed error={detail}")))
+        }
+        "cancelled" => Err(incomplete_failure("status=cancelled".into())),
+        "queued" => Err(incomplete_failure(
+            "status=queued (unexpected for synchronous provider)".into(),
+        )),
+        "in_progress" => Err(incomplete_failure(
+            "status=in_progress (unexpected for synchronous provider)".into(),
+        )),
+        other => Err(incomplete_failure(format!(
+            "unsupported response status '{other}'"
+        ))),
+    }
+}
+
+fn extract_error_detail(error: Option<&Value>) -> Option<String> {
+    let err = error?;
+    if let Some(obj) = err.as_object() {
+        if let Some(message) = obj
+            .get("message")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+        {
+            return Some(bounded_and_redacted(message, None, 512));
+        }
+        // Nested {"error": {...}} shapes
+        if let Some(nested) = obj.get("error") {
+            return extract_error_detail(Some(nested));
+        }
+    }
+    if let Some(s) = err.as_str().filter(|s| !s.trim().is_empty()) {
+        return Some(bounded_and_redacted(s, None, 512));
+    }
+    None
+}
+
+/// Model-neutral OpenAI Responses AgentProvider.
+///
+/// Transport identity is OpenAI Responses; provider/preset identity
+/// (e.g. `openai-luna`) is supplied separately for AgentError labels.
 ///
 /// Omen remains substrate: this provider only proposes typed actions.
 /// It never executes model-produced text and never places the API key in
 /// AgentContext, Debug output, or Display output.
 #[derive(Clone)]
-pub struct OpenAiLunaProvider {
-    config: OpenAiLunaConfig,
+pub struct OpenAiResponsesProvider {
+    config: OpenAiResponsesConfig,
     api_key: Option<String>,
     http: Arc<dyn HttpPost>,
+    /// Provider identity used in AgentError labels (preset id, not transport name).
+    provider_id: String,
 }
 
-impl std::fmt::Debug for OpenAiLunaProvider {
+impl std::fmt::Debug for OpenAiResponsesProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OpenAiLunaProvider")
+        f.debug_struct("OpenAiResponsesProvider")
+            .field("provider_id", &self.provider_id)
             .field("model", &self.config.model)
             .field("responses_url", &self.config.responses_url)
             .field("reasoning_effort", &self.config.reasoning_effort)
             .field("timeout", &self.config.timeout)
+            .field("max_output_tokens", &self.config.max_output_tokens)
             .field("credential", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("has_credential", &self.api_key.is_some())
             .finish()
     }
 }
 
-impl OpenAiLunaProvider {
-    pub fn from_env() -> Self {
-        Self::with_config(OpenAiLunaConfig::default(), openai_api_key_from_env())
+impl OpenAiResponsesProvider {
+    /// Luna preset constructor: transport + model + provider id together.
+    pub fn luna_preset() -> Self {
+        Self::with_config(
+            OpenAiResponsesConfig::luna_preset(),
+            openai_api_key_from_env(),
+            OPENAI_LUNA_PROVIDER_ID.to_string(),
+        )
     }
 
-    pub fn with_config(config: OpenAiLunaConfig, api_key: Option<String>) -> Self {
+    /// Preset-shaped constructor from environment (Luna default model).
+    pub fn from_env() -> Self {
+        Self::luna_preset()
+    }
+
+    pub fn with_config(
+        config: OpenAiResponsesConfig,
+        api_key: Option<String>,
+        provider_id: impl Into<String>,
+    ) -> Self {
         let timeout = config.timeout;
         Self {
             config,
             api_key,
             http: Arc::new(UreqHttpPost::new(timeout)),
+            provider_id: provider_id.into(),
         }
     }
 
     pub fn with_http(
-        config: OpenAiLunaConfig,
+        config: OpenAiResponsesConfig,
         api_key: Option<String>,
         http: Arc<dyn HttpPost>,
+        provider_id: impl Into<String>,
     ) -> Self {
         Self {
             config,
             api_key,
             http,
+            provider_id: provider_id.into(),
         }
     }
 
     pub fn model(&self) -> &str {
         &self.config.model
+    }
+
+    pub fn provider_id(&self) -> &str {
+        &self.provider_id
     }
 
     pub fn has_credential(&self) -> bool {
@@ -428,7 +552,7 @@ impl OpenAiLunaProvider {
         let message = AgentContext::bounded_excerpt(&request.prompt, MAX_MESSAGE_CHARS);
 
         let mut system = String::from(
-            "You are Luna, the reasoning lane inside Omen. Omen establishes machine truth; \
+            "You are a reasoning assistant inside Omen. Omen establishes machine truth; \
 you reason over the supplied structured context; authority remains with Omen/Tethers. \
 Return ONLY JSON matching the required schema. Do not claim you executed anything. \
 Proposals are typed intents, not permissions. If machine truth already answers the \
@@ -473,7 +597,7 @@ question, prefer a short explanation over inventing actions.",
                     "schema": agent_response_json_schema()
                 }
             },
-            "max_output_tokens": 800
+            "max_output_tokens": self.config.max_output_tokens
         });
 
         if let Some(effort) = &self.config.reasoning_effort {
@@ -483,7 +607,9 @@ question, prefer a short explanation over inventing actions.",
         Ok(body)
     }
 
-    /// Parses a successful Responses API body into a typed AgentResponse.
+    /// Parses a Responses API body into a typed AgentResponse.
+    ///
+    /// Only `status == completed` may produce an AgentResponse.
     pub fn parse_responses_body(body: &str) -> Result<AgentResponse, OpenAiFailure> {
         let envelope: ResponsesApiEnvelope =
             serde_json::from_str(body).map_err(|e| OpenAiFailure {
@@ -492,17 +618,7 @@ question, prefer a short explanation over inventing actions.",
                 retry_after_secs: None,
             })?;
 
-        if let Some(status) = envelope.status.as_deref()
-            && status != "completed"
-            && status != "incomplete"
-            && let Some(err) = envelope.error
-        {
-            return Err(OpenAiFailure {
-                class: OpenAiFailureClass::ProviderFailure,
-                message: err.to_string(),
-                retry_after_secs: None,
-            });
-        }
+        ensure_completed_status(&envelope)?;
 
         let mut text_parts: Vec<String> = Vec::new();
         if let Some(output) = envelope.output {
@@ -565,9 +681,16 @@ question, prefer a short explanation over inventing actions.",
             }),
         }
     }
+
+    fn safe_error(&self, mut failure: OpenAiFailure) -> AgentError {
+        if let Some(secret) = redactable_secret(self.api_key.as_deref()) {
+            failure.message = failure.message.replace(secret, "[REDACTED]");
+        }
+        failure.to_agent_error(&self.provider_id)
+    }
 }
 
-impl AgentProvider for OpenAiLunaProvider {
+impl AgentProvider for OpenAiResponsesProvider {
     fn respond<'a>(
         &'a self,
         request: AgentRequest,
@@ -590,15 +713,6 @@ impl AgentProvider for OpenAiLunaProvider {
                 bounded_and_redacted(&snap.body, self.api_key.as_deref(), MAX_RESPONSE_BYTES);
             Self::parse_responses_body(&safe_body).map_err(|f| self.safe_error(f))
         })
-    }
-}
-
-impl OpenAiLunaProvider {
-    fn safe_error(&self, mut failure: OpenAiFailure) -> AgentError {
-        if let Some(secret) = redactable_secret(self.api_key.as_deref()) {
-            failure.message = failure.message.replace(secret, "[REDACTED]");
-        }
-        failure.to_agent_error(OPENAI_LUNA_PROVIDER_ID)
     }
 }
 
@@ -797,6 +911,7 @@ fn map_wire_to_agent_response(wire: WireAgentResponse) -> Result<AgentResponse, 
         }
     }
 
+    // Authority boundary: every action element must validate, regardless of kind.
     if !action_errors.is_empty() {
         return Err(OpenAiFailure {
             class: OpenAiFailureClass::MalformedResponse,
@@ -896,6 +1011,15 @@ mod tests {
         }
     }
 
+    fn luna_provider(http: Arc<dyn HttpPost>, key: Option<&str>) -> OpenAiResponsesProvider {
+        OpenAiResponsesProvider::with_http(
+            OpenAiResponsesConfig::luna_preset(),
+            key.map(str::to_string),
+            http,
+            OPENAI_LUNA_PROVIDER_ID,
+        )
+    }
+
     fn ok_body(message: &str, kind: &str) -> String {
         json!({
             "status": "completed",
@@ -916,11 +1040,55 @@ mod tests {
         .to_string()
     }
 
+    fn envelope_with_status(status: &str, extra: Value) -> String {
+        let mut obj = json!({ "status": status });
+        if let Value::Object(map) = extra {
+            for (k, v) in map {
+                obj[k] = v;
+            }
+        }
+        obj.to_string()
+    }
+
+    #[test]
+    fn generic_config_emits_synthetic_model() {
+        let cfg = OpenAiResponsesConfig::new("example-model");
+        let provider = OpenAiResponsesProvider::with_http(
+            cfg,
+            Some("k".into()),
+            Arc::new(FixedHttp::new(200, "{}", None)),
+            "example-provider",
+        );
+        let body = provider.build_request_body(&sample_request("hi")).unwrap();
+        assert_eq!(body["model"], "example-model");
+        assert!(
+            !body.to_string().contains("gpt-6-luna"),
+            "synthetic model must not be rewritten to Luna"
+        );
+    }
+
+    #[test]
+    fn luna_preset_emits_gpt_6_luna() {
+        let provider = OpenAiResponsesProvider::with_http(
+            OpenAiResponsesConfig::luna_preset(),
+            Some("k".into()),
+            Arc::new(FixedHttp::new(200, "{}", None)),
+            OPENAI_LUNA_PROVIDER_ID,
+        );
+        let body = provider.build_request_body(&sample_request("hi")).unwrap();
+        assert_eq!(body["model"], "gpt-6-luna");
+        assert_eq!(body["reasoning"]["effort"], "medium");
+        assert_eq!(body["max_output_tokens"], 800);
+        assert!(body.to_string().contains("json_schema"));
+    }
+
     #[test]
     fn builds_bounded_request_without_credential() {
-        let provider = OpenAiLunaProvider::with_config(
-            OpenAiLunaConfig::default(),
+        let provider = OpenAiResponsesProvider::with_http(
+            OpenAiResponsesConfig::luna_preset(),
             Some("sk-test-secret".into()),
+            Arc::new(FixedHttp::new(200, "{}", None)),
+            OPENAI_LUNA_PROVIDER_ID,
         );
         let body = provider
             .build_request_body(&sample_request("why exit 2?"))
@@ -935,8 +1103,12 @@ mod tests {
     #[test]
     fn request_redacts_credential_from_prompt_and_context() {
         let secret = "sk-test-secret";
-        let provider =
-            OpenAiLunaProvider::with_config(OpenAiLunaConfig::default(), Some(secret.into()));
+        let provider = OpenAiResponsesProvider::with_http(
+            OpenAiResponsesConfig::luna_preset(),
+            Some(secret.into()),
+            Arc::new(FixedHttp::new(200, "{}", None)),
+            OPENAI_LUNA_PROVIDER_ID,
+        );
         let mut request = sample_request(&format!("please inspect {secret}"));
         request.context.environment.username = secret.into();
         request.conversation[0].text = secret.into();
@@ -954,20 +1126,12 @@ mod tests {
             &format!(r#"{{"error":{{"message":"rejected {secret}"}}}}"#),
             None,
         ));
-        let provider = OpenAiLunaProvider::with_http(
-            OpenAiLunaConfig::default(),
-            Some(secret.into()),
-            error_http,
-        );
+        let provider = luna_provider(error_http, Some(secret));
         let error = provider.respond(sample_request("x")).await.unwrap_err();
         assert!(!error.to_string().contains(secret));
 
         let success_http = Arc::new(FixedHttp::new(200, &ok_body(secret, "explanation"), None));
-        let provider = OpenAiLunaProvider::with_http(
-            OpenAiLunaConfig::default(),
-            Some(secret.into()),
-            success_http,
-        );
+        let provider = luna_provider(success_http, Some(secret));
         let response = provider.respond(sample_request("x")).await.unwrap();
         assert!(!response.message.contains(secret));
         assert!(response.message.contains("[REDACTED]"));
@@ -975,20 +1139,22 @@ mod tests {
 
     #[test]
     fn debug_never_prints_api_key() {
-        let provider = OpenAiLunaProvider::with_config(
-            OpenAiLunaConfig::default(),
+        let provider = OpenAiResponsesProvider::with_http(
+            OpenAiResponsesConfig::luna_preset(),
             Some("sk-super-secret-value".into()),
+            Arc::new(FixedHttp::new(200, "{}", None)),
+            OPENAI_LUNA_PROVIDER_ID,
         );
         let dbg = format!("{provider:?}");
         assert!(!dbg.contains("sk-super-secret-value"));
         assert!(dbg.contains("<redacted>"));
         assert!(dbg.contains("gpt-6-luna"));
+        assert!(dbg.contains("openai-luna"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn missing_credential_is_authentication_required() {
-        let http = Arc::new(FixedHttp::new(200, "{}", None));
-        let provider = OpenAiLunaProvider::with_http(OpenAiLunaConfig::default(), None, http);
+        let provider = luna_provider(Arc::new(FixedHttp::new(200, "{}", None)), None);
         let err = provider.respond(sample_request("hi")).await;
         match err.expect_err("missing key must fail") {
             AgentError::AuthenticationRequired { provider, message } => {
@@ -1001,28 +1167,26 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn maps_auth_rate_limit_unavailable_timeout() {
-        let p = OpenAiLunaProvider::with_http(
-            OpenAiLunaConfig::default(),
-            Some("k".into()),
+        let p = luna_provider(
             Arc::new(FixedHttp::new(
                 401,
                 r#"{"error":{"message":"bad key"}}"#,
                 None,
             )),
+            Some("k"),
         );
         match p.respond(sample_request("x")).await.unwrap_err() {
             AgentError::AuthenticationRequired { .. } => {}
             other => panic!("{other:?}"),
         }
 
-        let p = OpenAiLunaProvider::with_http(
-            OpenAiLunaConfig::default(),
-            Some("k".into()),
+        let p = luna_provider(
             Arc::new(FixedHttp::new(
                 429,
                 r#"{"error":{"message":"slow down"}}"#,
                 Some(7),
             )),
+            Some("k"),
         );
         match p.respond(sample_request("x")).await.unwrap_err() {
             AgentError::RateLimited {
@@ -1032,14 +1196,13 @@ mod tests {
             other => panic!("{other:?}"),
         }
 
-        let p = OpenAiLunaProvider::with_http(
-            OpenAiLunaConfig::default(),
-            Some("k".into()),
+        let p = luna_provider(
             Arc::new(FixedHttp::new(
                 404,
                 r#"{"error":{"message":"The model `gpt-6-luna` does not exist"}}"#,
                 None,
             )),
+            Some("k"),
         );
         match p.respond(sample_request("x")).await.unwrap_err() {
             AgentError::ProviderUnavailable { .. } => {}
@@ -1057,11 +1220,7 @@ mod tests {
                 Err("timeout: deadline exceeded".into())
             }
         }
-        let p = OpenAiLunaProvider::with_http(
-            OpenAiLunaConfig::default(),
-            Some("k".into()),
-            Arc::new(TimeoutHttp),
-        );
+        let p = luna_provider(Arc::new(TimeoutHttp), Some("k"));
         match p.respond(sample_request("x")).await.unwrap_err() {
             AgentError::Timeout(_) => {}
             other => panic!("{other:?}"),
@@ -1070,10 +1229,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn maps_success_and_malformed_action() {
-        let p = OpenAiLunaProvider::with_http(
-            OpenAiLunaConfig::default(),
-            Some("k".into()),
+        let p = luna_provider(
             Arc::new(FixedHttp::new(200, &ok_body("hello", "explanation"), None)),
+            Some("k"),
         );
         let resp = p.respond(sample_request("x")).await.unwrap();
         assert_eq!(resp.kind, AgentResponseKind::Explanation);
@@ -1092,16 +1250,13 @@ mod tests {
             }]
         })
         .to_string();
-        let p = OpenAiLunaProvider::with_http(
-            OpenAiLunaConfig::default(),
-            Some("k".into()),
-            Arc::new(FixedHttp::new(200, &bad, None)),
-        );
+        let p = luna_provider(Arc::new(FixedHttp::new(200, &bad, None)), Some("k"));
         match p.respond(sample_request("x")).await.unwrap_err() {
             AgentError::Rejected(msg) => assert!(msg.contains("malformed") || msg.contains("argv")),
             other => panic!("{other:?}"),
         }
 
+        // Authority: kind=explanation must not bypass action validation.
         let malformed_explanation = json!({
             "status": "completed",
             "output": [{
@@ -1113,21 +1268,16 @@ mod tests {
             }]
         })
         .to_string();
-        let p = OpenAiLunaProvider::with_http(
-            OpenAiLunaConfig::default(),
-            Some("k".into()),
+        let p = luna_provider(
             Arc::new(FixedHttp::new(200, &malformed_explanation, None)),
+            Some("k"),
         );
         assert!(matches!(
             p.respond(sample_request("x")).await.unwrap_err(),
             AgentError::Rejected(_)
         ));
 
-        let p = OpenAiLunaProvider::with_http(
-            OpenAiLunaConfig::default(),
-            Some("k".into()),
-            Arc::new(FixedHttp::new(200, "not-json", None)),
-        );
+        let p = luna_provider(Arc::new(FixedHttp::new(200, "not-json", None)), Some("k"));
         match p.respond(sample_request("x")).await.unwrap_err() {
             AgentError::Rejected(msg) => assert!(msg.contains("malformed structured response")),
             other => panic!("{other:?}"),
@@ -1162,11 +1312,7 @@ mod tests {
             }]
         })
         .to_string();
-        let p = OpenAiLunaProvider::with_http(
-            OpenAiLunaConfig::default(),
-            Some("k".into()),
-            Arc::new(FixedHttp::new(200, &ok, None)),
-        );
+        let p = luna_provider(Arc::new(FixedHttp::new(200, &ok, None)), Some("k"));
         let resp = p.respond(sample_request("x")).await.unwrap();
         assert_eq!(resp.kind, AgentResponseKind::Proposal);
         assert_eq!(resp.proposed_actions.len(), 1);
@@ -1176,6 +1322,154 @@ mod tests {
                 if tool == "cargo" && operation == "check"
         ));
         assert_eq!(resp.uncertainty.as_deref(), Some("if workspace is dirty"));
+    }
+
+    #[test]
+    fn completed_valid_structured_output_passes() {
+        let resp =
+            OpenAiResponsesProvider::parse_responses_body(&ok_body("done", "result")).unwrap();
+        assert_eq!(resp.kind, AgentResponseKind::Result);
+        assert_eq!(resp.message, "done");
+    }
+
+    #[test]
+    fn incomplete_max_output_tokens_fails_closed_with_reason() {
+        let body = envelope_with_status(
+            "incomplete",
+            json!({ "incomplete_details": { "reason": "max_output_tokens" } }),
+        );
+        let err = OpenAiResponsesProvider::parse_responses_body(&body).unwrap_err();
+        assert_eq!(err.class, OpenAiFailureClass::IncompleteResponse);
+        assert!(err.message.contains("status=incomplete"));
+        assert!(err.message.contains("reason=max_output_tokens"));
+        let agent = err.to_agent_error("openai-luna");
+        assert!(matches!(agent, AgentError::Rejected(_)));
+        let text = agent.to_string();
+        assert!(text.contains("openai-luna"));
+        assert!(text.contains("max_output_tokens"));
+        assert!(!text.contains("malformed structured response"));
+    }
+
+    #[test]
+    fn incomplete_content_filter_fails_closed_with_reason() {
+        let body = envelope_with_status(
+            "incomplete",
+            json!({ "incomplete_details": { "reason": "content_filter" } }),
+        );
+        let err = OpenAiResponsesProvider::parse_responses_body(&body).unwrap_err();
+        assert_eq!(err.class, OpenAiFailureClass::IncompleteResponse);
+        assert!(err.message.contains("reason=content_filter"));
+    }
+
+    #[test]
+    fn incomplete_unknown_reason_is_preserved() {
+        let body = envelope_with_status(
+            "incomplete",
+            json!({ "incomplete_details": { "reason": "some_future_reason" } }),
+        );
+        let err = OpenAiResponsesProvider::parse_responses_body(&body).unwrap_err();
+        assert!(err.message.contains("reason=some_future_reason"));
+    }
+
+    #[test]
+    fn incomplete_without_reason_fails_closed() {
+        let body = envelope_with_status("incomplete", json!({}));
+        let err = OpenAiResponsesProvider::parse_responses_body(&body).unwrap_err();
+        assert_eq!(err.class, OpenAiFailureClass::IncompleteResponse);
+        assert!(err.message.contains("status=incomplete"));
+        assert!(err.message.contains("reason=unknown"));
+    }
+
+    #[test]
+    fn failed_with_error_object_fails_closed_with_detail() {
+        let body = envelope_with_status(
+            "failed",
+            json!({ "error": { "message": "upstream model exploded safely" } }),
+        );
+        let err = OpenAiResponsesProvider::parse_responses_body(&body).unwrap_err();
+        assert_eq!(err.class, OpenAiFailureClass::IncompleteResponse);
+        assert!(err.message.contains("status=failed"));
+        assert!(err.message.contains("upstream model exploded safely"));
+    }
+
+    #[test]
+    fn cancelled_fails_closed_truthfully() {
+        let body = envelope_with_status("cancelled", json!({}));
+        let err = OpenAiResponsesProvider::parse_responses_body(&body).unwrap_err();
+        assert_eq!(err.class, OpenAiFailureClass::IncompleteResponse);
+        assert!(err.message.contains("status=cancelled"));
+        assert!(!err.message.to_lowercase().contains("timeout"));
+        assert!(!err.message.to_lowercase().contains("auth"));
+    }
+
+    #[test]
+    fn queued_and_in_progress_fail_closed() {
+        for status in ["queued", "in_progress"] {
+            let body = envelope_with_status(status, json!({}));
+            let err = OpenAiResponsesProvider::parse_responses_body(&body).unwrap_err();
+            assert_eq!(err.class, OpenAiFailureClass::IncompleteResponse);
+            assert!(err.message.contains(status));
+            assert!(err.message.contains("unexpected"));
+        }
+    }
+
+    #[test]
+    fn missing_status_fails_closed() {
+        let body = r#"{"output":[]}"#;
+        let err = OpenAiResponsesProvider::parse_responses_body(body).unwrap_err();
+        assert_eq!(err.class, OpenAiFailureClass::IncompleteResponse);
+        assert!(err.message.contains("missing response status"));
+    }
+
+    #[test]
+    fn unknown_status_string_fails_closed() {
+        let body = envelope_with_status("future_status_xyz", json!({}));
+        let err = OpenAiResponsesProvider::parse_responses_body(&body).unwrap_err();
+        assert_eq!(err.class, OpenAiFailureClass::IncompleteResponse);
+        assert!(err.message.contains("future_status_xyz"));
+    }
+
+    #[test]
+    fn non_completed_status_never_parses_partial_output() {
+        // Even with completed-looking structured text, incomplete must not parse.
+        let body = json!({
+            "status": "incomplete",
+            "incomplete_details": { "reason": "max_output_tokens" },
+            "output": [{
+                "type": "message",
+                "content": [{
+                    "type": "output_text",
+                    "text": json!({
+                        "kind": "explanation",
+                        "message": "partial",
+                        "proposed_actions": [],
+                        "references": [],
+                        "uncertainty": null
+                    }).to_string()
+                }]
+            }]
+        })
+        .to_string();
+        let err = OpenAiResponsesProvider::parse_responses_body(&body).unwrap_err();
+        assert_eq!(err.class, OpenAiFailureClass::IncompleteResponse);
+        assert!(err.message.contains("max_output_tokens"));
+    }
+
+    #[test]
+    fn completed_malformed_payload_still_rejected() {
+        let body = json!({
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "not-json" }]
+            }]
+        })
+        .to_string();
+        let err = OpenAiResponsesProvider::parse_responses_body(&body).unwrap_err();
+        assert_eq!(err.class, OpenAiFailureClass::MalformedResponse);
+        let agent = err.to_agent_error("openai-luna");
+        assert!(matches!(agent, AgentError::Rejected(_)));
+        assert!(agent.to_string().contains("malformed structured response"));
     }
 
     #[test]

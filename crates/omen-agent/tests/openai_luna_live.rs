@@ -6,7 +6,7 @@
 
 use omen_agent::{
     AgentContext, AgentProvider, AgentRequest, AgentTurn, OPENAI_LUNA_PROVIDER_ID,
-    OpenAiLunaProvider,
+    OpenAiResponsesProvider,
 };
 use omen_core::InteractiveSessionId;
 use std::path::PathBuf;
@@ -38,7 +38,7 @@ async fn live_luna_raw_smoke() {
         panic!("OPENAI_API_KEY must be set for live smoke");
     };
 
-    let provider = OpenAiLunaProvider::from_env();
+    let provider = OpenAiResponsesProvider::luna_preset();
     assert_eq!(provider.model(), "gpt-6-luna");
     assert!(provider.has_credential());
     assert_eq!(provider.descriptor().id, OPENAI_LUNA_PROVIDER_ID);
