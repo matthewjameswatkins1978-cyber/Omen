@@ -21,6 +21,7 @@ chrono = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 tracing = { workspace = true }
+ureq = { workspace = true }
 
 [dev-dependencies]
 omen-test-fixtures = { workspace = true }

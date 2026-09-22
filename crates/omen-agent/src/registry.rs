@@ -1,4 +1,5 @@
 use crate::diagnostic_provider::DiagnosticAgentProvider;
+use crate::openai_luna::{OpenAiLunaProvider, openai_luna_descriptor};
 use crate::provider::{AgentError, AgentProvider, DEFAULT_AGENT_TIMEOUT, TimeoutProvider};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -14,6 +15,8 @@ pub struct ProviderDescriptor {
     pub capabilities: Vec<String>,
     pub is_available: bool,
 }
+
+const OPENAI_LUNA_ID: &str = crate::openai_luna::OPENAI_LUNA_PROVIDER_ID;
 
 type ProviderEntry = (ProviderDescriptor, Arc<dyn AgentProvider>);
 
@@ -52,6 +55,19 @@ impl ProviderRegistry {
             DEFAULT_AGENT_TIMEOUT,
         ));
         map.insert("diagnostic".into(), (diag_desc, diag_provider));
+
+        // Register OpenAI Luna whenever a credential is present. Availability
+        // and model identity are truthful; the key itself is never stored on
+        // the descriptor.
+        let luna_key = crate::openai_luna::openai_api_key_from_env();
+        let luna_available = luna_key.is_some();
+        if luna_available {
+            let luna = OpenAiLunaProvider::from_env();
+            let desc = openai_luna_descriptor(luna.model(), true);
+            let luna_provider: Arc<dyn AgentProvider> =
+                Arc::new(TimeoutProvider::new(Arc::new(luna), DEFAULT_AGENT_TIMEOUT));
+            map.insert(OPENAI_LUNA_ID.into(), (desc, luna_provider));
+        }
 
         Self {
             providers: RwLock::new(map),
