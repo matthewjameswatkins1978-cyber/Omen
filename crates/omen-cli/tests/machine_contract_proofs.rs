@@ -29,7 +29,7 @@ fn unknown_digest_does_not_fake_a_contract_delta() {
     assert_eq!(value["changed"], true);
     assert_eq!(value["delta_available"], false);
     assert!(value.get("capabilities_added").is_none());
-    assert_eq!(value["next_actions"][0], "orient");
+    assert_eq!(value["next_actions"][0]["operation"], "orient");
 }
 
 #[test]
@@ -38,15 +38,11 @@ fn discovery_status_is_runtime_unknown_and_not_static_contract_truth() {
     let entries = value["capabilities"].as_array().expect("capability array");
     assert!(!entries.is_empty());
     for entry in entries {
-        assert_eq!(entry["status"]["availability"], "unknown");
-        assert_eq!(entry["status"]["admission"], "unknown");
-        assert!(entry["definition"]["effect_class"].is_string());
-        assert!(
-            entry["definition"]["input_schema"]["$schema"]
-                .as_str()
-                .unwrap()
-                .contains("2020-12")
-        );
+        assert_eq!(entry["availability"], "unknown");
+        assert_eq!(entry["admission"], "unknown");
+        assert!(entry["describe_ref"].is_string());
+        assert!(entry["summary"].is_string());
+        assert!(entry.get("input_schema").is_none());
     }
 }
 

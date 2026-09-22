@@ -413,7 +413,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "delta_available": false,
                         "previous_digest": previous,
                         "contract_digest": digest,
-                        "next_actions": ["orient"]
+                        "next_actions": [{
+                            "operation": "orient",
+                            "cli": "orient --machine",
+                            "mcp_tool": "omen_orient",
+                            "purpose": "refresh the static discovery digest"
+                        }]
                     })
                 };
                 println!("{}", serde_json::to_string_pretty(&doc)?);
