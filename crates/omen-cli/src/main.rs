@@ -651,7 +651,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     serde_json::json!({"changed":false,"from_generation":generation,"context_generation":generation,"changes":[]})
                 }
                 Some(generation) => {
-                    serde_json::json!({"error":"DELTA_UNAVAILABLE","from_generation":generation,"state_changed":false,"retryable":true,"context_generation":machine_context.context_generation,"reason":"Omen does not retain that historical generation","next_actions":["context"]})
+                    let mut error = OmenError::from_code(
+                        ErrorCode::DeltaUnavailable,
+                        "Omen does not retain that historical generation",
+                    );
+                    error.retryability = omen_core::Retryability::Never;
+                    error.details = serde_json::json!({
+                        "from_generation": generation,
+                        "context_generation": machine_context.context_generation,
+                        "next_actions": ["context --machine"]
+                    });
+                    serde_json::to_value(error)?
                 }
             };
             println!("{}", serde_json::to_string_pretty(&doc)?);
@@ -1037,10 +1047,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     Err(e) => {
                         if json_mode {
-                            let err_json = serde_json::json!({
-                                "error": e.to_string(),
-                                "code": format!("{:?}", e.code()),
-                            });
+                            let err_json = OmenError::from_core(&e);
                             println!("{}", serde_json::to_string_pretty(&err_json)?);
                         } else {
                             eprintln!("Refusal: {e}");
