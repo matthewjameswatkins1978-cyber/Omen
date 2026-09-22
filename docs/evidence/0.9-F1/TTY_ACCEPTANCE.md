@@ -30,11 +30,11 @@ closed by which evidence class, and which remain for human feel sign-off.
 | 13 | Windows PATH truth (`.exe`→stem, `.cmd`/`.bat`/`.com`→retain extension) | Deterministic | **PASS** | `windows_path_truth::*` (10 tests) |
 | 14 | No destructive mid-token replacement | Deterministic | **PASS** | `f1_mid_token_incompatible_suffix_is_not_destroyed`, `f1_unquoted_space_middle_is_declined_not_corrupted`, `f1_already_matching_token_has_no_destructive_edit`, `f1_open_quote_unsafe_rewrites_are_declined` |
 | 15 | Display/insertion safety (no ANSI, no unrepresentable corruption) | Deterministic | **PASS** | `f1_degraded_terminal_relies_on_plain_insertion_text`, `f1_insertion_text_is_never_the_display_text_when_quoting_is_needed`, `f1_unrepresentable_literals_are_unknown_not_corrupt` |
-| 16 | Ghost hint acceptance via keybinding (Right/End) feels natural | Human feel | **pending human** | see below |
+| 16 | Ghost hint acceptance via keybinding (Right/End) mutates buffer | ConPTY | **PASS** (was **FAIL** pre-repair) | `pty_right_arrow_accepts_ghost_into_buffer`, `pty_end_key_accepts_ghost_into_buffer` |
 
-## Genuine ConPTY proofs (6)
+## Genuine ConPTY proofs (8)
 
-All six run through real Windows ConPTY (`NativePtyHandle::spawn` →
+All eight run through real Windows ConPTY (`NativePtyHandle::spawn` →
 `CreatePseudoConsole`), real Reedline (`OmenCompleter` + `OmenHinter`), real
 keystroke injection, and real terminal output reading with ANSI stripping.
 
@@ -44,6 +44,18 @@ keystroke injection, and real terminal output reading with ANSI stripping.
 4. **Tab menu shows `cargo`** — `pty_tab_shows_completion_menu_with_candidates`
 5. **Escape dismisses ghost without insertion** — `pty_escape_dismisses_ghost_without_insert`
 6. **NO_COLOR ghost remains plain and usable** — `pty_no_color_ghost_is_plain_text`
+7. **Right Arrow accepts ghost into buffer** (`:stat` → `:status`) — `pty_right_arrow_accepts_ghost_into_buffer`
+8. **End key accepts ghost into buffer** (`:stat` → `:status`) — `pty_end_key_accepts_ghost_into_buffer`
+
+### Pre-repair failure (recorded)
+
+Before the `OmenHinter` repair, the build at `89348a2` exhibited a real
+correctness defect: `complete_hint()` returned `String::new()`, so Reedline's
+`HistoryHintComplete` path inserted nothing. The ghost was **visible** but
+**not acceptable**. Matthew's human terminal check confirmed: typing `:stat`
+showed ghost `us`, but pressing Right or End did not mutate the buffer.
+This was repaired by storing the safe ghost suffix in `OmenHinter::current_hint`
+and returning it from `complete_hint()`.
 
 ## Deterministic proofs (already established)
 
@@ -60,18 +72,24 @@ evidence.
 - Windows PATH truth: `.exe`→stem, `.cmd`/`.bat`/`.com`→retain extension, unsupported forms excluded
 - No destructive mid-token replacement: incompatible suffixes and quote surgery declined
 - Display/insertion safety: no ANSI in insertion/display, unrepresentable literals declined
+- Ghost acceptance payload: `complete_hint()` matches rendered ghost exactly
+- Stale hint clearing: buffer change, ambiguity, unsafe input, empty input all clear the accept payload
+- `next_hint_token` policy: returns whole hint (F1 hints are single-token suffixes)
 
 ## Remaining human check
 
-The only remaining human check is a **feel/keybinding acceptance** check, not
-a correctness proof:
+Matthew's original human check **failed** on the pre-repair build
+(`89348a2`): Right/End did not accept the ghost. This is now **repaired and
+proven by ConPTY** (`pty_right_arrow_accepts_ghost_into_buffer`,
+`pty_end_key_accepts_ghost_into_buffer`).
+
+The remaining human check is a **feel confirmation** only:
 
 > Type `:stat`, observe ghost `us`, press **Right** or **End**, confirm the
 > buffer becomes `:status` naturally.
 
-This verifies that Reedline's default hint-acceptance keybinding feels correct
-in a real terminal. The engine, edit semantics, and ghost rendering are
-already proven.
+This is not a correctness proof — correctness is proven by ConPTY. It
+verifies the interaction feels calm and natural.
 
 ## Known UI limitations (F1)
 
@@ -96,4 +114,5 @@ already proven.
 | Real-terminal rendering | **proven** (ConPTY) |
 | Ghost visibility and dismissal | **proven** (ConPTY) |
 | Tab menu | **proven** (ConPTY) |
-| Keybinding acceptance feel | **pending human** (1 row) |
+| Ghost acceptance (Right/End) | **proven** (ConPTY) — was **FAIL** pre-repair |
+| Keybinding acceptance feel | **pending human** (1 row, feel only) |

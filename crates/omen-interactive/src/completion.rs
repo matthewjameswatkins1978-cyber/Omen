@@ -1026,13 +1026,24 @@ impl Completer for OmenCompleter {
 }
 
 /// Ghost-suggestion hinter. Append-only; calm by construction.
+///
+/// Retains the current safe ghost suffix so Reedline's `HistoryHintComplete`
+/// (Right / End) can insert it into the editable buffer via [`complete_hint`].
+/// The cached accept payload is cleared on every `handle()` call and is only
+/// populated when [`CompletionEngine::ghost_hint`] approves a ghost. The
+/// visible ghost and the accepted payload are always the same safe edit.
 pub struct OmenHinter {
     completer: Arc<Mutex<OmenCompleter>>,
+    /// Raw unformatted safe ghost suffix approved by `CompletionEngine::ghost_hint`.
+    current_hint: String,
 }
 
 impl OmenHinter {
     pub fn new(completer: Arc<Mutex<OmenCompleter>>) -> Self {
-        Self { completer }
+        Self {
+            completer,
+            current_hint: String::new(),
+        }
     }
 }
 
@@ -1045,6 +1056,9 @@ impl Hinter for OmenHinter {
         _use_ansi: bool,
         _cwd: &str,
     ) -> String {
+        // Always clear the accept payload first: stale hints must never survive
+        // a buffer change, cursor move, ambiguity, lock failure, or empty input.
+        self.current_hint.clear();
         if line.is_empty() {
             return String::new();
         }
@@ -1054,16 +1068,23 @@ impl Hinter for OmenHinter {
         let Ok(ctx) = comp.context.lock() else {
             return String::new();
         };
-        CompletionEngine::ghost_hint(&ctx, line, pos)
-            .map(|(hint, _)| hint)
-            .unwrap_or_default()
+        match CompletionEngine::ghost_hint(&ctx, line, pos) {
+            Some((hint, _)) => {
+                self.current_hint = hint.clone();
+                hint
+            }
+            None => String::new(),
+        }
     }
 
     fn complete_hint(&self) -> String {
-        String::new()
+        self.current_hint.clone()
     }
 
     fn next_hint_token(&self) -> String {
-        String::new()
+        // F1 ghost hints are always single-token word suffixes (e.g. `"us"`,
+        // `"go"`, `"tor"`). The first semantic token is the whole hint.
+        // Partial-token acceptance is not intentionally supported in F1.
+        self.current_hint.clone()
     }
 }

@@ -904,3 +904,135 @@ mod windows_path_truth {
         assert!(!dir.path().join("helper.exe").is_file());
     }
 }
+
+// ---------------------------------------------------------------------------
+// GHOST ACCEPTANCE (OmenHinter complete_hint / next_hint_token)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod ghost_acceptance {
+    use omen_interactive::completion::{
+        CompletionContext, HotSemanticIndex, OmenCompleter, OmenHinter,
+    };
+    use reedline::{FileBackedHistory, Hinter};
+    use std::sync::{Arc, Mutex};
+    use tempfile::tempdir;
+
+    fn make_hinter(cmds: &[&str]) -> (OmenHinter, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let mut hot = HotSemanticIndex::default();
+        hot.update_path_commands(cmds.iter().map(|s| s.to_string()).collect());
+        let ctx = Arc::new(Mutex::new(CompletionContext {
+            cwd: dir.path().to_path_buf(),
+            hot_index: hot,
+        }));
+        let completer = Arc::new(Mutex::new(OmenCompleter::new(ctx)));
+        (OmenHinter::new(completer), dir)
+    }
+
+    fn history(dir: &std::path::Path) -> FileBackedHistory {
+        FileBackedHistory::with_file(10, dir.join("h.txt")).unwrap()
+    }
+
+    #[test]
+    fn f1_ghost_acceptance_handle_and_complete_hint_match() {
+        let (mut hinter, dir) = make_hinter(&["cargo"]);
+        let hist = history(dir.path());
+        let rendered = hinter.handle(":stat", 5, &hist, false, ".");
+        assert_eq!(rendered, "us", "handle must render 'us'");
+        assert_eq!(
+            hinter.complete_hint(),
+            "us",
+            "complete_hint must return the same safe payload"
+        );
+    }
+
+    #[test]
+    fn f1_ghost_acceptance_payload_matches_rendered() {
+        let (mut hinter, dir) = make_hinter(&["cargo"]);
+        let hist = history(dir.path());
+        for (line, pos, expected) in [(":stat", 5, "us"), ("car", 3, "go"), (":doc", 4, "tor")] {
+            hinter.handle(line, pos, &hist, false, ".");
+            assert_eq!(
+                hinter.complete_hint(),
+                expected,
+                "accept payload must match rendered ghost for {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn f1_ghost_acceptance_ambiguous_clears_hint() {
+        let (mut hinter, dir) = make_hinter(&["card", "cargo", "carbon"]);
+        let hist = history(dir.path());
+        let rendered = hinter.handle("car", 3, &hist, false, ".");
+        assert!(
+            rendered.is_empty(),
+            "ambiguous must be quiet, got {rendered:?}"
+        );
+        assert_eq!(
+            hinter.complete_hint(),
+            "",
+            "ambiguous must clear accept payload"
+        );
+    }
+
+    #[test]
+    fn f1_ghost_acceptance_buffer_change_clears_stale_hint() {
+        let (mut hinter, dir) = make_hinter(&["cargo"]);
+        let hist = history(dir.path());
+        // First: ghost appears.
+        hinter.handle(":stat", 5, &hist, false, ".");
+        assert_eq!(hinter.complete_hint(), "us");
+        // Buffer changes to something with no ghost.
+        hinter.handle("fakecommand", 11, &hist, false, ".");
+        assert_eq!(
+            hinter.complete_hint(),
+            "",
+            "stale hint must be cleared after buffer change"
+        );
+    }
+
+    #[test]
+    fn f1_ghost_acceptance_unsafe_input_clears_hint() {
+        let (mut hinter, dir) = make_hinter(&["cargo"]);
+        let hist = history(dir.path());
+        hinter.handle(":stat", 5, &hist, false, ".");
+        assert_eq!(hinter.complete_hint(), "us");
+        // Malformed / unsafe input: open quote with no ghost.
+        hinter.handle("cat 'file", 9, &hist, false, ".");
+        assert_eq!(
+            hinter.complete_hint(),
+            "",
+            "unsafe input must clear cached hint"
+        );
+    }
+
+    #[test]
+    fn f1_ghost_acceptance_empty_input_clears_hint() {
+        let (mut hinter, dir) = make_hinter(&["cargo"]);
+        let hist = history(dir.path());
+        hinter.handle(":stat", 5, &hist, false, ".");
+        assert_eq!(hinter.complete_hint(), "us");
+        hinter.handle("", 0, &hist, false, ".");
+        assert_eq!(
+            hinter.complete_hint(),
+            "",
+            "empty input must clear cached hint"
+        );
+    }
+
+    #[test]
+    fn f1_ghost_acceptance_next_hint_token_is_whole_hint() {
+        let (mut hinter, dir) = make_hinter(&["cargo"]);
+        let hist = history(dir.path());
+        hinter.handle(":stat", 5, &hist, false, ".");
+        // F1 ghost hints are single-token suffixes; first token == whole hint.
+        assert_eq!(hinter.next_hint_token(), "us");
+        hinter.handle("car", 3, &hist, false, ".");
+        assert_eq!(hinter.next_hint_token(), "go");
+        // Empty after clear.
+        hinter.handle("", 0, &hist, false, ".");
+        assert_eq!(hinter.next_hint_token(), "");
+    }
+}

@@ -274,3 +274,79 @@ fn pty_no_color_ghost_is_plain_text() {
     handle.write_input(b"exit\r").unwrap();
     let _ = read_until(&mut handle, "PTY_GATE_EXIT");
 }
+
+// ---------------------------------------------------------------------------
+// GHOST ACCEPTANCE: actual buffer mutation via HistoryHintComplete
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pty_right_arrow_accepts_ghost_into_buffer() {
+    let mut handle = spawn_gate();
+    read_until(&mut handle, "pty-gate>");
+
+    // Type `:stat` — ghost renders `us`.
+    handle.write_input(b":stat").unwrap();
+    let out = read_until(&mut handle, ":status");
+    let plain = strip_ansi(&out);
+    assert!(
+        plain.contains(":status"),
+        "ghost must render 'us' as ':status', got: {plain:?}"
+    );
+
+    // Press Right Arrow (ESC [ C) to accept the ghost via HistoryHintComplete.
+    handle.write_input(b"\x1b[C").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let _ = read_available(&mut handle, Duration::from_millis(100));
+
+    // Press Enter. The editable buffer must be `:status`, NOT `:stat`.
+    handle.write_input(b"\r").unwrap();
+    let out = read_until(&mut handle, "PTY_GATE_LINE:");
+    let plain = strip_ansi(&out);
+    assert!(
+        plain.contains("PTY_GATE_LINE::status"),
+        "Right must accept ghost into buffer as ':status', got: {plain:?}"
+    );
+    assert!(
+        !plain.contains("PTY_GATE_LINE::stat\r") && !plain.contains("PTY_GATE_LINE::stat\n"),
+        "buffer must NOT be ':stat' after acceptance: {plain:?}"
+    );
+
+    handle.write_input(b"exit\r").unwrap();
+    let _ = read_until(&mut handle, "PTY_GATE_EXIT");
+}
+
+#[test]
+fn pty_end_key_accepts_ghost_into_buffer() {
+    let mut handle = spawn_gate();
+    read_until(&mut handle, "pty-gate>");
+
+    // Type `:stat` — ghost renders `us`.
+    handle.write_input(b":stat").unwrap();
+    let out = read_until(&mut handle, ":status");
+    let plain = strip_ansi(&out);
+    assert!(
+        plain.contains(":status"),
+        "ghost must render 'us' as ':status', got: {plain:?}"
+    );
+
+    // Press End (ESC [ F) to accept the ghost via HistoryHintComplete.
+    handle.write_input(b"\x1b[F").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let _ = read_available(&mut handle, Duration::from_millis(100));
+
+    // Press Enter. The editable buffer must be `:status`, NOT `:stat`.
+    handle.write_input(b"\r").unwrap();
+    let out = read_until(&mut handle, "PTY_GATE_LINE:");
+    let plain = strip_ansi(&out);
+    assert!(
+        plain.contains("PTY_GATE_LINE::status"),
+        "End must accept ghost into buffer as ':status', got: {plain:?}"
+    );
+    assert!(
+        !plain.contains("PTY_GATE_LINE::stat\r") && !plain.contains("PTY_GATE_LINE::stat\n"),
+        "buffer must NOT be ':stat' after acceptance: {plain:?}"
+    );
+
+    handle.write_input(b"exit\r").unwrap();
+    let _ = read_until(&mut handle, "PTY_GATE_EXIT");
+}
