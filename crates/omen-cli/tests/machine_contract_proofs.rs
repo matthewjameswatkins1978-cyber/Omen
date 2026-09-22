@@ -91,3 +91,34 @@ fn capability_catalogue_exposes_real_invocation_routes() {
     assert!(diagnostics["invocation"]["cli"].is_null());
     assert!(diagnostics["invocation"]["mcp_tool"].is_null());
 }
+
+
+#[test]
+fn context_delta_failure_uses_the_frozen_omen_error_envelope() {
+    let value = run(&["context", "--machine", "--since", "999999"]);
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["code"], "DELTA_UNAVAILABLE");
+    assert_eq!(value["category"], "RESOURCE");
+    assert_eq!(value["state_changed"], "NO");
+    assert_eq!(value["retryability"], "NEVER");
+    assert_eq!(value["details"]["from_generation"], 999999);
+}
+
+#[test]
+fn fact_get_failure_uses_the_frozen_omen_error_envelope() {
+    let workspace = tempdir().expect("temporary workspace");
+    let output = Command::new(env!("CARGO_BIN_EXE_omen"))
+        .args(["--machine", "fact", "get", "fact://missing/value"])
+        .arg("--workspace")
+        .arg(workspace.path())
+        .output()
+        .expect("run fact get");
+    assert!(!output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).expect("machine error is JSON");
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["code"], "NOT_FOUND");
+    assert_eq!(value["category"], "RESOURCE");
+    assert_eq!(value["state_changed"], "NO");
+    assert!(value.get("message").is_some());
+    assert!(value.get("error").is_none());
+}
