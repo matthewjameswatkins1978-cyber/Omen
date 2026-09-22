@@ -490,10 +490,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Doctor) => {
             let supervisor = ProcessSupervisor::new();
             let backend_caps = supervisor.backend().capabilities();
+            let executable = std::env::current_exe()?;
             if json_mode {
                 let doc = serde_json::json!({
                     "status": "ok",
                     "version": env!("CARGO_PKG_VERSION"),
+                    "build_identity": env!("OMEN_BUILD_IDENTITY"),
+                    "executable": executable,
                     "doctrine": "substrate, not sovereign",
                     "platform": std::env::consts::OS,
                     "capabilities": {
@@ -505,6 +508,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", serde_json::to_string_pretty(&doc)?);
             } else {
                 println!("Omen {}: OK", env!("CARGO_PKG_VERSION"));
+                println!("Executable: {}", executable.display());
+                println!("Build: {}", env!("OMEN_BUILD_IDENTITY"));
                 println!("Doctrine: substrate, not sovereign");
                 println!("Platform Backend: {}", std::env::consts::OS);
                 println!("Descendant Containment: {:?}", backend_caps.descendants);
