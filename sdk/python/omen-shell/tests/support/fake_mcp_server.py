@@ -14,6 +14,12 @@ behavior selected by the ``FAKE_MCP_MODE`` environment variable:
 * ``slow`` — sleep 30s before answering tools/call (tests use short
   deadlines to observe the timeout, then kill).
 * ``duplicate`` — send the same response twice for one request.
+* ``bad-contract`` — initialize fine, but ``omen_orient`` reports an
+  unsupported Machine Contract (connect must fail AFTER spawn).
+* ``bad-payload`` — initialize fine, but ``omen_orient`` answers with a
+  non-JSON text payload (connect must fail AFTER spawn).
+* ``good-orient`` — initialize fine and ``omen_orient`` answers a minimal
+  valid orientation (contract 0.8), so connect succeeds; other tools echo.
 
 Every mode answers ``initialize`` so handshake tests stay simple.
 """
@@ -90,7 +96,29 @@ def _handle(message: dict[str, object], pending: list[dict[str, object]]) -> Non
         )
         return
     if method == "tools/call":
-        name = args.get("name") if isinstance(args, dict) else None
+        name = params.get("name") if isinstance(params, dict) else None
+        if name == "omen_orient" and MODE == "bad-contract":
+            _ok(
+                call_id,
+                _tool_text(
+                    {
+                        "contract_version": "99.99",
+                        "omen_version": "0.0.0-fake",
+                        "contract_digest": "fake",
+                        "workspace": {},
+                    }
+                ),
+            )
+            return
+        if name == "omen_orient" and MODE == "bad-payload":
+            _send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": call_id,
+                    "result": {"content": [{"type": "text", "text": "this is not json"}]},
+                }
+            )
+            return
         if MODE == "out-of-order" and not pending:
             pending.append(message)
             return
@@ -102,6 +130,19 @@ def _handle(message: dict[str, object], pending: list[dict[str, object]]) -> Non
         if MODE == "duplicate":
             _ok(call_id, _tool_text(payload))
             _ok(call_id, _tool_text(payload))
+            return
+        if name == "omen_orient" and MODE == "good-orient":
+            _ok(
+                call_id,
+                _tool_text(
+                    {
+                        "contract_version": "0.8",
+                        "omen_version": "0.0.0-fake",
+                        "contract_digest": "fake",
+                        "workspace": {},
+                    }
+                ),
+            )
             return
         if MODE == "out-of-order" and pending:
             first = pending.pop(0)

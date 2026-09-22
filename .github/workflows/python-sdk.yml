@@ -63,6 +63,11 @@ jobs:
       - name: Mypy strict
         working-directory: ${{ env.PYTHON_SDK_DIR }}
         run: mypy src
+      - name: Consumer typing proof (installed surface, not source tree)
+        working-directory: ${{ env.PYTHON_SDK_DIR }}
+        run: |
+          python -m pip install -e .
+          mypy typing_consumer
 
   sdk-test:
     runs-on: ${{ matrix.os }}

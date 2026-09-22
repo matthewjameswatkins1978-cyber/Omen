@@ -143,8 +143,11 @@ def test_artifact_slicing_bounds() -> None:
             omen.artifacts.read(result.stdout_artifact, offset=-1)
         with pytest.raises(OmenProtocolError):
             omen.artifacts.read("not-a-uri")
-        with pytest.raises(OmenError):
+        # Missing blob: JSON-RPC protocol truth, not a canonical OmenError.
+        with pytest.raises(OmenProtocolError) as exc_missing:
             omen.artifacts.read("artifact://sha256/" + "ff" * 32)
+        assert not isinstance(exc_missing.value, OmenError)
+        assert "-32004" in str(exc_missing.value)
 
 
 @needs_omen

@@ -85,9 +85,11 @@ lossy-UTF-8 text): `{"contents": [{"uri", "mimeType": "text/plain",
 "text"}]}`. Missing blob → `-32004 "Artifact not found in CAS:
 <digest>"`. Anything else (`fact://…`, `proc://…`, bare schemes) →
 `-32004 "Resource not found or unsupported scheme: <uri>"`.
-omen-shell maps `-32004` to `OmenError` (`ARTIFACT_NOT_FOUND` /
-`RESOURCE_NOT_FOUND` / `RESOURCE_ERROR`, category `Evidence`); other
-JSON-RPC errors stay `OmenProtocolError`.
+omen-shell keeps these as JSON-RPC/protocol truth
+(`OmenProtocolError` with code, message, and raw reply preserved) and
+does NOT map them to canonical `OmenError` — the SDK must not invent
+domain codes, categories, or retryability from human message text.
+Other JSON-RPC errors likewise stay `OmenProtocolError`.
 
 ## Result shapes (inner `content[0].text` JSON)
 

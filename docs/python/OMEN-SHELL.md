@@ -81,8 +81,10 @@ data = omen.artifacts.read(result.stdout_artifact, offset=0, length=4096)
 
 URIs pass through unchanged (`ArtifactRef` preserves
 `artifact://sha256/<digest>`). Omen truncates reads server-side at
-64 KiB; slicing applies to the returned payload. Missing blobs raise
-`OmenError` (`ARTIFACT_NOT_FOUND`, category `Evidence`).
+64 KiB; slicing applies to the returned payload. Missing blobs and
+unsupported schemes surface as JSON-RPC protocol truth
+(`OmenProtocolError` with code `-32004`, message, and raw reply) —
+the SDK invents no canonical `OmenError` fields from message text.
 
 ## History
 
@@ -138,7 +140,10 @@ capture (`OMEN_TEST_EVIDENCE_DIR`). It uses the public client.
 
 Bounded timeouts on connect/request/shutdown; deterministic shutdown
 (stdin EOF → grace → terminate → kill); no leaked processes, tasks, or
-pending futures. No `shell=True` anywhere, no network, no telemetry,
+pending futures. A failed connect raises AND leaves zero transport
+ownership behind (no reliance on GC). A successful `reconnect()`
+resets the Python session overlay; durable Omen history is untouched.
+No `shell=True` anywhere, no network, no telemetry,
 no model calls, no secret logging (default logs carry ids/durations
 only). No streaming in E1 — Omen has no execution event stream, and
 the SDK will not fake one by polling.

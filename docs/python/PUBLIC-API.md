@@ -30,16 +30,28 @@ Advanced error/model types stay in `omen_shell.errors` /
   `execution_status(request_id)`, `execute(argv, *, timeout=None,
   request_timeout=None, cwd=None, tool="exec", operation="")`,
   `reconnect()`, `connection_info`, `supported_contracts`.
+  Failed `connect`/`_open`/`reconnect` leaves zero transport ownership
+  (process reaped, tasks stopped, pending failed) and re-raises the
+  original failure. A successful `reconnect()` resets the Python
+  session overlay (`session_executions`); durable Omen history is untouched.
 - `execute()` accepts argv sequences only; a command string raises
   `OmenProtocolError`. Non-zero child exit returns `ExecutionResult`.
 
 ## Namespaces (sync and async mirrors)
 
+Sync namespaces are concrete typed classes (`SyncRawAccessor`,
+`SyncArtifacts`, `SyncSemantic`, `SyncActions`, `SyncHistory`,
+`SyncFacts`) delegating to the async implementation — one semantic
+layer only, with consumer-visible signatures (proven by
+`typing_consumer/consumer_check.py` under `mypy --strict`).
+
 - `omen.raw.list_tools()`, `call_tool(name, arguments=None)`,
   `list_resources()`, `read_resource(uri)`, `ping()`.
+  Resource failures stay `OmenProtocolError` (JSON-RPC truth, raw kept).
 - `omen.artifacts.read(uri, *, offset=0, length=None)` → `ArtifactData`;
   `inspect(uri)` → `ArtifactMetadata`. Server truncates at 64 KiB;
-  slicing applies to the returned payload.
+  slicing applies to the returned payload; completeness beyond the
+  served bound is never claimed.
 - `omen.semantic.definition(symbol, *, file=None, line=None, col=None)`,
   `references(symbol, *, file=None, line=None, col=None, limit=50)`,
   `search(query, *, limit=50)` → `SemanticResult` (never None).

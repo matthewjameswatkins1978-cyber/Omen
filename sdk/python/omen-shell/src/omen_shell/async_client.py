@@ -368,6 +368,20 @@ class AsyncOmen:
         return self
 
     async def _open(self) -> None:
+        # Invariant: _open succeeds, OR it raises having left zero
+        # transport ownership behind (process reaped, reader/stderr tasks
+        # stopped, pending failed). Callers that never receive the object
+        # (connect, __aenter__, reconnect) rely on this — no GC needed.
+        try:
+            await self._open_inner()
+        except BaseException:
+            try:
+                await self._transport.aclose()
+            except BaseException:  # noqa: S110 — original failure is the truth
+                pass
+            raise
+
+    async def _open_inner(self) -> None:
         await self._transport.start()
         # MCP handshake: explicit protocol version, then optional
         # initialized notification (no reply is expected or required).
@@ -431,27 +445,10 @@ class AsyncOmen:
             code = error.get("code")
             text = error.get("message", "")
             text_str = text if isinstance(text, str) else ""
-            if code == -32004:
-                # Omen serves resource failures (notably artifact reads) as
-                # bare JSON-RPC errors: resources/read cannot carry the
-                # isError envelope. Map losslessly to OmenError using
-                # Omen's own message prefix; nothing is invented beyond the
-                # required envelope fields, and the raw reply is preserved.
-                if text_str.startswith("Artifact not found"):
-                    domain_code = "ARTIFACT_NOT_FOUND"
-                elif text_str.startswith("Resource not found"):
-                    domain_code = "RESOURCE_NOT_FOUND"
-                else:
-                    domain_code = "RESOURCE_ERROR"
-                raise OmenError(
-                    code=domain_code,
-                    message=text_str,
-                    category="Evidence",
-                    state_changed="NO",
-                    retryability="UNKNOWN",
-                    details={"jsonrpc_code": code, "method": method},
-                    raw=message,
-                )
+            # JSON-RPC truth stays JSON-RPC/protocol truth. In particular,
+            # resources/read failures (-32004) are NOT mapped to canonical
+            # OmenError: the SDK must not invent domain codes, categories,
+            # or retryability from human message text. Raw reply preserved.
             raise OmenProtocolError(
                 f"JSON-RPC error {code}: {text_str} (method {method!r})", raw=message
             )
@@ -654,8 +651,11 @@ class AsyncOmen:
     async def reconnect(self) -> None:
         """Explicitly start a new session after close or transport death.
 
-        Never automatic: the caller decides. Pending state from the old
-        session is gone; the new handshake re-establishes truth.
+        Never automatic: the caller decides. On success the Python
+        session overlay is reset — session knowledge is session-scoped,
+        and a new session starts empty. Omen durable history is untouched
+        (it is Omen's, not ours). If reconnect fails, no new session is
+        claimed: the transport stays closed and calls fail closed.
         """
         if self._transport.is_usable and not self._closed:
             return
@@ -667,6 +667,7 @@ class AsyncOmen:
         self._server_version = None
         self._closed = False
         await self._open()
+        self._session_executions.clear()
 
     async def close(self) -> None:
         """Close cleanly. Idempotent; no threads, tasks, or processes remain."""

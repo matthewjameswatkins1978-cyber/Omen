@@ -164,7 +164,9 @@ def test_bat09_two_workspaces_isolated() -> None:
         assert first.state_home != second.state_home
         r1 = first.omen.execute(["python", "-c", "print('ws-one-marker')"])
         assert r1.stdout_artifact is not None
-        with pytest.raises(OmenError):
+        # Absence across the boundary surfaces as JSON-RPC protocol truth
+        # (-32004), never as an invented canonical OmenError.
+        with pytest.raises(OmenProtocolError):
             second.omen.artifacts.read(r1.stdout_artifact)
         # A never-used state home has no history DB yet; Omen answers
         # PERSISTENCE_FAILURE rather than empty history. That is Omen's
@@ -183,17 +185,32 @@ def test_bat09_two_workspaces_isolated() -> None:
 
 @needs_omen
 def test_bat10_wrong_resource() -> None:
-    """Bat 10 — Wrong Resource: canonical OmenError, lossless envelope."""
+    """Bat 10 — Wrong Resource: JSON-RPC truth stays protocol truth.
+
+    resources/read failures arrive as JSON-RPC errors (-32004). The SDK
+    preserves the code, message, and raw reply as OmenProtocolError and
+    invents no canonical OmenError fields (no domain code, category,
+    state_changed, or retryability) from human message text.
+    """
     with OmenHarness() as harness:
-        with pytest.raises(OmenError) as exc_info:
+        with pytest.raises(OmenProtocolError) as exc_info:
             harness.omen.artifacts.read("artifact://sha256/" + "00" * 32)
         err = exc_info.value
-        assert err.code == "ARTIFACT_NOT_FOUND"
-        assert err.category == "Evidence"
-        assert err.state_changed == "NO"
-        with pytest.raises(OmenError) as exc_scheme:
+        assert not isinstance(err, OmenError)
+        assert "-32004" in str(err)
+        assert "Artifact not found" in str(err)
+        raw = err.raw
+        assert isinstance(raw, dict)
+        error_obj = raw.get("error")
+        assert isinstance(error_obj, dict)
+        assert error_obj.get("code") == -32004
+        with pytest.raises(OmenProtocolError) as exc_scheme:
             harness.omen.raw.read_resource("fact://unsupported-shape")
-        assert exc_scheme.value.code == "RESOURCE_NOT_FOUND"
+        raw_scheme = exc_scheme.value.raw
+        assert isinstance(raw_scheme, dict)
+        error_scheme = raw_scheme.get("error")
+        assert isinstance(error_scheme, dict)
+        assert error_scheme.get("code") == -32004
 
 
 @needs_omen
@@ -216,8 +233,50 @@ def test_bat11_process_resurrection() -> None:
 
 
 @needs_omen
+def test_reconnect_resets_session_overlay() -> None:
+    """Repair 2 — same client reconnect starts a fresh session overlay.
+
+    Session knowledge is session-scoped: after a successful reconnect
+    the overlay is empty until new work happens. Durable Omen history
+    is a separate authority and must not be confused with the overlay.
+    """
+    psutil = pytest.importorskip("psutil")
+    with OmenHarness() as harness:
+        omen = harness.omen
+        pid = omen.connection_info.pid
+        assert pid is not None
+        exec_a = omen.execute(["python", "-c", "print('session-A')"])
+        assert exec_a.ok
+        assert omen.history.query(limit=20).knows(exec_a.execution_id)
+        overlay_before = omen.history.query(limit=20).session_executions
+        assert [e.execution_id for e in overlay_before] == [exec_a.execution_id]
+
+        psutil.Process(pid).kill()
+        with pytest.raises(OmenConnectionClosedError):
+            omen.execute(["python", "-c", "print('interrupted')"])
+
+        omen.reconnect()
+        overlay_after = omen.history.query(limit=20).session_executions
+        assert overlay_after == (), f"new session overlay must start empty, got {overlay_after!r}"
+        assert not any(e.execution_id == exec_a.execution_id for e in overlay_after)
+
+        exec_b = omen.execute(["python", "-c", "print('session-B')"])
+        assert exec_b.ok
+        overlay_new = omen.history.query(limit=20).session_executions
+        assert [e.execution_id for e in overlay_new] == [exec_b.execution_id]
+
+
+@needs_omen
 def test_bat12_big_mouth() -> None:
-    """Bat 12 — Big Mouth: large output stays bounded in previews, full in CAS."""
+    """Bat 12 — Big Mouth: 200 KB child output produces bounded inline
+    previews, a stable artifact reference, and a bounded artifact resource
+    read through the public SDK.
+
+    Omen's public MCP resource endpoint serves at most 64 KiB per read,
+    so this Bat does NOT claim the full payload is recoverable through
+    the SDK — only that large output neither floods previews nor breaks
+    artifact identity/readability.
+    """
     with OmenHarness() as harness:
         omen = harness.omen
         result = omen.execute(
@@ -228,7 +287,11 @@ def test_bat12_big_mouth() -> None:
         assert len(result.stdout_preview) < 200000
         assert result.stdout_artifact is not None
         data = omen.artifacts.read(result.stdout_artifact)
+        # Bounded resource read: at least the preview, at most Omen's
+        # 64 KiB per-read serving bound — completeness beyond that is
+        # NOT proven here and must not be claimed.
         assert len(data.text) >= len(result.stdout_preview)
+        assert data.byte_length <= 64 * 1024
 
 
 @needs_omen
