@@ -26,6 +26,13 @@ struct GremlinArgs {
     #[arg(long)]
     echo_stdin: bool,
 
+    /// Report stdin topology as JSON (`STDIN_TOPOLOGY:{...}`) without
+    /// consuming a terminal. Reads stdin to EOF only when stdin is not a
+    /// terminal, so harness pipes and null devices report byte counts while
+    /// interactive runs never block.
+    #[arg(long)]
+    report_stdin_topology: bool,
+
     #[arg(long)]
     hostile_terminal_escapes: bool,
 
@@ -102,6 +109,11 @@ fn main() {
         let mut buffer = String::new();
         let bytes_read = io::stdin().read_to_string(&mut buffer).unwrap_or(0);
         println!("READ_STDIN_BYTES:{bytes_read}");
+        let _ = io::stdout().flush();
+    }
+
+    if args.report_stdin_topology {
+        println!("STDIN_TOPOLOGY:{}", stdin_topology_json());
         let _ = io::stdout().flush();
     }
 
@@ -191,6 +203,71 @@ fn main() {
     }
 
     std::process::exit(args.exit);
+}
+
+/// Classify what the child observes on stdin without blocking.
+///
+/// `kind` is one of `tty`, `pipe`, `char` (console or null device), `disk`
+/// (file redirection), `socket`, `unknown`, or `invalid`. `stdin_bytes` is
+/// the number of bytes readable to EOF, or 0 when stdin is a terminal (never
+/// consumed, so interactive runs cannot hang the fixture).
+fn stdin_topology_json() -> String {
+    let is_tty = io::stdin().is_terminal();
+    let kind = stdin_kind();
+    let stdin_bytes = if is_tty {
+        0
+    } else {
+        let mut buffer = Vec::new();
+        io::stdin().read_to_end(&mut buffer).unwrap_or(0)
+    };
+    format!("{{\"is_tty\":{is_tty},\"kind\":\"{kind}\",\"stdin_bytes\":{stdin_bytes}}}")
+}
+
+#[cfg(windows)]
+fn stdin_kind() -> &'static str {
+    use std::os::windows::io::AsRawHandle;
+    // GetFileType via direct FFI (no extra dependency for a fixture).
+    // FILE_TYPE_UNKNOWN = 0, FILE_TYPE_DISK = 1, FILE_TYPE_CHAR = 2, FILE_TYPE_PIPE = 3.
+    unsafe extern "system" {
+        fn GetFileType(hFile: isize) -> u32;
+    }
+    let handle = io::stdin().as_raw_handle() as isize;
+    if handle == 0 {
+        return "invalid";
+    }
+    match unsafe { GetFileType(handle) } {
+        1 => "disk",
+        2 => "char",
+        3 => "pipe",
+        _ => "unknown",
+    }
+}
+
+#[cfg(unix)]
+fn stdin_kind() -> &'static str {
+    use std::os::unix::fs::FileTypeExt;
+    match std::fs::metadata("/dev/stdin") {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_fifo() {
+                "pipe"
+            } else if file_type.is_socket() {
+                "socket"
+            } else if file_type.is_char_device() {
+                "char"
+            } else if file_type.is_block_device() || file_type.is_file() {
+                "disk"
+            } else {
+                "unknown"
+            }
+        }
+        Err(_) => "unknown",
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
+fn stdin_kind() -> &'static str {
+    "unknown"
 }
 
 fn run_hostile_lsp(mode: &str) {

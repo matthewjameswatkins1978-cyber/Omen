@@ -33,4 +33,5 @@ fn main() {
     );
 
     println!("cargo:rustc-env=OMEN_BUILD_IDENTITY={identity}");
+    println!("cargo:rustc-env=OMEN_GIT_SHA={git_sha}");
 }

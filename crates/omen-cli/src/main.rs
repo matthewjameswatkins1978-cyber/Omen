@@ -209,6 +209,105 @@ fn print_composition_error(error: impl std::fmt::Display, code: &str) {
     println!("{}", serde_json::json!({"ok":false,"error":envelope}));
 }
 
+/// Project a consequential machine failure through the canonical OmenError
+/// envelope (`docs/MACHINE-ERRORS.md`) and exit. Human surfaces get the
+/// concise prose form with the same exit code.
+fn emit_machine_error_and_exit(json_mode: bool, error: &CoreError) -> ! {
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::json!({"ok":false,"error":OmenError::from_core(error)})
+        );
+    } else {
+        eprintln!("Error: {error}");
+    }
+    std::process::exit(1);
+}
+
+/// Artifact reference failures (unparseable `artifact://` input or missing
+/// CAS digest) in either presentation mode.
+fn emit_artifact_reference_error(json_mode: bool, error: &CoreError) -> ! {
+    emit_machine_error_and_exit(json_mode, error);
+}
+
+/// One-line human rendering of static invocation routing: which surfaces
+/// can perform this capability step without guessing command syntax.
+fn describe_invocation(invocation: &omen_core::machine_contract::Invocation) -> String {
+    let mut parts = Vec::new();
+    if let Some(cli) = &invocation.cli {
+        parts.push(format!("omen {cli}"));
+    }
+    if let Some(tool) = &invocation.mcp_tool {
+        parts.push(format!("mcp:{tool}"));
+    }
+    if let Some(verb) = &invocation.interactive {
+        parts.push(format!("shell:{verb}"));
+    }
+    if parts.is_empty() {
+        "composition action step only".to_string()
+    } else {
+        parts.join(" | ")
+    }
+}
+
+/// Installer record for the running binary, when Omen was placed by the
+/// preview conveyor (`<install-root>/state/installed.json`). Returns the
+/// active manifest identity subset, or `None` for dev cargo builds.
+fn installed_preview_identity() -> Option<serde_json::Value> {
+    let root = std::env::var_os(if cfg!(windows) {
+        "LOCALAPPDATA"
+    } else {
+        "HOME"
+    })
+    .map(PathBuf::from)?;
+    let state = std::fs::read(root.join("Omen").join("state").join("installed.json")).ok()?;
+    let state: serde_json::Value = serde_json::from_slice(&state).ok()?;
+    let active = state.get("active")?;
+    if active.is_null() {
+        return None;
+    }
+    Some(serde_json::json!({
+        "provenance": active.get("provenance"),
+        "git_sha": active.get("git_sha"),
+        "preview_version": active.get("preview_version"),
+    }))
+}
+
+/// Other `omen` executables resolvable via PATH that are *not* the running
+/// binary (rollback slots, historical installs). Read-only: lists candidates
+/// so a user or agent can answer "which Omen am I actually running" without
+/// reverse-engineering PATH manually. Never modifies anything.
+fn other_omen_executables_on_path(current: Option<&str>) -> Vec<String> {
+    let exe_name = if cfg!(windows) { "omen.exe" } else { "omen" };
+    let current_canonical = current.and_then(|path| std::fs::canonicalize(path).ok());
+    let mut others = Vec::new();
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            if others.len() >= 8 {
+                break;
+            }
+            let candidate = dir.join(exe_name);
+            if candidate.is_file() {
+                let same = match (
+                    std::fs::canonicalize(&candidate).ok(),
+                    current_canonical.as_ref(),
+                ) {
+                    (Some(found), Some(current)) => found == *current,
+                    _ => {
+                        Some(candidate.to_string_lossy().to_string()) == current.map(str::to_string)
+                    }
+                };
+                if !same {
+                    others.push(candidate.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    others.sort();
+    others.dedup();
+    others
+}
+
 fn bundled_tool_profile(tool_id: &str) -> Result<RuntimeProfile, CoreError> {
     let content = match tool_id {
         "cargo" => include_str!(concat!(
@@ -340,7 +439,10 @@ enum FactSubcommands {
 
 #[derive(Args, Debug)]
 struct ExecArgs {
-    /// Logical tool URI or binary name
+    /// Binary name followed by arguments (argv; no shell expansion).
+    /// Human one-shot execution inherits the caller's stdin; machine
+    /// execution attaches the null device so children never observe an
+    /// empty harness pipe as input.
     argv: Vec<String>,
     /// Execution timeout in milliseconds
     #[arg(long, default_value = "30000")]
@@ -442,6 +544,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "platform": std::env::consts::OS,
                 "backend": "native",
                 "capability_groups": capability_groups,
+                "surfaces": {
+                    "cli": "this command tree (a subset projection)",
+                    "mcp": "omen mcp --workspace <path> serves the complete agent/tool surface",
+                    "interactive": "bare omen on a TTY (full shell with :verbs and @references)"
+                },
                 "references": ["@last", "@failed"],
                 "recipes": machine_contract::contract().recipe_definitions.iter().map(|recipe| &recipe.id).collect::<Vec<_>>(),
                 "next": ["capabilities", "history", "describe <capability>", "how <recipe>", "context --since <generation>"],
@@ -490,12 +597,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Doctor) => {
             let supervisor = ProcessSupervisor::new();
             let backend_caps = supervisor.backend().capabilities();
+            let executable = std::env::current_exe()
+                .ok()
+                .map(|path| path.to_string_lossy().to_string());
+            let installed = installed_preview_identity();
+            let duplicates = other_omen_executables_on_path(executable.as_deref());
             if json_mode {
                 let doc = serde_json::json!({
                     "status": "ok",
                     "version": env!("CARGO_PKG_VERSION"),
+                    "git_sha": env!("OMEN_GIT_SHA"),
+                    "contract_version": machine_contract::CONTRACT_VERSION,
                     "doctrine": "substrate, not sovereign",
                     "platform": std::env::consts::OS,
+                    "executable": executable,
+                    "provenance": installed.as_ref().and_then(|value| value.get("provenance").and_then(|v| v.as_str())),
+                    "installed_git_sha": installed.as_ref().and_then(|value| value.get("git_sha").and_then(|v| v.as_str())),
+                    "path_duplicates": duplicates,
                     "capabilities": {
                         "filesystem": format!("{:?}", backend_caps.filesystem),
                         "network": format!("{:?}", backend_caps.network),
@@ -508,6 +626,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Doctrine: substrate, not sovereign");
                 println!("Platform Backend: {}", std::env::consts::OS);
                 println!("Descendant Containment: {:?}", backend_caps.descendants);
+                println!("Executable: {}", executable.as_deref().unwrap_or("unknown"));
+                println!("Git SHA: {}", env!("OMEN_GIT_SHA"));
+                println!("Machine Contract: {}", machine_contract::CONTRACT_VERSION);
+                match installed
+                    .as_ref()
+                    .and_then(|value| value.get("provenance").and_then(|v| v.as_str()))
+                {
+                    Some(provenance) => println!("Provenance: {provenance}"),
+                    None => println!("Provenance: unknown (no installer record)"),
+                }
+                if !duplicates.is_empty() {
+                    println!("Other Omen executables on PATH (not running):");
+                    for other in &duplicates {
+                        println!("  - {other}");
+                    }
+                }
             }
         }
         Some(Commands::Describe(args)) => {
@@ -601,6 +735,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     for (i, step) in doc.steps.iter().enumerate() {
                         println!("{}. {}", i + 1, step.capability_id);
                         println!("   {}", step.purpose);
+                        println!("   invoke: {}", describe_invocation(&step.invocation));
+                    }
+                    if !doc.notes.is_empty() {
+                        println!("notes:");
+                        for note in &doc.notes {
+                            println!("   - {note}");
+                        }
                     }
                 }
             }
@@ -632,7 +773,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     serde_json::json!({"changed":false,"from_generation":generation,"context_generation":generation,"changes":[]})
                 }
                 Some(generation) => {
-                    serde_json::json!({"error":"DELTA_UNAVAILABLE","from_generation":generation,"state_changed":false,"retryable":true,"context_generation":machine_context.context_generation,"reason":"Omen does not retain that historical generation","next_actions":["context"]})
+                    let mut error = OmenError::from_code(
+                        ErrorCode::DeltaUnavailable,
+                        "Omen does not retain that historical generation",
+                    );
+                    error.details = serde_json::json!({
+                        "from_generation": generation,
+                        "context_generation": machine_context.context_generation,
+                        "next_actions": ["context"],
+                    });
+                    serde_json::json!({"ok":false,"error":error})
                 }
             };
             println!("{}", serde_json::to_string_pretty(&doc)?);
@@ -683,9 +833,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             if json_mode {
-                println!("{}", serde_json::to_string_pretty(&result)?);
+                // Shared constructor with `omen_history_query`: when a direct
+                // local execution marker exists, both surfaces wrap the
+                // durable result with UNJOURNALED_LOCAL_EXECUTION instead of
+                // one of them hiding that truth.
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &omen_knowledge::history_view_with_unjournaled_marker(&ws_root, &result)
+                    )?
+                );
             } else if result.entries.is_empty() {
                 println!("No durable execution history recorded.");
+                if let Some(marker) = omen_knowledge::read_unjournaled_marker(&ws_root) {
+                    let command = marker
+                        .get("command")
+                        .and_then(|value| value.as_array())
+                        .map(|argv| {
+                            argv.iter()
+                                .filter_map(|item| item.as_str())
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        })
+                        .unwrap_or_else(|| "unknown command".to_string());
+                    let status = marker
+                        .get("runtime_status")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("UNKNOWN");
+                    let exit = marker
+                        .get("exit_code")
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "n/a".to_string());
+                    let identity = marker
+                        .get("execution_id")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("unidentified");
+                    println!("Last local execution is unjournaled ({identity}).");
+                    println!("{command} · {status} · exit {exit}");
+                }
             } else {
                 println!(
                     "TIME                         STATUS      ID                 ACTION / COMMAND"
@@ -993,11 +1178,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     Err(e) => {
                         if json_mode {
-                            let err_json = serde_json::json!({
-                                "error": e.to_string(),
-                                "code": format!("{:?}", e.code()),
-                            });
-                            println!("{}", serde_json::to_string_pretty(&err_json)?);
+                            println!(
+                                "{}",
+                                serde_json::json!({"ok":false,"error":OmenError::from_core(&e)})
+                            );
                         } else {
                             eprintln!("Refusal: {e}");
                         }
@@ -1065,16 +1249,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", serde_json::to_string_pretty(&res_wire)?);
             } else {
                 if exec_args.argv.is_empty() {
-                    eprintln!("Error: argv cannot be empty");
+                    if json_mode {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&OmenError::from_code(
+                                ErrorCode::InvalidId,
+                                "argv cannot be empty"
+                            ))?
+                        );
+                    } else {
+                        eprintln!("Error: argv cannot be empty");
+                    }
                     std::process::exit(1);
                 }
 
                 let command = exec_args.argv.clone();
+                // Human one-shot execution inherits the caller's stdin so
+                // ordinary commands keep normal terminal semantics (a bare
+                // `rg pattern` must search the workspace, not an empty
+                // harness pipe). Machine execution keeps Closed: a child
+                // must never consume an agent's control channel, observe
+                // MCP protocol bytes, or block waiting for interaction.
+                // Closed without a payload attaches the null device rather
+                // than an empty readable pipe (see backend stdio setup).
+                let (stdin_mode, stdin_disposition) = if json_mode {
+                    (StdioMode::Closed, "closed:null-device")
+                } else {
+                    (StdioMode::Inherit, "inherit")
+                };
                 let req = ExecutionRequest {
                     argv: command.clone(),
                     cwd: ws_root.clone(),
                     env: vec![],
-                    stdin_mode: StdioMode::Closed,
+                    stdin_mode,
                     stdin_payload: None,
                     timeout_ms: exec_args.timeout_ms,
                     inline_budget: exec_args.budget,
@@ -1083,21 +1290,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
 
                 let output = supervisor.execute(req).await?;
-                let artifact = cas.store(
+                let execution_id = omen_core::ExecutionId::generate();
+                let stdout_artifact = cas.store(
                     &mut db,
                     &output.stdout_all,
                     "text/plain",
                     "omen://execution/direct",
                     omen_core::RetentionClass::Referenced,
                 )?;
+                let stderr_artifact = if output.stderr_all.is_empty() {
+                    None
+                } else {
+                    Some(cas.store(
+                        &mut db,
+                        &output.stderr_all,
+                        "text/plain",
+                        "omen://execution/direct",
+                        omen_core::RetentionClass::Referenced,
+                    )?)
+                };
+                // Canonical SCREAMING_SNAKE_CASE status spelling shared with
+                // machine results, history, and the daemon broker.
+                let runtime_status = serde_json::to_value(output.runtime_status)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_string))
+                    .unwrap_or_else(|| format!("{:?}", output.runtime_status));
 
                 std::fs::write(
                     omen_knowledge::local_execution_status_path(&ws_root),
                     serde_json::to_vec_pretty(&serde_json::json!({
                         "history_status": "UNJOURNALED_LOCAL_EXECUTION",
+                        "execution_id": execution_id.to_string(),
                         "command": command,
                         "exit_code": output.process_exit.code,
-                        "runtime_status": format!("{:?}", output.runtime_status),
+                        "runtime_status": runtime_status,
+                        "stdout_artifact": stdout_artifact.uri.to_string(),
+                        "stderr_artifact": stderr_artifact.as_ref().map(|meta| meta.uri.to_string()),
                         "recorded_at_unix_seconds": std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|duration| duration.as_secs())
@@ -1107,15 +1335,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 if json_mode {
                     let out_json = serde_json::json!({
-                        "runtime_status": format!("{:?}", output.runtime_status),
+                        "execution_id": execution_id.to_string(),
+                        "runtime_status": runtime_status,
                         "exit_code": output.process_exit.code,
-                        "artifact_uri": artifact.uri.to_string(),
+                        "artifact_uri": stdout_artifact.uri.to_string(),
+                        "stdout_artifact_uri": stdout_artifact.uri.to_string(),
+                        "stderr_artifact_uri": stderr_artifact.as_ref().map(|meta| meta.uri.to_string()),
                         "stdout_bounded": String::from_utf8_lossy(&output.stdout_bounded),
                         "stderr_bounded": String::from_utf8_lossy(&output.stderr_bounded),
+                        "stdin_disposition": stdin_disposition,
                     });
                     println!("{}", serde_json::to_string_pretty(&out_json)?);
                 } else {
+                    use omen_core::RuntimeStatus as DirectRuntimeStatus;
                     print!("{}", String::from_utf8_lossy(&output.stdout_bounded));
+                    if !output.stderr_bounded.is_empty() {
+                        eprint!("{}", String::from_utf8_lossy(&output.stderr_bounded));
+                    }
+                    // Shell truth: a successful child is silent beyond its
+                    // own streams (stdout stays pipeline-clean). Anything
+                    // else carries identity and evidence on stderr and a
+                    // meaningful process status.
+                    let failed = match output.runtime_status {
+                        DirectRuntimeStatus::Completed => !output.process_exit.is_zero(),
+                        _ => true,
+                    };
+                    if failed {
+                        let exit_detail = match output.process_exit.code {
+                            Some(code) => format!("exit {code}"),
+                            None => runtime_status.clone(),
+                        };
+                        eprintln!(
+                            "\\O/ {} · {} · stdout: {} · stderr: {}",
+                            execution_id,
+                            exit_detail,
+                            stdout_artifact.uri,
+                            stderr_artifact
+                                .as_ref()
+                                .map(|meta| meta.uri.to_string())
+                                .unwrap_or_else(|| "none".to_string()),
+                        );
+                        let process_status = match output.runtime_status {
+                            DirectRuntimeStatus::Completed => output.process_exit.code.unwrap_or(1),
+                            DirectRuntimeStatus::TimedOut => 124,
+                            _ => 1,
+                        };
+                        std::process::exit(process_status);
+                    }
                 }
             }
         }
@@ -1125,12 +1391,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 offset,
                 length,
             } => {
+                // One canonical parser: bare digests and artifact:// URIs
+                // converge; anything else is a structured InvalidUri.
+                let digest = match omen_knowledge::resolve_artifact_digest(&hash) {
+                    Ok(digest) => digest,
+                    Err(error) => {
+                        emit_artifact_reference_error(json_mode, &error);
+                    }
+                };
                 let mut db = Database::open(&db_path)?;
                 let cas = ContentAddressedStore::new(cas_dir);
-                let slice = cas.read_slice(&mut db, &hash, offset, length as u64)?;
+                let slice = match cas.read_slice(&mut db, &digest, offset, length as u64) {
+                    Ok(slice) => slice,
+                    Err(error) => {
+                        emit_artifact_reference_error(json_mode, &error);
+                    }
+                };
                 if json_mode {
                     let out_json = serde_json::json!({
-                        "hash": hash,
+                        "hash": digest,
                         "offset": offset,
                         "length": slice.len(),
                         "content": String::from_utf8_lossy(&slice),
@@ -1141,9 +1420,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             ArtifactSubcommands::Inspect { hash } => {
+                let digest = match omen_knowledge::resolve_artifact_digest(&hash) {
+                    Ok(digest) => digest,
+                    Err(error) => {
+                        emit_artifact_reference_error(json_mode, &error);
+                    }
+                };
                 let db = Database::open(&db_path)?;
                 let cas = ContentAddressedStore::new(cas_dir);
-                let meta = cas.inspect(&db, &hash)?;
+                let meta = match cas.inspect(&db, &digest) {
+                    Ok(meta) => meta,
+                    Err(error) => {
+                        emit_artifact_reference_error(json_mode, &error);
+                    }
+                };
                 if json_mode {
                     println!("{}", serde_json::to_string_pretty(&meta)?);
                 } else {
@@ -1227,7 +1517,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
                     }
 
-                    let _child = cmd.spawn()?;
+                    let _child = cmd.spawn().map_err(|error| {
+                        std::io::Error::new(
+                            error.kind(),
+                            format!(
+                                "failed to launch daemon executable '{}': {error} (expected the omend sibling of the running omen binary, else omend on PATH)",
+                                omend_bin.display()
+                            ),
+                        )
+                    })?;
 
                     let start_poll = std::time::Instant::now();
                     let mut running = false;

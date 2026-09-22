@@ -396,6 +396,11 @@ impl McpServer {
             "platform": std::env::consts::OS,
             "backend": "native",
             "capability_groups": groups,
+            "surfaces": {
+                "cli": "omen command tree (a subset projection)",
+                "mcp": "this server: the complete agent/tool surface",
+                "interactive": "bare omen on a TTY (full shell with :verbs and @references)"
+            },
             "references": ["@last", "@failed"],
             "recipes": contract.recipe_definitions.iter().map(|recipe| &recipe.id).collect::<Vec<_>>(),
             "next": ["capabilities", "history", "describe <capability>", "recipe <recipe>", "context"],
@@ -489,11 +494,18 @@ impl McpServer {
             })).unwrap()),
             Some(generation) if Some(generation) == context.context_generation =>
                 CallToolResult::text(serde_json::to_string_pretty(&json!({"changed":false,"from_generation":generation,"context_generation":generation,"changes":[]})).unwrap()),
-            Some(generation) => CallToolResult::text(serde_json::to_string_pretty(&json!({
-                "error":"DELTA_UNAVAILABLE", "from_generation":generation, "state_changed":false,
-                "retryable":true, "context_generation":context.context_generation,
-                "reason":"Omen does not retain that historical generation", "next_actions":["omen_context"]
-            })).unwrap()),
+            Some(generation) => {
+                let mut error = omen_core::OmenError::from_code(
+                    omen_core::ErrorCode::DeltaUnavailable,
+                    "Omen does not retain that historical generation",
+                );
+                error.details = serde_json::json!({
+                    "from_generation": generation,
+                    "context_generation": context.context_generation,
+                    "next_actions": ["omen_context"],
+                });
+                CallToolResult::domain_error(error)
+            }
         }
     }
 
@@ -816,14 +828,14 @@ impl McpServer {
             .and_then(|db| query_history(&db, &query))
         {
             Ok(result) if result.entries.is_empty() => {
-                local_history_result(&self.workspace_path, result)
+                local_history_result(&self.workspace_path, &result)
             }
             Ok(result) => CallToolResult::text(serde_json::to_string_pretty(&result).unwrap()),
             Err(error) => {
                 if local_execution_status_path(&self.workspace_path).exists() {
                     local_history_result(
                         &self.workspace_path,
-                        omen_knowledge::HistoryResult {
+                        &omen_knowledge::HistoryResult {
                             schema_version: 1,
                             entries: Vec::new(),
                             limit: query.limit,
@@ -1175,23 +1187,16 @@ impl McpServer {
     }
 }
 
-fn local_history_result<T: serde::Serialize>(
+fn local_history_result(
     workspace: &std::path::Path,
-    history: T,
+    history: &omen_knowledge::HistoryResult,
 ) -> CallToolResult {
-    let marker = fs::read_to_string(local_execution_status_path(workspace))
-        .ok()
-        .and_then(|content| serde_json::from_str::<Value>(&content).ok());
-    if let Some(marker) = marker {
-        CallToolResult::text(
-            serde_json::to_string_pretty(&json!({
-                "history": history,
-                "history_status": "UNJOURNALED_LOCAL_EXECUTION",
-                "local_execution": marker
-            }))
-            .unwrap(),
-        )
-    } else {
-        CallToolResult::text(serde_json::to_string_pretty(&history).unwrap())
-    }
+    // Shared constructor with `omen history --machine`: identical truth on
+    // both surfaces (see omen-knowledge history_view_with_unjournaled_marker).
+    CallToolResult::text(
+        serde_json::to_string_pretty(&omen_knowledge::history_view_with_unjournaled_marker(
+            workspace, history,
+        ))
+        .unwrap(),
+    )
 }

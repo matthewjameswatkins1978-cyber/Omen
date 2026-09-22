@@ -356,8 +356,26 @@ impl ExecutionBackend for NativeExecutionBackend {
             }
         }
 
-        // Stdio setup
+        // Stdio setup.
+        //
+        // Closed means the child is not expected to consume caller input.
+        // A created-but-immediately-dropped pipe would still present an
+        // *empty readable* stdin, which stdin-sensitive tools (ripgrep with
+        // no explicit path, etc.) interpret as "search this empty stream"
+        // instead of their normal no-stdin behavior -- a plausible wrong
+        // result caused solely by harness topology. Attaching null
+        // (/dev/null, NUL) instead yields immediate EOF with no readable
+        // pipe, so children observe "no input" rather than "empty input".
+        // Inline (or stdin secrets) carries explicit bytes and keeps a pipe.
+        let stdin_carries_bytes = req.stdin_payload.as_ref().is_some_and(|p| !p.is_empty())
+            || req
+                .secrets
+                .iter()
+                .any(|secret| matches!(secret.contract, omen_core::SecretInjectionContract::Stdin));
         match req.stdin_mode {
+            omen_core::StdioMode::Closed if !stdin_carries_bytes => {
+                cmd.stdin(std::process::Stdio::null());
+            }
             omen_core::StdioMode::Closed | omen_core::StdioMode::Inline => {
                 cmd.stdin(std::process::Stdio::piped());
             }

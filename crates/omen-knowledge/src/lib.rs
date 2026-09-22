@@ -6,11 +6,12 @@ pub mod history;
 pub mod registry;
 pub mod workspace;
 
-pub use cas::{ArtifactMetadata, ContentAddressedStore, GcReport};
+pub use cas::{ArtifactMetadata, ContentAddressedStore, GcReport, resolve_artifact_digest};
 pub use db::Database;
 pub use history::{
     DEFAULT_HISTORY_LIMIT, ExecutionHistory, ExecutionRecord, HistoryEntry, HistoryQuery,
-    HistoryResult, HistoryStatus, InteractiveSessionRecord, MAX_HISTORY_LIMIT, query_history,
+    HistoryResult, HistoryStatus, InteractiveSessionRecord, MAX_HISTORY_LIMIT,
+    history_view_with_unjournaled_marker, query_history, read_unjournaled_marker,
 };
 pub use registry::{
     DependencyRecord, FactProvenance, FactRecord, FactRegistry, PublishFactRequest,

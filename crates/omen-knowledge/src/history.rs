@@ -216,6 +216,45 @@ fn parse_state_change(value: &str) -> Option<StateChange> {
     }
 }
 
+/// Project a history result for surfaces that must communicate unjournaled
+/// local execution truthfully.
+///
+/// Direct local execution writes a `local-execution-status.json` marker
+/// (`UNJOURNALED_LOCAL_EXECUTION`) beside the workspace state. When that
+/// marker exists, the returned value wraps the durable result as
+/// `{history, history_status, local_execution}`; without a marker the
+/// durable result is returned unchanged. CLI (`omen history --machine`)
+/// and MCP (`omen_history_query`) share this constructor so both surfaces
+/// project identical truth instead of one of them hiding the marker.
+pub fn history_view_with_unjournaled_marker(
+    workspace_root: &std::path::Path,
+    history: &HistoryResult,
+) -> Value {
+    let history_value = serde_json::to_value(history).expect("history result is serializable");
+    let marker = std::fs::read_to_string(crate::workspace::local_execution_status_path(
+        workspace_root,
+    ))
+    .ok()
+    .and_then(|contents| serde_json::from_str::<Value>(&contents).ok());
+    match marker {
+        Some(local_execution) => serde_json::json!({
+            "history": history_value,
+            "history_status": "UNJOURNALED_LOCAL_EXECUTION",
+            "local_execution": local_execution,
+        }),
+        None => history_value,
+    }
+}
+
+/// Read the unjournaled local-execution marker for a workspace, if present.
+pub fn read_unjournaled_marker(workspace_root: &std::path::Path) -> Option<Value> {
+    std::fs::read_to_string(crate::workspace::local_execution_status_path(
+        workspace_root,
+    ))
+    .ok()
+    .and_then(|contents| serde_json::from_str::<Value>(&contents).ok())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InteractiveSessionRecord {
     pub session_id: InteractiveSessionId,

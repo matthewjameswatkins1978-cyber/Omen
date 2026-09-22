@@ -83,6 +83,10 @@ pub struct Manifest {
     pub ci_run_id: Option<u64>,
     pub artifact_id: Option<u64>,
     pub fixture_files: std::collections::BTreeMap<String, String>,
+    /// SHA-256 of the sibling daemon executable (`omend`) shipped in the
+    /// same package. `None` only for packages produced before Preview 8.
+    #[serde(default)]
+    pub daemon_binary_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -472,11 +476,17 @@ fn preflight(root: &Path, package: Option<String>) -> Result<(), String> {
 
 fn package(root: &Path, ci_run_id: Option<u64>, artifact_id: Option<u64>) -> Result<(), String> {
     run_cmd(root, "cargo", &["build", "--release", "-p", "omen-cli"])?;
+    run_cmd(root, "cargo", &["build", "--release", "-p", "omen-daemon"])?;
     let exe =
         root.join("target")
             .join("release")
             .join(if cfg!(windows) { "omen.exe" } else { "omen" });
+    let daemon_exe =
+        root.join("target")
+            .join("release")
+            .join(if cfg!(windows) { "omend.exe" } else { "omend" });
     let bin_hash = digest_file(&exe)?;
+    let daemon_bin_hash = digest_file(&daemon_exe)?;
     let version = preview_version(root)?;
     let sha = git(root, &["rev-parse", "HEAD"])?;
     let fixture_files = fixture_hashes(root)?;
@@ -497,6 +507,7 @@ fn package(root: &Path, ci_run_id: Option<u64>, artifact_id: Option<u64>) -> Res
         ci_run_id,
         artifact_id,
         fixture_files,
+        daemon_binary_sha256: Some(daemon_bin_hash),
     };
     let suffix = if matches!(manifest.provenance, Provenance::Ci) {
         "windows-x86_64"
@@ -519,6 +530,16 @@ fn package(root: &Path, ci_run_id: Option<u64>, artifact_id: Option<u64>) -> Res
     zip.start_file(if cfg!(windows) { "omen.exe" } else { "omen" }, opts)
         .unwrap();
     zip.write_all(&bytes).unwrap();
+    // Sibling daemon executable: `omen daemon start` locates omend next to
+    // the running omen binary (Preview 8+ packages; older packages lack it).
+    let mut daemon_bytes = Vec::new();
+    fs::File::open(&daemon_exe)
+        .map_err(|e| e.to_string())?
+        .read_to_end(&mut daemon_bytes)
+        .map_err(|e| e.to_string())?;
+    zip.start_file(if cfg!(windows) { "omend.exe" } else { "omend" }, opts)
+        .unwrap();
+    zip.write_all(&daemon_bytes).unwrap();
     zip.start_file("manifest.json", opts).unwrap();
     zip.write_all(serde_json::to_string_pretty(&manifest).unwrap().as_bytes())
         .unwrap();
@@ -608,6 +629,28 @@ fn install(_root: &Path, artifact: Option<PathBuf>) -> Result<(), String> {
             "binary digest differs from manifest",
         ));
     }
+    let daemon_name = if cfg!(windows) { "omend.exe" } else { "omend" };
+    let mut archive_daemon = Vec::new();
+    match archive.by_name(daemon_name) {
+        Ok(mut entry) => {
+            entry
+                .read_to_end(&mut archive_daemon)
+                .map_err(|e| e.to_string())?;
+            if let Some(expected) = manifest.daemon_binary_sha256.as_deref()
+                && hex::encode(Sha256::digest(&archive_daemon)) != expected
+            {
+                return Err(fail(
+                    "OMEN_PREVIEW_HASH_MISMATCH",
+                    "daemon digest differs from manifest",
+                ));
+            }
+        }
+        Err(_) => {
+            // Packages before Preview 8 ship no daemon executable; install
+            // stays compatible and `omen daemon start` keeps its PATH fallback.
+            archive_daemon.clear();
+        }
+    }
     if payload_digest(&manifest.binary_sha256, &manifest.fixture_files) != manifest.package_sha256 {
         return Err(fail(
             "OMEN_PREVIEW_HASH_MISMATCH",
@@ -643,6 +686,9 @@ fn install(_root: &Path, artifact: Option<PathBuf>) -> Result<(), String> {
         fs::write(dir.join(if cfg!(windows) { "omen.exe" } else { "omen" }), b)
             .map_err(|e| e.to_string())?;
         fs::write(dir.join("manifest.json"), m).map_err(|e| e.to_string())?;
+        if !archive_daemon.is_empty() {
+            fs::write(dir.join(daemon_name), &archive_daemon).map_err(|e| e.to_string())?;
+        }
         for rel in FIXTURE {
             let mut fixture_bytes = Vec::new();
             z.by_name(&format!("fixture/{rel}"))
@@ -662,6 +708,14 @@ fn install(_root: &Path, artifact: Option<PathBuf>) -> Result<(), String> {
         .join(if cfg!(windows) { "omen.exe" } else { "omen" });
     let candidate = dir.join(if cfg!(windows) { "omen.exe" } else { "omen" });
     fs::copy(candidate, &stable).map_err(|e| fail("OMEN_INSTALL_IDENTITY_MISMATCH", e))?;
+    // Sibling daemon follows the active slot so `omen daemon start` finds
+    // the exact matching omend next to the running binary.
+    let stable_daemon = install_root().join("bin").join(daemon_name);
+    let candidate_daemon = dir.join(daemon_name);
+    if candidate_daemon.exists() {
+        fs::copy(candidate_daemon, &stable_daemon)
+            .map_err(|e| fail("OMEN_INSTALL_IDENTITY_MISMATCH", e))?;
+    }
     let mut s = read_state();
     s.previous_slot = s.active_slot.take();
     s.active_slot = Some(slot);
@@ -1144,11 +1198,29 @@ mod tests {
             ci_run_id: None,
             artifact_id: None,
             fixture_files: Default::default(),
+            daemon_binary_sha256: Some("daemon".into()),
         };
         assert_eq!(
             serde_json::from_str::<Manifest>(&serde_json::to_string(&m).unwrap()).unwrap(),
             m
         );
+        // Pre-Preview-8 manifests without the daemon field still parse.
+        let legacy = serde_json::json!({
+            "schema_version": 1,
+            "provenance": "ci",
+            "preview_version": "0.9.0-preview.7",
+            "git_sha": "abc",
+            "contract_version": "0.8",
+            "target": "x86_64",
+            "profile": "release",
+            "binary_sha256": "bin",
+            "package_sha256": "pkg",
+            "ci_run_id": null,
+            "artifact_id": null,
+            "fixture_files": {},
+        });
+        let parsed: Manifest = serde_json::from_value(legacy).unwrap();
+        assert_eq!(parsed.daemon_binary_sha256, None);
     }
     #[test]
     fn local_never_external() {

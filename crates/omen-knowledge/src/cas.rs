@@ -1,5 +1,5 @@
 use chrono::Utc;
-use omen_core::{BlobState, CoreError, ResourceUri, RetentionClass};
+use omen_core::{BlobState, CoreError, ResourceKind, ResourceUri, RetentionClass};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -22,6 +22,42 @@ pub struct ArtifactMetadata {
 
 pub struct ContentAddressedStore {
     root: PathBuf,
+}
+
+/// Canonical artifact reference parsing.
+///
+/// Accepts the two spellings Omen itself emits and documents:
+/// - bare `<64 hex digest>` (convenience input only), and
+/// - canonical `artifact://sha256/<64 hex digest>` (machine presentation).
+///
+/// Both converge to the same lowercase CAS digest. Anything else --
+/// wrong scheme (`artifact://md5/...`), truncated or non-hex digests,
+/// trailing junk -- is a structured `InvalidUri` failure, never a silent
+/// miss. Use this single authority wherever an artifact reference enters
+/// (CLI `artifact read/inspect`, MCP resource reads, interactive
+/// references) instead of re-implementing URI stripping per call site.
+pub fn resolve_artifact_digest(input: &str) -> Result<String, CoreError> {
+    let trimmed = input.trim();
+    if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Ok(trimmed.to_ascii_lowercase());
+    }
+    let uri = ResourceUri::parse(trimmed)
+        .map_err(|_| CoreError::InvalidUri(format!("invalid artifact reference: {trimmed}")))?;
+    if uri.kind() != ResourceKind::Artifact {
+        return Err(CoreError::InvalidUri(format!(
+            "not an artifact reference: {trimmed}"
+        )));
+    }
+    let path = uri.path();
+    let digest = path.strip_prefix("sha256/").ok_or_else(|| {
+        CoreError::InvalidUri(format!("unsupported artifact hash algorithm: {trimmed}"))
+    })?;
+    if digest.len() != 64 || !digest.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(CoreError::InvalidUri(format!(
+            "artifact digest must be 64 hexadecimal characters: {trimmed}"
+        )));
+    }
+    Ok(digest.to_ascii_lowercase())
 }
 
 impl ContentAddressedStore {

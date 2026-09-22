@@ -1,5 +1,44 @@
 use omen_core::{Assurance, BlobState, CoreError, ResourceUri, RetentionClass, ValidityState};
-use omen_knowledge::{ContentAddressedStore, Database, FactRegistry, PublishFactRequest};
+use omen_knowledge::{
+    ContentAddressedStore, Database, FactRegistry, PublishFactRequest, resolve_artifact_digest,
+};
+
+#[test]
+fn artifact_references_converge_to_one_digest() {
+    let digest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    // Bare digest convenience input.
+    assert_eq!(resolve_artifact_digest(digest).unwrap(), digest);
+    // Canonical URI presentation.
+    assert_eq!(
+        resolve_artifact_digest(&format!("artifact://sha256/{digest}")).unwrap(),
+        digest
+    );
+    // Surrounding whitespace is tolerated.
+    assert_eq!(
+        resolve_artifact_digest(&format!("  artifact://sha256/{digest}  ")).unwrap(),
+        digest
+    );
+    // Uppercase hex normalizes to the canonical lowercase digest.
+    assert_eq!(
+        resolve_artifact_digest(&digest.to_ascii_uppercase()).unwrap(),
+        digest
+    );
+    // Rejections are structured InvalidUri, never silent misses.
+    for bad in [
+        "artifact://md5/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "artifact://sha256/tooshort",
+        "artifact://sha256/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        "artifact://sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/trailing",
+        "tool://rg",
+        "not-a-reference",
+        "",
+    ] {
+        assert!(
+            matches!(resolve_artifact_digest(bad), Err(CoreError::InvalidUri(_))),
+            "must reject {bad:?}"
+        );
+    }
+}
 use tempfile::tempdir;
 
 #[test]

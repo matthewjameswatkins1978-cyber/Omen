@@ -65,6 +65,76 @@ pub struct CapabilityDefinition {
     pub bounds: String,
     pub timeout: String,
     pub examples: Vec<Value>,
+    /// Static deterministic routing: which product surfaces can invoke this
+    /// capability. `None` means the surface cannot invoke it directly
+    /// (it may still be reachable as a composition action step).
+    pub invocation: Invocation,
+}
+
+/// Static invocation routing for one capability.
+///
+/// This is contract metadata, not runtime probing: a client must be able to
+/// determine how to invoke a described capability without guessing command
+/// syntax and without parsing prose.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Invocation {
+    /// CLI invocation, e.g. `"exec -- ..."`. `None` when the CLI surface
+    /// cannot invoke this capability directly.
+    pub cli: Option<String>,
+    /// MCP tool name, e.g. `"omen_execute"`. `None` when no MCP tool
+    /// invokes this capability directly.
+    pub mcp_tool: Option<String>,
+    /// Interactive shell verb, e.g. `":history"`. `None` when the
+    /// interactive shell has no direct verb (execution.run is invoked by
+    /// typing the command itself, not by a verb).
+    pub interactive: Option<String>,
+}
+
+impl Invocation {
+    fn new(cli: Option<&str>, mcp_tool: Option<&str>, interactive: Option<&str>) -> Self {
+        Self {
+            cli: cli.map(str::to_string),
+            mcp_tool: mcp_tool.map(str::to_string),
+            interactive: interactive.map(str::to_string),
+        }
+    }
+}
+
+/// Static deterministic routing table: capability id -> supported surfaces.
+///
+/// CLI spellings are the canonical `omen` subcommand fragments; MCP names are
+/// the `omen mcp` tool names; interactive names are the REPL verbs. Entries
+/// with all three surfaces `None` are reachable only as composition action
+/// steps (see `composition.plan` / `composition.run`).
+pub fn invocation_for(capability_id: &str) -> Invocation {
+    match capability_id {
+        "semantic.references" => {
+            Invocation::new(None, Some("omen_symbol_references"), Some(":refs"))
+        }
+        "semantic.definition" => {
+            Invocation::new(None, Some("omen_symbol_definition"), Some(":def"))
+        }
+        "semantic.diagnostics" => Invocation::new(None, None, None),
+        "structure.search" => {
+            Invocation::new(None, Some("omen_structure_search"), Some(":structure"))
+        }
+        "history.query" => Invocation::new(
+            Some("history --machine"),
+            Some("omen_history_query"),
+            Some(":history"),
+        ),
+        "execution.run" => {
+            Invocation::new(Some("exec --machine -- <argv>"), Some("omen_execute"), None)
+        }
+        "mutation.threadmoth" => Invocation::new(None, None, None),
+        "composition.run" => Invocation::new(Some("action run"), None, None),
+        "filesystem.read" => Invocation::new(None, None, None),
+        "filesystem.write" => Invocation::new(None, None, None),
+        "composition.plan" => {
+            Invocation::new(Some("action plan"), Some("omen_action_plan"), Some(":plan"))
+        }
+        _ => Invocation::new(None, None, None),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -97,12 +167,17 @@ pub struct CapabilityCatalogueEntry {
     /// The stable capability id accepted by `describe` / `omen_describe`.
     pub describe_ref: String,
     pub related_capabilities: Vec<String>,
+    /// Static invocation routing (mirrors the capability definition).
+    pub invocation: Invocation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RecipeStep {
     pub capability_id: String,
     pub purpose: String,
+    /// Static invocation routing for the step's capability, so callers on any
+    /// surface can resolve how to perform the step without guessing syntax.
+    pub invocation: Invocation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -170,6 +245,7 @@ pub fn contract() -> MachineContract {
     let capability_definitions = vec![
         CapabilityDefinition {
             id: "semantic.references".into(),
+            invocation: invocation_for("semantic.references"),
             group: "semantic".into(),
             summary: "Find references to a known symbol.".into(),
             input_schema: object_schema(
@@ -188,6 +264,7 @@ pub fn contract() -> MachineContract {
         },
         CapabilityDefinition {
             id: "semantic.definition".into(),
+            invocation: invocation_for("semantic.definition"),
             group: "semantic".into(),
             summary: "Resolve the definition of a known symbol.".into(),
             input_schema: object_schema(
@@ -206,6 +283,7 @@ pub fn contract() -> MachineContract {
         },
         CapabilityDefinition {
             id: "semantic.diagnostics".into(),
+            invocation: invocation_for("semantic.diagnostics"),
             group: "semantic".into(),
             summary: "Return deterministic workspace diagnostics when a provider is available."
                 .into(),
@@ -222,6 +300,7 @@ pub fn contract() -> MachineContract {
         },
         CapabilityDefinition {
             id: "structure.search".into(),
+            invocation: invocation_for("structure.search"),
             group: "structure".into(),
             summary: "Search source using the structural adapter.".into(),
             input_schema: object_schema(
@@ -240,6 +319,7 @@ pub fn contract() -> MachineContract {
         },
         CapabilityDefinition {
             id: "history.query".into(),
+            invocation: invocation_for("history.query"),
             group: "history".into(),
             summary: "Query bounded durable Omen execution history.".into(),
             input_schema: object_schema(
@@ -262,6 +342,7 @@ pub fn contract() -> MachineContract {
         },
         CapabilityDefinition {
             id: "execution.run".into(),
+            invocation: invocation_for("execution.run"),
             group: "execution".into(),
             summary: "Run an explicitly supplied argv under an execution contract; Omen mints the physical execution_id.".into(),
             input_schema: object_schema(
@@ -280,6 +361,7 @@ pub fn contract() -> MachineContract {
         },
         CapabilityDefinition {
             id: "mutation.threadmoth".into(),
+            invocation: invocation_for("mutation.threadmoth"),
             group: "mutation".into(),
             summary: "Apply a deterministic ThreadMoth mutation.".into(),
             input_schema: object_schema(json!({"plan":{"type":"string","minLength":1}}), &["plan"]),
@@ -295,6 +377,7 @@ pub fn contract() -> MachineContract {
         },
         CapabilityDefinition {
             id: "composition.run".into(),
+            invocation: invocation_for("composition.run"),
             group: "composition".into(),
             summary: "Execute one explicitly planned sequential action.".into(),
             input_schema: object_schema(
@@ -316,6 +399,7 @@ pub fn contract() -> MachineContract {
         },
         CapabilityDefinition {
             id: "filesystem.read".into(),
+            invocation: invocation_for("filesystem.read"),
             group: "filesystem".into(),
             summary: "Read bounded workspace data.".into(),
             input_schema: object_schema(json!({"path":{"type":"string","minLength":1}}), &["path"]),
@@ -331,6 +415,7 @@ pub fn contract() -> MachineContract {
         },
         CapabilityDefinition {
             id: "filesystem.write".into(),
+            invocation: invocation_for("filesystem.write"),
             group: "filesystem".into(),
             summary: "Write workspace data when separately admitted by Tethers.".into(),
             input_schema: object_schema(
@@ -349,6 +434,7 @@ pub fn contract() -> MachineContract {
         },
         CapabilityDefinition {
             id: "composition.plan".into(),
+            invocation: invocation_for("composition.plan"),
             group: "composition".into(),
             summary: "Validate a named action and build a deterministic read-only plan.".into(),
             input_schema: object_schema(
@@ -373,14 +459,17 @@ pub fn contract() -> MachineContract {
             steps: vec![
                 RecipeStep {
                     capability_id: "filesystem.read".into(),
+                    invocation: invocation_for("filesystem.read"),
                     purpose: "inspect @failed or its bounded artifact reference".into(),
                 },
                 RecipeStep {
                     capability_id: "semantic.diagnostics".into(),
+                    invocation: invocation_for("semantic.diagnostics"),
                     purpose: "resolve deterministic diagnostics when available".into(),
                 },
                 RecipeStep {
                     capability_id: "semantic.definition".into(),
+                    invocation: invocation_for("semantic.definition"),
                     purpose: "resolve relevant symbols only when needed".into(),
                 },
             ],
@@ -393,14 +482,17 @@ pub fn contract() -> MachineContract {
             steps: vec![
                 RecipeStep {
                     capability_id: "structure.search".into(),
+                    invocation: invocation_for("structure.search"),
                     purpose: "discover the target structurally".into(),
                 },
                 RecipeStep {
                     capability_id: "mutation.threadmoth".into(),
+                    invocation: invocation_for("mutation.threadmoth"),
                     purpose: "apply only an explicitly previewed and admitted mutation plan".into(),
                 },
                 RecipeStep {
                     capability_id: "execution.run".into(),
+                    invocation: invocation_for("execution.run"),
                     purpose: "run relevant verification after current authority is re-checked"
                         .into(),
                 },
@@ -419,10 +511,12 @@ pub fn contract() -> MachineContract {
             steps: vec![
                 RecipeStep {
                     capability_id: "semantic.definition".into(),
+                    invocation: invocation_for("semantic.definition"),
                     purpose: "resolve the exact symbol definition".into(),
                 },
                 RecipeStep {
                     capability_id: "semantic.references".into(),
+                    invocation: invocation_for("semantic.references"),
                     purpose: "retrieve bounded references after identity is known".into(),
                 },
             ],
@@ -435,16 +529,19 @@ pub fn contract() -> MachineContract {
             steps: vec![
                 RecipeStep {
                     capability_id: "execution.run".into(),
+                    invocation: invocation_for("execution.run"),
                     purpose: "run the explicitly supplied argv under current authority".into(),
                 },
                 RecipeStep {
                     capability_id: "history.query".into(),
+                    invocation: invocation_for("history.query"),
                     purpose: "retrieve the durable execution record and artifact references".into(),
                 },
             ],
             advisory: true,
             notes: vec![
                 "Execution requires current external authority; the recipe grants none.".into(),
+                "Standalone local execution is UNJOURNALED_LOCAL_EXECUTION: durable history entries require daemon-brokered execution; local evidence is preserved as artifacts.".into(),
             ],
         },
         RecipeDefinition {
@@ -452,10 +549,14 @@ pub fn contract() -> MachineContract {
             summary: "Query bounded durable history and follow recorded evidence.".into(),
             steps: vec![RecipeStep {
                 capability_id: "history.query".into(),
+                invocation: invocation_for("history.query"),
                 purpose: "query the current or session-scoped execution history".into(),
             }],
             advisory: true,
-            notes: vec!["History is Omen evidence, not a complete OS audit log.".into()],
+            notes: vec![
+                "History is Omen evidence, not a complete OS audit log.".into(),
+                "Direct local executions are reported as UNJOURNALED_LOCAL_EXECUTION rather than durable entries.".into(),
+            ],
         },
         RecipeDefinition {
             id: "plan-action".into(),
@@ -464,10 +565,12 @@ pub fn contract() -> MachineContract {
             steps: vec![
                 RecipeStep {
                     capability_id: "composition.plan".into(),
+                    invocation: invocation_for("composition.plan"),
                     purpose: "validate the named action and compute its plan digest".into(),
                 },
                 RecipeStep {
                     capability_id: "composition.run".into(),
+                    invocation: invocation_for("composition.run"),
                     purpose: "execute only after the plan and current authority are rechecked"
                         .into(),
                 },
@@ -561,6 +664,7 @@ pub fn catalogue(
                 reason: status.reason.clone(),
                 describe_ref: definition.id.clone(),
                 related_capabilities,
+                invocation: definition.invocation.clone(),
             })
         })
         .collect()
@@ -645,5 +749,55 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn every_capability_carries_deterministic_invocation_routing() {
+        let c = contract();
+        for definition in &c.capability_definitions {
+            // Static table must agree with the embedded routing.
+            assert_eq!(
+                definition.invocation,
+                invocation_for(&definition.id),
+                "routing drift for {}",
+                definition.id
+            );
+        }
+        for recipe in &c.recipe_definitions {
+            for step in &recipe.steps {
+                assert_eq!(
+                    step.invocation,
+                    invocation_for(&step.capability_id),
+                    "step routing drift for {}",
+                    step.capability_id
+                );
+            }
+        }
+        // Representative review-visible routings.
+        let execution = invocation_for("execution.run");
+        assert_eq!(execution.cli.as_deref(), Some("exec --machine -- <argv>"));
+        assert_eq!(execution.mcp_tool.as_deref(), Some("omen_execute"));
+        let history = invocation_for("history.query");
+        assert_eq!(history.cli.as_deref(), Some("history --machine"));
+        assert_eq!(history.mcp_tool.as_deref(), Some("omen_history_query"));
+        assert_eq!(history.interactive.as_deref(), Some(":history"));
+        let definition = invocation_for("semantic.definition");
+        assert_eq!(definition.cli, None);
+        assert_eq!(
+            definition.mcp_tool.as_deref(),
+            Some("omen_symbol_definition")
+        );
+        assert_eq!(definition.interactive.as_deref(), Some(":def"));
+        // Composition-only capabilities advertise no direct surface rather
+        // than a guessed command string.
+        let read = invocation_for("filesystem.read");
+        assert_eq!(read.cli, None);
+        assert_eq!(read.mcp_tool, None);
+        assert_eq!(read.interactive, None);
+        // Unknown ids never invent a route.
+        let unknown = invocation_for("no.such.capability");
+        assert_eq!(unknown.cli, None);
+        assert_eq!(unknown.mcp_tool, None);
+        assert_eq!(unknown.interactive, None);
     }
 }
