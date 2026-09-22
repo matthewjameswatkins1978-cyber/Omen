@@ -227,6 +227,7 @@ jobs:
             runtime_version = $manifest.preview_version
             artifact_name = (Split-Path -Leaf $zipPath)
             binary_sha256 = $manifest.binary_sha256
+            daemon_binary_sha256 = $manifest.daemon_binary_sha256
             package_sha256 = $manifest.package_sha256
           } | ConvertTo-Json | Set-Content -Encoding utf8 work/provenance.json
           Get-Content work/provenance.json
