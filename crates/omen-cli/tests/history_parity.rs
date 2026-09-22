@@ -223,3 +223,124 @@ fn history_query_observations_cover_empty_ten_and_hundred_entries() {
         assert_eq!(result.entries.len(), count.min(100));
     }
 }
+
+
+#[tokio::test]
+async fn direct_local_execution_status_is_equivalent_across_cli_and_mcp() {
+    let temp = tempdir().unwrap();
+
+    let executed = Command::new(env!("CARGO_BIN_EXE_omen"))
+        .args(["--machine", "exec", "rustc", "--", "--version"])
+        .arg("--workspace")
+        .arg(temp.path())
+        .output()
+        .unwrap();
+    assert!(
+        executed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&executed.stderr)
+    );
+    let execution: Value = serde_json::from_slice(&executed.stdout).unwrap();
+    assert!(execution["execution_id"].as_str().unwrap().starts_with("exec_"));
+    assert_eq!(execution["exit_code"], 0);
+    assert!(execution["stdout_artifact_uri"]
+        .as_str()
+        .unwrap()
+        .starts_with("artifact://sha256/"));
+    assert!(execution["stderr_artifact_uri"]
+        .as_str()
+        .unwrap()
+        .starts_with("artifact://sha256/"));
+
+    let cli_output = Command::new(env!("CARGO_BIN_EXE_omen"))
+        .args(["--machine", "history"])
+        .arg("--workspace")
+        .arg(temp.path())
+        .output()
+        .unwrap();
+    assert!(cli_output.status.success());
+    let cli: Value = serde_json::from_slice(&cli_output.stdout).unwrap();
+
+    let server = McpServer::new(temp.path().to_path_buf(), None);
+    let response = server
+        .handle_request(JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(4)),
+            method: "tools/call".into(),
+            params: Some(json!({
+                "name": "omen_history_query",
+                "arguments": {}
+            })),
+        })
+        .await;
+    let call: CallToolResult = serde_json::from_value(response.result.unwrap()).unwrap();
+    let mcp: Value = serde_json::from_str(&call.content[0].text).unwrap();
+
+    assert_eq!(cli, mcp);
+    assert_eq!(cli["history_status"], "UNJOURNALED_LOCAL_EXECUTION");
+    assert_eq!(
+        cli["local_execution"]["execution_id"],
+        execution["execution_id"]
+    );
+}
+
+#[test]
+fn human_exec_propagates_child_failure_and_stderr() {
+    let temp = tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_omen"))
+        .args(["exec", "rustc", "--", "--definitely-not-a-rustc-option"])
+        .arg("--workspace")
+        .arg(temp.path())
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "child failure must reach the shell");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("exec_"), "execution identity must be visible: {stderr}");
+    assert!(
+        stderr.contains("stderr evidence: artifact://sha256/"),
+        "failure evidence must be visible: {stderr}"
+    );
+}
+
+#[test]
+fn closed_stdin_does_not_turn_ripgrep_into_empty_stdin_search() {
+    if Command::new("rg").arg("--version").output().is_err() {
+        eprintln!("SKIP: ripgrep is unavailable on this host");
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("needle.txt"),
+        "OMEN_STDIN_REGRESSION_NEEDLE\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_omen"))
+        .args([
+            "--machine",
+            "exec",
+            "rg",
+            "--",
+            "OMEN_STDIN_REGRESSION_NEEDLE",
+        ])
+        .arg("--workspace")
+        .arg(temp.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["exit_code"], 0);
+    assert!(
+        result["stdout_bounded"]
+            .as_str()
+            .unwrap()
+            .contains("needle.txt"),
+        "ripgrep must search the workspace rather than an EOF pipe: {result}"
+    );
+}
