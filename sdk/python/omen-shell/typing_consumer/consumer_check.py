@@ -25,6 +25,7 @@ def exercise(omen: Omen) -> None:
     assert_type(omen.facts.query(), list[JsonObject])
     assert_type(omen.describe("execution.run"), JsonObject)
     assert_type(omen.context(), JsonObject)
+    assert_type(omen.cancel_execution("exec_01K9F82A"), JsonObject)
 
 
 def main() -> None:

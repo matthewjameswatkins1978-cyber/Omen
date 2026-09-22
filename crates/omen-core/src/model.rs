@@ -65,6 +65,13 @@ pub struct ExecutionContract {
 }
 
 /// Execution runtime status.
+///
+/// E2 cancellation truth: `Cancelled` means a stop was requested AND the
+/// physical process death was actually observed afterwards. `OutcomeUnknown`
+/// means Omen can no longer determine the physical outcome (kill attempted
+/// but death unconfirmed, or the execution crossed a restart/crash boundary
+/// while still running). Uncertainty is preserved, never rewritten into
+/// success or failure for convenience.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum RuntimeStatus {
@@ -72,8 +79,32 @@ pub enum RuntimeStatus {
     SpawnFailed,
     TimedOut,
     Cancelled,
+    OutcomeUnknown,
     ContainmentFailed,
     IoFailed,
+}
+
+impl RuntimeStatus {
+    /// Coarse history status label for durable history envelopes.
+    ///
+    /// One semantic authority (Rule 7): every surface that records history
+    /// (daemon broker, MCP standalone, interactive standalone) maps through
+    /// this function, so the same physical outcome always projects the same
+    /// history status. Preserves the long-standing fallback semantics (exit
+    /// 0 → COMPLETED, non-zero → FAILED) while making timeout / cancel /
+    /// unknown outcomes explicit instead of UNKNOWN.
+    pub fn history_label(&self, exit_code: Option<i32>) -> &'static str {
+        match self {
+            RuntimeStatus::Completed if exit_code == Some(0) => "COMPLETED",
+            RuntimeStatus::Completed => "FAILED",
+            RuntimeStatus::SpawnFailed
+            | RuntimeStatus::ContainmentFailed
+            | RuntimeStatus::IoFailed => "FAILED",
+            RuntimeStatus::TimedOut => "TIMED_OUT",
+            RuntimeStatus::Cancelled => "CANCELLED",
+            RuntimeStatus::OutcomeUnknown => "OUTCOME_UNKNOWN",
+        }
+    }
 }
 
 /// Process exit representation.

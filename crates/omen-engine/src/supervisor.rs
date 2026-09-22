@@ -201,7 +201,30 @@ impl ProcessSupervisor {
         .await
     }
 
-    pub async fn execute(&self, mut req: ExecutionRequest) -> Result<ExecutionOutput, CoreError> {
+    pub async fn execute(&self, req: ExecutionRequest) -> Result<ExecutionOutput, CoreError> {
+        self.execute_inner(req, None).await
+    }
+
+    /// Execute with an external cancellation flag.
+    ///
+    /// E2 stop truth: a fired flag before dispatch means the child is never
+    /// spawned (`Cancelled`, `CANCELLED_BEFORE_DISPATCH`, empty evidence).
+    /// A fired flag mid-flight kills the tree and confirms death
+    /// (`Cancelled`) or records `OutcomeUnknown` when death cannot be
+    /// confirmed. Firing the flag never manufactures a terminal state.
+    pub async fn execute_cancelable(
+        &self,
+        req: ExecutionRequest,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<ExecutionOutput, CoreError> {
+        self.execute_inner(req, Some(cancel)).await
+    }
+
+    async fn execute_inner(
+        &self,
+        mut req: ExecutionRequest,
+        cancel: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<ExecutionOutput, CoreError> {
         // 1. Preflight check: fail-closed if required assurance cannot be enforced
         self.backend.preflight(&req.required_assurance)?;
 
@@ -210,6 +233,31 @@ impl ProcessSupervisor {
         }
 
         let start_time = std::time::Instant::now();
+
+        // Cancel-before-dispatch: intent arrived before any physical work.
+        // No spawn, no child, no side effects — but the refusal is recorded
+        // as Cancelled truth by the caller (daemon receipt + history).
+        if cancel.as_ref().is_some_and(|flag| *flag.borrow()) {
+            return Ok(ExecutionOutput {
+                runtime_status: RuntimeStatus::Cancelled,
+                process_exit: ProcessExit {
+                    code: None,
+                    signal: Some("CANCELLED_BEFORE_DISPATCH".into()),
+                },
+                adapter_classification: AdapterClassification::Failure,
+                enforcement: EnforcementReport {
+                    filesystem: self.backend.capabilities().filesystem,
+                    network: self.backend.capabilities().network,
+                    descendant_processes: self.backend.capabilities().descendants,
+                    symlink_escape: self.backend.capabilities().symlink_escape,
+                },
+                stdout_bounded: Vec::new(),
+                stderr_bounded: Vec::new(),
+                stdout_all: Vec::new(),
+                stderr_all: Vec::new(),
+                duration_ms: start_time.elapsed().as_millis() as u64,
+            });
+        }
 
         // Handle temporary file secret injection
         let _temp_dir_guard = if req
@@ -241,10 +289,14 @@ impl ProcessSupervisor {
         // 2. Physical spawn through the execution backend
         let handle = self.backend.spawn(&req)?;
 
-        // 3. Supervised wait with bounded timeout and tree cleanup
+        // 3. Supervised wait with bounded timeout and tree cleanup.
+        // With a cancellation flag the wait additionally honors stop
+        // requests with confirm-or-unknown semantics (see backend).
         let timeout_duration = Duration::from_millis(req.timeout_ms);
-        let (runtime_status, process_exit, mut stdout_all, mut stderr_all) =
-            handle.wait_bounded(timeout_duration).await?;
+        let (runtime_status, process_exit, mut stdout_all, mut stderr_all) = match cancel {
+            Some(flag) => handle.wait_cancelable(timeout_duration, flag).await?,
+            None => handle.wait_bounded(timeout_duration).await?,
+        };
 
         // 4. Automatic secret redaction from captured stdout and stderr
         for secret in &req.secrets {

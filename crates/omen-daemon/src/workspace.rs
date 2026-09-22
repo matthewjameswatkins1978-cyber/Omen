@@ -2,15 +2,15 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::sync::{Mutex, RwLock, broadcast, watch};
 
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 
 use omen_core::{CoreError, ExecutionId, InteractiveSessionId};
 use omen_engine::{ExecutionRequest, ProcessSupervisor};
 use omen_ipc::{
-    EventPayload, ExecutionResultSummary, FactInfo, IpcEvent, LocalIpcError, ManagedServiceInfo,
-    SharedIndexSnapshot,
+    CancelOutcome, CancelRecord, EventPayload, ExecutionResultSummary, FactInfo, IpcEvent,
+    LocalIpcError, ManagedServiceInfo, SharedIndexSnapshot,
 };
 use omen_knowledge::{
     Database, ExecutionHistory, ExecutionRecord, FactRegistry, RequestReceiptRecord, ServiceRecord,
@@ -20,6 +20,31 @@ use omen_knowledge::{
 
 pub type InFlightMap =
     Arc<Mutex<HashMap<String, broadcast::Sender<Result<ExecutionResultSummary, LocalIpcError>>>>>;
+
+/// Bounded wait for the terminal broadcast after firing a cancellation flag.
+/// Expiry reports `OutcomeUnknown`; the caller never hangs on a wedged task.
+pub const CANCEL_OBSERVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Reproduce a recorded terminal runtime for the dedup-replay path.
+///
+/// The broker stamps every history record with an explicit status envelope.
+/// `FAILED` (and the physical failure spellings) replay as `Completed`
+/// because the original summary reported physical completion with a
+/// non-zero exit; the exit code itself carries the failure. Returns `None`
+/// for records without a parsable envelope (legacy rows).
+fn recorded_history_runtime(rec: &ExecutionRecord) -> Option<omen_core::RuntimeStatus> {
+    let envelope = rec.envelope_json.as_deref()?;
+    let value: serde_json::Value = serde_json::from_str(envelope).ok()?;
+    match value.get("status")?.as_str()? {
+        "COMPLETED" | "FAILED" | "SPAWN_FAILED" | "CONTAINMENT_FAILED" | "IO_FAILED" => {
+            Some(omen_core::RuntimeStatus::Completed)
+        }
+        "TIMED_OUT" => Some(omen_core::RuntimeStatus::TimedOut),
+        "CANCELLED" => Some(omen_core::RuntimeStatus::Cancelled),
+        "OUTCOME_UNKNOWN" => Some(omen_core::RuntimeStatus::OutcomeUnknown),
+        _ => None,
+    }
+}
 
 pub struct ManagedChildService {
     pub name: String,
@@ -59,6 +84,13 @@ pub struct WorkspaceState {
     supervisor: Arc<ProcessSupervisor>,
     execution_cache: RwLock<HashMap<String, ExecutionResultSummary>>,
     in_flight_executions: InFlightMap,
+    /// E2 stop truth: live cancellation flags keyed by canonical execution
+    /// ID. Firing a flag records INTENT; the broker task still performs the
+    /// physical stop and observes the outcome (confirm or unknown).
+    cancel_switches: Mutex<HashMap<String, watch::Sender<bool>>>,
+    /// Execution ID → dedup (consequential request) ID for in-flight work.
+    /// Needed to observe the terminal broadcast after firing a cancel flag.
+    cancel_index: Mutex<HashMap<String, String>>,
     event_tx: broadcast::Sender<IpcEvent>,
     watcher: Arc<Mutex<Option<RecommendedWatcher>>>,
 }
@@ -199,6 +231,8 @@ impl WorkspaceState {
             supervisor,
             execution_cache,
             in_flight_executions,
+            cancel_switches: Mutex::new(HashMap::new()),
+            cancel_index: Mutex::new(HashMap::new()),
             event_tx,
             watcher: Arc::new(Mutex::new(None)),
         })
@@ -756,6 +790,223 @@ impl WorkspaceState {
             .flatten()
     }
 
+    /// E2 stop truth: request cancellation of a live brokered execution.
+    ///
+    /// Intent and proof are strictly separated:
+    /// - firing the live flag records `CancellationRequested` (intent);
+    /// - the broker task still performs the physical tree-stop and observes
+    ///   the child; only observed death becomes `TerminationConfirmed`;
+    /// - a naturally finished execution reports `AlreadyFinished` with its
+    ///   terminal receipt status — cancel never rewrites a completed outcome;
+    /// - no live handle and no terminal receipt (restart/crash boundary)
+    ///   reports `OutcomeUnknown` and reconciles the receipt to `Unknown`.
+    ///
+    /// The observation wait is bounded (`CANCEL_OBSERVE_TIMEOUT`); expiry
+    /// also reports `OutcomeUnknown` rather than hanging the caller.
+    /// Subscribe to the terminal broadcast for `dedup_id`, if a broker task
+    /// is still holding its `in_flight` entry. A double-checked subscribe
+    /// covers a task completing between the check and the subscription.
+    async fn subscribe_cancel_terminal(
+        &self,
+        dedup_id: &str,
+    ) -> Option<tokio::sync::broadcast::Receiver<Result<ExecutionResultSummary, LocalIpcError>>>
+    {
+        {
+            let in_flight = self.in_flight_executions.lock().await;
+            if let Some(tx) = in_flight.get(dedup_id) {
+                return Some(tx.subscribe());
+            }
+        }
+        tokio::task::yield_now().await;
+        let in_flight = self.in_flight_executions.lock().await;
+        in_flight.get(dedup_id).map(|tx| tx.subscribe())
+    }
+
+    /// Await an observed terminal broadcast, mapping it to a cancel report.
+    /// Returns `None` only when the broadcast was lost (senders dropped
+    /// without a value): the caller must fall through to the durable
+    /// receipt instead of manufacturing an outcome. A timed-out wait
+    /// reports `OutcomeUnknown` directly — the flag was fired and the task
+    /// did not resolve within the bound.
+    async fn await_cancel_terminal(
+        &self,
+        execution_id: &str,
+        mut sub: tokio::sync::broadcast::Receiver<Result<ExecutionResultSummary, LocalIpcError>>,
+    ) -> Option<CancelRecord> {
+        let mk = |outcome: CancelOutcome, detail: &str| CancelRecord {
+            execution_id: execution_id.to_string(),
+            outcome,
+            detail: detail.to_string(),
+        };
+        match tokio::time::timeout(CANCEL_OBSERVE_TIMEOUT, sub.recv()).await {
+            Ok(Ok(Ok(summary))) => Some(match summary.runtime_status {
+                omen_core::RuntimeStatus::Cancelled => mk(
+                    CancelOutcome::TerminationConfirmed,
+                    "stop requested, tree-stop issued, physical death observed",
+                ),
+                omen_core::RuntimeStatus::OutcomeUnknown => mk(
+                    CancelOutcome::OutcomeUnknown,
+                    "stop requested but physical death could not be confirmed",
+                ),
+                _ => mk(
+                    CancelOutcome::AlreadyFinished {
+                        terminal_status: format!("{:?}", summary.runtime_status),
+                    },
+                    "execution reached a terminal state before the stop took effect",
+                ),
+            }),
+            Ok(Ok(Err(_))) | Ok(Err(_)) => {
+                // Task error or lost broadcast: the durable receipt (written
+                // before any broadcast) is the surviving truth. Fall through.
+                None
+            }
+            Err(_) => Some(mk(
+                CancelOutcome::OutcomeUnknown,
+                "stop requested but the terminal outcome was not observable within the bounded wait",
+            )),
+        }
+    }
+
+    /// Report from a durable receipt. Terminal receipts speak for
+    /// themselves; anything else with no live task behind it is a
+    /// restart/crash boundary and reconciles to `Unknown`.
+    async fn report_receipt_for_cancel(
+        &self,
+        execution_id: &str,
+        rec: RequestReceiptRecord,
+    ) -> CancelRecord {
+        let mk = |outcome: CancelOutcome, detail: &str| CancelRecord {
+            execution_id: execution_id.to_string(),
+            outcome,
+            detail: detail.to_string(),
+        };
+        match rec.status.as_str() {
+            "Completed" | "Failed" | "Cancelled" => mk(
+                CancelOutcome::AlreadyFinished {
+                    terminal_status: rec.status,
+                },
+                "execution already reached a terminal state",
+            ),
+            "Unknown" => mk(
+                CancelOutcome::OutcomeUnknown,
+                "execution outcome is already unknown (restart/crash boundary)",
+            ),
+            _ => {
+                self.record_request_receipt(
+                    &rec.consequential_request_id,
+                    Some(execution_id),
+                    "Unknown",
+                )
+                .await;
+                mk(
+                    CancelOutcome::OutcomeUnknown,
+                    "no live execution task; receipt reconciled to Unknown",
+                )
+            }
+        }
+    }
+
+    /// E2 stop truth: request cancellation of a live brokered execution.
+    ///
+    /// Intent and proof are strictly separated:
+    /// - firing the live flag records `CancellationRequested` (intent);
+    /// - the broker task still performs the physical tree-stop and observes
+    ///   the child; only observed death becomes `TerminationConfirmed`;
+    /// - a naturally finished execution reports `AlreadyFinished` with its
+    ///   terminal receipt status — cancel never rewrites a completed outcome;
+    /// - no live task and no terminal receipt (restart/crash boundary)
+    ///   reports `OutcomeUnknown` and reconciles the receipt to `Unknown`.
+    ///
+    /// Race discipline: a live broker task always holds its `in_flight`
+    /// broadcast entry until AFTER the terminal receipt is written, so a
+    /// missed broadcast implies the receipt went terminal — the receipt is
+    /// re-read rather than trusted from a potentially transient observation.
+    /// The observation wait is bounded (`CANCEL_OBSERVE_TIMEOUT`); expiry
+    /// reports `OutcomeUnknown` rather than hanging the caller.
+    pub async fn cancel_execution(&self, execution_id: &str) -> CancelRecord {
+        let mk = |outcome: CancelOutcome, detail: &str| CancelRecord {
+            execution_id: execution_id.to_string(),
+            outcome,
+            detail: detail.to_string(),
+        };
+
+        // Live in-flight execution: record intent, fire the flag, observe.
+        // Order matters: the receipt write precedes the fire so status
+        // queries can observe CancellationRequested; the fire precedes the
+        // subscribe so a completing task cannot slip between them (a missed
+        // broadcast then implies the terminal receipt write already landed).
+        let live = {
+            let switches = self.cancel_switches.lock().await;
+            let index = self.cancel_index.lock().await;
+            match (
+                switches.get(execution_id).cloned(),
+                index.get(execution_id).cloned(),
+            ) {
+                (Some(tx), Some(dedup_id)) => Some((tx, dedup_id)),
+                _ => None,
+            }
+        };
+        if let Some((cancel_tx, dedup_id)) = live {
+            self.record_request_receipt(&dedup_id, Some(execution_id), "CancellationRequested")
+                .await;
+            let _ = cancel_tx.send(true);
+            if let Some(sub) = self.subscribe_cancel_terminal(&dedup_id).await
+                && let Some(report) = self.await_cancel_terminal(execution_id, sub).await
+            {
+                return report;
+            }
+            // Unobservable broadcast: fall through to the durable receipt.
+        }
+
+        // Durable receipt decides. A task that is still alive holds its
+        // in_flight entry until after its terminal receipt write, so prefer
+        // live observation for non-terminal receipts; otherwise report.
+        let receipt = {
+            let db = self.db.lock().await;
+            WorkspacePersistence::get_receipt_by_execution_id(&db, execution_id)
+                .ok()
+                .flatten()
+        };
+        match receipt {
+            None => mk(
+                CancelOutcome::NotFound,
+                "no execution with this ID is known to the daemon",
+            ),
+            Some(rec) => match rec.status.as_str() {
+                "Completed" | "Failed" | "Cancelled" | "Unknown" => {
+                    self.report_receipt_for_cancel(execution_id, rec).await
+                }
+                _ => {
+                    // Non-terminal receipt: the task may still be alive
+                    // (switches cleaned just ahead of us). Prefer live
+                    // observation; a missed broadcast implies the terminal
+                    // receipt write landed, so re-read rather than trusting
+                    // the transient observation.
+                    if let Some(sub) = self
+                        .subscribe_cancel_terminal(&rec.consequential_request_id)
+                        .await
+                        && let Some(report) = self.await_cancel_terminal(execution_id, sub).await
+                    {
+                        return report;
+                    }
+                    let reread = {
+                        let db = self.db.lock().await;
+                        WorkspacePersistence::get_receipt_by_execution_id(&db, execution_id)
+                            .ok()
+                            .flatten()
+                    };
+                    match reread {
+                        Some(fresh) => self.report_receipt_for_cancel(execution_id, fresh).await,
+                        None => mk(
+                            CancelOutcome::NotFound,
+                            "execution vanished between observations",
+                        ),
+                    }
+                }
+            },
+        }
+    }
+
     pub fn db(&self) -> Arc<Mutex<Database>> {
         self.db.clone()
     }
@@ -777,6 +1028,7 @@ impl WorkspaceState {
             duration_ms,
             stdout_artifact,
             stderr_artifact,
+            None,
         )
         .await
     }
@@ -791,6 +1043,7 @@ impl WorkspaceState {
         duration_ms: u64,
         stdout_artifact: Option<String>,
         stderr_artifact: Option<String>,
+        runtime: Option<omen_core::RuntimeStatus>,
     ) -> Result<String, CoreError> {
         let (execution_id, exec_id_str) = if let Some(id) = custom_execution_id {
             let s = id.to_string();
@@ -802,6 +1055,14 @@ impl WorkspaceState {
         };
         let session_id_typed = InteractiveSessionId::new(session_id)?;
 
+        // E2 history truth: the broker always stamps the coarse history
+        // status explicitly via the single RuntimeStatus::history_label
+        // authority, so every recording surface projects identical truth.
+        let envelope_json = runtime.map(|status| {
+            let history_status = status.history_label(exit_code);
+            format!(r#"{{"status":"{history_status}","source":"broker"}}"#)
+        });
+
         let record = ExecutionRecord {
             execution_id: execution_id.clone(),
             session_id: session_id_typed,
@@ -810,7 +1071,7 @@ impl WorkspaceState {
             duration_ms: Some(duration_ms as i64),
             stdout_artifact,
             stderr_artifact,
-            envelope_json: None,
+            envelope_json,
             created_at: chrono::Utc::now().to_rfc3339(),
         };
 
@@ -875,9 +1136,20 @@ impl WorkspaceState {
                 if let Ok(eid) = ExecutionId::new(&exec_id)
                     && let Ok(Some(rec)) = ExecutionHistory::get_execution(&db, &eid)
                 {
+                    // E2 replay truth: reproduce the recorded terminal
+                    // outcome, not a hardcoded Completed. The broker stamps
+                    // every record with an explicit history status envelope;
+                    // legacy records without one keep the previous fallback
+                    // (exit present → Completed, absent → TimedOut, the only
+                    // exit-None case the Completed receipt ever covered).
+                    let runtime_status =
+                        recorded_history_runtime(&rec).unwrap_or(match rec.exit_code {
+                            Some(_) => omen_core::RuntimeStatus::Completed,
+                            None => omen_core::RuntimeStatus::TimedOut,
+                        });
                     let summary = ExecutionResultSummary {
                         execution_id: exec_id,
-                        runtime_status: omen_core::RuntimeStatus::Completed,
+                        runtime_status,
                         exit_code: rec.exit_code,
                         duration_ms: rec.duration_ms.unwrap_or(0) as u64,
                         stdout_preview: rec.command.clone(),
@@ -954,6 +1226,17 @@ impl WorkspaceState {
             PathBuf::from(cwd)
         };
 
+        // E2 stop truth: live cancellation flag for this execution. Firing
+        // it records intent; the task below still performs the physical stop
+        // and observes the outcome (confirm or unknown).
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        {
+            let mut switches = self.cancel_switches.lock().await;
+            switches.insert(exec_id_str.clone(), cancel_tx);
+            let mut index = self.cancel_index.lock().await;
+            index.insert(exec_id_str.clone(), dedup_id_str.clone());
+        }
+
         let join_handle = tokio::spawn(async move {
             let req = ExecutionRequest {
                 argv: argv.clone(),
@@ -967,7 +1250,14 @@ impl WorkspaceState {
                 secrets: vec![],
             };
 
-            let exec_result = this.supervisor.execute(req).await;
+            let exec_result = this.supervisor.execute_cancelable(req, cancel_rx).await;
+            // The execution is terminal: release the cancellation switch.
+            {
+                let mut switches = this.cancel_switches.lock().await;
+                switches.remove(&exec_id_str);
+                let mut index = this.cancel_index.lock().await;
+                index.remove(&exec_id_str);
+            }
             match exec_result {
                 Ok(output) => {
                     let cmd_str = argv.join(" ");
@@ -1011,6 +1301,17 @@ impl WorkspaceState {
                     let stdout_preview = output.stdout_sanitized();
                     let stderr_preview = output.stderr_sanitized();
 
+                    // E2 terminal truth: the broker receipt distinguishes a
+                    // confirmed stop from natural completion and from an
+                    // unconfirmed outcome. The task owns this terminal write;
+                    // `cancel_execution` only records intent and observes.
+                    let terminal_receipt = match output.runtime_status {
+                        omen_core::RuntimeStatus::Cancelled => "Cancelled",
+                        omen_core::RuntimeStatus::OutcomeUnknown => "Unknown",
+                        _ => "Completed",
+                    };
+                    let history_runtime = Some(output.runtime_status);
+
                     // Record history with the same canonical execution_id
                     let _ = this
                         .record_history_with_id(
@@ -1021,12 +1322,17 @@ impl WorkspaceState {
                             duration_ms,
                             stdout_art.clone(),
                             stderr_art.clone(),
+                            history_runtime,
                         )
                         .await;
 
                     // Update request receipt
-                    this.record_request_receipt(&dedup_id_str, Some(&exec_id_str), "Completed")
-                        .await;
+                    this.record_request_receipt(
+                        &dedup_id_str,
+                        Some(&exec_id_str),
+                        terminal_receipt,
+                    )
+                    .await;
 
                     let summary = ExecutionResultSummary {
                         execution_id: exec_id_str,
@@ -1068,9 +1374,20 @@ impl WorkspaceState {
 
         match join_handle.await {
             Ok(res) => res,
-            Err(e) => Err(LocalIpcError::InternalRuntimeError(format!(
-                "Execution task panicked: {e}"
-            ))),
+            Err(e) => {
+                // Failure must return control: a panicking broker task must
+                // not strand coalesced in-flight subscribers (or future
+                // cancel observers) on a broadcast that will never send.
+                // The receipt stays non-terminal (Running/Cancellation-
+                // Requested) so recovery reconciles it to Unknown honestly.
+                let err =
+                    LocalIpcError::InternalRuntimeError(format!("Execution task panicked: {e}"));
+                let mut in_flight = self.in_flight_executions.lock().await;
+                if let Some(tx) = in_flight.remove(dedup_id) {
+                    let _ = tx.send(Err(err.clone()));
+                }
+                Err(err)
+            }
         }
     }
 }

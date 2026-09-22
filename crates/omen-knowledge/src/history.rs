@@ -23,6 +23,7 @@ pub enum HistoryStatus {
     Refused,
     TimedOut,
     Partial,
+    Cancelled,
     Unknown,
 }
 
@@ -199,10 +200,12 @@ fn parse_history_status(value: &str) -> Option<HistoryStatus> {
     match value {
         "COMPLETED" | "Completed" => Some(HistoryStatus::Completed),
         "FAILED" | "Failed" => Some(HistoryStatus::Failed),
+        "SPAWN_FAILED" | "CONTAINMENT_FAILED" | "IO_FAILED" => Some(HistoryStatus::Failed),
         "REFUSED" | "Refused" => Some(HistoryStatus::Refused),
         "TIMED_OUT" | "TimedOut" => Some(HistoryStatus::TimedOut),
+        "CANCELLED" | "Cancelled" => Some(HistoryStatus::Cancelled),
         "PARTIAL" | "Partial" => Some(HistoryStatus::Partial),
-        "UNKNOWN" | "Unknown" => Some(HistoryStatus::Unknown),
+        "OUTCOME_UNKNOWN" | "UNKNOWN" | "Unknown" => Some(HistoryStatus::Unknown),
         _ => None,
     }
 }

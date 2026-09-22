@@ -212,6 +212,17 @@ impl McpServer {
                 }),
             },
             ToolDefinition {
+                name: "omen_cancel_execution".into(),
+                description: "Request cancellation of a live brokered execution by canonical execution_id. Intent and proof are distinct: only observed physical death reports TerminationConfirmed; unconfirmed stops report OutcomeUnknown; finished executions report AlreadyFinished without rewriting history.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["execution_id"],
+                    "properties": {
+                        "execution_id": { "type": "string", "minLength": 1, "description": "Omen-minted canonical execution_id from omen_execute" }
+                    }
+                }),
+            },
+            ToolDefinition {
                 name: "omen_history_query".into(),
                 description: "Query bounded durable Omen execution history; this is evidence recorded by Omen, not a complete OS or shell audit log.".into(),
                 input_schema: json!({
@@ -349,6 +360,7 @@ impl McpServer {
             "omen_facts_query" => self.tool_facts_query(&arguments).await,
             "omen_execute" => self.tool_execute(&arguments).await,
             "omen_execution_status" => self.tool_execution_status(&arguments).await,
+            "omen_cancel_execution" => self.tool_cancel_execution(&arguments).await,
             "omen_history_query" => self.tool_history_query(&arguments).await,
             "omen_services_list" => self.tool_services_list().await,
             "omen_services_control" => self.tool_services_control(&arguments).await,
@@ -741,8 +753,43 @@ impl McpServer {
                         None
                     };
 
+                    // E2.5: standalone execution records durable history with
+                    // its canonical ID (mirroring interactive standalone),
+                    // so the same identity is visible on every surface. The
+                    // ID is minted once and shared by the record and the
+                    // response — never discarded and reminted.
+                    let execution_id = omen_core::ExecutionId::generate();
+                    if let Some(ref mut d) = db
+                        && let Ok(session_id) =
+                            omen_core::InteractiveSessionId::new(&self.session_id)
+                    {
+                        let history_status = output
+                            .runtime_status
+                            .history_label(output.process_exit.code);
+                        let record = omen_knowledge::ExecutionRecord {
+                            execution_id: execution_id.clone(),
+                            session_id,
+                            command: argv.join(" "),
+                            exit_code: output.process_exit.code,
+                            duration_ms: Some(output.duration_ms as i64),
+                            stdout_artifact: stdout_artifact.clone(),
+                            stderr_artifact: stderr_artifact.clone(),
+                            envelope_json: Some(format!(
+                                r#"{{"status":"{history_status}","source":"standalone"}}"#
+                            )),
+                            created_at: chrono::Utc::now().to_rfc3339(),
+                        };
+                        let _ = omen_knowledge::ExecutionHistory::record_execution(
+                            d,
+                            &record,
+                            &[],
+                            &[],
+                            &[],
+                        );
+                    }
+
                     let out = json!({
-                        "execution_id": omen_core::ExecutionId::generate(),
+                        "execution_id": execution_id,
                         "runtime_status": output.runtime_status,
                         "exit_code": output.process_exit.code,
                         "duration_ms": output.duration_ms,
@@ -773,6 +820,27 @@ impl McpServer {
             }
         } else {
             CallToolResult::error("Shared daemon client not connected")
+        }
+    }
+
+    async fn tool_cancel_execution(&self, args: &Value) -> CallToolResult {
+        let execution_id = match args.get("execution_id").and_then(|v| v.as_str()) {
+            Some(id) if !id.trim().is_empty() => id,
+            _ => return CallToolResult::error("Missing 'execution_id'"),
+        };
+
+        if let Some(ref c) = self.client {
+            match c.cancel_execution(execution_id).await {
+                Ok(record) => CallToolResult::text(serde_json::to_string_pretty(&record).unwrap()),
+                Err(e) => CallToolResult::error(format!("Cancel execution error: {e}")),
+            }
+        } else {
+            // Truthful limitation: standalone local execution has no daemon
+            // broker tracking live handles, so there is nothing Omen can
+            // confirm stopped. Refuse rather than fake a cancellation.
+            CallToolResult::error(
+                "Cancel requires the shared daemon broker: standalone local execution cannot be cancelled post-hoc",
+            )
         }
     }
 
@@ -827,10 +895,10 @@ impl McpServer {
             })
             .and_then(|db| query_history(&db, &query))
         {
-            Ok(result) if result.entries.is_empty() => {
-                local_history_result(&self.workspace_path, &result)
-            }
-            Ok(result) => CallToolResult::text(serde_json::to_string_pretty(&result).unwrap()),
+            // E2.5: every success projects through the shared constructor,
+            // so a direct-local-execution marker is never hidden merely
+            // because durable entries also exist (CLI `--machine` parity).
+            Ok(result) => local_history_result(&self.workspace_path, &result),
             Err(error) => {
                 if local_execution_status_path(&self.workspace_path).exists() {
                     local_history_result(
@@ -920,6 +988,7 @@ impl McpServer {
                 "omen_facts_query",
                 "omen_execute",
                 "omen_execution_status",
+                "omen_cancel_execution",
                 "omen_history_query",
                 "omen_services_list",
                 "omen_services_control",

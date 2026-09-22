@@ -62,6 +62,7 @@ impl TryFrom<ExecutionResultWire> for ExecutionResult {
             "SPAWN_FAILED" => RuntimeStatus::SpawnFailed,
             "TIMED_OUT" => RuntimeStatus::TimedOut,
             "CANCELLED" => RuntimeStatus::Cancelled,
+            "OUTCOME_UNKNOWN" => RuntimeStatus::OutcomeUnknown,
             "CONTAINMENT_FAILED" => RuntimeStatus::ContainmentFailed,
             "IO_FAILED" => RuntimeStatus::IoFailed,
             other => {

@@ -47,6 +47,9 @@ pub enum RequestPayload {
     QueryRequestStatus {
         consequential_request_id: String,
     },
+    CancelExecution {
+        execution_id: String,
+    },
     StartService {
         name: String,
         command: String,
@@ -154,6 +157,7 @@ pub enum ResponsePayload {
     },
     ExecutionFinished(ExecutionResultSummary),
     RequestStatus(ExecutionStatusRecord),
+    CancelResult(CancelRecord),
     ServiceStarted(ManagedServiceInfo),
     ServiceStopped {
         name: String,
@@ -321,6 +325,8 @@ pub enum ExecutionStatusCode {
     NotSeen,
     Accepted,
     Running,
+    CancellationRequested,
+    Cancelled,
     Completed,
     Failed,
     Unknown,
@@ -331,6 +337,30 @@ pub struct ExecutionStatusRecord {
     pub consequential_request_id: String,
     pub execution_id: Option<String>,
     pub status: ExecutionStatusCode,
+}
+
+/// E2 stop truth for a `CancelExecution` request.
+///
+/// Intent (`CancellationRequested` receipt) and proof are distinct: the
+/// daemon fires the stop flag, performs the physical tree-stop, and then
+/// observes the child. Only observed death is `TerminationConfirmed`.
+/// Anything unconfirmed is `OutcomeUnknown` — never a manufactured
+/// success or failure. A naturally finished execution reports
+/// `AlreadyFinished` with its terminal receipt status.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "outcome")]
+pub enum CancelOutcome {
+    TerminationConfirmed,
+    AlreadyFinished { terminal_status: String },
+    OutcomeUnknown,
+    NotFound,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CancelRecord {
+    pub execution_id: String,
+    pub outcome: CancelOutcome,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

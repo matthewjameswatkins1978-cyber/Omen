@@ -1134,3 +1134,258 @@ async fn test_mcp_provider_failure_does_not_become_not_found_and_recovers() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn test_mcp_standalone_execute_records_durable_history_with_same_id() {
+    // E2.5: standalone execution must record durable history under the SAME
+    // canonical ID it returns (previously the minted ID was discarded and
+    // nothing was recorded).
+    let temp = tempdir().unwrap();
+    let server = McpServer::new(temp.path().to_path_buf(), None);
+    let response = server
+        .handle_request(JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(101)),
+            method: "tools/call".into(),
+            params: Some(json!({
+                "name": "omen_execute",
+                "arguments": {
+                    "argv": [semantic_gremlin_exe(), "--stdout", "e2-standalone-id"],
+                    "cwd": temp.path().to_string_lossy()
+                }
+            })),
+        })
+        .await;
+    assert!(response.error.is_none());
+    let result: CallToolResult = serde_json::from_value(response.result.unwrap()).unwrap();
+    let value: Value = serde_json::from_str(&result.content[0].text).unwrap();
+    let exec_id = value["execution_id"].as_str().unwrap().to_string();
+    assert_eq!(value["runtime_status"], "COMPLETED");
+
+    let history_resp = server
+        .handle_request(JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(102)),
+            method: "tools/call".into(),
+            params: Some(json!({"name": "omen_history_query", "arguments": {"limit": 20}})),
+        })
+        .await;
+    let history_call: CallToolResult =
+        serde_json::from_value(history_resp.result.unwrap()).unwrap();
+    let history: Value = serde_json::from_str(&history_call.content[0].text).unwrap();
+    let entries = history["entries"].as_array().unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|e| e["execution_id"] == exec_id && e["status"] == "COMPLETED"),
+        "standalone execution {exec_id} must be visible in history with the same identity"
+    );
+}
+
+#[tokio::test]
+async fn test_mcp_history_with_marker_and_entries_shows_both() {
+    // E2.5 marker symmetry: a direct-local-execution marker must be
+    // projected even when durable entries exist (CLI `--machine` parity).
+    let temp = tempdir().unwrap();
+    let server = McpServer::new(temp.path().to_path_buf(), None);
+    let exec_resp = server
+        .handle_request(JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(103)),
+            method: "tools/call".into(),
+            params: Some(json!({
+                "name": "omen_execute",
+                "arguments": {
+                    "argv": [semantic_gremlin_exe(), "--stdout", "e2-marker-both"],
+                    "cwd": temp.path().to_string_lossy()
+                }
+            })),
+        })
+        .await;
+    assert!(exec_resp.error.is_none());
+    fs::create_dir_all(
+        omen_knowledge::local_execution_status_path(temp.path())
+            .parent()
+            .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        omen_knowledge::local_execution_status_path(temp.path()),
+        r#"{"history_status":"UNJOURNALED_LOCAL_EXECUTION","command":["local","only"]}"#,
+    )
+    .unwrap();
+
+    let history_resp = server
+        .handle_request(JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(104)),
+            method: "tools/call".into(),
+            params: Some(json!({"name": "omen_history_query", "arguments": {"limit": 20}})),
+        })
+        .await;
+    let history_call: CallToolResult =
+        serde_json::from_value(history_resp.result.unwrap()).unwrap();
+    let history: Value = serde_json::from_str(&history_call.content[0].text).unwrap();
+    assert_eq!(history["history_status"], "UNJOURNALED_LOCAL_EXECUTION");
+    assert!(
+        !history["history"]["entries"].as_array().unwrap().is_empty(),
+        "durable entries must still be present alongside the marker"
+    );
+}
+
+#[tokio::test]
+async fn test_mcp_cancel_standalone_refuses_truthfully() {
+    let temp = tempdir().unwrap();
+    let server = McpServer::new(temp.path().to_path_buf(), None);
+    let response = server
+        .handle_request(JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(105)),
+            method: "tools/call".into(),
+            params: Some(json!({
+                "name": "omen_cancel_execution",
+                "arguments": {"execution_id": "exec_ghost_0000"}
+            })),
+        })
+        .await;
+    assert!(response.error.is_none());
+    let result: CallToolResult = serde_json::from_value(response.result.unwrap()).unwrap();
+    assert_eq!(result.is_error, Some(true));
+    assert!(
+        result.content[0].text.contains("shared daemon broker"),
+        "standalone cancel must refuse with the broker reason, got: {}",
+        result.content[0].text
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mcp_cancel_execution_via_broker_confirms_and_preserves_history() {
+    run_with_test_timeout(
+        "test_mcp_cancel_execution_via_broker_confirms_and_preserves_history",
+        INTEGRATION_TIMEOUT,
+        |ctx| async move {
+            ctx.phase("SETUP_DAEMON_AND_CLIENTS");
+            let temp = tempdir().unwrap();
+            let ws_path = temp.path().to_path_buf();
+
+            let daemon = Arc::new(omen_daemon::DaemonServer::new(Some(
+                "duplex://e2_mcp_cancel".into(),
+            )));
+            let spawn_conn = |daemon: &Arc<omen_daemon::DaemonServer>| {
+                let (client_stream, daemon_stream) = omen_ipc::PlatformStream::duplex_pair(65536);
+                let instance_id = daemon.instance_id().to_string();
+                let registry = daemon.registry();
+                let shutdown_rx = daemon.subscribe_shutdown();
+                tokio::spawn(async move {
+                    let _ = omen_daemon::DaemonServer::handle_connection(
+                        daemon_stream,
+                        instance_id,
+                        registry,
+                        shutdown_rx,
+                    )
+                    .await;
+                });
+                client_stream
+            };
+            let submit_conn = spawn_conn(&daemon);
+            let submitter = omen_client::OmenClient::from_stream(
+                submit_conn,
+                Some("memory://e2-mcp-cancel-sub".into()),
+                Some("sess-e2-mcp-cancel-sub".into()),
+            )
+            .await
+            .unwrap();
+            submitter
+                .attach_workspace(ws_path.to_str().unwrap())
+                .await
+                .unwrap();
+
+            let cancel_conn = spawn_conn(&daemon);
+            let canceller = omen_client::OmenClient::from_stream(
+                cancel_conn,
+                Some("memory://e2-mcp-cancel-do".into()),
+                Some("sess-e2-mcp-cancel-do".into()),
+            )
+            .await
+            .unwrap();
+            canceller
+                .attach_workspace(ws_path.to_str().unwrap())
+                .await
+                .unwrap();
+            let server = McpServer::new(ws_path.clone(), Some(canceller));
+
+            ctx.phase("SUBMIT_LONG_RUNNING");
+            let gremlin = semantic_gremlin_exe().to_string_lossy().to_string();
+            let ws_string = ws_path.to_str().unwrap().to_string();
+            let submit_task = tokio::spawn(async move {
+                submitter
+                    .submit_consequential_execution(
+                        "req-e2-mcp-cancel-01",
+                        "exec",
+                        gremlin,
+                        vec!["--sleep-ms".into(), "30000".into()],
+                        ws_string,
+                        60000,
+                    )
+                    .await
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            let exec_id = {
+                let db = omen_knowledge::Database::open(
+                    &omen_knowledge::canonical_workspace_db_path(&ws_path),
+                )
+                .unwrap();
+                omen_knowledge::WorkspacePersistence::get_request_receipt(
+                    &db,
+                    "req-e2-mcp-cancel-01",
+                )
+                .unwrap()
+                .unwrap()
+                .execution_id
+                .unwrap()
+            };
+
+            ctx.phase("CANCEL_THROUGH_MCP_TOOL");
+            let cancel_resp = server
+                .handle_request(JsonRpcRequest {
+                    jsonrpc: "2.0".into(),
+                    id: Some(json!(106)),
+                    method: "tools/call".into(),
+                    params: Some(json!({
+                        "name": "omen_cancel_execution",
+                        "arguments": {"execution_id": exec_id}
+                    })),
+                })
+                .await;
+            assert!(cancel_resp.error.is_none());
+            let cancel_call: CallToolResult =
+                serde_json::from_value(cancel_resp.result.unwrap()).unwrap();
+            assert_ne!(cancel_call.is_error, Some(true));
+            let cancel_val: Value = serde_json::from_str(&cancel_call.content[0].text).unwrap();
+            assert_eq!(cancel_val["outcome"]["outcome"], "TerminationConfirmed");
+
+            ctx.phase("VERIFY_SAME_HISTORY_THROUGH_MCP");
+            let summary = submit_task.await.unwrap().unwrap();
+            assert_eq!(summary.runtime_status, omen_core::RuntimeStatus::Cancelled);
+            let history_resp = server
+                .handle_request(JsonRpcRequest {
+                    jsonrpc: "2.0".into(),
+                    id: Some(json!(107)),
+                    method: "tools/call".into(),
+                    params: Some(json!({"name": "omen_history_query", "arguments": {"limit": 20}})),
+                })
+                .await;
+            let history_call: CallToolResult =
+                serde_json::from_value(history_resp.result.unwrap()).unwrap();
+            let history: Value = serde_json::from_str(&history_call.content[0].text).unwrap();
+            let entries = history["entries"].as_array().unwrap();
+            assert!(
+                entries
+                    .iter()
+                    .any(|e| e["execution_id"] == exec_id && e["status"] == "CANCELLED"),
+                "brokered cancel must project CANCELLED through the MCP history surface"
+            );
+        },
+    )
+    .await;
+}

@@ -86,6 +86,21 @@ unsupported schemes surface as JSON-RPC protocol truth
 (`OmenProtocolError` with code `-32004`, message, and raw reply) —
 the SDK invents no canonical `OmenError` fields from message text.
 
+## Cancellation
+
+```python
+record = omen.cancel_execution(result.execution_id)
+record["outcome"]  # {"outcome": "TerminationConfirmed"} | {"outcome": "AlreadyFinished", ...} | ...
+```
+
+Intent and proof stay distinct end to end: Omen records
+`CancellationRequested`, performs the physical tree-stop, and only
+observed death becomes `TerminationConfirmed`. Unconfirmed stops stay
+`OutcomeUnknown`; finished executions report `AlreadyFinished` without
+rewriting history. The SDK passes the record through opaquely — it never
+reinterprets the outcome. Cancelling needs the daemon broker; standalone
+mode refuses explicitly instead of faking a stop.
+
 ## History
 
 ```python
@@ -97,10 +112,12 @@ history.knows(execution_id)   # durable OR session knowledge
 ```
 
 Omen is the authority for durable history. Standalone `omen mcp`
-executions are not journaled by Omen (known Preview 8 behavior, same
-family as the deferred daemon-visibility issue); the SDK attaches
-session knowledge so it never claims "nothing happened" for its own
-work — clearly separated from durable truth.
+executions are recorded directly into durable history under their
+canonical ID (same as interactive standalone). Direct `omen exec`
+remains marker-based by design (`UNJOURNALED_LOCAL_EXECUTION`), and MCP
+history never hides that marker when durable entries also exist.
+The SDK attaches session knowledge so it never claims "nothing happened"
+for its own work — clearly separated from durable truth.
 
 ## Semantics
 

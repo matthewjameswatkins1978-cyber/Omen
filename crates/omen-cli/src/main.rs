@@ -68,6 +68,8 @@ enum Commands {
     Fact(FactArgs),
     /// Query bounded durable execution history.
     History(HistoryArgs),
+    /// Request cancellation of a live brokered execution by canonical execution ID.
+    Cancel(CancelArgs),
     /// Execute an argv or contract
     Exec(ExecArgs),
     /// CAS artifact inspection and retrieval
@@ -104,6 +106,12 @@ struct HistoryArgs {
     /// Maximum number of entries to return (1-100).
     #[arg(long, default_value_t = DEFAULT_HISTORY_LIMIT)]
     limit: usize,
+}
+
+#[derive(Args, Debug)]
+struct CancelArgs {
+    /// Canonical execution ID (exec_...) of the live brokered execution to stop.
+    execution_id: String,
 }
 
 #[derive(Args, Debug)]
@@ -898,6 +906,73 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         entry.execution_id,
                         entry.command
                     );
+                }
+            }
+        }
+        Some(Commands::Cancel(args)) => {
+            // E2 stop truth over the shared daemon broker: intent and proof
+            // stay distinct end to end; only observed death is confirmed.
+            match omen_client::OmenClient::connect_default(None).await {
+                Ok(client) => {
+                    let ws_string = ws_root.to_string_lossy().to_string();
+                    if let Err(error) = client.attach_workspace(&ws_string).await {
+                        if json_mode {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&OmenError::from_core(
+                                    &CoreError::ExecutionFailed(format!(
+                                        "cancel attach failed: {error}"
+                                    ))
+                                ))?
+                            );
+                        } else {
+                            eprintln!("Cancel failed: cannot attach workspace ({error})");
+                        }
+                        std::process::exit(2);
+                    }
+                    match client.cancel_execution(&args.execution_id).await {
+                        Ok(record) => {
+                            if json_mode {
+                                println!("{}", serde_json::to_string_pretty(&record)?);
+                            } else {
+                                println!(
+                                    "cancel {}: {} — {}",
+                                    record.execution_id,
+                                    serde_json::to_string(&record.outcome)?.trim_matches('"'),
+                                    record.detail
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            if json_mode {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&OmenError::from_core(
+                                        &CoreError::ExecutionFailed(format!(
+                                            "cancel request failed: {error}"
+                                        ))
+                                    ))?
+                                );
+                            } else {
+                                eprintln!("Cancel failed: {error}");
+                            }
+                            std::process::exit(2);
+                        }
+                    }
+                }
+                Err(_) => {
+                    if json_mode {
+                        let doc = serde_json::json!({
+                            "status": "offline",
+                            "endpoint": omen_ipc::default_endpoint_address(),
+                        });
+                        println!("{}", serde_json::to_string_pretty(&doc)?);
+                    } else {
+                        println!(
+                            "Daemon is offline: cancellation requires the shared daemon broker."
+                        );
+                    }
+                    std::process::exit(2);
                 }
             }
         }

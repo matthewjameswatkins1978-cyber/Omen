@@ -1,5 +1,6 @@
 //! Omen Core domain types and identity primitives.
 
+pub mod authority;
 pub mod composition;
 pub mod error;
 pub mod id;
@@ -9,6 +10,11 @@ pub mod resource;
 pub mod resource_identity;
 pub mod types;
 
+pub use authority::{
+    AdmissionRequest, AdmissionVerdict, AuthorityEvidenceReference, CapabilityIdentity,
+    LiveAdmissionStatus, NotAdmittedReason, ScopeIdentity, check_live_admission,
+    live_admission_status,
+};
 pub use error::{
     CoreError, ERROR_SCHEMA_VERSION, ErrorCategory, ErrorCode, ErrorEvidence, OmenError,
     Retryability,

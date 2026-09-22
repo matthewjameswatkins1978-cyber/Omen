@@ -444,6 +444,10 @@ impl DaemonServer {
                             let status = match rec.status.as_str() {
                                 "Completed" => omen_ipc::ExecutionStatusCode::Completed,
                                 "Running" => omen_ipc::ExecutionStatusCode::Running,
+                                "CancellationRequested" => {
+                                    omen_ipc::ExecutionStatusCode::CancellationRequested
+                                }
+                                "Cancelled" => omen_ipc::ExecutionStatusCode::Cancelled,
                                 "Accepted" => omen_ipc::ExecutionStatusCode::Accepted,
                                 "Failed" => omen_ipc::ExecutionStatusCode::Failed,
                                 _ => omen_ipc::ExecutionStatusCode::Unknown,
@@ -594,6 +598,19 @@ impl DaemonServer {
             }
 
             RequestPayload::ReportOfflineGap { .. } => Ok(ResponsePayload::OfflineGapAcknowledged),
+
+            RequestPayload::CancelExecution { execution_id } => {
+                let current = attached_workspace.read().await;
+                match &*current {
+                    Some(ws) => {
+                        let record = ws.cancel_execution(&execution_id).await;
+                        Ok(ResponsePayload::CancelResult(record))
+                    }
+                    None => Err(LocalIpcError::WorkspaceNotAttached(
+                        "No workspace attached for this session".into(),
+                    )),
+                }
+            }
 
             RequestPayload::Shutdown => {
                 let _ = shutdown_tx.send(true);

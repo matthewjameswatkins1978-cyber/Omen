@@ -384,6 +384,26 @@ impl OmenClient {
         }
     }
 
+    /// E2 stop truth: request cancellation of a live brokered execution by
+    /// canonical execution ID. Returns intent-vs-proof distinguished truth
+    /// (`TerminationConfirmed` only when physical death was observed).
+    pub async fn cancel_execution(
+        &self,
+        execution_id: impl Into<String>,
+    ) -> Result<omen_ipc::CancelRecord, LocalIpcError> {
+        let resp = self
+            .send_request(RequestPayload::CancelExecution {
+                execution_id: execution_id.into(),
+            })
+            .await?;
+        match resp {
+            ResponsePayload::CancelResult(record) => Ok(record),
+            other => Err(LocalIpcError::MalformedRequest(format!(
+                "Expected CancelResult, got {other:?}"
+            ))),
+        }
+    }
+
     pub async fn start_service(
         &self,
         name: impl Into<String>,

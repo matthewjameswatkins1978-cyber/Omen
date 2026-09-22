@@ -365,10 +365,52 @@ impl WorkspacePersistence {
                 r#"
                 UPDATE request_receipts
                 SET status = 'Unknown'
-                WHERE status = 'Running'
+                WHERE status = 'Running' OR status = 'CancellationRequested'
                 "#,
                 [],
             )
             .map_err(|e| CoreError::Internal(format!("Failed to reconcile running receipts: {e}")))
+    }
+
+    /// E2 stop truth: resolve a receipt by canonical execution ID (the
+    /// cross-surface identity) rather than by dedup key. Used by the cancel
+    /// path after a restart, when the in-memory execution→dedup index is
+    /// gone but the durable receipt survives.
+    pub fn get_receipt_by_execution_id(
+        db: &Database,
+        execution_id: &str,
+    ) -> Result<Option<RequestReceiptRecord>, CoreError> {
+        let mut stmt = db
+            .conn()
+            .prepare(
+                "SELECT consequential_request_id, execution_id, status, recorded_at FROM request_receipts WHERE execution_id = ?1",
+            )
+            .map_err(|e| CoreError::Internal(format!("Failed to prepare receipt query: {e}")))?;
+
+        let mut rows = stmt
+            .query(params![execution_id])
+            .map_err(|e| CoreError::Internal(format!("Failed to query receipt: {e}")))?;
+
+        if let Some(row) = rows
+            .next()
+            .map_err(|e| CoreError::Internal(format!("Failed to read receipt row: {e}")))?
+        {
+            Ok(Some(RequestReceiptRecord {
+                consequential_request_id: row
+                    .get(0)
+                    .map_err(|e| CoreError::Internal(format!("Failed to get receipt id: {e}")))?,
+                execution_id: row
+                    .get(1)
+                    .map_err(|e| CoreError::Internal(format!("Failed to get execution id: {e}")))?,
+                status: row
+                    .get(2)
+                    .map_err(|e| CoreError::Internal(format!("Failed to get status: {e}")))?,
+                recorded_at: row
+                    .get(3)
+                    .map_err(|e| CoreError::Internal(format!("Failed to get recorded_at: {e}")))?,
+            }))
+        } else {
+            Ok(None)
+        }
     }
 }
