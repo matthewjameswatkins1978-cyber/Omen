@@ -109,10 +109,39 @@ pub fn tool_subcommands(tool: &str) -> &'static [&'static str] {
 ///
 /// Out-of-hot-path only. Never call this on a keystroke. Results are
 /// deterministic (sorted, deduplicated) and truncated to the supplied bounds.
-/// On Windows only PATHEXT-recognised executable forms are accepted and the
-/// extension is stripped to form the command name. PowerShell aliases are NOT
-/// invented: a name appears only when a matching executable actually exists.
+///
+/// On Windows the candidate text is the exact string to pass to
+/// [`std::process::Command::new`] / `tokio::process::Command::new` so that the
+/// execution backend can resolve the file reliably:
+///
+/// - `.exe` — candidate is the stem (`cargo.exe` → `cargo`). Bare executable
+///   lookup appends `.exe`, so the stem is valid completion truth.
+/// - `.cmd`, `.bat`, `.com` — candidate retains the extension
+///   (`helper.cmd` → `helper.cmd`). Bare lookup does NOT search these forms,
+///   so stripping the extension would produce false completion truth.
+/// - All other PATHEXT forms (`.ps1`, `.vbs`, …) are excluded: they are not
+///   directly executable through Omen's current execution backend
+///   (`std::process::Command` / `CreateProcess`).
+///
+/// PowerShell aliases are NOT invented: a name appears only when a matching
+/// executable actually exists.
 pub fn list_path_commands(
+    max_dirs: usize,
+    max_entries_per_dir: usize,
+    max_commands: usize,
+) -> Vec<String> {
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return Vec::new();
+    };
+    list_path_commands_in(&path_var, max_dirs, max_entries_per_dir, max_commands)
+}
+
+/// Same as [`list_path_commands`] but with an explicit `PATH` value.
+///
+/// Exists so tests can supply a controlled fixture without mutating the
+/// process environment.
+pub fn list_path_commands_in(
+    path_var: &std::ffi::OsStr,
     max_dirs: usize,
     max_entries_per_dir: usize,
     max_commands: usize,
@@ -121,9 +150,12 @@ pub fn list_path_commands(
     use std::path::Path;
 
     let mut names: BTreeSet<String> = BTreeSet::new();
-    let Some(path_var) = std::env::var_os("PATH") else {
-        return Vec::new();
-    };
+
+    // Windows executable forms that Omen's execution backend
+    // (std::process::Command / CreateProcess) can run directly.
+    // `.exe` bare lookup works (Rust appends `.exe`); every other form must
+    // keep its extension in the program name to resolve.
+    const SUPPORTED_WIN_EXTS: &[&str] = &[".exe", ".cmd", ".bat", ".com"];
 
     let path_ext: Vec<String> = if cfg!(windows) {
         std::env::var("PATHEXT")
@@ -131,12 +163,13 @@ pub fn list_path_commands(
             .split(';')
             .filter(|s| !s.is_empty())
             .map(|s| s.to_ascii_lowercase())
+            .filter(|s| SUPPORTED_WIN_EXTS.contains(&s.as_str()))
             .collect()
     } else {
         Vec::new()
     };
 
-    for dir in std::env::split_paths(&path_var).take(max_dirs) {
+    for dir in std::env::split_paths(path_var).take(max_dirs) {
         if names.len() >= max_commands {
             break;
         }
@@ -169,7 +202,14 @@ pub fn list_path_commands(
                 if stem.is_empty() {
                     continue;
                 }
-                names.insert(stem.to_string());
+                if ext == ".exe" {
+                    // Bare lookup appends `.exe`; the stem is valid truth.
+                    names.insert(stem.to_string());
+                } else {
+                    // Non-.exe forms must keep their extension in the program
+                    // name so Command can resolve them.
+                    names.insert(name.to_string());
+                }
             } else {
                 #[cfg(unix)]
                 {

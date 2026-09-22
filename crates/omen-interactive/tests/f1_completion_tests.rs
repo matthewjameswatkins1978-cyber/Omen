@@ -750,3 +750,157 @@ fn f1_candidate_generation_is_bounded_per_source() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// WINDOWS PATH TRUTH
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+mod windows_path_truth {
+    use omen_interactive::commands::list_path_commands_in;
+    use std::ffi::OsStr;
+    use std::fs;
+    use std::path::Path;
+    use tempfile::tempdir;
+
+    /// Controlled PATH fixture with every executable form Omen claims to support
+    /// plus forms it must reject.
+    fn make_fixture() -> tempfile::TempDir {
+        let dir = tempdir().unwrap();
+        for name in [
+            "cargo.exe",
+            "helper.cmd",
+            "setup.bat",
+            "legacy.com",
+            "script.ps1",
+            "readme.txt",
+        ] {
+            fs::write(dir.path().join(name), b"@echo off").unwrap();
+        }
+        dir
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        list_path_commands_in(dir.as_os_str(), 4, 64, 64)
+    }
+
+    #[test]
+    fn f1_exe_maps_to_stem() {
+        let dir = make_fixture();
+        let names = names_in(dir.path());
+        assert!(names.contains(&"cargo".to_string()), "got: {names:?}");
+        assert!(!names.contains(&"cargo.exe".to_string()), "got: {names:?}");
+    }
+
+    #[test]
+    fn f1_cmd_retains_extension_not_bare_stem() {
+        let dir = make_fixture();
+        let names = names_in(dir.path());
+        assert!(names.contains(&"helper.cmd".to_string()), "got: {names:?}");
+        assert!(
+            !names.contains(&"helper".to_string()),
+            "bare `helper` is false truth: {names:?}"
+        );
+    }
+
+    #[test]
+    fn f1_bat_retains_extension_not_bare_stem() {
+        let dir = make_fixture();
+        let names = names_in(dir.path());
+        assert!(names.contains(&"setup.bat".to_string()), "got: {names:?}");
+        assert!(
+            !names.contains(&"setup".to_string()),
+            "bare `setup` is false truth: {names:?}"
+        );
+    }
+
+    #[test]
+    fn f1_com_retains_extension_not_bare_stem() {
+        let dir = make_fixture();
+        let names = names_in(dir.path());
+        assert!(names.contains(&"legacy.com".to_string()), "got: {names:?}");
+        assert!(
+            !names.contains(&"legacy".to_string()),
+            "bare `legacy` is false truth: {names:?}"
+        );
+    }
+
+    #[test]
+    fn f1_unsupported_forms_are_excluded() {
+        let dir = make_fixture();
+        let names = names_in(dir.path());
+        // .ps1 requires PowerShell; not directly executable via Command.
+        assert!(!names.iter().any(|n| n.ends_with(".ps1")), "got: {names:?}");
+        assert!(!names.contains(&"script".to_string()), "got: {names:?}");
+        // .txt is not an executable form at all.
+        assert!(!names.iter().any(|n| n.ends_with(".txt")), "got: {names:?}");
+    }
+
+    #[test]
+    fn f1_duplicates_deduplicate_predictably() {
+        let dir1 = tempdir().unwrap();
+        let dir2 = tempdir().unwrap();
+        fs::write(dir1.path().join("cargo.exe"), b"x").unwrap();
+        fs::write(dir2.path().join("cargo.exe"), b"x").unwrap();
+        let path = format!("{};{}", dir1.path().display(), dir2.path().display());
+        let names = list_path_commands_in(OsStr::new(&path), 4, 64, 64);
+        assert_eq!(
+            names.iter().filter(|n| **n == "cargo").count(),
+            1,
+            "got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn f1_same_name_different_extensions_are_distinct() {
+        let dir = make_fixture();
+        fs::write(dir.path().join("cargo.cmd"), b"@echo off").unwrap();
+        let names = names_in(dir.path());
+        assert!(names.contains(&"cargo".to_string()), "got: {names:?}");
+        assert!(names.contains(&"cargo.cmd".to_string()), "got: {names:?}");
+    }
+
+    #[test]
+    fn f1_extension_case_is_handled_correctly() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("HELPER.CMD"), b"@echo off").unwrap();
+        fs::write(dir.path().join("Cargo.EXE"), b"x").unwrap();
+        let names = names_in(dir.path());
+        // .CMD -> retain extension, preserve filename case.
+        assert!(names.contains(&"HELPER.CMD".to_string()), "got: {names:?}");
+        assert!(!names.contains(&"HELPER".to_string()), "got: {names:?}");
+        // .EXE -> stem, preserve filename case.
+        assert!(names.contains(&"Cargo".to_string()), "got: {names:?}");
+        assert!(!names.contains(&"Cargo.EXE".to_string()), "got: {names:?}");
+    }
+
+    #[test]
+    fn f1_candidate_matches_execution_backend_lookup() {
+        // The candidate string is exactly what `std::process::Command::new`
+        // expects. Verify the lookup name (stem -> `.exe` appended, otherwise
+        // as-is) resolves to a real file in the fixture.
+        let dir = make_fixture();
+        let names = names_in(dir.path());
+        assert!(!names.is_empty());
+        for candidate in &names {
+            let lookup = if Path::new(candidate).extension().is_none() {
+                format!("{candidate}.exe")
+            } else {
+                candidate.clone()
+            };
+            assert!(
+                dir.path().join(&lookup).is_file(),
+                "candidate {candidate:?} -> lookup {lookup:?} not found"
+            );
+        }
+    }
+
+    #[test]
+    fn f1_stripped_cmd_would_not_resolve() {
+        // Proof that stripping .cmd produces false truth: Command::new("helper")
+        // looks for `helper.exe`, not `helper.cmd`.
+        let dir = make_fixture();
+        assert!(dir.path().join("helper.cmd").is_file());
+        assert!(!dir.path().join("helper.exe").is_file());
+    }
+}
