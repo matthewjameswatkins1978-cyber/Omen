@@ -493,11 +493,19 @@ impl McpServer {
             })).unwrap()),
             Some(generation) if Some(generation) == context.context_generation =>
                 CallToolResult::text(serde_json::to_string_pretty(&json!({"changed":false,"from_generation":generation,"context_generation":generation,"changes":[]})).unwrap()),
-            Some(generation) => CallToolResult::text(serde_json::to_string_pretty(&json!({
-                "error":"DELTA_UNAVAILABLE", "from_generation":generation, "state_changed":false,
-                "retryable":true, "context_generation":context.context_generation,
-                "reason":"Omen does not retain that historical generation", "next_actions":["omen_context"]
-            })).unwrap()),
+            Some(generation) => {
+                let mut error = omen_core::OmenError::from_code(
+                    omen_core::ErrorCode::DeltaUnavailable,
+                    "Omen does not retain that historical generation",
+                );
+                error.retryability = omen_core::Retryability::Never;
+                error.details = json!({
+                    "from_generation": generation,
+                    "context_generation": context.context_generation,
+                    "next_actions": ["omen_context"]
+                });
+                CallToolResult::domain_error(error)
+            }
         }
     }
 
