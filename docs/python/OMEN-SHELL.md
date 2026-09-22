@@ -17,7 +17,7 @@ Runtime dependencies: none (standard library only).
 pip install omen-shell
 ```
 
-You also need an `omen` binary (Preview 10, Machine Contract 0.8).
+You also need an `omen` binary (Preview 11, Machine Contract 0.8).
 Resolution order: `executable=` argument → `OMEN_EXE` env →
 `omen` on `PATH`. Otherwise `OmenNotFoundError` with remediation.
 

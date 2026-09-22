@@ -1,4 +1,4 @@
-# Omen MCP surface (Preview 10, contract 0.8) — as seen by omen-shell
+# Omen MCP surface (Preview 11, contract 0.8) — as seen by omen-shell
 
 Source of truth: `crates/omen-mcp/src/server.rs`, `protocol.rs`.
 Transport: newline-delimited JSON-RPC 2.0 on stdio. Pure JSON on

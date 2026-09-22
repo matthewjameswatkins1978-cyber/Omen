@@ -779,7 +779,7 @@ dependencies = [
 
 [[package]]
 name = "omen-adapters"
-version = "0.9.0-preview.10"
+version = "0.9.0-preview.11"
 dependencies = [
  "hex",
  "omen-atlas",
@@ -801,7 +801,7 @@ dependencies = [
 
 [[package]]
 name = "omen-agent"
-version = "0.9.0-preview.10"
+version = "0.9.0-preview.11"
 dependencies = [
  "chrono",
  "hex",
@@ -823,7 +823,7 @@ dependencies = [
 
 [[package]]
 name = "omen-atlas"
-version = "0.9.0-preview.10"
+version = "0.9.0-preview.11"
 dependencies = [
  "chrono",
  "hex",
@@ -842,7 +842,7 @@ dependencies = [
 
 [[package]]
 name = "omen-cli"
-version = "0.9.0-preview.10"
+version = "0.9.0-preview.11"
 dependencies = [
  "clap",
  "clap_complete",
@@ -872,7 +872,7 @@ dependencies = [
 
 [[package]]
 name = "omen-client"
-version = "0.9.0-preview.10"
+version = "0.9.0-preview.11"
 dependencies = [
  "chrono",
  "omen-core",
@@ -890,7 +890,7 @@ dependencies = [
 
 [[package]]
 name = "omen-core"
-version = "0.9.0-preview.10"
+version = "0.9.0-preview.11"
 dependencies = [
  "chrono",
  "hex",
@@ -904,7 +904,7 @@ dependencies = [
 
 [[package]]
 name = "omen-daemon"
-version = "0.9.0-preview.10"
+version = "0.9.0-preview.11"
 dependencies = [
  "chrono",
  "clap",
@@ -933,7 +933,7 @@ dependencies = [
 
 [[package]]
 name = "omen-engine"
-version = "0.9.0-preview.10"
+version = "0.9.0-preview.11"
 dependencies = [
  "omen-core",
  "omen-schema",
@@ -950,7 +950,7 @@ dependencies = [
 
 [[package]]
 name = "omen-interactive"
-version = "0.9.0-preview.10"
+version = "0.9.0-preview.11"
 dependencies = [
  "chrono",
  "fuzzy-matcher",
@@ -982,7 +982,7 @@ dependencies = [
 
 [[package]]
 name = "omen-ipc"
-version = "0.9.0-preview.10"
+version = "0.9.0-preview.11"
 dependencies = [
  "omen-core",
  "omen-schema",
@@ -997,7 +997,7 @@ dependencies = [
 
 [[package]]
 name = "omen-knowledge"
-version = "0.9.0-preview.10"
+version = "0.9.0-preview.11"
 dependencies = [
  "chrono",
  "hex",
@@ -1013,7 +1013,7 @@ dependencies = [
 
 [[package]]
 name = "omen-mcp"
-version = "0.9.0-preview.10"
+version = "0.9.0-preview.11"
 dependencies = [
  "chrono",
  "clap",
@@ -1040,7 +1040,7 @@ dependencies = [
 
 [[package]]
 name = "omen-schema"
-version = "0.9.0-preview.10"
+version = "0.9.0-preview.11"
 dependencies = [
  "omen-core",
  "schemars",
@@ -1051,7 +1051,7 @@ dependencies = [
 
 [[package]]
 name = "omen-semantic"
-version = "0.9.0-preview.10"
+version = "0.9.0-preview.11"
 dependencies = [
  "hex",
  "omen-core",
@@ -1067,7 +1067,7 @@ dependencies = [
 
 [[package]]
 name = "omen-test-fixtures"
-version = "0.9.0-preview.10"
+version = "0.9.0-preview.11"
 dependencies = [
  "clap",
  "crossterm",
@@ -1077,7 +1077,7 @@ dependencies = [
 
 [[package]]
 name = "omen-ui"
-version = "0.9.0-preview.10"
+version = "0.9.0-preview.11"
 dependencies = [
  "crossterm",
  "nu-ansi-term",
@@ -2088,7 +2088,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.9.0-preview.10"
+version = "0.9.0-preview.11"
 dependencies = [
  "chrono",
  "clap",
