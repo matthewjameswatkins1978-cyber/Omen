@@ -533,6 +533,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     serde_json::json!(machine_contract::contract_digest()),
                                 );
                                 object.insert("describe_ref".into(), serde_json::json!(id));
+                                object.insert(
+                                    "invocation".into(),
+                                    serde_json::to_value(machine_contract::invocation_for(&id))?,
+                                );
                             }
                             println!("{}", serde_json::to_string_pretty(&doc)?);
                         } else {
@@ -542,6 +546,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "Availability: {:?}, Admission: {:?}",
                                 entry.status.availability, entry.status.admission
                             );
+                            let invocation = machine_contract::invocation_for(&id);
+                            if let Some(cli) = invocation.cli {
+                                println!("CLI: omen {cli}");
+                            }
+                            if let Some(mcp_tool) = invocation.mcp_tool {
+                                println!("MCP: {mcp_tool}");
+                            }
+                            if invocation.cli.is_none() && invocation.mcp_tool.is_none() {
+                                println!("Direct invocation: not exposed on CLI or MCP");
+                            }
                         }
                     }
                     None => {
