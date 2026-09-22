@@ -56,3 +56,38 @@ fn orient_digest_match_is_a_bounded_no_delta_response() {
         serde_json::json!({"changed": false, "contract_digest": digest})
     );
 }
+
+
+#[test]
+fn capability_catalogue_exposes_real_invocation_routes() {
+    let history = run(&["capabilities", "history", "--machine"]);
+    let history_entry = &history["capabilities"][0];
+    assert_eq!(history_entry["id"], "history.query");
+    assert_eq!(history_entry["invocation"]["cli"], "history --machine");
+    assert_eq!(
+        history_entry["invocation"]["mcp_tool"],
+        "omen_history_query"
+    );
+
+    let semantic = run(&["capabilities", "semantic", "--machine"]);
+    let definition = semantic["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == "semantic.definition")
+        .unwrap();
+    assert!(definition["invocation"]["cli"].is_null());
+    assert_eq!(
+        definition["invocation"]["mcp_tool"],
+        "omen_symbol_definition"
+    );
+
+    let diagnostics = semantic["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == "semantic.diagnostics")
+        .unwrap();
+    assert!(diagnostics["invocation"]["cli"].is_null());
+    assert!(diagnostics["invocation"]["mcp_tool"].is_null());
+}
