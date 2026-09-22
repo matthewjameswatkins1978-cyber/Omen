@@ -86,6 +86,14 @@ pub struct CapabilityProjection {
 /// The compact static-plus-runtime entry returned by broad discovery.
 /// Detailed schemas remain behind `describe_ref`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapabilityInvocation {
+    /// Concrete CLI form when this capability is directly exposed by the CLI.
+    pub cli: Option<String>,
+    /// Concrete MCP tool name when this capability is directly exposed by MCP.
+    pub mcp_tool: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CapabilityCatalogueEntry {
     pub id: String,
     pub group: String,
@@ -96,6 +104,7 @@ pub struct CapabilityCatalogueEntry {
     pub reason: Option<String>,
     /// The stable capability id accepted by `describe` / `omen_describe`.
     pub describe_ref: String,
+    pub invocation: CapabilityInvocation,
     pub related_capabilities: Vec<String>,
 }
 
@@ -533,6 +542,35 @@ pub fn project(contract: &MachineContract, context: &MachineContext) -> Vec<Capa
         .collect()
 }
 
+pub fn invocation_for(capability_id: &str) -> CapabilityInvocation {
+    let (cli, mcp_tool) = match capability_id {
+        "semantic.references" => (None, Some("omen_symbol_references")),
+        "semantic.definition" => (None, Some("omen_symbol_definition")),
+        "semantic.diagnostics" => (None, None),
+        "structure.search" => (None, Some("omen_structure_search")),
+        "history.query" => (Some("history --machine"), Some("omen_history_query")),
+        "execution.run" => (
+            Some("exec --contract <contract.json> --machine"),
+            Some("omen_execute"),
+        ),
+        "mutation.threadmoth" => (None, None),
+        "composition.run" => (
+            Some("action run <action_id> --expect-plan <digest> --machine"),
+            None,
+        ),
+        "filesystem.read" | "filesystem.write" => (None, None),
+        "composition.plan" => (
+            Some("action plan <action_id> --machine"),
+            Some("omen_action_plan"),
+        ),
+        _ => (None, None),
+    };
+    CapabilityInvocation {
+        cli: cli.map(str::to_owned),
+        mcp_tool: mcp_tool.map(str::to_owned),
+    }
+}
+
 pub fn catalogue(
     contract: &MachineContract,
     context: &MachineContext,
@@ -560,6 +598,7 @@ pub fn catalogue(
                 provider: status.provider.clone(),
                 reason: status.reason.clone(),
                 describe_ref: definition.id.clone(),
+                invocation: invocation_for(&definition.id),
                 related_capabilities,
             })
         })
