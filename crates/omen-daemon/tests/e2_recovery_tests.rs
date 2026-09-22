@@ -125,6 +125,7 @@ async fn history_after_restart_visible_via_readonly_path() {
             let receipt = ws2
                 .query_request_receipt("req-e2-restart-01")
                 .await
+                .expect("receipt read must succeed")
                 .expect("receipt must survive restart");
             assert_eq!(receipt.status, "Completed");
             assert_eq!(receipt.execution_id.as_deref(), Some(exec_id.as_str()));
@@ -290,6 +291,7 @@ async fn abandoned_running_receipt_leaves_no_phantom_history() {
             let receipt = ws
                 .query_request_receipt("req-e2-crashed-run")
                 .await
+                .expect("receipt read must succeed")
                 .expect("receipt must exist");
             assert_eq!(receipt.status, "Unknown");
 

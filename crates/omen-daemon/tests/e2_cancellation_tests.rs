@@ -489,6 +489,7 @@ async fn cancellation_requested_receipt_reconciled_on_restart() {
             let receipt = ws
                 .query_request_receipt("req-e2-cancel-intent")
                 .await
+                .expect("receipt read must succeed")
                 .expect("receipt must exist");
             assert_eq!(receipt.status, "Unknown");
         },

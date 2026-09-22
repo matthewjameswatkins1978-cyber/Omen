@@ -110,6 +110,20 @@ pub enum PersistenceFailpoint {
     FailHistoryWrite,
     /// Refuse terminal receipt writes after history succeeded.
     FailTerminalReceipt,
+    /// Fail every durable request-receipt (`get_request_receipt`) read.
+    /// Repair Preview 12: lets tests prove a receipt-read failure can never
+    /// authorize dispatch or overwrite a consumed receipt.
+    FailRequestReceiptRead,
+    /// Fail every durable execution-ID (`get_receipt_by_execution_id`) read.
+    /// Repair Preview 12: lets tests prove a cancel lookup failure can never
+    /// become `NotFound`.
+    FailReceiptByExecRead,
+    /// Let exactly `u64` durable receipt reads succeed, then fail every
+    /// subsequent read until disarmed. Repair Preview 12: makes the cancel
+    /// durable-reread path (initial lookup OK, reread fails)
+    /// deterministically reachable — it is otherwise unobservable from
+    /// outside a single `cancel_execution` call.
+    FailReceiptReadAfterSuccesses(u64),
 }
 
 /// Which receipt write is being attempted. Injection targets the broker's
@@ -953,11 +967,59 @@ impl WorkspaceState {
         )
     }
 
-    pub async fn query_request_receipt(&self, req_id: &str) -> Option<RequestReceiptRecord> {
+    pub async fn query_request_receipt(
+        &self,
+        req_id: &str,
+    ) -> Result<Option<RequestReceiptRecord>, CoreError> {
+        if self.poll_read_failpoint(true) {
+            return Err(CoreError::Internal(
+                "injected persistence failure: durable request-receipt read refused".to_string(),
+            ));
+        }
         let db = self.db.lock().await;
         WorkspacePersistence::get_request_receipt(&db, req_id)
-            .ok()
-            .flatten()
+    }
+
+    /// Repair Preview 12: durable execution-ID receipt lookup that preserves
+    /// read failure instead of collapsing it into absence. `Ok(None)` is
+    /// positive proof no receipt exists; `Err` means Omen could not
+    /// establish whether one exists — callers must fail closed.
+    pub async fn query_receipt_by_execution_id(
+        &self,
+        execution_id: &str,
+    ) -> Result<Option<RequestReceiptRecord>, CoreError> {
+        if self.poll_read_failpoint(false) {
+            return Err(CoreError::Internal(
+                "injected persistence failure: durable execution-ID receipt read refused"
+                    .to_string(),
+            ));
+        }
+        let db = self.db.lock().await;
+        WorkspacePersistence::get_receipt_by_execution_id(&db, execution_id)
+    }
+
+    /// Repair Preview 12: consult the read-failure failpoint. `by_request`
+    /// selects which durable lookup is being attempted. Returns true when
+    /// the read must fail. Production runs `Off` (and an exhausted
+    /// `FailReceiptReadAfterSuccesses(0)`), so the real lookup proceeds.
+    fn poll_read_failpoint(&self, by_request: bool) -> bool {
+        let mut slot = match self.persistence_failpoint.lock() {
+            Ok(slot) => slot,
+            Err(_) => return false,
+        };
+        match *slot {
+            PersistenceFailpoint::FailRequestReceiptRead if by_request => true,
+            PersistenceFailpoint::FailReceiptByExecRead if !by_request => true,
+            PersistenceFailpoint::FailReceiptReadAfterSuccesses(remaining) => {
+                if remaining == 0 {
+                    true
+                } else {
+                    *slot = PersistenceFailpoint::FailReceiptReadAfterSuccesses(remaining - 1);
+                    false
+                }
+            }
+            _ => false,
+        }
     }
 
     /// E2 stop truth: request cancellation of a live brokered execution.
@@ -1163,11 +1225,19 @@ impl WorkspaceState {
         // Durable receipt decides. A task that is still alive holds its
         // in_flight entry until after its terminal receipt write, so prefer
         // live observation for non-terminal receipts; otherwise report.
-        let receipt = {
-            let db = self.db.lock().await;
-            WorkspacePersistence::get_receipt_by_execution_id(&db, execution_id)
-                .ok()
-                .flatten()
+        // Repair Preview 12: read failure is NOT absence — a failed lookup
+        // can never become `NotFound`. Only a successful read returning no
+        // row proves the execution is unknown to the daemon.
+        let receipt = match self.query_receipt_by_execution_id(execution_id).await {
+            Ok(receipt) => receipt,
+            Err(read_error) => {
+                return mk(
+                    CancelOutcome::OutcomeUnknown,
+                    &format!(
+                        "durable receipt lookup failed; Omen cannot establish whether this execution is known or terminal: {read_error}"
+                    ),
+                );
+            }
         };
         match receipt {
             None => mk(
@@ -1191,11 +1261,19 @@ impl WorkspaceState {
                     {
                         return report;
                     }
-                    let reread = {
-                        let db = self.db.lock().await;
-                        WorkspacePersistence::get_receipt_by_execution_id(&db, execution_id)
-                            .ok()
-                            .flatten()
+                    // Repair Preview 12: a reread failure is NOT a vanishing
+                    // execution — the identity is preserved, only the
+                    // observation failed. Never `NotFound`, never "vanished".
+                    let reread = match self.query_receipt_by_execution_id(execution_id).await {
+                        Ok(reread) => reread,
+                        Err(read_error) => {
+                            return mk(
+                                CancelOutcome::OutcomeUnknown,
+                                &format!(
+                                    "durable receipt reread failed after live observation lapsed; Omen cannot establish terminal truth — the execution has NOT vanished and its identity is preserved: {read_error}"
+                                ),
+                            );
+                        }
                     };
                     match reread {
                         Some(fresh) => self.report_receipt_for_cancel(execution_id, fresh).await,
@@ -1407,14 +1485,22 @@ impl WorkspaceState {
             .execution_id
             .clone()
             .ok_or_else(|| refused("carries no execution identity".to_string()))?;
+        let eid = ExecutionId::new(&exec_id)
+            .map_err(|_| refused("carries an unreadable execution identity".to_string()))?;
         let rec = {
             let db = self.db.lock().await;
-            match ExecutionId::new(&exec_id)
-                .ok()
-                .and_then(|eid| ExecutionHistory::get_execution(&db, &eid).ok().flatten())
-            {
-                Some(rec) => rec,
-                None => return Err(refused("has no readable history".to_string())),
+            match ExecutionHistory::get_execution(&db, &eid) {
+                Ok(Some(rec)) => rec,
+                // Repair Preview 12: the history-read error text is preserved
+                // in the refusal instead of being blurred into absence. Every
+                // path below still refuses redispatch — zero replay without
+                // exact readable truth.
+                Ok(None) => return Err(refused("has no readable history".to_string())),
+                Err(history_error) => {
+                    return Err(refused(format!(
+                        "history read failed so exact runtime truth cannot be established ({history_error})"
+                    )));
+                }
             }
         };
         // E2 replay truth: reproduce the recorded EXACT runtime, never a
@@ -1508,11 +1594,38 @@ impl WorkspaceState {
         // write landing concurrently is resolved (replay/refuse) rather
         // than raced into a duplicate dispatch; subscribers that attached
         // to our fresh slot receive the same resolution.
-        if let Some(receipt) = self.query_request_receipt(dedup_id).await {
-            let resolution = self.resolve_existing_receipt(dedup_id, &receipt).await;
-            self.release_claimed_slot(dedup_id, resolution.clone())
-                .await;
-            return resolution;
+        //
+        // Repair Preview 12: `Ok(None)` is positive proof of absence and the
+        // ONLY path toward dispatch. `Err` means Omen failed to establish
+        // whether a receipt exists — unknown is not absent — so the broker
+        // fails closed with an explicit `PersistenceFailure`: zero dispatch,
+        // zero new identity, zero overwrite, zero history. The claimed slot
+        // is released so every coalesced subscriber receives the same
+        // failure and no future submitter strands.
+        match self.query_request_receipt(dedup_id).await {
+            Ok(Some(receipt)) => {
+                let resolution = self.resolve_existing_receipt(dedup_id, &receipt).await;
+                self.release_claimed_slot(dedup_id, resolution.clone())
+                    .await;
+                return resolution;
+            }
+            Ok(None) => {}
+            Err(read_error) => {
+                let refusal = Err(LocalIpcError::PersistenceFailure {
+                    // No execution identity was minted on this path — and
+                    // none is persisted — so there is nothing truthful to
+                    // name here. The consequential request ID is carried in
+                    // the detail instead.
+                    execution_id: "<none>".to_string(),
+                    stage: "receipt_read".to_string(),
+                    physical_outcome: "no physical work started".to_string(),
+                    detail: format!(
+                        "durable receipt lookup for consequential request '{dedup_id}' failed; Omen cannot establish whether a receipt exists, so absence is not assumed: {read_error}"
+                    ),
+                });
+                self.release_claimed_slot(dedup_id, refusal.clone()).await;
+                return refusal;
+            }
         }
 
         let execution_id = ExecutionId::generate();

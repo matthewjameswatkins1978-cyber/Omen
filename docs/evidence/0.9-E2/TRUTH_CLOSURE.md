@@ -94,6 +94,36 @@ States (never collapsed):
 - Proofs: engine `engine_tests` (3 new), `e2_cancellation_tests` (6),
   `e2_hostile_tests` (3), MCP (4 new), CLI live test, Python (3 new).
 
+## Repair Preview 12 — durable receipt reads fail closed
+
+- `Ok(None)` != `Err(...)`. `query_request_receipt` and the cancel-path
+  durable lookups return `Result<Option<RequestReceiptRecord>, CoreError>`;
+  no `.ok().flatten()` erasure remains on the E2 receipt-truth path.
+- `Ok(Some)` → resolve existing receipt, zero new dispatch. `Ok(None)` is
+  positive proof of absence and the ONLY path toward dispatch. `Err` →
+  explicit `PersistenceFailure` (stage `receipt_read`, "no physical work
+  started", no identity minted or persisted), claimed in-flight slot
+  released so every coalesced subscriber receives the same failure.
+- Cancel lookup/reread failure → `CancelOutcome::OutcomeUnknown` with a
+  lookup-/reread-failed detail; never `NotFound`, never "vanished". Only a
+  successful read returning no row proves not-known. The status-query
+  surface maps a failed read to `Unknown`, never `NotSeen` (read-only; no
+  dispatch authorized there on any path).
+- History replay reads already refused redispatch; the actual persistence
+  error text is now preserved in the refusal instead of being blurred
+  into "no readable history".
+- Deterministic seams: `PersistenceFailpoint::FailRequestReceiptRead`,
+  `FailReceiptByExecRead` (fail-all), `FailReceiptReadAfterSuccesses(n)`
+  (n successes, then fail — makes the cancel reread path reachable).
+  Production runs `Off`.
+- Proofs: `receipt_read_failure_with_existing_terminal_receipt_fails_closed`
+  (Proof 1), `receipt_read_failure_with_absent_receipt_refuses_dispatch`
+  (Proof 2), `cancel_lookup_read_failure_reports_unknown_not_notfound`
+  (Proof 3), `cancel_reread_failure_preserves_uncertainty` (Proof 4),
+  `receipt_read_failure_releases_slot_to_coalesced_submitters` (slot
+  cleanup: 4 coalesced submitters share one failure, post-disarm submit
+  proceeds — no stranded slot).
+
 ## Repair A — exact runtime replay (Preview 11)
 
 - Coarse history status != exact `RuntimeStatus`. The durable envelope

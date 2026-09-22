@@ -439,34 +439,47 @@ impl DaemonServer {
                 let current = attached_workspace.read().await;
                 match &*current {
                     Some(ws) => {
-                        if let Some(rec) = ws.query_request_receipt(&consequential_request_id).await
-                        {
-                            let status = match rec.status.as_str() {
-                                "Completed" => omen_ipc::ExecutionStatusCode::Completed,
-                                "Running" => omen_ipc::ExecutionStatusCode::Running,
-                                "CancellationRequested" => {
-                                    omen_ipc::ExecutionStatusCode::CancellationRequested
-                                }
-                                "Cancelled" => omen_ipc::ExecutionStatusCode::Cancelled,
-                                "Accepted" => omen_ipc::ExecutionStatusCode::Accepted,
-                                "Failed" => omen_ipc::ExecutionStatusCode::Failed,
-                                _ => omen_ipc::ExecutionStatusCode::Unknown,
-                            };
-                            Ok(ResponsePayload::RequestStatus(
-                                omen_ipc::ExecutionStatusRecord {
-                                    consequential_request_id,
-                                    execution_id: rec.execution_id,
-                                    status,
-                                },
-                            ))
-                        } else {
-                            Ok(ResponsePayload::RequestStatus(
+                        // Repair Preview 12: a failed receipt read is not
+                        // proof of absence — report `Unknown` (could not
+                        // establish), never `NotSeen`. Only a successful read
+                        // returning no row proves the request was never seen.
+                        // This is a read-only status surface: no dispatch is
+                        // authorized on any path here.
+                        match ws.query_request_receipt(&consequential_request_id).await {
+                            Ok(Some(rec)) => {
+                                let status = match rec.status.as_str() {
+                                    "Completed" => omen_ipc::ExecutionStatusCode::Completed,
+                                    "Running" => omen_ipc::ExecutionStatusCode::Running,
+                                    "CancellationRequested" => {
+                                        omen_ipc::ExecutionStatusCode::CancellationRequested
+                                    }
+                                    "Cancelled" => omen_ipc::ExecutionStatusCode::Cancelled,
+                                    "Accepted" => omen_ipc::ExecutionStatusCode::Accepted,
+                                    "Failed" => omen_ipc::ExecutionStatusCode::Failed,
+                                    _ => omen_ipc::ExecutionStatusCode::Unknown,
+                                };
+                                Ok(ResponsePayload::RequestStatus(
+                                    omen_ipc::ExecutionStatusRecord {
+                                        consequential_request_id,
+                                        execution_id: rec.execution_id,
+                                        status,
+                                    },
+                                ))
+                            }
+                            Ok(None) => Ok(ResponsePayload::RequestStatus(
                                 omen_ipc::ExecutionStatusRecord {
                                     consequential_request_id,
                                     execution_id: None,
                                     status: omen_ipc::ExecutionStatusCode::NotSeen,
                                 },
-                            ))
+                            )),
+                            Err(_) => Ok(ResponsePayload::RequestStatus(
+                                omen_ipc::ExecutionStatusRecord {
+                                    consequential_request_id,
+                                    execution_id: None,
+                                    status: omen_ipc::ExecutionStatusCode::Unknown,
+                                },
+                            )),
                         }
                     }
                     None => Err(LocalIpcError::WorkspaceNotAttached(

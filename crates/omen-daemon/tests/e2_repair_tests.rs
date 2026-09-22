@@ -1,6 +1,7 @@
 //! OMEN 0.9-E2 repair proofs: terminal dedup, pre-dispatch cancel truth,
-//! persistence fail-closed behaviour, exact runtime replay, and Failed
-//! receipt identity preservation.
+//! persistence fail-closed behaviour, exact runtime replay, Failed
+//! receipt identity preservation, and durable receipt-read fail-closed
+//! truth (unknown is not absent; read failure is not not-found).
 //!
 //! Governing invariant: a consequential request ID may create physical work
 //! only when no durable receipt for that ID exists. Once a receipt exists,
@@ -134,6 +135,7 @@ async fn receipt_status_of(
 ) -> Option<(String, Option<String>)> {
     ws.query_request_receipt(dedup_id)
         .await
+        .expect("receipt read must succeed with the read failpoint Off")
         .map(|rec| (rec.status, rec.execution_id))
 }
 
@@ -1487,6 +1489,402 @@ async fn failed_receipt_preserves_execution_identity() {
                 "failed dispatch records no history and spawns nothing on retry"
             );
             ws.set_prespawn_gate(None);
+        },
+    )
+    .await;
+    unlock_env(guard);
+}
+
+/// REPAIR Preview 12 / PROOF 1 — an existing terminal receipt plus an
+/// injected receipt-read failure: the resubmit must fail closed with an
+/// explicit `PersistenceFailure` (stage `receipt_read`), with zero new
+/// dispatch, zero new identity, zero receipt mutation, zero history — and
+/// after the failpoint is removed the original receipt replays normally
+/// with still no second dispatch.
+#[tokio::test(flavor = "multi_thread")]
+async fn receipt_read_failure_with_existing_terminal_receipt_fails_closed() {
+    let (guard, _state) = lock_env();
+    run_with_test_timeout(
+        "receipt_read_failure_with_existing_terminal_receipt_fails_closed",
+        INTEGRATION_TIMEOUT,
+        |ctx| async move {
+            ctx.phase("SUBMIT_BASELINE_COMPLETED");
+            let tmp = tempdir().unwrap();
+            let ws_path = tmp.path().to_path_buf();
+            let spawns = Arc::new(AtomicUsize::new(0));
+            let exec_a = {
+                let ws = stub_workspace(
+                    &ws_path,
+                    1,
+                    omen_core::RuntimeStatus::Completed,
+                    Some(0),
+                    &spawns,
+                );
+                let original = submit_consequential(
+                    &ws,
+                    "req-repair-readfail-01",
+                    "exec".to_string(),
+                    vec!["stubbed".to_string()],
+                    10000,
+                )
+                .await
+                .unwrap();
+                assert_eq!(original.runtime_status, omen_core::RuntimeStatus::Completed);
+                assert_eq!(spawns.load(Ordering::SeqCst), 1);
+                original.execution_id.clone()
+            };
+            let history_before = total_history_rows(&ws_path);
+
+            ctx.phase("RESTART_INJECT_READ_FAILURE_AND_RESUBMIT");
+            let ws2 = stub_workspace(
+                &ws_path,
+                2,
+                omen_core::RuntimeStatus::Completed,
+                Some(0),
+                &spawns,
+            );
+            ws2.set_persistence_failpoint(PersistenceFailpoint::FailRequestReceiptRead);
+            let blocked = submit_consequential(
+                &ws2,
+                "req-repair-readfail-01",
+                "exec".to_string(),
+                vec!["stubbed".to_string()],
+                10000,
+            )
+            .await;
+            match &blocked {
+                Err(LocalIpcError::PersistenceFailure {
+                    stage,
+                    physical_outcome,
+                    ..
+                }) => {
+                    assert_eq!(stage, "receipt_read");
+                    assert_eq!(physical_outcome, "no physical work started");
+                }
+                other => panic!("read failure must surface explicitly, got {other:?}"),
+            }
+            assert_eq!(
+                spawns.load(Ordering::SeqCst),
+                1,
+                "read failure must never authorize a second dispatch"
+            );
+
+            ctx.phase("VERIFY_NO_MUTATION_THEN_REPLAY_AFTER_DISARM");
+            ws2.set_persistence_failpoint(PersistenceFailpoint::Off);
+            assert_eq!(
+                receipt_status_of(&ws2, "req-repair-readfail-01").await,
+                Some(("Completed".to_string(), Some(exec_a.clone()))),
+                "existing receipt keeps its identity and status (no overwrite)"
+            );
+            assert_eq!(
+                total_history_rows(&ws_path),
+                history_before,
+                "no additional history from the blocked resubmit"
+            );
+            let replay = submit_consequential(
+                &ws2,
+                "req-repair-readfail-01",
+                "exec".to_string(),
+                vec!["stubbed".to_string()],
+                10000,
+            )
+            .await
+            .unwrap();
+            assert_eq!(replay.execution_id, exec_a);
+            assert_eq!(
+                spawns.load(Ordering::SeqCst),
+                1,
+                "original receipt replays normally with no second dispatch"
+            );
+        },
+    )
+    .await;
+    unlock_env(guard);
+}
+
+/// REPAIR Preview 12 / PROOF 2 — a request ID with genuinely no receipt
+/// plus an injected receipt-read failure: inability to establish absence
+/// is sufficient to stop consequential work. Zero spawn, zero receipt,
+/// zero history, zero durable identity.
+#[tokio::test(flavor = "multi_thread")]
+async fn receipt_read_failure_with_absent_receipt_refuses_dispatch() {
+    let (guard, _state) = lock_env();
+    run_with_test_timeout(
+        "receipt_read_failure_with_absent_receipt_refuses_dispatch",
+        INTEGRATION_TIMEOUT,
+        |ctx| async move {
+            ctx.phase("SETUP_WORKSPACE_AND_FAILPOINT");
+            let tmp = tempdir().unwrap();
+            let ws_path = tmp.path().to_path_buf();
+            let spawns = Arc::new(AtomicUsize::new(0));
+            let ws = stub_workspace(
+                &ws_path,
+                1,
+                omen_core::RuntimeStatus::Completed,
+                Some(0),
+                &spawns,
+            );
+            ws.set_persistence_failpoint(PersistenceFailpoint::FailRequestReceiptRead);
+
+            ctx.phase("SUBMIT_WITH_READ_FAULT");
+            let result = submit_consequential(
+                &ws,
+                "req-repair-readfail-02",
+                "exec".to_string(),
+                vec!["stubbed".to_string()],
+                10000,
+            )
+            .await;
+            match &result {
+                Err(LocalIpcError::PersistenceFailure {
+                    stage,
+                    physical_outcome,
+                    ..
+                }) => {
+                    assert_eq!(stage, "receipt_read");
+                    assert_eq!(physical_outcome, "no physical work started");
+                }
+                other => panic!("read failure must surface explicitly, got {other:?}"),
+            }
+
+            ctx.phase("VERIFY_ZERO_SPAWN_ZERO_RECEIPT_ZERO_HISTORY");
+            assert_eq!(
+                spawns.load(Ordering::SeqCst),
+                0,
+                "no absence proof means no dispatch"
+            );
+            ws.set_persistence_failpoint(PersistenceFailpoint::Off);
+            assert_eq!(
+                ws.query_request_receipt("req-repair-readfail-02")
+                    .await
+                    .expect("receipt read must succeed with the failpoint Off"),
+                None,
+                "no durable execution identity may be created"
+            );
+            assert_eq!(
+                total_history_rows(&ws_path),
+                0,
+                "zero physical work: no history may be recorded"
+            );
+        },
+    )
+    .await;
+    unlock_env(guard);
+}
+
+/// REPAIR Preview 12 / PROOF 3 — cancel durable-lookup read failure must
+/// report `OutcomeUnknown` with a lookup-failed detail, never `NotFound`.
+/// After the failpoint is removed the same execution is discoverable
+/// normally (`AlreadyFinished`).
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_lookup_read_failure_reports_unknown_not_notfound() {
+    let (guard, _state) = lock_env();
+    run_with_test_timeout(
+        "cancel_lookup_read_failure_reports_unknown_not_notfound",
+        INTEGRATION_TIMEOUT,
+        |ctx| async move {
+            ctx.phase("SUBMIT_BASELINE_COMPLETED");
+            let tmp = tempdir().unwrap();
+            let ws_path = tmp.path().to_path_buf();
+            let spawns = Arc::new(AtomicUsize::new(0));
+            let exec_a = {
+                let ws = stub_workspace(
+                    &ws_path,
+                    1,
+                    omen_core::RuntimeStatus::Completed,
+                    Some(0),
+                    &spawns,
+                );
+                let original = submit_consequential(
+                    &ws,
+                    "req-repair-cancelfail-01",
+                    "exec".to_string(),
+                    vec!["stubbed".to_string()],
+                    10000,
+                )
+                .await
+                .unwrap();
+                original.execution_id.clone()
+            };
+
+            ctx.phase("RESTART_INJECT_LOOKUP_FAILURE");
+            let ws2 = Arc::new(WorkspaceState::new(ws_path.clone(), 2).unwrap());
+            ws2.set_persistence_failpoint(PersistenceFailpoint::FailReceiptByExecRead);
+            let blocked = ws2.cancel_execution(&exec_a).await;
+            assert!(
+                matches!(blocked.outcome, CancelOutcome::OutcomeUnknown),
+                "lookup failure must preserve uncertainty, got {:?}",
+                blocked.outcome
+            );
+            assert!(
+                blocked.detail.contains("durable receipt lookup failed"),
+                "detail must say the durable lookup failed, got: {}",
+                blocked.detail
+            );
+
+            ctx.phase("VERIFY_DISCOVERABLE_AFTER_DISARM");
+            ws2.set_persistence_failpoint(PersistenceFailpoint::Off);
+            let after = ws2.cancel_execution(&exec_a).await;
+            match &after.outcome {
+                CancelOutcome::AlreadyFinished { terminal_status } => {
+                    assert_eq!(terminal_status, "Completed");
+                }
+                other => panic!("execution must be discoverable normally, got {other:?}"),
+            }
+        },
+    )
+    .await;
+    unlock_env(guard);
+}
+
+/// REPAIR Preview 12 / PROOF 4 — cancel durable-reread failure (initial
+/// lookup succeeds on a non-terminal receipt, reread fails) must preserve
+/// uncertainty: `OutcomeUnknown`, never `NotFound`, never "vanished".
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_reread_failure_preserves_uncertainty() {
+    let (guard, _state) = lock_env();
+    run_with_test_timeout(
+        "cancel_reread_failure_preserves_uncertainty",
+        INTEGRATION_TIMEOUT,
+        |ctx| async move {
+            ctx.phase("SEED_NONTERMINAL_RECEIPT_WITHOUT_LIVE_OWNER");
+            let tmp = tempdir().unwrap();
+            let ws_path = tmp.path().to_path_buf();
+            let exec_id = "exec-seeded-req-repair-reread-01".to_string();
+            // Fresh state (no live task could own this identity), seeded
+            // AFTER construction so startup reconcile cannot hide the
+            // reread branch.
+            let ws2 = Arc::new(WorkspaceState::new(ws_path.clone(), 1).unwrap());
+            {
+                let db_path = canonical_workspace_db_path(&ws_path);
+                let db = Database::open(&db_path).expect("daemon database must exist");
+                WorkspacePersistence::record_request_receipt(
+                    &db,
+                    &RequestReceiptRecord {
+                        consequential_request_id: "req-repair-reread-01".into(),
+                        execution_id: Some(exec_id.clone()),
+                        status: "Running".into(),
+                        recorded_at: chrono::Utc::now().to_rfc3339(),
+                    },
+                )
+                .expect("receipt seeding must succeed");
+            }
+
+            ctx.phase("FAIL_REREAD_ONLY");
+            // Exactly one successful read (the initial lookup), then every
+            // subsequent read fails — deterministically arming the reread.
+            ws2.set_persistence_failpoint(PersistenceFailpoint::FailReceiptReadAfterSuccesses(1));
+            let blocked = ws2.cancel_execution(&exec_id).await;
+            assert!(
+                matches!(blocked.outcome, CancelOutcome::OutcomeUnknown),
+                "reread failure must preserve uncertainty, got {:?}",
+                blocked.outcome
+            );
+            assert!(
+                blocked.detail.contains("reread failed"),
+                "detail must name the reread failure, got: {}",
+                blocked.detail
+            );
+            assert!(
+                !blocked.detail.contains("vanished between observations"),
+                "the execution must NOT be reported vanished, got: {}",
+                blocked.detail
+            );
+
+            ctx.phase("VERIFY_IDENTITY_HANDLED_NORMALLY_AFTER_DISARM");
+            ws2.set_persistence_failpoint(PersistenceFailpoint::Off);
+            let after = ws2.cancel_execution(&exec_id).await;
+            assert!(
+                matches!(after.outcome, CancelOutcome::OutcomeUnknown),
+                "restart-boundary receipt still reconciles to Unknown, got {:?}",
+                after.outcome
+            );
+            assert_eq!(
+                receipt_status_of(&ws2, "req-repair-reread-01").await,
+                Some(("Unknown".to_string(), Some(exec_id))),
+                "identity preserved and reconciled, never vanished"
+            );
+        },
+    )
+    .await;
+    unlock_env(guard);
+}
+
+/// REPAIR Preview 12 / SLOT CLEANUP — when the initial receipt read fails,
+/// the claimed in-flight slot is released and every coalesced subscriber
+/// receives the same explicit failure; a later submit proceeds normally.
+#[tokio::test(flavor = "multi_thread")]
+async fn receipt_read_failure_releases_slot_to_coalesced_submitters() {
+    let (guard, _state) = lock_env();
+    run_with_test_timeout(
+        "receipt_read_failure_releases_slot_to_coalesced_submitters",
+        INTEGRATION_TIMEOUT,
+        |ctx| async move {
+            ctx.phase("SETUP_WORKSPACE_AND_FAILPOINT");
+            let tmp = tempdir().unwrap();
+            let ws_path = tmp.path().to_path_buf();
+            let spawns = Arc::new(AtomicUsize::new(0));
+            let ws = stub_workspace(
+                &ws_path,
+                1,
+                omen_core::RuntimeStatus::Completed,
+                Some(0),
+                &spawns,
+            );
+            ws.set_persistence_failpoint(PersistenceFailpoint::FailRequestReceiptRead);
+
+            ctx.phase("CONCURRENT_SUBMITS_SHARE_ONE_FAILURE");
+            let mut joiners = Vec::new();
+            for _ in 0..4 {
+                let ws_submit = Arc::clone(&ws);
+                joiners.push(tokio::spawn(async move {
+                    submit_consequential(
+                        &ws_submit,
+                        "req-repair-readfail-slot",
+                        "exec".to_string(),
+                        vec!["stubbed".to_string()],
+                        10000,
+                    )
+                    .await
+                }));
+            }
+            for joiner in joiners {
+                let result = tokio::time::timeout(Duration::from_secs(25), joiner)
+                    .await
+                    .expect("phase=coalesce: every submitter must resolve bounded")
+                    .unwrap();
+                match &result {
+                    Err(LocalIpcError::PersistenceFailure { stage, .. }) => {
+                        assert_eq!(stage, "receipt_read");
+                    }
+                    other => {
+                        panic!("every coalesced caller must get the failure, got {other:?}")
+                    }
+                }
+            }
+            assert_eq!(spawns.load(Ordering::SeqCst), 0);
+
+            ctx.phase("VERIFY_SLOT_RELEASED_AFTER_DISARM");
+            ws.set_persistence_failpoint(PersistenceFailpoint::Off);
+            let recovered = tokio::time::timeout(
+                Duration::from_secs(25),
+                submit_consequential(
+                    &ws,
+                    "req-repair-readfail-slot",
+                    "exec".to_string(),
+                    vec!["stubbed".to_string()],
+                    10000,
+                ),
+            )
+            .await
+            .expect("phase=recover: post-failure submit must not strand on a dead slot")
+            .unwrap();
+            assert_eq!(
+                recovered.runtime_status,
+                omen_core::RuntimeStatus::Completed,
+                "after disarm the request dispatches normally"
+            );
+            assert_eq!(spawns.load(Ordering::SeqCst), 1);
         },
     )
     .await;
