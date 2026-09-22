@@ -1,0 +1,238 @@
+name: Python SDK
+
+on:
+  push:
+    branches: [main, feature/*]
+    paths:
+      - 'sdk/python/**'
+      - 'crates/omen-mcp/**'
+      - 'crates/omen-cli/**'
+      - 'crates/omen-core/**'
+      - 'crates/omen-knowledge/**'
+      - '.github/workflows/python-sdk.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'sdk/python/**'
+  workflow_dispatch:
+    inputs:
+      target_sha:
+        description: "Exact product source commit to build and test"
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  PYTHON_SDK_DIR: sdk/python/omen-shell
+
+jobs:
+  sdk-lint-typecheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.target_sha || github.sha }}
+          fetch-depth: 0
+      - name: Verify exact product source
+        shell: pwsh
+        env:
+          REQUESTED_PRODUCT_SHA: ${{ inputs.target_sha || github.sha }}
+        run: |
+          $requested = $env:REQUESTED_PRODUCT_SHA.Trim().ToLowerInvariant()
+          if ($requested -notmatch '^[0-9a-f]{40}$') { throw "target_sha must be a full 40-character commit SHA" }
+          $resolved = (git rev-parse "$requested^{commit}").Trim().ToLowerInvariant()
+          $checkedOut = (git rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($resolved -ne $requested -or $checkedOut -ne $requested) {
+            throw "EXACT_SHA_GUARD_FAILED: requested=$requested resolved=$resolved checked_out=$checkedOut"
+          }
+          "EXACT_SHA_GUARD: PASS ($checkedOut)"
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install lint tooling
+        run: python -m pip install ruff mypy types-psutil
+      - name: Ruff check and format
+        working-directory: ${{ env.PYTHON_SDK_DIR }}
+        run: |
+          ruff check .
+          ruff format --check .
+      - name: Mypy strict
+        working-directory: ${{ env.PYTHON_SDK_DIR }}
+        run: mypy src
+      - name: Consumer typing proof (installed surface, not source tree)
+        working-directory: ${{ env.PYTHON_SDK_DIR }}
+        run: |
+          python -m pip install -e .
+          mypy typing_consumer
+
+  sdk-test:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python-version: '3.11'
+          - os: ubuntu-latest
+            python-version: '3.12'
+          - os: ubuntu-latest
+            python-version: '3.13'
+          - os: ubuntu-latest
+            python-version: '3.14'
+          - os: windows-latest
+            python-version: '3.11'
+          - os: windows-latest
+            python-version: '3.14'
+          - os: macos-latest
+            python-version: '3.11'
+          - os: macos-latest
+            python-version: '3.14'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.target_sha || github.sha }}
+          fetch-depth: 0
+      - name: Verify exact product source
+        shell: pwsh
+        env:
+          REQUESTED_PRODUCT_SHA: ${{ inputs.target_sha || github.sha }}
+        run: |
+          $requested = $env:REQUESTED_PRODUCT_SHA.Trim().ToLowerInvariant()
+          if ($requested -notmatch '^[0-9a-f]{40}$') { throw "target_sha must be a full 40-character commit SHA" }
+          $resolved = (git rev-parse "$requested^{commit}").Trim().ToLowerInvariant()
+          $checkedOut = (git rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($resolved -ne $requested -or $checkedOut -ne $requested) {
+            throw "EXACT_SHA_GUARD_FAILED: requested=$requested resolved=$resolved checked_out=$checkedOut"
+          }
+          "EXACT_SHA_GUARD: PASS ($checkedOut)"
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup default 1.98.1
+      - name: Restore Rust cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-sdk-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-sdk-${{ runner.os }}-
+      - name: Build Omen binary for integration tests
+        run: cargo build -p omen-cli
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install package with dev extras
+        run: python -m pip install -e "${{ env.PYTHON_SDK_DIR }}[dev]"
+      - name: Unit tests (no Omen)
+        working-directory: ${{ env.PYTHON_SDK_DIR }}
+        run: python -m pytest tests/unit -q
+      - name: Transport fixture tests
+        working-directory: ${{ env.PYTHON_SDK_DIR }}
+        run: python -m pytest tests/integration -q
+      - name: Stateful lifecycle tests
+        working-directory: ${{ env.PYTHON_SDK_DIR }}
+        run: python -m pytest tests/stateful -q
+      - name: Real-Omen Bats
+        working-directory: ${{ env.PYTHON_SDK_DIR }}
+        shell: pwsh
+        run: |
+          $exe = "omen"
+          if ($IsWindows) { $exe = "omen.exe" }
+          $omenBin = Join-Path (git rev-parse --show-toplevel) "target/debug/$exe"
+          $env:OMEN_EXE = $omenBin
+          & $omenBin --version
+          python -m pytest tests/bats -q
+        env:
+          OMEN_TEST_EVIDENCE_DIR: ${{ github.workspace }}/sdk-evidence
+      - name: Upload test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-evidence-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: ${{ github.workspace }}/sdk-evidence
+          if-no-files-found: ignore
+
+  sdk-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: [sdk-lint-typecheck]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.target_sha || github.sha }}
+          fetch-depth: 0
+      - name: Verify exact product source
+        shell: pwsh
+        env:
+          REQUESTED_PRODUCT_SHA: ${{ inputs.target_sha || github.sha }}
+        run: |
+          $requested = $env:REQUESTED_PRODUCT_SHA.Trim().ToLowerInvariant()
+          if ($requested -notmatch '^[0-9a-f]{40}$') { throw "target_sha must be a full 40-character commit SHA" }
+          $resolved = (git rev-parse "$requested^{commit}").Trim().ToLowerInvariant()
+          $checkedOut = (git rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($resolved -ne $requested -or $checkedOut -ne $requested) {
+            throw "EXACT_SHA_GUARD_FAILED: requested=$requested resolved=$resolved checked_out=$checkedOut"
+          }
+          "OMEN_CHECKED_OUT_PRODUCT_SHA=$checkedOut" >> $env:GITHUB_ENV
+          "EXACT_SHA_GUARD: PASS ($checkedOut)"
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup default 1.98.1
+      - name: Restore Rust cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-sdk-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-sdk-${{ runner.os }}-
+      - name: Build Omen binary for smoke test
+        run: cargo build -p omen-cli
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Build wheel and sdist
+        run: |
+          python -m pip install build twine
+          python -m build "${{ env.PYTHON_SDK_DIR }}"
+          twine check "${{ env.PYTHON_SDK_DIR }}/dist/*"
+      - name: Record artifact SHAs
+        shell: pwsh
+        run: |
+          Get-ChildItem "${{ env.PYTHON_SDK_DIR }}/dist/*" | ForEach-Object {
+            "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $_.Name
+          } | Set-Content "${{ env.PYTHON_SDK_DIR }}/dist/SHA256SUMS.txt"
+          Get-Content "${{ env.PYTHON_SDK_DIR }}/dist/SHA256SUMS.txt"
+      - name: Clean-venv install and smoke test
+        shell: pwsh
+        run: |
+          $wheel = (Get-ChildItem "${{ env.PYTHON_SDK_DIR }}/dist/*.whl" | Select-Object -First 1).FullName
+          python -m venv clean-env
+          $venvPython = "clean-env/bin/python"
+          if ($IsWindows) { $venvPython = "clean-env/Scripts/python.exe" }
+          & $venvPython -m pip install --no-deps "$wheel"
+          & $venvPython -c "import omen_shell; print(omen_shell.__version__)"
+          $env:OMEN_EXE = Join-Path (git rev-parse --show-toplevel) "target/debug/omen"
+          & $venvPython "${{ env.PYTHON_SDK_DIR }}/examples/basic.py"
+          & $venvPython "${{ env.PYTHON_SDK_DIR }}/examples/harness.py"
+      - name: Upload Python artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: omen-shell-0.9.0a1-dist
+          path: |
+            ${{ env.PYTHON_SDK_DIR }}/dist/*.whl
+            ${{ env.PYTHON_SDK_DIR }}/dist/*.tar.gz
+            ${{ env.PYTHON_SDK_DIR }}/dist/SHA256SUMS.txt

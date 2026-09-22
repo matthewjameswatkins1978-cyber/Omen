@@ -4,3 +4,15 @@ Cargo.lock.bak
 *.log
 .DS_Store
 Thumbs.db
+# Python (omen-shell SDK)
+__pycache__/
+*.egg-info/
+*.whl
+*.tar.gz
+sdk/python/omen-shell/dist/
+sdk/python/omen-shell/.venv/
+.venv/
+.hypothesis/
+.coverage
+htmlcov/
+clean-env/

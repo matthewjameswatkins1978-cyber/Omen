@@ -1,0 +1,83 @@
+[project]
+name = "omen-shell"
+version = "0.9.0a1"
+description = "Official Python interface to Omen. Python provides orchestration. Omen provides machine truth."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+authors = [{ name = "Matthew James Watkins", email = "matthewjameswatkins1978@cyber.net" }]
+maintainers = [{ name = "Matthew James Watkins", email = "matthewjameswatkins1978@cyber.net" }]
+urls = { Repository = "https://github.com/matthewjameswatkins1978-cyber/Omen" }
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Operating System :: OS Independent",
+    "Typing :: Typed",
+]
+# NOTE: the Omen repository declares no license file; no license is
+# invented here. Distribution terms follow the Omen repository.
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "hypothesis>=6",
+    "psutil>=6",
+    "types-psutil>=7",
+    "ruff>=0.8",
+    "mypy>=1.11",
+    "coverage>=7",
+    "nox>=2024",
+    "build>=1.2",
+    "twine>=6",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/omen_shell"]
+
+[tool.hatch.build]
+artifacts = ["src/omen_shell/py.typed"]
+include = ["src/omen_shell", "README.md"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC", "S"]
+ignore = ["S101"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+show_error_codes = true
+warn_unused_ignores = true
+[[tool.mypy.overrides]]
+module = "omen_shell.testing.*"
+ignore_errors = false
+[[tool.mypy.overrides]]
+module = "tests.*"
+ignore_errors = true
+
+[tool.coverage.run]
+branch = true
+source = ["omen_shell"]
+omit = ["*/tests/*", "*/testing/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "real_omen: tests that spawn a real Omen binary",
+    "slow: long-running or heavy tests",
+]
