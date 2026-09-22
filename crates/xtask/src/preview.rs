@@ -79,6 +79,8 @@ pub struct Manifest {
     pub target: String,
     pub profile: String,
     pub binary_sha256: String,
+    #[serde(default)]
+    pub daemon_binary_sha256: Option<String>,
     pub package_sha256: String,
     pub ci_run_id: Option<u64>,
     pub artifact_id: Option<u64>,
@@ -181,9 +183,18 @@ fn digest_file(path: &Path) -> Result<String, String> {
     let bytes = fs::read(path).map_err(|e| fail("OMEN_PREVIEW_HASH_MISMATCH", e))?;
     Ok(hex::encode(Sha256::digest(bytes)))
 }
-fn payload_digest(binary: &str, fixtures: &std::collections::BTreeMap<String, String>) -> String {
+fn payload_digest(
+    binary: &str,
+    daemon_binary: Option<&str>,
+    fixtures: &std::collections::BTreeMap<String, String>,
+) -> String {
     let mut h = Sha256::new();
+    h.update(b"omen");
     h.update(binary.as_bytes());
+    if let Some(daemon) = daemon_binary {
+        h.update(b"omend");
+        h.update(daemon.as_bytes());
+    }
     for (name, digest) in fixtures {
         h.update(name.as_bytes());
         h.update(digest.as_bytes());
@@ -471,17 +482,26 @@ fn preflight(root: &Path, package: Option<String>) -> Result<(), String> {
 }
 
 fn package(root: &Path, ci_run_id: Option<u64>, artifact_id: Option<u64>) -> Result<(), String> {
-    run_cmd(root, "cargo", &["build", "--release", "-p", "omen-cli"])?;
+    run_cmd(
+        root,
+        "cargo",
+        &["build", "--release", "-p", "omen-cli", "-p", "omen-daemon"],
+    )?;
     let exe =
         root.join("target")
             .join("release")
             .join(if cfg!(windows) { "omen.exe" } else { "omen" });
+    let daemon_exe =
+        root.join("target")
+            .join("release")
+            .join(if cfg!(windows) { "omend.exe" } else { "omend" });
     let bin_hash = digest_file(&exe)?;
+    let daemon_bin_hash = digest_file(&daemon_exe)?;
     let version = preview_version(root)?;
     let sha = git(root, &["rev-parse", "HEAD"])?;
     let fixture_files = fixture_hashes(root)?;
     let mut manifest = Manifest {
-        schema_version: 1,
+        schema_version: 2,
         provenance: if ci_run_id.is_some() {
             Provenance::Ci
         } else {
@@ -493,7 +513,8 @@ fn package(root: &Path, ci_run_id: Option<u64>, artifact_id: Option<u64>) -> Res
         target: target_triple()?,
         profile: "release".into(),
         binary_sha256: bin_hash.clone(),
-        package_sha256: payload_digest(&bin_hash, &fixture_files),
+        daemon_binary_sha256: Some(daemon_bin_hash.clone()),
+        package_sha256: payload_digest(&bin_hash, Some(&daemon_bin_hash), &fixture_files),
         ci_run_id,
         artifact_id,
         fixture_files,
@@ -519,6 +540,14 @@ fn package(root: &Path, ci_run_id: Option<u64>, artifact_id: Option<u64>) -> Res
     zip.start_file(if cfg!(windows) { "omen.exe" } else { "omen" }, opts)
         .unwrap();
     zip.write_all(&bytes).unwrap();
+    let mut daemon_bytes = Vec::new();
+    fs::File::open(&daemon_exe)
+        .map_err(|e| e.to_string())?
+        .read_to_end(&mut daemon_bytes)
+        .map_err(|e| e.to_string())?;
+    zip.start_file(if cfg!(windows) { "omend.exe" } else { "omend" }, opts)
+        .unwrap();
+    zip.write_all(&daemon_bytes).unwrap();
     zip.start_file("manifest.json", opts).unwrap();
     zip.write_all(serde_json::to_string_pretty(&manifest).unwrap().as_bytes())
         .unwrap();
@@ -608,7 +637,29 @@ fn install(_root: &Path, artifact: Option<PathBuf>) -> Result<(), String> {
             "binary digest differs from manifest",
         ));
     }
-    if payload_digest(&manifest.binary_sha256, &manifest.fixture_files) != manifest.package_sha256 {
+    let mut archive_daemon = None;
+    if let Some(expected_daemon) = manifest.daemon_binary_sha256.as_deref() {
+        let mut bytes = Vec::new();
+        archive
+            .by_name(if cfg!(windows) { "omend.exe" } else { "omend" })
+            .map_err(|e| fail("OMEN_PREVIEW_HASH_MISMATCH", e))?
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        let actual_daemon = hex::encode(Sha256::digest(&bytes));
+        if actual_daemon != expected_daemon {
+            return Err(fail(
+                "OMEN_PREVIEW_HASH_MISMATCH",
+                "daemon binary digest differs from manifest",
+            ));
+        }
+        archive_daemon = Some(bytes);
+    }
+    if payload_digest(
+        &manifest.binary_sha256,
+        manifest.daemon_binary_sha256.as_deref(),
+        &manifest.fixture_files,
+    ) != manifest.package_sha256
+    {
         return Err(fail(
             "OMEN_PREVIEW_HASH_MISMATCH",
             "package digest differs from manifest",
@@ -642,6 +693,13 @@ fn install(_root: &Path, artifact: Option<PathBuf>) -> Result<(), String> {
             .unwrap();
         fs::write(dir.join(if cfg!(windows) { "omen.exe" } else { "omen" }), b)
             .map_err(|e| e.to_string())?;
+        if let Some(daemon_bytes) = archive_daemon.as_ref() {
+            fs::write(
+                dir.join(if cfg!(windows) { "omend.exe" } else { "omend" }),
+                daemon_bytes,
+            )
+            .map_err(|e| e.to_string())?;
+        }
         fs::write(dir.join("manifest.json"), m).map_err(|e| e.to_string())?;
         for rel in FIXTURE {
             let mut fixture_bytes = Vec::new();
@@ -662,6 +720,13 @@ fn install(_root: &Path, artifact: Option<PathBuf>) -> Result<(), String> {
         .join(if cfg!(windows) { "omen.exe" } else { "omen" });
     let candidate = dir.join(if cfg!(windows) { "omen.exe" } else { "omen" });
     fs::copy(candidate, &stable).map_err(|e| fail("OMEN_INSTALL_IDENTITY_MISMATCH", e))?;
+    if manifest.daemon_binary_sha256.is_some() {
+        let daemon_name = if cfg!(windows) { "omend.exe" } else { "omend" };
+        let daemon_candidate = dir.join(daemon_name);
+        let daemon_stable = install_root().join("bin").join(daemon_name);
+        fs::copy(daemon_candidate, daemon_stable)
+            .map_err(|e| fail("OMEN_INSTALL_IDENTITY_MISMATCH", e))?;
+    }
     let mut s = read_state();
     s.previous_slot = s.active_slot.take();
     s.active_slot = Some(slot);
