@@ -34,12 +34,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ inputs.target_sha || github.sha }}
+          ref: ${{ github.event.pull_request.head.sha || inputs.target_sha || github.sha }}
           fetch-depth: 0
       - name: Verify exact product source
         shell: pwsh
         env:
-          REQUESTED_PRODUCT_SHA: ${{ inputs.target_sha || github.sha }}
+          REQUESTED_PRODUCT_SHA: ${{ github.event.pull_request.head.sha || inputs.target_sha || github.sha }}
         run: |
           $requested = $env:REQUESTED_PRODUCT_SHA.Trim().ToLowerInvariant()
           if ($requested -notmatch '^[0-9a-f]{40}$') { throw "target_sha must be a full 40-character commit SHA" }
@@ -96,12 +96,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ inputs.target_sha || github.sha }}
+          ref: ${{ github.event.pull_request.head.sha || inputs.target_sha || github.sha }}
           fetch-depth: 0
       - name: Verify exact product source
         shell: pwsh
         env:
-          REQUESTED_PRODUCT_SHA: ${{ inputs.target_sha || github.sha }}
+          REQUESTED_PRODUCT_SHA: ${{ github.event.pull_request.head.sha || inputs.target_sha || github.sha }}
         run: |
           $requested = $env:REQUESTED_PRODUCT_SHA.Trim().ToLowerInvariant()
           if ($requested -notmatch '^[0-9a-f]{40}$') { throw "target_sha must be a full 40-character commit SHA" }
@@ -169,12 +169,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ inputs.target_sha || github.sha }}
+          ref: ${{ github.event.pull_request.head.sha || inputs.target_sha || github.sha }}
           fetch-depth: 0
       - name: Verify exact product source
         shell: pwsh
         env:
-          REQUESTED_PRODUCT_SHA: ${{ inputs.target_sha || github.sha }}
+          REQUESTED_PRODUCT_SHA: ${{ github.event.pull_request.head.sha || inputs.target_sha || github.sha }}
         run: |
           $requested = $env:REQUESTED_PRODUCT_SHA.Trim().ToLowerInvariant()
           if ($requested -notmatch '^[0-9a-f]{40}$') { throw "target_sha must be a full 40-character commit SHA" }

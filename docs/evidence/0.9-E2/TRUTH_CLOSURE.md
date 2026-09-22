@@ -10,6 +10,14 @@ Omen authority ontology. Proofs in `e2_repair_tests` (7). The repair
 changes runtime bytes, so Preview 9 (rejected candidate) is superseded by
 Preview 10; machine contract stays `0.8` (additive only).
 
+Final repair pass (Preview 11): exact runtime replay (coarse history
+status != exact `RuntimeStatus`; the durable envelope preserves both),
+Failed-receipt identity preservation, and exact-SHA product candidacy
+(PR merge-ref testing vs exact product-head identity — see
+`EXACT_SHA_RELEASE.md`). Proofs in `e2_repair_tests` (10 total).
+Preview 10 is a rejected candidate; Preview 11 is the new E2 candidate.
+Machine contract stays `0.8`.
+
 ## E2.1 Durable history: read-after-write point
 
 - **Visibility point**: `ExecutionHistory::record_execution` transaction
@@ -85,6 +93,47 @@ States (never collapsed):
   cancel truth through shared history.
 - Proofs: engine `engine_tests` (3 new), `e2_cancellation_tests` (6),
   `e2_hostile_tests` (3), MCP (4 new), CLI live test, Python (3 new).
+
+## Repair A — exact runtime replay (Preview 11)
+
+- Coarse history status != exact `RuntimeStatus`. The durable envelope
+  (`HistoryStatusEnvelope`: `status` + `runtime_status` + `source` +
+  `dispatch_prevented`) preserves both: `status` is presentation
+  (stamped via the single `history_label` authority), `runtime_status`
+  is the exact physical outcome round-tripped verbatim through serde.
+- Replay rule: exact field present → use it (all variants, including
+  `IoFailed`); never reconstruct precision from the coarse label.
+  `IoFailed -> FAILED -> Completed` is the canonical forbidden rewrite.
+- Legacy policy (rows without the exact field): 1:1 labels replay
+  exactly (`COMPLETED`/`TIMED_OUT`/`CANCELLED`/`OUTCOME_UNKNOWN`);
+  `FAILED` + an actual child exit replays `Completed` (the only
+  `FAILED`-with-exit producer); `FAILED` without distinguishing
+  information REFUSES replay (identity stays consumed, never re-arms);
+  envelope-less rows keep the narrow pre-existing fallback. Missing
+  exact information is not permission to invent it.
+- Deterministic `IoFailed` proof via an injected stub backend through
+  the real supervisor/broker path (test-only seam
+  `WorkspaceState::new_with_supervisor`; production uses `new()`).
+- Proofs: `exact_runtime_survives_restart_replay` (Completed 0,
+  Completed non-zero, TimedOut, Cancelled, IoFailed, OutcomeUnknown —
+  same ID, one dispatch, one history identity each),
+  `legacy_envelope_replay_policy` (4 legacy shapes).
+
+## Repair A.1 — Failed receipt identity (Preview 11)
+
+- Once a consequential request has a durable execution ID, later receipt
+  transitions preserve it (receipts UPSERT): `Running(exec_A)` →
+  `Failed(exec_A)`, never `Failed(None)`.
+- Proof: `failed_receipt_preserves_execution_identity` (parked task
+  observes Running ID, release into spawn failure, Failed keeps the ID,
+  retry refused with no second identity).
+
+## Repair B — exact-SHA product candidate (Preview 11)
+
+- PR merge-ref testing (`refs/pull/.../merge`) vs exact product-head
+  identity: the candidate is built from `github.event.pull_request.head.sha`
+  on pull_request (see `EXACT_SHA_RELEASE.md`); `github.sha` is recorded
+  separately as `control_plane_sha` so the distinction is explicit.
 
 ## Repair 1 — terminal dedup (Preview 10)
 

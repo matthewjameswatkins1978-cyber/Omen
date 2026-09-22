@@ -13,9 +13,9 @@ use omen_ipc::{
     LocalIpcError, ManagedServiceInfo, SharedIndexSnapshot,
 };
 use omen_knowledge::{
-    Database, ExecutionHistory, ExecutionRecord, FactRegistry, RequestReceiptRecord, ServiceRecord,
-    WorkspacePersistence, canonical_workspace_db_path, cas::ContentAddressedStore,
-    deterministic_workspace_id, resolve_workspace_dir,
+    Database, ExecutionHistory, ExecutionRecord, FactRegistry, HistoryStatusEnvelope,
+    RequestReceiptRecord, ServiceRecord, WorkspacePersistence, canonical_workspace_db_path,
+    cas::ContentAddressedStore, deterministic_workspace_id, resolve_workspace_dir,
 };
 
 pub type InFlightMap =
@@ -32,24 +32,57 @@ pub const CANCEL_OBSERVE_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// because the original summary reported physical completion with a
 /// non-zero exit; the exit code itself carries the failure. Returns `None`
 /// for records without a parsable envelope (legacy rows).
-/// Reproduce a recorded terminal runtime for the dedup-replay path.
+/// Repair A: resolve the exact physical runtime for durable replay.
 ///
-/// The broker stamps every history record with an explicit status envelope.
-/// `FAILED` (and the physical failure spellings) replay as `Completed`
-/// because the original summary reported physical completion with a
-/// non-zero exit; the exit code itself carries the failure. Returns `None`
-/// for records without a parsable envelope (legacy rows).
-fn recorded_history_runtime(rec: &ExecutionRecord) -> Option<omen_core::RuntimeStatus> {
-    let envelope = rec.envelope_json.as_deref()?;
-    let value: serde_json::Value = serde_json::from_str(envelope).ok()?;
-    match value.get("status")?.as_str()? {
-        "COMPLETED" | "FAILED" | "SPAWN_FAILED" | "CONTAINMENT_FAILED" | "IO_FAILED" => {
-            Some(omen_core::RuntimeStatus::Completed)
+/// Exact typed truth wins: broker-stamped envelopes carry `runtime_status`
+/// verbatim and round-trip every `RuntimeStatus` variant, so the same
+/// physical execution can never change its story across a restart
+/// (`IoFailed -> FAILED -> Completed` is the canonical forbidden
+/// rewrite). The coarse `status` label is presentation only and is NEVER
+/// used to reconstruct precision.
+///
+/// Legacy rows without exact information fall back to narrow safe
+/// mappings; genuinely ambiguous rows return `None` and the caller
+/// refuses replay. Missing exact historical information is not permission
+/// to invent it — refusal is safe because the identity stays consumed and
+/// must not physically execute again.
+fn replay_runtime_status(
+    rec: &ExecutionRecord,
+    receipt_status: &str,
+) -> Option<omen_core::RuntimeStatus> {
+    use omen_core::RuntimeStatus as Exact;
+    if let Some(envelope) = rec
+        .envelope_json
+        .as_deref()
+        .and_then(HistoryStatusEnvelope::parse)
+    {
+        if let Some(exact) = envelope.runtime_status {
+            return Some(exact);
         }
-        "TIMED_OUT" => Some(omen_core::RuntimeStatus::TimedOut),
-        "CANCELLED" => Some(omen_core::RuntimeStatus::Cancelled),
-        "OUTCOME_UNKNOWN" => Some(omen_core::RuntimeStatus::OutcomeUnknown),
-        _ => None,
+        // Legacy envelope: coarse label only. 1:1 labels replay exactly.
+        // FAILED is ambiguous (Completed-with-nonzero-exit vs IoFailed vs
+        // spawn/containment failures) — only an actual child exit code
+        // proves a Completed origin, because that is the sole
+        // FAILED-with-exit producer. Anything else refuses.
+        return match envelope.status.as_str() {
+            "COMPLETED" => Some(Exact::Completed),
+            "TIMED_OUT" => Some(Exact::TimedOut),
+            "CANCELLED" => Some(Exact::Cancelled),
+            "OUTCOME_UNKNOWN" => Some(Exact::OutcomeUnknown),
+            "FAILED" if rec.exit_code.is_some() => Some(Exact::Completed),
+            _ => None,
+        };
+    }
+    // Envelope-less rows predate envelope stamping: keep the narrow
+    // pre-existing fallback (a Cancelled receipt without an envelope
+    // replays Cancelled; exit present → Completed, absent → TimedOut).
+    if receipt_status == "Cancelled" {
+        Some(Exact::Cancelled)
+    } else {
+        match rec.exit_code {
+            Some(_) => Some(Exact::Completed),
+            None => Some(Exact::TimedOut),
+        }
     }
 }
 
@@ -58,12 +91,8 @@ fn recorded_history_runtime(rec: &ExecutionRecord) -> Option<omen_core::RuntimeS
 fn recorded_dispatch_prevented(rec: &ExecutionRecord) -> bool {
     rec.envelope_json
         .as_deref()
-        .and_then(|envelope| serde_json::from_str::<serde_json::Value>(envelope).ok())
-        .and_then(|value| {
-            value
-                .get("dispatch_prevented")
-                .and_then(|flag| flag.as_bool())
-        })
+        .and_then(HistoryStatusEnvelope::parse)
+        .map(|envelope| envelope.dispatch_prevented)
         .unwrap_or(false)
 }
 
@@ -162,6 +191,18 @@ pub struct WorkspaceState {
 
 impl WorkspaceState {
     pub fn new(canonical_path: PathBuf, epoch: u64) -> Result<Self, LocalIpcError> {
+        Self::new_with_supervisor(canonical_path, epoch, Arc::new(ProcessSupervisor::new()))
+    }
+
+    /// Repair A test seam: construct with an injected execution supervisor
+    /// (e.g. a deterministic stub backend returning `IoFailed` through the
+    /// real supervisor/broker path). Production always uses `new()`.
+    #[doc(hidden)]
+    pub fn new_with_supervisor(
+        canonical_path: PathBuf,
+        epoch: u64,
+        supervisor: Arc<ProcessSupervisor>,
+    ) -> Result<Self, LocalIpcError> {
         let workspace_id = deterministic_workspace_id(&canonical_path);
         let state_dir = resolve_workspace_dir(&canonical_path);
         let db_path = canonical_workspace_db_path(&canonical_path);
@@ -276,7 +317,6 @@ impl WorkspaceState {
 
         let (event_tx, _) = broadcast::channel(512);
         let cas = Arc::new(ContentAddressedStore::new(state_dir.join("cas")));
-        let supervisor = Arc::new(ProcessSupervisor::new());
         let execution_cache = RwLock::new(HashMap::new());
         let in_flight_executions = Arc::new(Mutex::new(HashMap::new()));
         let managed_processes = Arc::new(Mutex::new(HashMap::new()));
@@ -1222,13 +1262,12 @@ impl WorkspaceState {
         // E2 history truth: the broker always stamps the coarse history
         // status explicitly via the single RuntimeStatus::history_label
         // authority, so every recording surface projects identical truth.
-        // Repair 2: the typed dispatch-prevention flag travels in the
-        // envelope so replay reproduces it without inference.
+        // Repair A: the stamp is a TYPED envelope carrying the exact
+        // physical runtime verbatim alongside the coarse label — coarse
+        // history status != exact RuntimeStatus, and replay uses the exact
+        // field, never the label.
         let envelope_json = runtime.map(|status| {
-            let history_status = status.history_label(exit_code);
-            format!(
-                r#"{{"status":"{history_status}","source":"broker","dispatch_prevented":{dispatch_prevented}}}"#
-            )
+            HistoryStatusEnvelope::broker(status, exit_code, dispatch_prevented).to_json()
         });
 
         let record = ExecutionRecord {
@@ -1378,21 +1417,13 @@ impl WorkspaceState {
                 None => return Err(refused("has no readable history".to_string())),
             }
         };
-        // E2 replay truth: reproduce the recorded terminal outcome, not a
-        // hardcoded status. The broker stamps every record with an explicit
-        // history status envelope; legacy rows without one keep the previous
-        // fallback (exit present → Completed, absent → TimedOut, the only
-        // exit-None case the Completed receipt ever covered; a Cancelled
-        // receipt without an envelope replays Cancelled).
-        let runtime_status =
-            recorded_history_runtime(&rec).unwrap_or(if receipt_status == "Cancelled" {
-                omen_core::RuntimeStatus::Cancelled
-            } else {
-                match rec.exit_code {
-                    Some(_) => omen_core::RuntimeStatus::Completed,
-                    None => omen_core::RuntimeStatus::TimedOut,
-                }
-            });
+        // E2 replay truth: reproduce the recorded EXACT runtime, never a
+        // reconstruction from the coarse label. Legacy rows without exact
+        // information use the narrow safe fallback; ambiguous legacy rows
+        // refuse replay (the identity stays consumed — refusal never
+        // re-arms physical execution).
+        let runtime_status = replay_runtime_status(&rec, receipt_status)
+            .ok_or_else(|| refused("has no exact runtime truth to replay".to_string()))?;
         let dispatch_prevented = recorded_dispatch_prevented(&rec);
         let summary = ExecutionResultSummary {
             execution_id: exec_id,
@@ -1755,15 +1786,19 @@ impl WorkspaceState {
                 }
                 Err(e) => {
                     // Spawn/validation failure inside the task: record the
-                    // terminal Failed receipt. If even that write fails,
-                    // nothing was dispatched, so fail closed with the
-                    // persistence fault made explicit alongside the cause.
+                    // terminal Failed receipt. Repair A.1: the execution ID
+                    // was already durably minted on the Running receipt and
+                    // receipt persistence is an UPSERT — writing None here
+                    // would erase established identity. Preserve it.
+                    // If even that write fails, nothing was dispatched, so
+                    // fail closed with the persistence fault made explicit
+                    // alongside the cause.
                     let physical_outcome = format!("spawn failed: {e}");
                     if let Err(receipt_error) = this
                         .record_request_receipt_staged(
                             ReceiptStage::Terminal,
                             &dedup_id_str,
-                            None,
+                            Some(&exec_id_str),
                             "Failed",
                         )
                         .await

@@ -10,8 +10,9 @@ pub use cas::{ArtifactMetadata, ContentAddressedStore, GcReport, resolve_artifac
 pub use db::Database;
 pub use history::{
     DEFAULT_HISTORY_LIMIT, ExecutionHistory, ExecutionRecord, HistoryEntry, HistoryQuery,
-    HistoryResult, HistoryStatus, InteractiveSessionRecord, MAX_HISTORY_LIMIT,
-    history_view_with_unjournaled_marker, query_history, read_unjournaled_marker,
+    HistoryResult, HistoryStatus, HistoryStatusEnvelope, InteractiveSessionRecord,
+    MAX_HISTORY_LIMIT, history_view_with_unjournaled_marker, query_history,
+    read_unjournaled_marker,
 };
 pub use registry::{
     DependencyRecord, FactProvenance, FactRecord, FactRegistry, PublishFactRequest,

@@ -1,9 +1,13 @@
 //! OMEN 0.9-E2 repair proofs: terminal dedup, pre-dispatch cancel truth,
-//! and persistence fail-closed behaviour.
+//! persistence fail-closed behaviour, exact runtime replay, and Failed
+//! receipt identity preservation.
 //!
 //! Governing invariant: a consequential request ID may create physical work
 //! only when no durable receipt for that ID exists. Once a receipt exists,
 //! the identity is consumed — no state silently falls through to dispatch.
+//! And: the same execution must not change its story merely because the
+//! daemon restarted (exact `RuntimeStatus` survives durable replay; the
+//! coarse history label is presentation only).
 //! All durable assertions go through the read-only history path or the
 //! durable receipt table, never through in-memory caches.
 //
@@ -14,19 +18,28 @@
 #![allow(clippy::await_holding_lock)]
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use omen_core::{ExecutionId, InteractiveSessionId};
 use omen_daemon::workspace::{
     BrokerExecutionParams, PersistenceFailpoint, PrespawnGate, WorkspaceState,
 };
+use omen_engine::backend::ExecutionWaitFuture;
+use omen_engine::{
+    BackendAvailability, BackendCapabilities, BackendDescriptor, BackendKind, ExecutionBackend,
+    ExecutionHandle, ProcessSupervisor, PtyExecutionHandle, PtyExecutionRequest,
+};
 use omen_ipc::{CancelOutcome, LocalIpcError};
 use omen_knowledge::db::Database;
-use omen_knowledge::history::{HistoryQuery, HistoryStatus, query_history};
+use omen_knowledge::history::{HistoryQuery, HistoryStatus, HistoryStatusEnvelope, query_history};
 use omen_knowledge::workspace::{
     canonical_workspace_db_path, canonical_workspace_db_path_readonly,
 };
-use omen_knowledge::{RequestReceiptRecord, WorkspacePersistence};
+use omen_knowledge::{
+    ExecutionHistory, ExecutionRecord, RequestReceiptRecord, WorkspacePersistence,
+};
 use omen_test_fixtures::{INTEGRATION_TIMEOUT, run_with_test_timeout, wait_for_condition};
 use tempfile::tempdir;
 
@@ -787,6 +800,693 @@ async fn terminal_receipt_persistence_failure_blocks_replay() {
                 "retry must spawn nothing; the one history row is the original"
             );
             ws.set_persistence_failpoint(PersistenceFailpoint::Off);
+        },
+    )
+    .await;
+    unlock_env(guard);
+}
+
+/// Repair A stub backend: returns a FIXED terminal outcome through the real
+/// supervisor/broker path (no OS wait failure required). Counts spawns so
+/// replay tests prove exactly-once physical dispatch.
+struct FixedOutcomeHandle {
+    status: omen_core::RuntimeStatus,
+    code: Option<i32>,
+}
+
+impl ExecutionHandle for FixedOutcomeHandle {
+    fn pid(&self) -> Option<u32> {
+        None
+    }
+    fn terminate_tree(&mut self) -> Result<(), omen_core::CoreError> {
+        Ok(())
+    }
+    fn wait_bounded(self: Box<Self>, _timeout: Duration) -> ExecutionWaitFuture {
+        let (status, code) = (self.status, self.code);
+        Box::pin(async move {
+            Ok((
+                status,
+                omen_core::ProcessExit {
+                    code,
+                    signal: Some("injected-test-outcome".into()),
+                },
+                Vec::new(),
+                Vec::new(),
+            ))
+        })
+    }
+    fn wait_cancelable(
+        self: Box<Self>,
+        _timeout: Duration,
+        _cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> ExecutionWaitFuture {
+        self.wait_bounded(_timeout)
+    }
+}
+
+struct FixedOutcomeBackend {
+    status: omen_core::RuntimeStatus,
+    code: Option<i32>,
+    spawns: Arc<AtomicUsize>,
+}
+
+impl ExecutionBackend for FixedOutcomeBackend {
+    fn id(&self) -> omen_core::BackendId {
+        omen_core::BackendId::native()
+    }
+    fn descriptor(&self) -> BackendDescriptor {
+        BackendDescriptor {
+            id: self.id(),
+            name: "FixedOutcome".into(),
+            kind: BackendKind::NativeHost,
+            availability: BackendAvailability::Available,
+            capabilities: BackendCapabilities {
+                filesystem: omen_core::EnforcementLevel::Observed,
+                network: omen_core::EnforcementLevel::Observed,
+                descendants: omen_core::EnforcementLevel::Observed,
+                symlink_escape: omen_core::EnforcementLevel::Observed,
+                pty: false,
+            },
+        }
+    }
+    fn spawn(
+        &self,
+        _req: &omen_engine::supervisor::ExecutionRequest,
+    ) -> Result<Box<dyn ExecutionHandle>, omen_core::CoreError> {
+        self.spawns.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(FixedOutcomeHandle {
+            status: self.status,
+            code: self.code,
+        }))
+    }
+    fn spawn_pty(
+        &self,
+        _req: &PtyExecutionRequest,
+    ) -> Result<Box<dyn PtyExecutionHandle>, omen_core::CoreError> {
+        Err(omen_core::CoreError::ExecutionFailed(
+            "FixedOutcome has no PTY".into(),
+        ))
+    }
+}
+
+fn stub_workspace(
+    ws_path: &std::path::Path,
+    epoch: u64,
+    status: omen_core::RuntimeStatus,
+    code: Option<i32>,
+    spawns: &Arc<AtomicUsize>,
+) -> Arc<WorkspaceState> {
+    Arc::new(
+        WorkspaceState::new_with_supervisor(
+            ws_path.to_path_buf(),
+            epoch,
+            Arc::new(ProcessSupervisor::with_backend(Arc::new(
+                FixedOutcomeBackend {
+                    status,
+                    code,
+                    spawns: Arc::clone(spawns),
+                },
+            ))),
+        )
+        .unwrap(),
+    )
+}
+
+/// Read the raw durable envelope for one execution ID.
+fn raw_envelope_for(workspace_root: &std::path::Path, execution_id: &str) -> Option<String> {
+    let db_path = canonical_workspace_db_path(workspace_root);
+    let db = Database::open(&db_path).expect("daemon database must exist");
+    db.conn()
+        .query_row(
+            "SELECT envelope_json FROM execution_history WHERE execution_id = ?1",
+            rusqlite::params![execution_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+}
+
+/// REPAIR A — the same physical execution must not change its story across
+/// a restart: exact `RuntimeStatus` survives durable replay for every
+/// broker terminal outcome, while the coarse history label stays
+/// presentation-appropriate.
+#[tokio::test(flavor = "multi_thread")]
+async fn exact_runtime_survives_restart_replay() {
+    let (guard, _state) = lock_env();
+    run_with_test_timeout(
+        "exact_runtime_survives_restart_replay",
+        INTEGRATION_TIMEOUT,
+        |ctx| async move {
+            ctx.phase("SETUP_WORKSPACE");
+            let tmp = tempdir().unwrap();
+            let ws_path = tmp.path().to_path_buf();
+            let gremlin = gremlin_exe().to_string_lossy().into_owned();
+            let mut epoch = 1u64;
+
+            // Each case: submit -> terminal truth -> restart (fresh
+            // WorkspaceState, real restart path) -> resubmit same
+            // consequential ID -> replay must reproduce the EXACT runtime
+            // with the SAME execution ID and no new dispatch.
+
+            ctx.phase("CASE_COMPLETED_EXIT_0");
+            {
+                let ws = Arc::new(WorkspaceState::new(ws_path.clone(), epoch).unwrap());
+                let original = submit_consequential(
+                    &ws,
+                    "req-replay-completed-0",
+                    "exec".to_string(),
+                    vec![gremlin.clone(), "--stdout".to_string(), "ok".to_string()],
+                    10000,
+                )
+                .await
+                .unwrap();
+                assert_eq!(original.runtime_status, omen_core::RuntimeStatus::Completed);
+                assert_eq!(original.exit_code, Some(0));
+                epoch += 1;
+                let ws2 = Arc::new(WorkspaceState::new(ws_path.clone(), epoch).unwrap());
+                let replay = submit_consequential(
+                    &ws2,
+                    "req-replay-completed-0",
+                    "exec".to_string(),
+                    vec![gremlin.clone(), "--stdout".to_string(), "ok".to_string()],
+                    10000,
+                )
+                .await
+                .unwrap();
+                assert_eq!(replay.runtime_status, omen_core::RuntimeStatus::Completed);
+                assert_eq!(replay.execution_id, original.execution_id);
+                assert_eq!(
+                    history_statuses_for(&ws_path, &original.execution_id),
+                    vec![HistoryStatus::Completed],
+                    "coarse label stays COMPLETED"
+                );
+            }
+
+            ctx.phase("CASE_COMPLETED_NONZERO_EXIT");
+            {
+                let ws = Arc::new(WorkspaceState::new(ws_path.clone(), epoch).unwrap());
+                let original = submit_consequential(
+                    &ws,
+                    "req-replay-completed-3",
+                    "exec".to_string(),
+                    vec![gremlin.clone(), "--exit".to_string(), "3".to_string()],
+                    10000,
+                )
+                .await
+                .unwrap();
+                assert_eq!(original.runtime_status, omen_core::RuntimeStatus::Completed);
+                assert_eq!(original.exit_code, Some(3));
+                epoch += 1;
+                let ws2 = Arc::new(WorkspaceState::new(ws_path.clone(), epoch).unwrap());
+                let replay = submit_consequential(
+                    &ws2,
+                    "req-replay-completed-3",
+                    "exec".to_string(),
+                    vec![gremlin.clone(), "--exit".to_string(), "3".to_string()],
+                    10000,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    replay.runtime_status,
+                    omen_core::RuntimeStatus::Completed,
+                    "non-zero exit replays Completed (exit carries the failure), not a guess"
+                );
+                assert_eq!(replay.execution_id, original.execution_id);
+                assert_eq!(
+                    history_statuses_for(&ws_path, &original.execution_id),
+                    vec![HistoryStatus::Failed],
+                    "coarse label stays FAILED while exact runtime stays Completed"
+                );
+            }
+
+            ctx.phase("CASE_TIMED_OUT");
+            {
+                let ws = Arc::new(WorkspaceState::new(ws_path.clone(), epoch).unwrap());
+                let original = submit_consequential(
+                    &ws,
+                    "req-replay-timedout",
+                    "exec".to_string(),
+                    vec![
+                        gremlin.clone(),
+                        "--sleep-ms".to_string(),
+                        "30000".to_string(),
+                    ],
+                    1200,
+                )
+                .await
+                .unwrap();
+                assert_eq!(original.runtime_status, omen_core::RuntimeStatus::TimedOut);
+                epoch += 1;
+                let ws2 = Arc::new(WorkspaceState::new(ws_path.clone(), epoch).unwrap());
+                let replay = submit_consequential(
+                    &ws2,
+                    "req-replay-timedout",
+                    "exec".to_string(),
+                    vec![
+                        gremlin.clone(),
+                        "--sleep-ms".to_string(),
+                        "30000".to_string(),
+                    ],
+                    1200,
+                )
+                .await
+                .unwrap();
+                assert_eq!(replay.runtime_status, omen_core::RuntimeStatus::TimedOut);
+                assert_eq!(replay.execution_id, original.execution_id);
+                assert_eq!(
+                    history_statuses_for(&ws_path, &original.execution_id),
+                    vec![HistoryStatus::TimedOut]
+                );
+            }
+
+            ctx.phase("CASE_CANCELLED");
+            {
+                let ws = Arc::new(WorkspaceState::new(ws_path.clone(), epoch).unwrap());
+                let ws_submit = Arc::clone(&ws);
+                let gremlin_task = gremlin.clone();
+                let submitter = tokio::spawn(async move {
+                    submit_consequential(
+                        &ws_submit,
+                        "req-replay-cancelled",
+                        "exec".to_string(),
+                        vec![gremlin_task, "--sleep-ms".to_string(), "30000".to_string()],
+                        60000,
+                    )
+                    .await
+                });
+                wait_for_condition(
+                    Duration::from_secs(20),
+                    Duration::from_millis(20),
+                    "Running receipt for req-replay-cancelled",
+                    || {
+                        let ws = Arc::clone(&ws);
+                        async move {
+                            matches!(
+                                receipt_status_of(&ws, "req-replay-cancelled").await,
+                                Some((status, _)) if status == "Running"
+                            )
+                        }
+                    },
+                )
+                .await
+                .expect("Running receipt must appear");
+                let exec_id = receipt_status_of(&ws, "req-replay-cancelled")
+                    .await
+                    .expect("receipt must exist")
+                    .1
+                    .expect("Running receipt carries the execution id");
+                let record = ws.cancel_execution(&exec_id).await;
+                assert_eq!(record.outcome, CancelOutcome::TerminationConfirmed);
+                let original = submitter.await.unwrap().unwrap();
+                assert_eq!(original.runtime_status, omen_core::RuntimeStatus::Cancelled);
+                epoch += 1;
+                let ws2 = Arc::new(WorkspaceState::new(ws_path.clone(), epoch).unwrap());
+                let replay = submit_consequential(
+                    &ws2,
+                    "req-replay-cancelled",
+                    "exec".to_string(),
+                    vec![
+                        gremlin.clone(),
+                        "--sleep-ms".to_string(),
+                        "30000".to_string(),
+                    ],
+                    60000,
+                )
+                .await
+                .unwrap();
+                assert_eq!(replay.runtime_status, omen_core::RuntimeStatus::Cancelled);
+                assert_eq!(replay.execution_id, exec_id);
+                assert_eq!(
+                    history_statuses_for(&ws_path, &exec_id),
+                    vec![HistoryStatus::Cancelled]
+                );
+            }
+
+            ctx.phase("CASE_IO_FAILED_DETERMINISTIC_STUB");
+            {
+                let spawns = Arc::new(AtomicUsize::new(0));
+                let exec_id = {
+                    let ws = stub_workspace(
+                        &ws_path,
+                        epoch,
+                        omen_core::RuntimeStatus::IoFailed,
+                        None,
+                        &spawns,
+                    );
+                    let original = submit_consequential(
+                        &ws,
+                        "req-replay-iofailed",
+                        "exec".to_string(),
+                        vec!["stubbed".to_string()],
+                        10000,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        original.runtime_status,
+                        omen_core::RuntimeStatus::IoFailed,
+                        "stub must deliver IoFailed through the real broker path"
+                    );
+                    assert_eq!(spawns.load(Ordering::SeqCst), 1);
+                    original.execution_id.clone()
+                };
+                // Coarse label is FAILED while exact truth is IoFailed.
+                assert_eq!(
+                    history_statuses_for(&ws_path, &exec_id),
+                    vec![HistoryStatus::Failed]
+                );
+                epoch += 1;
+                // Real restart path (native supervisor): replay must read
+                // the DB only — never spawn.
+                let ws2 = Arc::new(WorkspaceState::new(ws_path.clone(), epoch).unwrap());
+                let replay = submit_consequential(
+                    &ws2,
+                    "req-replay-iofailed",
+                    "exec".to_string(),
+                    vec!["stubbed".to_string()],
+                    10000,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    replay.runtime_status,
+                    omen_core::RuntimeStatus::IoFailed,
+                    "IoFailed must NEVER become Completed across restart"
+                );
+                assert_eq!(replay.execution_id, exec_id);
+                assert_eq!(
+                    history_statuses_for(&ws_path, &exec_id),
+                    vec![HistoryStatus::Failed],
+                    "exactly one history identity; coarse label unchanged"
+                );
+                assert_eq!(
+                    spawns.load(Ordering::SeqCst),
+                    1,
+                    "replay must not physically dispatch again"
+                );
+            }
+
+            ctx.phase("CASE_OUTCOME_UNKNOWN_PRESERVED_NOT_REWRITTEN");
+            {
+                let spawns = Arc::new(AtomicUsize::new(0));
+                let exec_id = {
+                    let ws = stub_workspace(
+                        &ws_path,
+                        epoch,
+                        omen_core::RuntimeStatus::OutcomeUnknown,
+                        None,
+                        &spawns,
+                    );
+                    let original = submit_consequential(
+                        &ws,
+                        "req-replay-unknown",
+                        "exec".to_string(),
+                        vec!["stubbed".to_string()],
+                        10000,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        original.runtime_status,
+                        omen_core::RuntimeStatus::OutcomeUnknown
+                    );
+                    original.execution_id.clone()
+                };
+                epoch += 1;
+                let ws2 = Arc::new(WorkspaceState::new(ws_path.clone(), epoch).unwrap());
+                // The Unknown receipt fails closed (identity consumed, no
+                // replay, no re-execution) — and the durable story stays
+                // Unknown rather than being rewritten.
+                let retry = submit_consequential(
+                    &ws2,
+                    "req-replay-unknown",
+                    "exec".to_string(),
+                    vec!["stubbed".to_string()],
+                    10000,
+                )
+                .await;
+                assert!(
+                    matches!(retry, Err(LocalIpcError::ExecutionStatusUnknown(_))),
+                    "Unknown identity must fail closed, got {retry:?}"
+                );
+                let envelope =
+                    raw_envelope_for(&ws_path, &exec_id).expect("history row must exist");
+                let parsed = HistoryStatusEnvelope::parse(&envelope).expect("envelope must parse");
+                assert_eq!(
+                    parsed.runtime_status,
+                    Some(omen_core::RuntimeStatus::OutcomeUnknown)
+                );
+                assert_eq!(parsed.status, "OUTCOME_UNKNOWN");
+                assert_eq!(
+                    history_statuses_for(&ws_path, &exec_id),
+                    vec![HistoryStatus::Unknown]
+                );
+                assert_eq!(spawns.load(Ordering::SeqCst), 1);
+            }
+        },
+    )
+    .await;
+    unlock_env(guard);
+}
+
+/// Seed a crafted history row + Completed receipt (legacy shapes).
+fn seed_legacy_case(
+    workspace_root: &std::path::Path,
+    dedup_id: &str,
+    exec_id: &str,
+    exit_code: Option<i32>,
+    envelope: Option<String>,
+) {
+    let db_path = canonical_workspace_db_path(workspace_root);
+    let mut db = Database::open(&db_path).expect("daemon database must exist");
+    let record = ExecutionRecord {
+        execution_id: ExecutionId::new(exec_id).expect("seeded id must be valid"),
+        session_id: InteractiveSessionId::new("sess_legacy_repair").expect("session must be valid"),
+        command: "legacy-cmd".to_string(),
+        exit_code,
+        duration_ms: Some(5),
+        stdout_artifact: None,
+        stderr_artifact: None,
+        envelope_json: envelope,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    ExecutionHistory::record_execution(&mut db, &record, &[], &[], &[])
+        .expect("legacy history seeding must succeed");
+    WorkspacePersistence::record_request_receipt(
+        &db,
+        &RequestReceiptRecord {
+            consequential_request_id: dedup_id.to_string(),
+            execution_id: Some(exec_id.to_string()),
+            status: "Completed".to_string(),
+            recorded_at: chrono::Utc::now().to_rfc3339(),
+        },
+    )
+    .expect("legacy receipt seeding must succeed");
+}
+
+/// REPAIR A legacy policy: exact labels replay, ambiguous FAILED-without-exit
+/// refuses (never invents Completed), FAILED-with-exit replays Completed
+/// (the only FAILED-with-exit producer), envelope-less rows keep the narrow
+/// pre-existing fallback.
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_envelope_replay_policy() {
+    let (guard, _state) = lock_env();
+    run_with_test_timeout(
+        "legacy_envelope_replay_policy",
+        INTEGRATION_TIMEOUT,
+        |ctx| async move {
+            ctx.phase("SETUP_WORKSPACE_AND_SEED_LEGACY_ROWS");
+            let tmp = tempdir().unwrap();
+            let ws_path = tmp.path().to_path_buf();
+            // Seed BEFORE construction: rows predate the exact field.
+            let exec_a = ExecutionId::generate().to_string();
+            let exec_b = ExecutionId::generate().to_string();
+            let exec_c = ExecutionId::generate().to_string();
+            let exec_d = ExecutionId::generate().to_string();
+            seed_legacy_case(
+                &ws_path,
+                "req-legacy-a",
+                &exec_a,
+                Some(0),
+                Some(r#"{"status":"COMPLETED","source":"broker"}"#.to_string()),
+            );
+            seed_legacy_case(
+                &ws_path,
+                "req-legacy-b",
+                &exec_b,
+                None,
+                Some(r#"{"status":"FAILED","source":"broker"}"#.to_string()),
+            );
+            seed_legacy_case(
+                &ws_path,
+                "req-legacy-c",
+                &exec_c,
+                Some(3),
+                Some(r#"{"status":"FAILED","source":"broker"}"#.to_string()),
+            );
+            seed_legacy_case(&ws_path, "req-legacy-d", &exec_d, Some(0), None);
+            let ws = Arc::new(WorkspaceState::new(ws_path.clone(), 1).unwrap());
+
+            ctx.phase("LEGACY_COMPLETED_REPLAYS");
+            let replay_a = submit_consequential(
+                &ws,
+                "req-legacy-a",
+                "exec".to_string(),
+                vec!["unused".to_string()],
+                10000,
+            )
+            .await
+            .expect("legacy COMPLETED must replay");
+            assert_eq!(replay_a.runtime_status, omen_core::RuntimeStatus::Completed);
+            assert_eq!(replay_a.execution_id, exec_a);
+
+            ctx.phase("AMBIGUOUS_FAILED_REFUSES");
+            let replay_b = submit_consequential(
+                &ws,
+                "req-legacy-b",
+                "exec".to_string(),
+                vec!["unused".to_string()],
+                10000,
+            )
+            .await;
+            match &replay_b {
+                Err(LocalIpcError::InternalRuntimeError(message)) => {
+                    assert!(
+                        message.contains("no exact runtime truth"),
+                        "refusal must name the missing precision, got: {message}"
+                    );
+                }
+                other => panic!("ambiguous legacy FAILED must refuse replay, got {other:?}"),
+            }
+            assert_eq!(
+                receipt_status_of(&ws, "req-legacy-b").await,
+                Some(("Completed".to_string(), Some(exec_b.clone()))),
+                "refused identity stays consumed with its original truth"
+            );
+            assert_eq!(
+                history_statuses_for(&ws_path, &exec_b).len(),
+                1,
+                "refusal must spawn nothing"
+            );
+
+            ctx.phase("FAILED_WITH_EXIT_REPLAYS_COMPLETED");
+            let replay_c = submit_consequential(
+                &ws,
+                "req-legacy-c",
+                "exec".to_string(),
+                vec!["unused".to_string()],
+                10000,
+            )
+            .await
+            .expect("FAILED-with-exit must replay Completed");
+            assert_eq!(replay_c.runtime_status, omen_core::RuntimeStatus::Completed);
+            assert_eq!(replay_c.execution_id, exec_c);
+
+            ctx.phase("ENVELOPELESS_KEEPS_NARROW_FALLBACK");
+            let replay_d = submit_consequential(
+                &ws,
+                "req-legacy-d",
+                "exec".to_string(),
+                vec!["unused".to_string()],
+                10000,
+            )
+            .await
+            .expect("envelope-less Completed with exit must replay");
+            assert_eq!(replay_d.runtime_status, omen_core::RuntimeStatus::Completed);
+            assert_eq!(replay_d.execution_id, exec_d);
+        },
+    )
+    .await;
+    unlock_env(guard);
+}
+
+/// REPAIR A.1 — the terminal Failed transition must preserve the already
+/// minted execution ID (receipts UPSERT): Running(exec_A) -> Failed(exec_A),
+/// never Failed(None). Retry is refused with no second identity.
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_receipt_preserves_execution_identity() {
+    let (guard, _state) = lock_env();
+    run_with_test_timeout(
+        "failed_receipt_preserves_execution_identity",
+        INTEGRATION_TIMEOUT,
+        |ctx| async move {
+            ctx.phase("SETUP_WORKSPACE_AND_GATE");
+            let tmp = tempdir().unwrap();
+            let ws_path = tmp.path().to_path_buf();
+            let ws = Arc::new(WorkspaceState::new(ws_path.clone(), 1).unwrap());
+            let gate = PrespawnGate::default();
+            ws.set_prespawn_gate(Some(gate.clone()));
+
+            ctx.phase("SUBMIT_FAILING_DISPATCH_PARKED");
+            let ws_submit = Arc::clone(&ws);
+            let submitter = tokio::spawn(async move {
+                submit_consequential(
+                    &ws_submit,
+                    "req-repair-failedid-01",
+                    "omen-e2-no-such-binary-xyz".to_string(),
+                    vec![],
+                    10000,
+                )
+                .await
+            });
+            tokio::time::timeout(Duration::from_secs(20), gate.task_parked.notified())
+                .await
+                .expect("phase=park: broker task must park pre-dispatch");
+            let running_exec = receipt_status_of(&ws, "req-repair-failedid-01")
+                .await
+                .expect("Running receipt must exist");
+            assert_eq!(
+                running_exec.0, "Running",
+                "task must still be pre-dispatch, got {:?}",
+                running_exec
+            );
+            let exec_a = running_exec
+                .1
+                .expect("Running receipt carries the minted id");
+
+            ctx.phase("RELEASE_INTO_SPAWN_FAILURE");
+            gate.release.notify_one();
+            let first = tokio::time::timeout(Duration::from_secs(25), submitter)
+                .await
+                .expect("phase=submit: submit must resolve bounded")
+                .unwrap();
+            assert!(
+                first.is_err(),
+                "spawn of a nonexistent binary must fail, got {first:?}"
+            );
+
+            ctx.phase("VERIFY_IDENTITY_PRESERVED");
+            assert_eq!(
+                receipt_status_of(&ws, "req-repair-failedid-01").await,
+                Some(("Failed".to_string(), Some(exec_a.clone()))),
+                "Failed receipt must preserve the minted execution ID, not erase it"
+            );
+
+            ctx.phase("VERIFY_RETRY_REFUSED_WITHOUT_SECOND_IDENTITY");
+            let retry = submit_consequential(
+                &ws,
+                "req-repair-failedid-01",
+                "omen-e2-no-such-binary-xyz".to_string(),
+                vec![],
+                10000,
+            )
+            .await;
+            assert!(
+                matches!(retry, Err(LocalIpcError::RequestDuplicate(_))),
+                "Failed identity must refuse re-execution, got {retry:?}"
+            );
+            assert_eq!(
+                receipt_status_of(&ws, "req-repair-failedid-01").await,
+                Some(("Failed".to_string(), Some(exec_a))),
+                "terminal truth and identity unchanged after retry"
+            );
+            assert_eq!(
+                total_history_rows(&ws_path),
+                0,
+                "failed dispatch records no history and spawns nothing on retry"
+            );
+            ws.set_prespawn_gate(None);
         },
     )
     .await;
