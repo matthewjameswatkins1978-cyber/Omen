@@ -1162,7 +1162,32 @@ fn rollback(_root: &Path) -> Result<(), String> {
             "rollback executable digest differs from manifest",
         ));
     }
+
+    // A running daemon may keep the canonical daemon binary live/locked and,
+    // more importantly, would preserve the wrong runtime across a rollback.
+    // Stop the currently installed daemon best-effort before swapping bytes.
+    if active_binary().exists() {
+        let _ = Command::new(active_binary())
+            .args(["daemon", "stop"])
+            .output();
+    }
+
     fs::copy(&candidate, active_binary()).map_err(|e| fail("OMEN_INSTALL_BUSY", e))?;
+    let daemon_stable = active_daemon_binary();
+    if let Some(expected_daemon_hash) = manifest.daemon_binary_sha256.as_deref() {
+        let daemon_candidate = dir.join(if cfg!(windows) { "omend.exe" } else { "omend" });
+        if !daemon_candidate.exists() || digest_file(&daemon_candidate)? != expected_daemon_hash {
+            return Err(fail(
+                "OMEN_INSTALL_IDENTITY_MISMATCH",
+                "rollback daemon executable differs from manifest",
+            ));
+        }
+        fs::copy(daemon_candidate, &daemon_stable)
+            .map_err(|e| fail("OMEN_INSTALL_BUSY", e))?;
+    } else if daemon_stable.exists() {
+        fs::remove_file(&daemon_stable).map_err(|e| fail("OMEN_INSTALL_BUSY", e))?;
+    }
+
     s.active_slot = Some(prev);
     s.previous_slot = None;
     s.active = Some(manifest);
@@ -1213,13 +1238,14 @@ fn promote(root: &Path, expected: &str) -> Result<(), String> {
     command_output(root, "gh", &["--version"])?;
     command_output(root, "gh", &["auth", "status"])?;
     let notes = format!(
-        "Preview: {}\nSource SHA: {}\nCI run: {:?}\nArtifact: {:?}\nPackage SHA256: {}\nBinary SHA256: {}",
+        "Preview: {}\nSource SHA: {}\nCI run: {:?}\nArtifact: {:?}\nPackage SHA256: {}\nBinary SHA256: {}\nDaemon Binary SHA256: {:?}",
         manifest.preview_version,
         manifest.git_sha,
         manifest.ci_run_id,
         manifest.artifact_id,
         manifest.package_sha256,
-        manifest.binary_sha256
+        manifest.binary_sha256,
+        manifest.daemon_binary_sha256
     );
     command_output(
         root,
