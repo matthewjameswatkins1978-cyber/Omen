@@ -268,6 +268,11 @@ fn active_binary() -> PathBuf {
         .join("bin")
         .join(if cfg!(windows) { "omen.exe" } else { "omen" })
 }
+fn active_daemon_binary() -> PathBuf {
+    install_root()
+        .join("bin")
+        .join(if cfg!(windows) { "omend.exe" } else { "omend" })
+}
 fn proof_path() -> PathBuf {
     install_root().join("evidence").join("last-proof.json")
 }
@@ -757,6 +762,68 @@ fn prove(_root: &Path, mcp_protocol: &str) -> Result<(), String> {
             "OMEN_INSTALL_IDENTITY_MISMATCH",
             "active executable digest differs from manifest",
         ));
+    }
+    if let Some(expected_daemon_hash) = m.daemon_binary_sha256.as_deref() {
+        let daemon_binary = active_daemon_binary();
+        if !daemon_binary.exists() {
+            return Err(fail(
+                "OMEN_INSTALL_IDENTITY_MISMATCH",
+                "manifest requires omend but canonical daemon binary is missing",
+            ));
+        }
+        if digest_file(&daemon_binary)? != expected_daemon_hash {
+            return Err(fail(
+                "OMEN_INSTALL_IDENTITY_MISMATCH",
+                "active daemon executable digest differs from manifest",
+            ));
+        }
+
+        let status = run_capture(&binary, &["daemon", "status", "--machine"], None)?;
+        if !status.status.success() {
+            return Err(fail("OMEN_DAEMON_PROOF_FAILED", "daemon status failed"));
+        }
+        let status_json: serde_json::Value = serde_json::from_slice(&status.stdout)
+            .map_err(|e| fail("OMEN_DAEMON_PROOF_FAILED", e))?;
+        let was_running = status_json.get("status").and_then(|v| v.as_str()) == Some("running");
+
+        let start = if was_running {
+            None
+        } else {
+            Some(run_capture(
+                &binary,
+                &["daemon", "start", "--machine"],
+                None,
+            )?)
+        };
+        let ping = run_capture(&binary, &["daemon", "ping", "--machine"], None)?;
+        let stop = if was_running {
+            None
+        } else {
+            Some(run_capture(
+                &binary,
+                &["daemon", "stop", "--machine"],
+                None,
+            )?)
+        };
+
+        if start.as_ref().is_some_and(|out| !out.status.success()) {
+            return Err(fail(
+                "OMEN_DAEMON_PROOF_FAILED",
+                "installed daemon failed to start",
+            ));
+        }
+        if !ping.status.success() {
+            return Err(fail(
+                "OMEN_DAEMON_PROOF_FAILED",
+                "installed daemon failed to answer ping",
+            ));
+        }
+        if stop.as_ref().is_some_and(|out| !out.status.success()) {
+            return Err(fail(
+                "OMEN_DAEMON_PROOF_FAILED",
+                "daemon started by proof failed to stop",
+            ));
+        }
     }
     let fixture = installed_fixture();
     let before = fixture_hashes_at(&fixture)?;
