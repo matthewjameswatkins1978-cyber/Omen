@@ -547,10 +547,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 entry.status.availability, entry.status.admission
                             );
                             let invocation = machine_contract::invocation_for(&id);
-                            if let Some(cli) = invocation.cli {
+                            if let Some(cli) = invocation.cli.as_deref() {
                                 println!("CLI: omen {cli}");
                             }
-                            if let Some(mcp_tool) = invocation.mcp_tool {
+                            if let Some(mcp_tool) = invocation.mcp_tool.as_deref() {
                                 println!("MCP: {mcp_tool}");
                             }
                             if invocation.cli.is_none() && invocation.mcp_tool.is_none() {
