@@ -256,7 +256,7 @@ fn run_benchmarks() {
     }
     for i in 0..20 {
         hot_index
-            .workspace_entries
+            .path_commands
             .push(format!("workspace_file_{i}.rs"));
     }
 
@@ -275,8 +275,8 @@ fn run_benchmarks() {
         ":rer",
         ":in",
         "@",
-        "@fact://git",
-        "@fact://test",
+        "@fact.git",
+        "@fact.test",
         "@l",
         "@fa",
         "@er",
