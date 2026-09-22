@@ -365,7 +365,7 @@ impl ExecutionBackend for NativeExecutionBackend {
         // has bytes (or a stdin secret) to deliver.
         let has_stdin_secret = req.secrets.iter().any(|secret| {
             matches!(
-                secret.contract,
+                &secret.contract,
                 omen_core::SecretInjectionContract::Stdin
             )
         });
