@@ -52,7 +52,7 @@ def _parse_tool_text(result: JsonObject, *, tool: str) -> JsonValue:
     if not isinstance(text, str):
         raise OmenProtocolError(f"tool {tool!r}: text is not a string", raw=result)
     try:
-        return json.loads(text)
+        return cast(JsonValue, json.loads(text))
     except ValueError as exc:
         raise OmenProtocolError(f"tool {tool!r}: text is not JSON", raw=result) from exc
 

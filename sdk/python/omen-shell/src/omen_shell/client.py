@@ -13,15 +13,17 @@ import asyncio
 import concurrent.futures
 import os
 import threading
-from collections.abc import Sequence
+from collections.abc import Coroutine, Sequence
 from types import TracebackType
-from typing import Any
+from typing import Any, TypeVar, cast
 
 from . import protocol
 from .async_client import AsyncOmen
 from .errors import OmenConnectionClosedError, OmenTransportError
 from .models import ConnectionInfo, ExecutionResult, Orientation
 from .protocol import JsonObject
+
+_T = TypeVar("_T")
 
 
 class _LoopThread:
@@ -133,7 +135,7 @@ class Omen:
         """Connect explicitly; caller owns :meth:`close`."""
         return cls(workspace, **kwargs)
 
-    def _submit(self, coro: Any, *, timeout: float | None = None) -> Any:
+    def _submit(self, coro: Coroutine[Any, Any, _T], *, timeout: float | None = None) -> _T:
         if getattr(self, "_closed_flag", False):
             # The coroutine was already constructed by the call expression;
             # close it so nothing is left un-awaited, then reject the call.
@@ -145,8 +147,11 @@ class Omen:
                     pass
             raise OmenConnectionClosedError("client is closed")
         try:
-            return self._loop_thread.submit(
-                coro, timeout=self._call_timeout if timeout is None else timeout
+            return cast(
+                _T,
+                self._loop_thread.submit(
+                    coro, timeout=self._call_timeout if timeout is None else timeout
+                ),
             )
         except concurrent.futures.TimeoutError as exc:
             raise OmenTransportError("sync call exceeded local deadline") from exc
