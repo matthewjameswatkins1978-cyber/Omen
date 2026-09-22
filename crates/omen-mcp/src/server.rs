@@ -213,7 +213,7 @@ impl McpServer {
             },
             ToolDefinition {
                 name: "omen_cancel_execution".into(),
-                description: "Request cancellation of a live brokered execution by canonical execution_id. Intent and proof are distinct: only observed physical death reports TerminationConfirmed; unconfirmed stops report OutcomeUnknown; finished executions report AlreadyFinished without rewriting history.".into(),
+                description: "Request cancellation of a live brokered execution by canonical execution_id. Intent and proof are distinct: only observed physical death reports TerminationConfirmed; a stop that arrives before dispatch reports DispatchPrevented (no spawn, no tree-stop, no death claimed); unconfirmed stops report OutcomeUnknown; finished executions report AlreadyFinished without rewriting history.".into(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["execution_id"],

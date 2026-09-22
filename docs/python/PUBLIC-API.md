@@ -37,8 +37,8 @@ Advanced error/model types stay in `omen_shell.errors` /
   session overlay (`session_executions`); durable Omen history is untouched.
 - `cancel_execution(execution_id)` → raw cancel record (`execution_id` /
   `outcome` / `detail`); intent (`CancellationRequested`) and proof
-  (`TerminationConfirmed` / `OutcomeUnknown` / `AlreadyFinished` /
-  `NotFound`) stay distinct; passed through opaquely.
+  (`TerminationConfirmed` / `DispatchPrevented` / `OutcomeUnknown` /
+  `AlreadyFinished` / `NotFound`) stay distinct; passed through opaquely.
 - `execute()` accepts argv sequences only; a command string raises
   `OmenProtocolError`. Non-zero child exit returns `ExecutionResult`.
 

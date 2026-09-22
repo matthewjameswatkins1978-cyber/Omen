@@ -19,8 +19,11 @@ semantic bridge is not.
 ## Findings (absence proofs)
 
 - `AdmissionRequest` / `AdmissionResult` / `CapabilityIdentity` /
-  `ScopeIdentity`: **0 hits** anywhere before E2.4 (E2.4 adds neutral Omen
-  data carriers only — no Tethers logic).
+  `ScopeIdentity`: **0 hits** anywhere. (Repair note: the E2 candidate
+  briefly shipped Omen-owned neutral data carriers for these names; the
+  repair removes that speculative ontology. Tethers owns capability,
+  scope, admission, and revocation semantics, so Omen must not mint the
+  vocabulary first and force Tethers to conform to it.)
 - `*.toml + tether`: **0 hits**. Root `Cargo.toml` carries 16 `omen-*`
   path dependencies plus commodity crates; no `tethers` crate.
 - `TETHERS_*` env: **0 hits** in code and environment.
@@ -44,23 +47,19 @@ therefore:
   `OmenApprovalStore`, `OmenFallbackAuthority`, or semantic equivalent
   (verify: `rg -i "PermissionEngine|PolicyRules|ApprovalStore|FallbackAuthority" crates/`
   returns nothing);
-- ships neutral Host-side data carriers only
-  (`crates/omen-core/src/authority.rs`: `AdmissionRequest`,
-  `AdmissionResult`-shaped `AdmissionVerdict`, `CapabilityIdentity`,
-  `ScopeIdentity`, `AuthorityEvidenceReference`);
-- reports `live_admission_status() == BlockedByTethers` with this evidence;
-- fails closed: `check_live_admission()` returns `NotAdmitted {
-  ProviderUnavailable }` for every request shape (proven by
-  `authority::tests::no_live_provider_means_no_admission_for_any_shape`);
 - keeps executing file-directed mechanics exactly as before (no behavior
   change, no silent substitute).
+- ships NO Omen-owned authority/admission/scope/evidence types: the
+  blocked seam is evidence, not an invitation to design Tethers inside
+  Omen. When Tethers exposes its accepted Host contract, Omen will
+  implement the smallest adapter to that real contract.
 
 ## Revocation / multi-step admission
 
 With no live provider there is nothing to revoke and no step to re-admit.
-The data vocabulary for the hostile cases (stale admission, wrong
-capability/scope, revocation before dispatch, revocation between steps)
-exists as `NotAdmittedReason` data; the verdicts can only be supplied by a
+There is deliberately no Omen-side vocabulary for the hostile cases
+(stale admission, wrong capability/scope, revocation before dispatch,
+revocation between steps): those verdicts can only be supplied by a
 future live seam outside Omen. Last-responsible-moment checks belong
 immediately before consequential dispatch at that time — permission for
 step one must never silently become indefinite permission for later steps.

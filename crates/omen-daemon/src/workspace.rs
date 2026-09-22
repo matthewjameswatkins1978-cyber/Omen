@@ -32,6 +32,13 @@ pub const CANCEL_OBSERVE_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// because the original summary reported physical completion with a
 /// non-zero exit; the exit code itself carries the failure. Returns `None`
 /// for records without a parsable envelope (legacy rows).
+/// Reproduce a recorded terminal runtime for the dedup-replay path.
+///
+/// The broker stamps every history record with an explicit status envelope.
+/// `FAILED` (and the physical failure spellings) replay as `Completed`
+/// because the original summary reported physical completion with a
+/// non-zero exit; the exit code itself carries the failure. Returns `None`
+/// for records without a parsable envelope (legacy rows).
 fn recorded_history_runtime(rec: &ExecutionRecord) -> Option<omen_core::RuntimeStatus> {
     let envelope = rec.envelope_json.as_deref()?;
     let value: serde_json::Value = serde_json::from_str(envelope).ok()?;
@@ -44,6 +51,58 @@ fn recorded_history_runtime(rec: &ExecutionRecord) -> Option<omen_core::RuntimeS
         "OUTCOME_UNKNOWN" => Some(omen_core::RuntimeStatus::OutcomeUnknown),
         _ => None,
     }
+}
+
+/// Repair 2: recover the typed dispatch-prevention flag from a history
+/// envelope. Rows recorded before the flag existed report false.
+fn recorded_dispatch_prevented(rec: &ExecutionRecord) -> bool {
+    rec.envelope_json
+        .as_deref()
+        .and_then(|envelope| serde_json::from_str::<serde_json::Value>(envelope).ok())
+        .and_then(|value| {
+            value
+                .get("dispatch_prevented")
+                .and_then(|flag| flag.as_bool())
+        })
+        .unwrap_or(false)
+}
+
+/// Repair 3: deterministic persistence-failure injection for the repair
+/// proofs. Production code always runs `Off`. A narrow failpoint is used
+/// instead of filesystem sabotage so the faults are exact and bounded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PersistenceFailpoint {
+    /// Normal operation: every persistence write is attempted for real.
+    #[default]
+    Off,
+    /// Refuse the pre-dispatch `Running` receipt write (must block spawn).
+    FailRunningReceipt,
+    /// Refuse terminal history writes after physical execution.
+    FailHistoryWrite,
+    /// Refuse terminal receipt writes after history succeeded.
+    FailTerminalReceipt,
+}
+
+/// Which receipt write is being attempted. Injection targets the broker's
+/// pre-dispatch (`Running`) and terminal writes only; cancel-path intent
+/// and reconcile annotations (`Other`) always attempt the real write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceiptStage {
+    Running,
+    Terminal,
+    Other,
+}
+
+/// Repair 2 test seam: parks the broker task after it registers its live
+/// cancellation switch and BEFORE it calls into the execution backend, so
+/// repair tests can deterministically fire a cancel pre-dispatch, then
+/// release the task and observe `DispatchPrevented` with zero spawns.
+#[derive(Debug, Clone, Default)]
+pub struct PrespawnGate {
+    /// Signalled by the broker task once it is parked pre-dispatch.
+    pub task_parked: Arc<tokio::sync::Notify>,
+    /// Signalled by the test to release the parked broker task.
+    pub release: Arc<tokio::sync::Notify>,
 }
 
 pub struct ManagedChildService {
@@ -91,6 +150,12 @@ pub struct WorkspaceState {
     /// Execution ID → dedup (consequential request) ID for in-flight work.
     /// Needed to observe the terminal broadcast after firing a cancel flag.
     cancel_index: Mutex<HashMap<String, String>>,
+    /// Repair 3: persistence-failure injection (test seam; `Off` in
+    /// production). Guarded by a std mutex and never held across await.
+    persistence_failpoint: std::sync::Mutex<PersistenceFailpoint>,
+    /// Repair 2: pre-dispatch parking gate (test seam; `None` in
+    /// production). Guarded by a std mutex and never held across await.
+    prespawn_gate: std::sync::Mutex<Option<PrespawnGate>>,
     event_tx: broadcast::Sender<IpcEvent>,
     watcher: Arc<Mutex<Option<RecommendedWatcher>>>,
 }
@@ -233,9 +298,40 @@ impl WorkspaceState {
             in_flight_executions,
             cancel_switches: Mutex::new(HashMap::new()),
             cancel_index: Mutex::new(HashMap::new()),
+            persistence_failpoint: std::sync::Mutex::new(PersistenceFailpoint::Off),
+            prespawn_gate: std::sync::Mutex::new(None),
             event_tx,
             watcher: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Repair 3 test seam: arm deterministic persistence-failure injection.
+    /// Production paths never call this; it stays `Off` outside repair tests.
+    #[doc(hidden)]
+    pub fn set_persistence_failpoint(&self, failpoint: PersistenceFailpoint) {
+        if let Ok(mut slot) = self.persistence_failpoint.lock() {
+            *slot = failpoint;
+        }
+    }
+
+    fn persistence_failpoint(&self) -> PersistenceFailpoint {
+        self.persistence_failpoint
+            .lock()
+            .map(|slot| *slot)
+            .unwrap_or(PersistenceFailpoint::Off)
+    }
+
+    /// Repair 2 test seam: park the next broker task pre-dispatch.
+    /// Production paths never call this; it stays `None` outside repair tests.
+    #[doc(hidden)]
+    pub fn set_prespawn_gate(&self, gate: Option<PrespawnGate>) {
+        if let Ok(mut slot) = self.prespawn_gate.lock() {
+            *slot = gate;
+        }
+    }
+
+    fn prespawn_gate_snapshot(&self) -> Option<PrespawnGate> {
+        self.prespawn_gate.lock().ok().and_then(|slot| slot.clone())
     }
 
     pub fn is_ignored_path(path: &Path) -> bool {
@@ -770,9 +866,43 @@ impl WorkspaceState {
         }
     }
 
-    pub async fn record_request_receipt(&self, req_id: &str, exec_id: Option<&str>, status: &str) {
+    /// Repair 3: the persistence result is returned, never discarded.
+    /// Callers on the dispatch path refuse physical work when this fails;
+    /// callers after physical work surface an explicit persistence failure
+    /// instead of claiming durable truth.
+    pub async fn record_request_receipt(
+        &self,
+        req_id: &str,
+        exec_id: Option<&str>,
+        status: &str,
+    ) -> Result<(), CoreError> {
+        self.record_request_receipt_staged(ReceiptStage::Other, req_id, exec_id, status)
+            .await
+    }
+
+    async fn record_request_receipt_staged(
+        &self,
+        stage: ReceiptStage,
+        req_id: &str,
+        exec_id: Option<&str>,
+        status: &str,
+    ) -> Result<(), CoreError> {
+        match (stage, self.persistence_failpoint()) {
+            (ReceiptStage::Running, PersistenceFailpoint::FailRunningReceipt) => {
+                return Err(CoreError::Internal(
+                    "injected persistence failure: pre-dispatch Running receipt refused"
+                        .to_string(),
+                ));
+            }
+            (ReceiptStage::Terminal, PersistenceFailpoint::FailTerminalReceipt) => {
+                return Err(CoreError::Internal(
+                    "injected persistence failure: terminal receipt refused".to_string(),
+                ));
+            }
+            _ => {}
+        }
         let db = self.db.lock().await;
-        let _ = WorkspacePersistence::record_request_receipt(
+        WorkspacePersistence::record_request_receipt(
             &db,
             &RequestReceiptRecord {
                 consequential_request_id: req_id.to_string(),
@@ -780,7 +910,7 @@ impl WorkspaceState {
                 status: status.to_string(),
                 recorded_at: chrono::Utc::now().to_rfc3339(),
             },
-        );
+        )
     }
 
     pub async fn query_request_receipt(&self, req_id: &str) -> Option<RequestReceiptRecord> {
@@ -840,6 +970,15 @@ impl WorkspaceState {
         };
         match tokio::time::timeout(CANCEL_OBSERVE_TIMEOUT, sub.recv()).await {
             Ok(Ok(Ok(summary))) => Some(match summary.runtime_status {
+                // Repair 2: prevention of execution is not proof of
+                // termination. The typed `dispatch_prevented` flag comes
+                // from the engine's CANCELLED_BEFORE_DISPATCH signal, never
+                // from prose: no spawn means no tree-stop and no observed
+                // death, so TerminationConfirmed would be a lie here.
+                omen_core::RuntimeStatus::Cancelled if summary.dispatch_prevented => mk(
+                    CancelOutcome::DispatchPrevented,
+                    "stop arrived before physical dispatch: no process was spawned, no tree-stop was issued, no physical death was observed",
+                ),
                 omen_core::RuntimeStatus::Cancelled => mk(
                     CancelOutcome::TerminationConfirmed,
                     "stop requested, tree-stop issued, physical death observed",
@@ -892,15 +1031,27 @@ impl WorkspaceState {
                 "execution outcome is already unknown (restart/crash boundary)",
             ),
             _ => {
-                self.record_request_receipt(
-                    &rec.consequential_request_id,
-                    Some(execution_id),
-                    "Unknown",
-                )
-                .await;
+                // No live task behind a non-terminal receipt: restart/crash
+                // boundary. Reconcile to Unknown. If even the reconcile
+                // write fails, the receipt stays non-terminal (conservative:
+                // future submits fail closed again) and the report says so —
+                // the Unknown outcome itself comes from the absence of any
+                // live owner, not from the failed write.
+                let reconciled = self
+                    .record_request_receipt(
+                        &rec.consequential_request_id,
+                        Some(execution_id),
+                        "Unknown",
+                    )
+                    .await
+                    .is_ok();
                 mk(
                     CancelOutcome::OutcomeUnknown,
-                    "no live execution task; receipt reconciled to Unknown",
+                    if reconciled {
+                        "no live execution task; receipt reconciled to Unknown"
+                    } else {
+                        "no live execution task; receipt reconcile persistence failed so the identity stays non-terminal (fail closed); outcome Unknown from absence of a live owner"
+                    },
                 )
             }
         }
@@ -947,12 +1098,23 @@ impl WorkspaceState {
             }
         };
         if let Some((cancel_tx, dedup_id)) = live {
-            self.record_request_receipt(&dedup_id, Some(execution_id), "CancellationRequested")
-                .await;
+            // Intent annotation: best-effort is principled here, not a
+            // discarded error. The stop flag is still fired and the terminal
+            // outcome still comes from live observation plus the broker
+            // task's own fail-closed persistence (Repair 3), which surfaces
+            // explicitly to the submitter. An intent-write failure therefore
+            // annotates the report instead of rewriting observed truth.
+            let intent_persisted = self
+                .record_request_receipt(&dedup_id, Some(execution_id), "CancellationRequested")
+                .await
+                .is_ok();
             let _ = cancel_tx.send(true);
             if let Some(sub) = self.subscribe_cancel_terminal(&dedup_id).await
-                && let Some(report) = self.await_cancel_terminal(execution_id, sub).await
+                && let Some(mut report) = self.await_cancel_terminal(execution_id, sub).await
             {
+                if !intent_persisted {
+                    report.detail.push_str("; WARNING: cancellation-intent receipt persistence failed (observed outcome stands; the broker task reports its own durability explicitly)");
+                }
                 return report;
             }
             // Unobservable broadcast: fall through to the durable receipt.
@@ -1029,6 +1191,7 @@ impl WorkspaceState {
             stdout_artifact,
             stderr_artifact,
             None,
+            false,
         )
         .await
     }
@@ -1044,6 +1207,7 @@ impl WorkspaceState {
         stdout_artifact: Option<String>,
         stderr_artifact: Option<String>,
         runtime: Option<omen_core::RuntimeStatus>,
+        dispatch_prevented: bool,
     ) -> Result<String, CoreError> {
         let (execution_id, exec_id_str) = if let Some(id) = custom_execution_id {
             let s = id.to_string();
@@ -1058,9 +1222,13 @@ impl WorkspaceState {
         // E2 history truth: the broker always stamps the coarse history
         // status explicitly via the single RuntimeStatus::history_label
         // authority, so every recording surface projects identical truth.
+        // Repair 2: the typed dispatch-prevention flag travels in the
+        // envelope so replay reproduces it without inference.
         let envelope_json = runtime.map(|status| {
             let history_status = status.history_label(exit_code);
-            format!(r#"{{"status":"{history_status}","source":"broker"}}"#)
+            format!(
+                r#"{{"status":"{history_status}","source":"broker","dispatch_prevented":{dispatch_prevented}}}"#
+            )
         });
 
         let record = ExecutionRecord {
@@ -1107,6 +1275,160 @@ impl WorkspaceState {
         self.supervisor.clone()
     }
 
+    /// Release a claimed in-flight slot, delivering the resolution to any
+    /// submitter that coalesced onto us between the claim and the release.
+    /// No lock is held across await: send is synchronous.
+    async fn release_claimed_slot(
+        &self,
+        dedup_id: &str,
+        resolution: Result<ExecutionResultSummary, LocalIpcError>,
+    ) {
+        let mut in_flight = self.in_flight_executions.lock().await;
+        if let Some(tx) = in_flight.remove(dedup_id) {
+            let _ = tx.send(resolution);
+        }
+    }
+
+    /// Repair 1: resolve a durable receipt with no silent fall-through to
+    /// dispatch. The durable consequential receipt is the authority across
+    /// restart — a consumed identity never becomes eligible for physical
+    /// work again:
+    /// - `Completed` → replay the recorded terminal truth;
+    /// - `Cancelled` → replay the recorded cancellation truth (never
+    ///   resurrect a cancelled operation);
+    /// - `Failed` → explicit terminal-failure refusal (never silently
+    ///   retry physical work);
+    /// - `Unknown` → fail closed;
+    /// - anything else (`Running`, `CancellationRequested`, unexpected) →
+    ///   no live owner can exist (the caller claimed the only in-flight
+    ///   slot), so reconcile to `Unknown` and fail closed.
+    ///
+    /// Zero spawn on every path.
+    async fn resolve_existing_receipt(
+        &self,
+        dedup_id: &str,
+        receipt: &RequestReceiptRecord,
+    ) -> Result<ExecutionResultSummary, LocalIpcError> {
+        match receipt.status.as_str() {
+            "Unknown" => Err(LocalIpcError::ExecutionStatusUnknown(dedup_id.to_string())),
+            "Completed" => {
+                self.replay_terminal_receipt(dedup_id, receipt, "Completed")
+                    .await
+            }
+            "Cancelled" => {
+                self.replay_terminal_receipt(dedup_id, receipt, "Cancelled")
+                    .await
+            }
+            "Failed" => Err(LocalIpcError::RequestDuplicate(format!(
+                "consequential request '{dedup_id}' already reached terminal status 'Failed' (execution {}); refusing re-execution",
+                receipt
+                    .execution_id
+                    .as_deref()
+                    .unwrap_or("no execution recorded")
+            ))),
+            _ => {
+                // Non-terminal receipt with no live owner behind it:
+                // restart/crash/panic boundary. Reconcile to Unknown and
+                // fail closed. A reconcile-write failure is explicit — and
+                // still never dispatches.
+                match self
+                    .record_request_receipt(dedup_id, receipt.execution_id.as_deref(), "Unknown")
+                    .await
+                {
+                    Ok(()) => Err(LocalIpcError::ExecutionStatusUnknown(dedup_id.to_string())),
+                    Err(persistence) => Err(LocalIpcError::PersistenceFailure {
+                        execution_id: receipt
+                            .execution_id
+                            .clone()
+                            .unwrap_or_else(|| format!("request:{dedup_id}")),
+                        stage: "reconcile_receipt".to_string(),
+                        physical_outcome: "no physical work started".to_string(),
+                        detail: persistence.to_string(),
+                    }),
+                }
+            }
+        }
+    }
+
+    /// Reproduce a recorded terminal outcome for a consumed consequential
+    /// ID. A receipt whose history cannot be read is refused, never
+    /// re-executed: absence of readable truth is not a license to dispatch.
+    async fn replay_terminal_receipt(
+        &self,
+        dedup_id: &str,
+        receipt: &RequestReceiptRecord,
+        receipt_status: &str,
+    ) -> Result<ExecutionResultSummary, LocalIpcError> {
+        let refused = |why: String| {
+            LocalIpcError::InternalRuntimeError(format!(
+                "durable {receipt_status} receipt for consequential request '{dedup_id}' {why}; refusing new dispatch"
+            ))
+        };
+        let exec_id = receipt
+            .execution_id
+            .clone()
+            .ok_or_else(|| refused("carries no execution identity".to_string()))?;
+        let rec = {
+            let db = self.db.lock().await;
+            match ExecutionId::new(&exec_id)
+                .ok()
+                .and_then(|eid| ExecutionHistory::get_execution(&db, &eid).ok().flatten())
+            {
+                Some(rec) => rec,
+                None => return Err(refused("has no readable history".to_string())),
+            }
+        };
+        // E2 replay truth: reproduce the recorded terminal outcome, not a
+        // hardcoded status. The broker stamps every record with an explicit
+        // history status envelope; legacy rows without one keep the previous
+        // fallback (exit present → Completed, absent → TimedOut, the only
+        // exit-None case the Completed receipt ever covered; a Cancelled
+        // receipt without an envelope replays Cancelled).
+        let runtime_status =
+            recorded_history_runtime(&rec).unwrap_or(if receipt_status == "Cancelled" {
+                omen_core::RuntimeStatus::Cancelled
+            } else {
+                match rec.exit_code {
+                    Some(_) => omen_core::RuntimeStatus::Completed,
+                    None => omen_core::RuntimeStatus::TimedOut,
+                }
+            });
+        let dispatch_prevented = recorded_dispatch_prevented(&rec);
+        let summary = ExecutionResultSummary {
+            execution_id: exec_id,
+            runtime_status,
+            exit_code: rec.exit_code,
+            duration_ms: rec.duration_ms.unwrap_or(0) as u64,
+            stdout_preview: rec.command.clone(),
+            stderr_preview: String::new(),
+            stdout_artifact: rec.stdout_artifact,
+            stderr_artifact: rec.stderr_artifact,
+            dispatch_prevented,
+        };
+        self.execution_cache
+            .write()
+            .await
+            .insert(dedup_id.to_string(), summary.clone());
+        Ok(summary)
+    }
+
+    /// Repair 3: end a broker task terminally WITHOUT caching a success
+    /// and without advancing the receipt. Used when durability failed
+    /// after physical work: the receipt stays non-terminal so the identity
+    /// can never dispatch again, while coalesced subscribers still get
+    /// control back with the explicit failure.
+    async fn fail_task_terminal(
+        &self,
+        dedup_id: &str,
+        err: Result<ExecutionResultSummary, LocalIpcError>,
+    ) {
+        debug_assert!(err.is_err());
+        let mut in_flight = self.in_flight_executions.lock().await;
+        if let Some(tx) = in_flight.remove(dedup_id) {
+            let _ = tx.send(err);
+        }
+    }
+
     pub async fn execute_broker(
         self: &Arc<Self>,
         params: BrokerExecutionParams<'_>,
@@ -1124,49 +1446,10 @@ impl WorkspaceState {
             return Ok(cached.clone());
         }
 
-        // 2. Check if already recorded in request_receipts in SQLite
-        if let Some(receipt) = self.query_request_receipt(dedup_id).await {
-            if receipt.status == "Unknown" {
-                return Err(LocalIpcError::ExecutionStatusUnknown(dedup_id.to_string()));
-            }
-            if receipt.status == "Completed"
-                && let Some(exec_id) = receipt.execution_id
-            {
-                let db = self.db.lock().await;
-                if let Ok(eid) = ExecutionId::new(&exec_id)
-                    && let Ok(Some(rec)) = ExecutionHistory::get_execution(&db, &eid)
-                {
-                    // E2 replay truth: reproduce the recorded terminal
-                    // outcome, not a hardcoded Completed. The broker stamps
-                    // every record with an explicit history status envelope;
-                    // legacy records without one keep the previous fallback
-                    // (exit present → Completed, absent → TimedOut, the only
-                    // exit-None case the Completed receipt ever covered).
-                    let runtime_status =
-                        recorded_history_runtime(&rec).unwrap_or(match rec.exit_code {
-                            Some(_) => omen_core::RuntimeStatus::Completed,
-                            None => omen_core::RuntimeStatus::TimedOut,
-                        });
-                    let summary = ExecutionResultSummary {
-                        execution_id: exec_id,
-                        runtime_status,
-                        exit_code: rec.exit_code,
-                        duration_ms: rec.duration_ms.unwrap_or(0) as u64,
-                        stdout_preview: rec.command.clone(),
-                        stderr_preview: String::new(),
-                        stdout_artifact: rec.stdout_artifact,
-                        stderr_artifact: rec.stderr_artifact,
-                    };
-                    self.execution_cache
-                        .write()
-                        .await
-                        .insert(dedup_id.to_string(), summary.clone());
-                    return Ok(summary);
-                }
-            }
-        }
-
-        // 3. Check if currently in-flight
+        // 2. Claim the in-flight slot or coalesce onto a live owner. From
+        // here, exactly one task owns the dispatch decision for this
+        // consequential ID; every concurrent submitter observes our
+        // resolution through the broadcast instead of dispatching again.
         let maybe_sub = {
             let mut in_flight = self.in_flight_executions.lock().await;
             if let Some(tx) = in_flight.get(dedup_id) {
@@ -1187,14 +1470,24 @@ impl WorkspaceState {
             };
         }
 
+        // We claimed a fresh slot. Resolve the durable receipt BEFORE any
+        // physical work. Repair 1 invariant: a consequential request ID may
+        // create physical work only when no durable receipt for that ID
+        // exists. The receipt check happens AFTER the claim so a terminal
+        // write landing concurrently is resolved (replay/refuse) rather
+        // than raced into a duplicate dispatch; subscribers that attached
+        // to our fresh slot receive the same resolution.
+        if let Some(receipt) = self.query_request_receipt(dedup_id).await {
+            let resolution = self.resolve_existing_receipt(dedup_id, &receipt).await;
+            self.release_claimed_slot(dedup_id, resolution.clone())
+                .await;
+            return resolution;
+        }
+
         let execution_id = ExecutionId::generate();
         let exec_id_str = execution_id.to_string();
 
-        // 4. Mark Running in SQLite receipt with the canonical execution_id
-        self.record_request_receipt(dedup_id, Some(&exec_id_str), "Running")
-            .await;
-
-        // 5. Construct argv
+        // 3. Construct argv (pure validation input; no side effects yet).
         let mut argv = Vec::new();
         if !tool.is_empty() && tool != "exec" {
             argv.push(tool.to_string());
@@ -1207,13 +1500,45 @@ impl WorkspaceState {
             argv = args.to_vec();
         }
         if argv.is_empty() {
-            let mut in_flight = self.in_flight_executions.lock().await;
-            in_flight.remove(dedup_id);
-            self.record_request_receipt(dedup_id, Some(&exec_id_str), "Failed")
+            // Malformed requests never reach physical work. The Failed
+            // annotation is best-effort: the refusal is deterministic and
+            // reproducible, so a lost annotation simply re-validates on
+            // retry instead of dispatching anything.
+            let _ = self
+                .record_request_receipt_staged(
+                    ReceiptStage::Terminal,
+                    dedup_id,
+                    Some(&exec_id_str),
+                    "Failed",
+                )
                 .await;
-            return Err(LocalIpcError::MalformedRequest(
+            let refusal = Err(LocalIpcError::MalformedRequest(
                 "Command argv cannot be empty".into(),
             ));
+            self.release_claimed_slot(dedup_id, refusal.clone()).await;
+            return refusal;
+        }
+
+        // 4. Pre-dispatch: the Running receipt MUST persist or nothing
+        // spawns (Repair 3). No durable identity means no dispatch — this
+        // is the point where fail-closed is cheap.
+        if let Err(persistence) = self
+            .record_request_receipt_staged(
+                ReceiptStage::Running,
+                dedup_id,
+                Some(&exec_id_str),
+                "Running",
+            )
+            .await
+        {
+            let refusal = Err(LocalIpcError::PersistenceFailure {
+                execution_id: exec_id_str,
+                stage: "running_receipt".to_string(),
+                physical_outcome: "no physical work started".to_string(),
+                detail: persistence.to_string(),
+            });
+            self.release_claimed_slot(dedup_id, refusal.clone()).await;
+            return refusal;
         }
 
         let this = Arc::clone(self);
@@ -1238,6 +1563,15 @@ impl WorkspaceState {
         }
 
         let join_handle = tokio::spawn(async move {
+            // Repair 2 test seam: park here — after the live cancel switch
+            // is registered, before any backend contact — so a test can
+            // deterministically fire a cancel pre-dispatch. Production
+            // never arms the gate.
+            if let Some(gate) = this.prespawn_gate_snapshot() {
+                gate.task_parked.notify_one();
+                gate.release.notified().await;
+            }
+
             let req = ExecutionRequest {
                 argv: argv.clone(),
                 cwd: exec_cwd,
@@ -1300,6 +1634,12 @@ impl WorkspaceState {
                     let duration_ms = output.duration_ms;
                     let stdout_preview = output.stdout_sanitized();
                     let stderr_preview = output.stderr_sanitized();
+                    // Repair 2: typed dispatch truth from the execution
+                    // path. The engine sets CANCELLED_BEFORE_DISPATCH only
+                    // on the zero-spawn pre-dispatch path; anything else
+                    // that reports Cancelled went through a real spawn.
+                    let dispatch_prevented =
+                        output.process_exit.signal.as_deref() == Some("CANCELLED_BEFORE_DISPATCH");
 
                     // E2 terminal truth: the broker receipt distinguishes a
                     // confirmed stop from natural completion and from an
@@ -1311,9 +1651,33 @@ impl WorkspaceState {
                         _ => "Completed",
                     };
                     let history_runtime = Some(output.runtime_status);
+                    let physical_outcome = format!(
+                        "exit={exit_code:?} runtime={:?} dispatch_prevented={dispatch_prevented}",
+                        output.runtime_status
+                    );
 
-                    // Record history with the same canonical execution_id
-                    let _ = this
+                    // Repair 3, post-execution rule: physical work already
+                    // happened, so a history persistence failure must NOT
+                    // pretend nothing happened and must NOT rewrite the
+                    // physical result. The receipt is left non-terminal
+                    // (never re-executable), and the failure surfaces with
+                    // the execution identity plus the physical outcome.
+                    // The history failpoint is consulted here rather than
+                    // inside record_history_with_id so non-broker history
+                    // surfaces keep their own behavior.
+                    if this.persistence_failpoint() == PersistenceFailpoint::FailHistoryWrite {
+                        let err = LocalIpcError::PersistenceFailure {
+                            execution_id: exec_id_str.clone(),
+                            stage: "history".to_string(),
+                            physical_outcome,
+                            detail: "injected persistence failure: terminal history refused"
+                                .to_string(),
+                        };
+                        this.fail_task_terminal(&dedup_id_str, Err(err.clone()))
+                            .await;
+                        return Err(err);
+                    }
+                    if let Err(history_error) = this
                         .record_history_with_id(
                             Some(execution_id),
                             &session_id_str,
@@ -1323,16 +1687,45 @@ impl WorkspaceState {
                             stdout_art.clone(),
                             stderr_art.clone(),
                             history_runtime,
+                            dispatch_prevented,
                         )
-                        .await;
+                        .await
+                    {
+                        let err = LocalIpcError::PersistenceFailure {
+                            execution_id: exec_id_str.clone(),
+                            stage: "history".to_string(),
+                            physical_outcome,
+                            detail: history_error.to_string(),
+                        };
+                        this.fail_task_terminal(&dedup_id_str, Err(err.clone()))
+                            .await;
+                        return Err(err);
+                    }
 
-                    // Update request receipt
-                    this.record_request_receipt(
-                        &dedup_id_str,
-                        Some(&exec_id_str),
-                        terminal_receipt,
-                    )
-                    .await;
+                    // Repair 3: a terminal-receipt failure after history
+                    // succeeded preserves the recorded history truth and
+                    // leaves the receipt non-terminal, so the identity can
+                    // never dispatch again — future submits reconcile to
+                    // Unknown and fail closed.
+                    if let Err(receipt_error) = this
+                        .record_request_receipt_staged(
+                            ReceiptStage::Terminal,
+                            &dedup_id_str,
+                            Some(&exec_id_str),
+                            terminal_receipt,
+                        )
+                        .await
+                    {
+                        let err = LocalIpcError::PersistenceFailure {
+                            execution_id: exec_id_str.clone(),
+                            stage: "terminal_receipt".to_string(),
+                            physical_outcome,
+                            detail: receipt_error.to_string(),
+                        };
+                        this.fail_task_terminal(&dedup_id_str, Err(err.clone()))
+                            .await;
+                        return Err(err);
+                    }
 
                     let summary = ExecutionResultSummary {
                         execution_id: exec_id_str,
@@ -1343,6 +1736,7 @@ impl WorkspaceState {
                         stderr_preview,
                         stdout_artifact: stdout_art,
                         stderr_artifact: stderr_art,
+                        dispatch_prevented,
                     };
 
                     // Cache in memory
@@ -1360,8 +1754,30 @@ impl WorkspaceState {
                     Ok(summary)
                 }
                 Err(e) => {
-                    this.record_request_receipt(&dedup_id_str, None, "Failed")
-                        .await;
+                    // Spawn/validation failure inside the task: record the
+                    // terminal Failed receipt. If even that write fails,
+                    // nothing was dispatched, so fail closed with the
+                    // persistence fault made explicit alongside the cause.
+                    let physical_outcome = format!("spawn failed: {e}");
+                    if let Err(receipt_error) = this
+                        .record_request_receipt_staged(
+                            ReceiptStage::Terminal,
+                            &dedup_id_str,
+                            None,
+                            "Failed",
+                        )
+                        .await
+                    {
+                        let err = LocalIpcError::PersistenceFailure {
+                            execution_id: exec_id_str,
+                            stage: "terminal_receipt".to_string(),
+                            physical_outcome,
+                            detail: receipt_error.to_string(),
+                        };
+                        this.fail_task_terminal(&dedup_id_str, Err(err.clone()))
+                            .await;
+                        return Err(err);
+                    }
                     let err = LocalIpcError::InternalRuntimeError(format!("Execution failed: {e}"));
                     let mut in_flight = this.in_flight_executions.lock().await;
                     if let Some(tx) = in_flight.remove(&dedup_id_str) {

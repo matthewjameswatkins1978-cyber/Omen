@@ -90,12 +90,14 @@ the SDK invents no canonical `OmenError` fields from message text.
 
 ```python
 record = omen.cancel_execution(result.execution_id)
-record["outcome"]  # {"outcome": "TerminationConfirmed"} | {"outcome": "AlreadyFinished", ...} | ...
+record["outcome"]  # {"outcome": "TerminationConfirmed"} | {"outcome": "DispatchPrevented"} | {"outcome": "AlreadyFinished", ...} | ...
 ```
 
 Intent and proof stay distinct end to end: Omen records
 `CancellationRequested`, performs the physical tree-stop, and only
-observed death becomes `TerminationConfirmed`. Unconfirmed stops stay
+observed death becomes `TerminationConfirmed`. A stop that arrives
+before dispatch reports `DispatchPrevented` (no spawn, no tree-stop,
+no death claimed). Unconfirmed stops stay
 `OutcomeUnknown`; finished executions report `AlreadyFinished` without
 rewriting history. The SDK passes the record through opaquely — it never
 reinterprets the outcome. Cancelling needs the daemon broker; standalone

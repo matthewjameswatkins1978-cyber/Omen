@@ -105,10 +105,12 @@ Other JSON-RPC errors likewise stay `OmenProtocolError`.
   stderr_artifact (uri|null)}`. Standalone executions record durable
   history under the returned ID (same as interactive standalone).
 - **cancel_execution**: `{execution_id, outcome:
-  {outcome: TerminationConfirmed} | {outcome: AlreadyFinished,
+  {outcome: TerminationConfirmed} | {outcome: DispatchPrevented} |
+  {outcome: AlreadyFinished,
   terminal_status} | {outcome: OutcomeUnknown} | {outcome: NotFound},
   detail}`. Intent (`CancellationRequested` receipt) and proof are
-  distinct: only observed physical death confirms.
+  distinct: only observed physical death confirms; a pre-dispatch stop
+  reports `DispatchPrevented` without claiming a tree-stop or a death.
 - **history_query**: bare `HistoryResult{schema_version, entries[],
   limit, all_sessions, ordering, pagination}` unless
   `<state>/local-execution-status.json` exists → wrapped `{history,

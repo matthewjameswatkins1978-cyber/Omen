@@ -318,6 +318,13 @@ pub struct ExecutionResultSummary {
     pub stderr_preview: String,
     pub stdout_artifact: Option<String>,
     pub stderr_artifact: Option<String>,
+    /// Typed dispatch truth from the execution path: true only when the
+    /// stop arrived before physical dispatch, so no process was ever
+    /// spawned. Sourced from the engine's `CANCELLED_BEFORE_DISPATCH`
+    /// signal — never inferred from prose. Defaults false for rows
+    /// recorded before this field existed.
+    #[serde(default)]
+    pub dispatch_prevented: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -344,13 +351,18 @@ pub struct ExecutionStatusRecord {
 /// Intent (`CancellationRequested` receipt) and proof are distinct: the
 /// daemon fires the stop flag, performs the physical tree-stop, and then
 /// observes the child. Only observed death is `TerminationConfirmed`.
-/// Anything unconfirmed is `OutcomeUnknown` — never a manufactured
-/// success or failure. A naturally finished execution reports
-/// `AlreadyFinished` with its terminal receipt status.
+/// A stop that arrived before physical dispatch — so no process was ever
+/// spawned, no tree-stop issued, no death observed — is
+/// `DispatchPrevented`, never `TerminationConfirmed`: prevention of
+/// execution is not proof of termination. Anything unconfirmed is
+/// `OutcomeUnknown` — never a manufactured success or failure.
+/// A naturally finished execution reports `AlreadyFinished` with its
+/// terminal receipt status.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "outcome")]
 pub enum CancelOutcome {
     TerminationConfirmed,
+    DispatchPrevented,
     AlreadyFinished { terminal_status: String },
     OutcomeUnknown,
     NotFound,

@@ -368,7 +368,7 @@ pub fn contract() -> MachineContract {
             id: "execution.cancel".into(),
             invocation: invocation_for("execution.cancel"),
             group: "execution".into(),
-            summary: "Request cancellation of a live brokered execution by canonical execution_id. Intent and proof are distinct: only observed physical death reports TerminationConfirmed; unconfirmed stops report OutcomeUnknown; finished executions report AlreadyFinished without rewriting history.".into(),
+            summary: "Request cancellation of a live brokered execution by canonical execution_id. Intent and proof are distinct: only observed physical death reports TerminationConfirmed; a stop that arrives before dispatch reports DispatchPrevented (no spawn, no tree-stop, no death claimed); unconfirmed stops report OutcomeUnknown; finished executions report AlreadyFinished without rewriting history.".into(),
             input_schema: object_schema(
                 json!({"execution_id":{"type":"string","minLength":1}}),
                 &["execution_id"],

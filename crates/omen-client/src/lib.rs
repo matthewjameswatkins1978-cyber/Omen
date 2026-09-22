@@ -386,7 +386,8 @@ impl OmenClient {
 
     /// E2 stop truth: request cancellation of a live brokered execution by
     /// canonical execution ID. Returns intent-vs-proof distinguished truth
-    /// (`TerminationConfirmed` only when physical death was observed).
+    /// (`TerminationConfirmed` only when physical death was observed;
+    /// `DispatchPrevented` when the stop arrived before any spawn).
     pub async fn cancel_execution(
         &self,
         execution_id: impl Into<String>,

@@ -39,6 +39,16 @@ pub enum LocalIpcError {
     #[error("Execution status unknown for request {0}; automatic retry refused")]
     ExecutionStatusUnknown(String),
 
+    #[error(
+        "Durability failure at stage '{stage}' for execution {execution_id}: {detail} (physical outcome: {physical_outcome})"
+    )]
+    PersistenceFailure {
+        execution_id: String,
+        stage: String,
+        physical_outcome: String,
+        detail: String,
+    },
+
     #[error("Duplicate request: {0}")]
     RequestDuplicate(String),
 
