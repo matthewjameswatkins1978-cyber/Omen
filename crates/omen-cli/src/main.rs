@@ -1082,12 +1082,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     secrets: vec![],
                 };
 
+                let execution_id = omen_core::ExecutionId::generate();
                 let output = supervisor.execute(req).await?;
-                let artifact = cas.store(
+                let stdout_artifact = cas.store(
                     &mut db,
                     &output.stdout_all,
                     "text/plain",
-                    "omen://execution/direct",
+                    "omen://execution/direct/stdout",
+                    omen_core::RetentionClass::Referenced,
+                )?;
+                let stderr_artifact = cas.store(
+                    &mut db,
+                    &output.stderr_all,
+                    "text/plain",
+                    "omen://execution/direct/stderr",
                     omen_core::RetentionClass::Referenced,
                 )?;
 
@@ -1095,9 +1103,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     omen_knowledge::local_execution_status_path(&ws_root),
                     serde_json::to_vec_pretty(&serde_json::json!({
                         "history_status": "UNJOURNALED_LOCAL_EXECUTION",
+                        "execution_id": execution_id.to_string(),
                         "command": command,
                         "exit_code": output.process_exit.code,
                         "runtime_status": format!("{:?}", output.runtime_status),
+                        "stdout_artifact_uri": stdout_artifact.uri.to_string(),
+                        "stderr_artifact_uri": stderr_artifact.uri.to_string(),
                         "recorded_at_unix_seconds": std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|duration| duration.as_secs())
@@ -1107,15 +1118,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 if json_mode {
                     let out_json = serde_json::json!({
+                        "execution_id": execution_id.to_string(),
                         "runtime_status": format!("{:?}", output.runtime_status),
                         "exit_code": output.process_exit.code,
-                        "artifact_uri": artifact.uri.to_string(),
+                        "artifact_uri": stdout_artifact.uri.to_string(),
+                        "stdout_artifact_uri": stdout_artifact.uri.to_string(),
+                        "stderr_artifact_uri": stderr_artifact.uri.to_string(),
                         "stdout_bounded": String::from_utf8_lossy(&output.stdout_bounded),
                         "stderr_bounded": String::from_utf8_lossy(&output.stderr_bounded),
                     });
                     println!("{}", serde_json::to_string_pretty(&out_json)?);
                 } else {
+                    use std::io::Write as _;
+
                     print!("{}", String::from_utf8_lossy(&output.stdout_bounded));
+                    eprint!("{}", String::from_utf8_lossy(&output.stderr_bounded));
+                    if !output.stderr_bounded.is_empty() && !output.stderr_bounded.ends_with(b"\n") {
+                        eprintln!();
+                    }
+                    let exit_display = output
+                        .process_exit
+                        .code
+                        .map(|code| code.to_string())
+                        .unwrap_or_else(|| "none".to_string());
+                    eprintln!(
+                        "\\O/ {} | {:?} | exit {}",
+                        execution_id, output.runtime_status, exit_display
+                    );
+                    if output.process_exit.code != Some(0)
+                        || output.runtime_status != omen_core::RuntimeStatus::Completed
+                        || output.stdout_all.len() > output.stdout_bounded.len()
+                        || output.stderr_all.len() > output.stderr_bounded.len()
+                    {
+                        eprintln!("stdout evidence: {}", stdout_artifact.uri);
+                        eprintln!("stderr evidence: {}", stderr_artifact.uri);
+                    }
+                    let _ = std::io::stdout().flush();
+                    let _ = std::io::stderr().flush();
+
+                    if let Some(code) = output.process_exit.code {
+                        if code != 0 {
+                            std::process::exit(code);
+                        }
+                    } else if output.runtime_status == omen_core::RuntimeStatus::TimedOut {
+                        std::process::exit(124);
+                    } else if output.runtime_status != omen_core::RuntimeStatus::Completed {
+                        std::process::exit(1);
+                    }
                 }
             }
         }
