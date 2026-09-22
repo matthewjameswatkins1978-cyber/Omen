@@ -273,8 +273,23 @@ fn installed_preview_identity() -> Option<serde_json::Value> {
     }))
 }
 
-/// Other `omen` executables resolvable via PATH that are *not* the running
-/// binary (rollback slots, historical installs). Read-only: lists candidates
+/// Best-effort liveness probe: true when no daemon answers on the default
+/// endpoint after a short settle window. Used to distinguish "shutdown
+/// succeeded and the connection dropped" from "shutdown failed".
+async fn daemon_is_gone() -> bool {
+    for _ in 0..20 {
+        if omen_client::OmenClient::connect_default(None)
+            .await
+            .is_err()
+        {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    false
+}
+
+/// Other `omen` executables resolvable via PATH that are *not* the running/// binary (rollback slots, historical installs). Read-only: lists candidates
 /// so a user or agent can answer "which Omen am I actually running" without
 /// reverse-engineering PATH manually. Never modifies anything.
 fn other_omen_executables_on_path(current: Option<&str>) -> Vec<String> {
@@ -1577,16 +1592,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     Err(e) => {
-                        if json_mode {
-                            let doc = serde_json::json!({
-                                "status": "error",
-                                "message": e.to_string()
-                            });
-                            println!("{}", serde_json::to_string_pretty(&doc)?);
+                        // Shutdown drops the IPC connection as the daemon
+                        // exits, which surfaces as a transport error even
+                        // when shutdown succeeded. Verify the daemon is
+                        // actually gone before reporting failure.
+                        if daemon_is_gone().await {
+                            if json_mode {
+                                let doc = serde_json::json!({ "status": "stopped" });
+                                println!("{}", serde_json::to_string_pretty(&doc)?);
+                            } else {
+                                println!("Daemon stopped successfully.");
+                            }
                         } else {
-                            eprintln!("Error stopping daemon: {e}");
+                            if json_mode {
+                                let doc = serde_json::json!({
+                                    "status": "error",
+                                    "message": e.to_string()
+                                });
+                                println!("{}", serde_json::to_string_pretty(&doc)?);
+                            } else {
+                                eprintln!("Error stopping daemon: {e}");
+                            }
+                            std::process::exit(1);
                         }
-                        std::process::exit(1);
                     }
                 },
                 Err(_) => {
