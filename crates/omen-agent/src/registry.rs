@@ -1,6 +1,7 @@
 use crate::diagnostic_provider::DiagnosticAgentProvider;
 use crate::openai_responses::{
-    OPENAI_LUNA_PROVIDER_ID, OpenAiResponsesProvider, openai_luna_descriptor,
+    OpenAiResponsesConfig, OpenAiResponsesProvider, openai_api_key_from_env,
+    openai_credential_source,
 };
 use crate::provider::{AgentError, AgentProvider, DEFAULT_AGENT_TIMEOUT, TimeoutProvider};
 use serde::{Deserialize, Serialize};
@@ -18,7 +19,49 @@ pub struct ProviderDescriptor {
     pub is_available: bool,
 }
 
+/// User-facing Luna preset identity (registered plug id; not the transport name).
+pub const OPENAI_LUNA_PROVIDER_ID: &str = "openai-luna";
+/// Current Omen OpenAI Platform project policy preset model.
+pub const OPENAI_LUNA_MODEL: &str = "gpt-6-luna";
+
 const OPENAI_LUNA_ID: &str = OPENAI_LUNA_PROVIDER_ID;
+
+/// Luna preset configuration over the generic OpenAI Responses transport.
+pub fn openai_luna_config() -> OpenAiResponsesConfig {
+    OpenAiResponsesConfig::new(OPENAI_LUNA_MODEL)
+}
+
+/// Luna preset transport wired with local credential presence only.
+///
+/// This constructs the reusable transport; `ProviderDescriptor` ownership
+/// remains at the registry layer via [`openai_luna_descriptor`].
+pub fn openai_luna_provider() -> OpenAiResponsesProvider {
+    OpenAiResponsesProvider::with_config(
+        openai_luna_config(),
+        openai_api_key_from_env(),
+        OPENAI_LUNA_PROVIDER_ID.to_string(),
+    )
+}
+
+/// Builds the Luna preset registry descriptor without exposing credentials.
+pub fn openai_luna_descriptor(model: impl Into<String>, available: bool) -> ProviderDescriptor {
+    ProviderDescriptor {
+        id: OPENAI_LUNA_PROVIDER_ID.into(),
+        name: "OpenAI GPT-6 Luna".into(),
+        model: Some(model.into()),
+        credential_source: Some(openai_credential_source()),
+        capabilities: vec![
+            "reasoning".into(),
+            "structured-response".into(),
+            "failure-diagnosis".into(),
+            "navigation".into(),
+            "proposal".into(),
+            "tool-proposal".into(),
+        ],
+        // Locally configured enough to attempt use; remote entitlement is not claimed.
+        is_available: available,
+    }
+}
 
 type ProviderEntry = (ProviderDescriptor, Arc<dyn AgentProvider>);
 
@@ -63,8 +106,8 @@ impl ProviderRegistry {
         // not prove remote key validity, model entitlement, or network reach.
         // Runtime HTTP truth remains authoritative for those outcomes.
         // The key itself is never stored on the descriptor.
-        if crate::openai_responses::openai_api_key_from_env().is_some() {
-            let luna = OpenAiResponsesProvider::luna_preset();
+        if openai_api_key_from_env().is_some() {
+            let luna = openai_luna_provider();
             let desc = openai_luna_descriptor(luna.model(), true);
             let luna_provider: Arc<dyn AgentProvider> =
                 Arc::new(TimeoutProvider::new(Arc::new(luna), DEFAULT_AGENT_TIMEOUT));

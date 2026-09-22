@@ -378,6 +378,7 @@ fn provider_registry_registers_openai_luna_when_credential_present() {
             .iter()
             .find(|p| p.id == "openai-luna")
             .expect("openai-luna must be registered when OPENAI_API_KEY is set");
+        assert_eq!(luna.name, "OpenAI GPT-6 Luna");
         assert_eq!(luna.model.as_deref(), Some("gpt-6-luna"));
         assert_eq!(
             luna.credential_source.as_deref(),

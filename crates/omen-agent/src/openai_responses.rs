@@ -3,7 +3,6 @@ use crate::provider::{
     AgentError, AgentProvider, AgentRequest, AgentResponse, AgentResponseKind,
     DEFAULT_AGENT_TIMEOUT, ProposedAction,
 };
-use crate::registry::ProviderDescriptor;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::future::Future;
@@ -13,10 +12,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// User-facing Luna preset identity (registry-facing; not the transport name).
-pub const OPENAI_LUNA_PROVIDER_ID: &str = "openai-luna";
-/// Current Omen OpenAI Platform project policy preset.
-pub const OPENAI_LUNA_MODEL: &str = "gpt-6-luna";
 pub const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
 pub const OPENAI_RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
 pub const OPENAI_DEFAULT_REASONING_EFFORT: &str = "medium";
@@ -42,26 +37,6 @@ pub fn openai_api_key_from_env() -> Option<String> {
     match std::env::var(OPENAI_API_KEY_ENV) {
         Ok(k) if !k.trim().is_empty() => Some(k),
         _ => None,
-    }
-}
-
-/// Builds the Luna preset registry descriptor without exposing credentials.
-pub fn openai_luna_descriptor(model: impl Into<String>, available: bool) -> ProviderDescriptor {
-    ProviderDescriptor {
-        id: OPENAI_LUNA_PROVIDER_ID.into(),
-        name: "OpenAI GPT-6 Luna".into(),
-        model: Some(model.into()),
-        credential_source: Some(openai_credential_source()),
-        capabilities: vec![
-            "reasoning".into(),
-            "structured-response".into(),
-            "failure-diagnosis".into(),
-            "navigation".into(),
-            "proposal".into(),
-            "tool-proposal".into(),
-        ],
-        // Locally configured enough to attempt use; remote entitlement is not claimed.
-        is_available: available,
     }
 }
 
@@ -183,11 +158,6 @@ impl OpenAiResponsesConfig {
             timeout: DEFAULT_AGENT_TIMEOUT,
             max_output_tokens: OPENAI_DEFAULT_MAX_OUTPUT_TOKENS,
         }
-    }
-
-    /// Current Omen Luna preset over the same transport.
-    pub fn luna_preset() -> Self {
-        Self::new(OPENAI_LUNA_MODEL)
     }
 }
 
@@ -475,20 +445,6 @@ impl std::fmt::Debug for OpenAiResponsesProvider {
 }
 
 impl OpenAiResponsesProvider {
-    /// Luna preset constructor: transport + model + provider id together.
-    pub fn luna_preset() -> Self {
-        Self::with_config(
-            OpenAiResponsesConfig::luna_preset(),
-            openai_api_key_from_env(),
-            OPENAI_LUNA_PROVIDER_ID.to_string(),
-        )
-    }
-
-    /// Preset-shaped constructor from environment (Luna default model).
-    pub fn from_env() -> Self {
-        Self::luna_preset()
-    }
-
     pub fn with_config(
         config: OpenAiResponsesConfig,
         api_key: Option<String>,
@@ -527,10 +483,6 @@ impl OpenAiResponsesProvider {
 
     pub fn has_credential(&self) -> bool {
         self.api_key.is_some()
-    }
-
-    pub fn descriptor(&self) -> ProviderDescriptor {
-        openai_luna_descriptor(self.config.model.clone(), self.has_credential())
     }
 
     /// Builds a bounded structured request body (never includes credentials).
@@ -1013,10 +965,10 @@ mod tests {
 
     fn luna_provider(http: Arc<dyn HttpPost>, key: Option<&str>) -> OpenAiResponsesProvider {
         OpenAiResponsesProvider::with_http(
-            OpenAiResponsesConfig::luna_preset(),
+            crate::registry::openai_luna_config(),
             key.map(str::to_string),
             http,
-            OPENAI_LUNA_PROVIDER_ID,
+            crate::registry::OPENAI_LUNA_PROVIDER_ID,
         )
     }
 
@@ -1051,7 +1003,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_config_emits_synthetic_model() {
+    fn generic_transport_preserves_synthetic_model_and_provider_id() {
         let cfg = OpenAiResponsesConfig::new("example-model");
         let provider = OpenAiResponsesProvider::with_http(
             cfg,
@@ -1059,22 +1011,44 @@ mod tests {
             Arc::new(FixedHttp::new(200, "{}", None)),
             "example-provider",
         );
+        assert_eq!(provider.model(), "example-model");
+        assert_eq!(provider.provider_id(), "example-provider");
+        assert!(!provider.provider_id().contains("openai-luna"));
+        assert!(!provider.model().contains("gpt-6-luna"));
+
         let body = provider.build_request_body(&sample_request("hi")).unwrap();
         assert_eq!(body["model"], "example-model");
+        let body_s = body.to_string();
         assert!(
-            !body.to_string().contains("gpt-6-luna"),
+            !body_s.contains("gpt-6-luna"),
             "synthetic model must not be rewritten to Luna"
         );
+        assert!(
+            !body_s.contains("openai-luna"),
+            "synthetic provider id must not be rewritten to Luna"
+        );
+
+        let dbg = format!("{provider:?}");
+        assert!(dbg.contains("example-provider"));
+        assert!(dbg.contains("example-model"));
+        assert!(!dbg.contains("openai-luna"));
+        assert!(!dbg.contains("gpt-6-luna"));
     }
 
     #[test]
-    fn luna_preset_emits_gpt_6_luna() {
+    fn luna_preset_uses_registered_luna_identity() {
+        let config = crate::registry::openai_luna_config();
+        assert_eq!(config.model, crate::registry::OPENAI_LUNA_MODEL);
+
         let provider = OpenAiResponsesProvider::with_http(
-            OpenAiResponsesConfig::luna_preset(),
+            config,
             Some("k".into()),
             Arc::new(FixedHttp::new(200, "{}", None)),
-            OPENAI_LUNA_PROVIDER_ID,
+            crate::registry::OPENAI_LUNA_PROVIDER_ID,
         );
+        assert_eq!(provider.provider_id(), "openai-luna");
+        assert_eq!(provider.model(), "gpt-6-luna");
+
         let body = provider.build_request_body(&sample_request("hi")).unwrap();
         assert_eq!(body["model"], "gpt-6-luna");
         assert_eq!(body["reasoning"]["effort"], "medium");
@@ -1085,10 +1059,10 @@ mod tests {
     #[test]
     fn builds_bounded_request_without_credential() {
         let provider = OpenAiResponsesProvider::with_http(
-            OpenAiResponsesConfig::luna_preset(),
+            crate::registry::openai_luna_config(),
             Some("sk-test-secret".into()),
             Arc::new(FixedHttp::new(200, "{}", None)),
-            OPENAI_LUNA_PROVIDER_ID,
+            crate::registry::OPENAI_LUNA_PROVIDER_ID,
         );
         let body = provider
             .build_request_body(&sample_request("why exit 2?"))
@@ -1104,10 +1078,10 @@ mod tests {
     fn request_redacts_credential_from_prompt_and_context() {
         let secret = "sk-test-secret";
         let provider = OpenAiResponsesProvider::with_http(
-            OpenAiResponsesConfig::luna_preset(),
+            crate::registry::openai_luna_config(),
             Some(secret.into()),
             Arc::new(FixedHttp::new(200, "{}", None)),
-            OPENAI_LUNA_PROVIDER_ID,
+            crate::registry::OPENAI_LUNA_PROVIDER_ID,
         );
         let mut request = sample_request(&format!("please inspect {secret}"));
         request.context.environment.username = secret.into();
@@ -1140,10 +1114,10 @@ mod tests {
     #[test]
     fn debug_never_prints_api_key() {
         let provider = OpenAiResponsesProvider::with_http(
-            OpenAiResponsesConfig::luna_preset(),
+            crate::registry::openai_luna_config(),
             Some("sk-super-secret-value".into()),
             Arc::new(FixedHttp::new(200, "{}", None)),
-            OPENAI_LUNA_PROVIDER_ID,
+            crate::registry::OPENAI_LUNA_PROVIDER_ID,
         );
         let dbg = format!("{provider:?}");
         assert!(!dbg.contains("sk-super-secret-value"));
@@ -1474,8 +1448,9 @@ mod tests {
 
     #[test]
     fn descriptor_never_contains_secret() {
-        let desc = openai_luna_descriptor("gpt-6-luna", true);
+        let desc = crate::registry::openai_luna_descriptor("gpt-6-luna", true);
         assert_eq!(desc.id, "openai-luna");
+        assert_eq!(desc.name, "OpenAI GPT-6 Luna");
         assert_eq!(
             desc.credential_source.as_deref(),
             Some("environment:OPENAI_API_KEY")
