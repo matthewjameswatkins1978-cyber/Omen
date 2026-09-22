@@ -457,6 +457,10 @@ impl McpServer {
                 json!(machine_contract::contract_digest()),
             );
             object.insert("describe_ref".into(), json!(id));
+            object.insert(
+                "invocation".into(),
+                serde_json::to_value(machine_contract::invocation_for(id)).unwrap(),
+            );
         }
         CallToolResult::text(serde_json::to_string_pretty(&doc).unwrap())
     }
