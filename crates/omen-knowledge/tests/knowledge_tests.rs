@@ -103,6 +103,14 @@ fn cas_storage_bounded_slice_and_gc() {
     assert_eq!(meta.size, payload.len() as u64);
     assert_eq!(meta.blob_state, BlobState::Present);
 
+    // CAS consumers accept the canonical artifact URI Omen emits, not only
+    // the bare digest. This keeps producer and consumer identity grammar equal.
+    let canonical_uri = meta.uri.to_string();
+    let inspected_by_uri = cas.inspect(&db, &canonical_uri).unwrap();
+    assert_eq!(inspected_by_uri.digest, meta.digest);
+    let uri_slice = cas.read_slice(&mut db, &canonical_uri, 0, 5).unwrap();
+    assert_eq!(uri_slice, b"01234");
+
     // Read bounded slice: offset 10, length 16
     let slice = cas.read_slice(&mut db, &meta.digest, 10, 16).unwrap();
     assert_eq!(slice, b"ABCDEFGHIJKLMNOP");
