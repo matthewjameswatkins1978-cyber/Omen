@@ -8,7 +8,25 @@
 
 use omen_core::{RequiredAssurance, RuntimeStatus, StdioMode};
 use omen_engine::{ExecutionRequest, ProcessSupervisor};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+fn workspace_root() -> PathBuf {
+    // <root>/crates/omen-engine -> <root>
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf()
+}
+
+fn gremlin_supports_topology_flag(exe: &Path) -> bool {
+    std::process::Command::new(exe)
+        .arg("--help")
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).contains("report-stdin-topology"))
+        .unwrap_or(false)
+}
 
 fn gremlin_exe() -> PathBuf {
     let mut path = std::env::current_exe().expect("failed to get current_exe");
@@ -22,31 +40,34 @@ fn gremlin_exe() -> PathBuf {
         "omen-gremlin"
     };
     let exe = path.join(name);
-    if exe.exists() {
+    if exe.exists() && gremlin_supports_topology_flag(&exe) {
         return exe;
     }
 
-    let fallback = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("target")
-        .join("debug")
-        .join(name);
-    if fallback.exists() {
+    let fallback = workspace_root().join("target").join("debug").join(name);
+    if fallback.exists() && gremlin_supports_topology_flag(&fallback) {
         return fallback;
     }
 
-    // If binary not found, build it on-demand
-    let _ = std::process::Command::new("cargo")
-        .args(["build", "--bin", "omen-gremlin"])
+    // Build the fixture on demand from the workspace root (the test
+    // harness cwd is not necessarily the workspace root, and `cargo test`
+    // without --all-targets may leave bins stale or absent).
+    let build = std::process::Command::new("cargo")
+        .args(["build", "-p", "omen-test-fixtures", "--bin", "omen-gremlin"])
+        .current_dir(workspace_root())
         .status();
+    assert!(
+        build.map(|status| status.success()).unwrap_or(false),
+        "on-demand fixture build failed"
+    );
 
-    if exe.exists() {
+    if exe.exists() && gremlin_supports_topology_flag(&exe) {
         return exe;
     }
-    fallback
+    if fallback.exists() && gremlin_supports_topology_flag(&fallback) {
+        return fallback;
+    }
+    panic!("gremlin binary with --report-stdin-topology not found at {exe:?} or {fallback:?}");
 }
 
 fn request(mode: StdioMode, payload: Option<Vec<u8>>) -> ExecutionRequest {
@@ -70,9 +91,15 @@ fn topology(output: &omen_engine::ExecutionOutput) -> serde_json::Value {
     let text = String::from_utf8_lossy(&output.stdout_all);
     let line = text
         .lines()
-        .find(|line| line.starts_with("STDIN_TOPOLOGY:"))
-        .unwrap_or_else(|| panic!("missing STDIN_TOPOLOGY in {text:?}"));
-    serde_json::from_str(line.trim_start_matches("STDIN_TOPOLOGY:")).unwrap()
+        .find(|line| line.starts_with("STDIN_TOPOLOGY:"));
+    match line {
+        Some(line) => serde_json::from_str(line.trim_start_matches("STDIN_TOPOLOGY:")).unwrap(),
+        None => panic!(
+            "missing STDIN_TOPOLOGY (exit={:?} stdout={text:?} stderr={:?})",
+            output.process_exit.code,
+            String::from_utf8_lossy(&output.stderr_all),
+        ),
+    }
 }
 
 #[tokio::test]
