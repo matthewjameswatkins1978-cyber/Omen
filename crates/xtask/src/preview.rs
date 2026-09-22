@@ -189,11 +189,16 @@ fn payload_digest(
     fixtures: &std::collections::BTreeMap<String, String>,
 ) -> String {
     let mut h = Sha256::new();
-    h.update(b"omen");
-    h.update(binary.as_bytes());
     if let Some(daemon) = daemon_binary {
+        // Schema 2 package identity includes both executable names and digests.
+        h.update(b"omen");
+        h.update(binary.as_bytes());
         h.update(b"omend");
         h.update(daemon.as_bytes());
+    } else {
+        // Preserve schema 1 package identity so old installed previews remain
+        // verifiable and rollback-safe.
+        h.update(binary.as_bytes());
     }
     for (name, digest) in fixtures {
         h.update(name.as_bytes());
