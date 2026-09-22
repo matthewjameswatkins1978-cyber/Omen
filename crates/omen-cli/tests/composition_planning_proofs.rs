@@ -253,13 +253,34 @@ fn planning_reads_existing_generation_without_writing_state() {
     assert!(ok);
     assert_eq!(plan["context_generation"], 7);
     assert_eq!(fs::read(&db_path).unwrap(), before);
+    // E2.1: the read-only history path intentionally observes the live WAL
+    // (no `immutable=1`), so SQLite may materialize wal/shm sidecars as
+    // cooperation files. The load-bearing invariant is that planning writes
+    // no durable truth: the main database bytes are unchanged (above), no
+    // new non-sidecar files appear, and no WAL content is produced (a shm
+    // without WAL frames carries no truth and is rebuilt on next open).
     let after_entries = fs::read_dir(&state_dir)
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
         .collect::<Vec<_>>();
-    assert_eq!(before_entries, after_entries);
-    assert!(!state_dir.join("state.sqlite-wal").exists());
-    assert!(!state_dir.join("state.sqlite-shm").exists());
+    for entry in &after_entries {
+        let name = entry.to_string_lossy();
+        if name == "state.sqlite-wal" {
+            assert_eq!(
+                fs::metadata(state_dir.join(entry)).unwrap().len(),
+                0,
+                "planning must not write WAL content"
+            );
+        } else if name == "state.sqlite-shm" {
+            // Cooperation sidecar only; content truth lives in the main db
+            // (byte-identical, asserted above) and the WAL (absent/empty).
+        } else {
+            assert!(
+                before_entries.contains(entry),
+                "planning created unexpected state file: {name}"
+            );
+        }
+    }
 }
 
 #[test]

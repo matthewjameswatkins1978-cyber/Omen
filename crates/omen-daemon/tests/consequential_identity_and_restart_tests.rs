@@ -43,6 +43,7 @@ async fn test_receipt_execution_id_matches_history_execution_id() {
             let receipt = ws
                 .query_request_receipt(dedup_id)
                 .await
+                .expect("receipt read must succeed")
                 .expect("Receipt must exist");
             assert_eq!(receipt.status, "Completed");
             assert_eq!(
@@ -105,6 +106,7 @@ async fn test_running_receipt_after_crash_becomes_unknown_not_retried() {
             let receipt = ws
                 .query_request_receipt("req-crashed-run")
                 .await
+                .expect("receipt read must succeed")
                 .expect("Receipt must exist");
             assert_eq!(
                 receipt.status, "Unknown",
@@ -181,7 +183,7 @@ async fn test_consequential_request_survives_daemon_restart_without_reexecution(
             };
 
             let summary2 = ws2.execute_broker(params2).await.unwrap();
-            let receipt = ws2.query_request_receipt(dedup_id).await.unwrap();
+            let receipt = ws2.query_request_receipt(dedup_id).await.unwrap().unwrap();
 
             assert_eq!(receipt.status, "Completed");
             assert_eq!(summary2.execution_id, receipt.execution_id.unwrap());

@@ -322,6 +322,10 @@ class Omen:
         """Poll a caller-owned consequential request id."""
         return self._submit(self._async.execution_status(request_id))
 
+    def cancel_execution(self, execution_id: str) -> JsonObject:
+        """Request cancellation by canonical execution_id (intent != proof)."""
+        return self._submit(self._async.cancel_execution(execution_id))
+
     def execute(
         self,
         argv: Sequence[str],

@@ -73,6 +73,18 @@ pub trait ExecutionHandle: Send {
     fn pid(&self) -> Option<u32>;
     fn terminate_tree(&mut self) -> Result<(), CoreError>;
     fn wait_bounded(self: Box<Self>, timeout: Duration) -> ExecutionWaitFuture;
+    /// Wait with an external cancellation flag.
+    ///
+    /// E2 stop truth: firing `cancel` records INTENT only. This method still
+    /// performs the physical stop (`terminate_tree`) and then observes the
+    /// child for a bounded grace period. Death observed → `Cancelled`;
+    /// death unconfirmed within grace → `OutcomeUnknown`. The flag firing
+    /// never, by itself, manufactures a terminal state.
+    fn wait_cancelable(
+        self: Box<Self>,
+        timeout: Duration,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> ExecutionWaitFuture;
 }
 
 /// Request to spawn a PTY interactive process.
@@ -159,6 +171,27 @@ pub struct NativeExecutionHandle {
     pub pgid: Option<u32>,
 }
 
+impl NativeExecutionHandle {
+    /// Physical tree-stop for a child already taken out of the handle
+    /// (used by the wait paths, where `terminate_tree` cannot take it).
+    /// Same enforcement as `terminate_tree`: job object on Windows,
+    /// process-group KILL on Unix, direct kill as the last resort.
+    fn terminate_tree_for_wait(handle: &mut Box<Self>, child: &mut tokio::process::Child) {
+        #[cfg(windows)]
+        if let Some(jg) = &handle.job_guard {
+            jg.terminate(1);
+        }
+        #[cfg(unix)]
+        if let Some(pid_val) = handle
+            .pgid
+            .and_then(|pgid| rustix::process::Pid::from_raw(pgid as i32))
+        {
+            let _ = rustix::process::kill_process_group(pid_val, rustix::process::Signal::KILL);
+        }
+        let _ = child.start_kill();
+    }
+}
+
 impl ExecutionHandle for NativeExecutionHandle {
     fn pid(&self) -> Option<u32> {
         self.pid
@@ -225,21 +258,7 @@ impl ExecutionHandle for NativeExecutionHandle {
                         },
                     ),
                     Err(_) => {
-                        #[cfg(windows)]
-                        if let Some(jg) = &self.job_guard {
-                            jg.terminate(1);
-                        }
-                        #[cfg(unix)]
-                        if let Some(pid_val) = self
-                            .pgid
-                            .and_then(|pgid| rustix::process::Pid::from_raw(pgid as i32))
-                        {
-                            let _ = rustix::process::kill_process_group(
-                                pid_val,
-                                rustix::process::Signal::KILL,
-                            );
-                        }
-                        let _ = child.start_kill();
+                        Self::terminate_tree_for_wait(&mut self, &mut child);
                         (
                             RuntimeStatus::TimedOut,
                             ProcessExit {
@@ -273,8 +292,130 @@ impl ExecutionHandle for NativeExecutionHandle {
             Ok((wait_res.0, wait_res.1, stdout_all, stderr_all))
         })
     }
+
+    fn wait_cancelable(
+        mut self: Box<Self>,
+        timeout: Duration,
+        mut cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> ExecutionWaitFuture {
+        Box::pin(async move {
+            let stdout_pipe = self.stdout.take();
+            let stderr_pipe = self.stderr.take();
+
+            let stdout_task = tokio::spawn(async move {
+                if let Some(mut pipe) = stdout_pipe {
+                    let mut buf = Vec::new();
+                    let _ = tokio::io::AsyncReadExt::read_to_end(&mut pipe, &mut buf).await;
+                    buf
+                } else {
+                    Vec::new()
+                }
+            });
+
+            let stderr_task = tokio::spawn(async move {
+                if let Some(mut pipe) = stderr_pipe {
+                    let mut buf = Vec::new();
+                    let _ = tokio::io::AsyncReadExt::read_to_end(&mut pipe, &mut buf).await;
+                    buf
+                } else {
+                    Vec::new()
+                }
+            });
+
+            let (runtime_status, process_exit) = if let Some(mut child) = self.child.take() {
+                tokio::select! {
+                    res = child.wait() => {
+                        match res {
+                            Ok(status) => (
+                                RuntimeStatus::Completed,
+                                ProcessExit {
+                                    code: status.code(),
+                                    signal: None,
+                                },
+                            ),
+                            Err(e) => (
+                                RuntimeStatus::IoFailed,
+                                ProcessExit {
+                                    code: None,
+                                    signal: Some(e.to_string()),
+                                },
+                            ),
+                        }
+                    }
+                    _ = tokio::time::sleep(timeout) => {
+                        // Child deadline: same physical stop as wait_bounded.
+                        Self::terminate_tree_for_wait(&mut self, &mut child);
+                        (
+                            RuntimeStatus::TimedOut,
+                            ProcessExit {
+                                code: None,
+                                signal: Some("SIGKILL_TIMEOUT".into()),
+                            },
+                        )
+                    }
+                    _ = async {
+                        // Scope the watch guard: `Ref` is not Send, so it
+                        // must not be held across the branch's later awaits.
+                        let _ = cancel.wait_for(|fired| *fired).await;
+                    } => {
+                        // Intent observed. Attempt the physical stop, then
+                        // CONFIRM death within a bounded grace period.
+                        // Unconfirmed death stays OutcomeUnknown: Omen must
+                        // not rewrite uncertainty into success or failure.
+                        Self::terminate_tree_for_wait(&mut self, &mut child);
+                        match tokio::time::timeout(
+                            CANCEL_TERMINATION_GRACE,
+                            child.wait(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(status)) => (
+                                RuntimeStatus::Cancelled,
+                                ProcessExit {
+                                    code: status.code(),
+                                    signal: Some("CANCELLED".into()),
+                                },
+                            ),
+                            _ => (
+                                RuntimeStatus::OutcomeUnknown,
+                                ProcessExit {
+                                    code: None,
+                                    signal: Some("CANCELLED_UNCONFIRMED".into()),
+                                },
+                            ),
+                        }
+                    }
+                }
+            } else {
+                (
+                    RuntimeStatus::Completed,
+                    ProcessExit {
+                        code: Some(0),
+                        signal: None,
+                    },
+                )
+            };
+
+            let stdout_all = tokio::time::timeout(Duration::from_millis(500), stdout_task)
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or_default();
+            let stderr_all = tokio::time::timeout(Duration::from_millis(500), stderr_task)
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or_default();
+
+            Ok((runtime_status, process_exit, stdout_all, stderr_all))
+        })
+    }
 }
 
+/// Bounded grace period to observe physical death after a cancellation kill.
+/// Expiry means Omen could not confirm termination: the outcome stays
+/// `OutcomeUnknown`, never a manufactured success or failure.
+pub const CANCEL_TERMINATION_GRACE: Duration = Duration::from_secs(5);
 /// Native host execution backend.
 pub struct NativeExecutionBackend;
 

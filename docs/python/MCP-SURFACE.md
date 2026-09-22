@@ -1,4 +1,4 @@
-# Omen MCP surface (Preview 8, contract 0.8) — as seen by omen-shell
+# Omen MCP surface (Preview 11, contract 0.8) — as seen by omen-shell
 
 Source of truth: `crates/omen-mcp/src/server.rs`, `protocol.rs`.
 Transport: newline-delimited JSON-RPC 2.0 on stdio. Pure JSON on
@@ -63,7 +63,8 @@ Per-tool arguments (R required / O optional):
 | `omen_workspace_status` | none |
 | `omen_facts_query` | O `filter?: "all"\|"current"\|"dirty"` (default `all`) |
 | `omen_execute` | R `argv: string[]` (non-empty); O `tool` (default `"exec"`), `operation` (default `""`), `cwd` (default workspace), `timeout_ms` (default `60000`). **No stdin/budget/env args** — stdin always Closed, `inline_budget=8192` hardcoded |
-| `omen_execution_status` | R `request_id: string` (caller idempotency key, max 256; **not** execution_id) |
+| `omen_execution_status` | R `request_id: string` (caller idempotency key, max 256; **not** execution_id). Status `Running` / `CancellationRequested` / `Cancelled` / `Completed` / `Failed` / `Unknown` / `NotSeen` |
+| `omen_cancel_execution` | R `execution_id: string` (Omen-minted canonical ID). Needs the daemon broker; standalone refusals are explicit errors, never faked stops |
 | `omen_history_query` | O `all_sessions` (default true), `session_id`, `limit` (default 20, enforced 1..100). **No `since`** |
 | `omen_services_list` | none (needs daemon or errors) |
 | `omen_services_control` | R `action: start\|stop\|restart`, `name`; O `command` (start only) |
@@ -98,16 +99,27 @@ Other JSON-RPC errors likewise stay `OmenProtocolError`.
   platform, backend, capability_groups[], surfaces: {cli, mcp,
   interactive}, references, recipes[], next[], next_actions[]}`.
 - **execute** (daemon and standalone): `{execution_id,
-  runtime_status (COMPLETED/FAILED/TIMED_OUT/…), exit_code (int|null),
+  runtime_status (COMPLETED/SPAWN_FAILED/TIMED_OUT/CANCELLED/
+  OUTCOME_UNKNOWN/CONTAINMENT_FAILED/IO_FAILED), exit_code (int|null),
   duration_ms, stdout_preview, stderr_preview, stdout_artifact (uri|null),
-  stderr_artifact (uri|null)}`.
+  stderr_artifact (uri|null)}`. Standalone executions record durable
+  history under the returned ID (same as interactive standalone).
+- **cancel_execution**: `{execution_id, outcome:
+  {outcome: TerminationConfirmed} | {outcome: DispatchPrevented} |
+  {outcome: AlreadyFinished,
+  terminal_status} | {outcome: OutcomeUnknown} | {outcome: NotFound},
+  detail}`. Intent (`CancellationRequested` receipt) and proof are
+  distinct: only observed physical death confirms; a pre-dispatch stop
+  reports `DispatchPrevented` without claiming a tree-stop or a death.
 - **history_query**: bare `HistoryResult{schema_version, entries[],
   limit, all_sessions, ordering, pagination}` unless
   `<state>/local-execution-status.json` exists → wrapped `{history,
   history_status: "UNJOURNALED_LOCAL_EXECUTION", local_execution}`.
   Entry: `{sequence, execution_id, session_id, command, status
-  (COMPLETED|FAILED|REFUSED|TIMED_OUT|PARTIAL|UNKNOWN), recorded_at,
-  duration_ms, state_changed?, evidence[], error?}`.
+  (COMPLETED|FAILED|REFUSED|TIMED_OUT|PARTIAL|CANCELLED|UNKNOWN), recorded_at,
+  duration_ms, state_changed?, evidence[], error?}`. Timeout / cancel /
+  unknown broker outcomes are stamped explicitly (TIMED_OUT / CANCELLED /
+  UNKNOWN), never collapsed into success or failure.
 - **semantic** (`definition`/`symbol_search`/`references`):
   `SemanticResult{schema_version, operation (snake_case), outcome
   (FOUND|NOT_FOUND|AMBIGUOUS), coverage (COMPLETE|PARTIAL|NONE),

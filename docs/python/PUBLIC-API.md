@@ -29,11 +29,16 @@ Advanced error/model types stay in `omen_shell.errors` /
   `context(*, since=None)`, `workspace_status()`,
   `execution_status(request_id)`, `execute(argv, *, timeout=None,
   request_timeout=None, cwd=None, tool="exec", operation="")`,
+  `cancel_execution(execution_id)`,
   `reconnect()`, `connection_info`, `supported_contracts`.
   Failed `connect`/`_open`/`reconnect` leaves zero transport ownership
   (process reaped, tasks stopped, pending failed) and re-raises the
   original failure. A successful `reconnect()` resets the Python
   session overlay (`session_executions`); durable Omen history is untouched.
+- `cancel_execution(execution_id)` → raw cancel record (`execution_id` /
+  `outcome` / `detail`); intent (`CancellationRequested`) and proof
+  (`TerminationConfirmed` / `DispatchPrevented` / `OutcomeUnknown` /
+  `AlreadyFinished` / `NotFound`) stay distinct; passed through opaquely.
 - `execute()` accepts argv sequences only; a command string raises
   `OmenProtocolError`. Non-zero child exit returns `ExecutionResult`.
 

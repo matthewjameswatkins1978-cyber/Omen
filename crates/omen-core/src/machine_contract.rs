@@ -126,6 +126,11 @@ pub fn invocation_for(capability_id: &str) -> Invocation {
         "execution.run" => {
             Invocation::new(Some("exec --machine -- <argv>"), Some("omen_execute"), None)
         }
+        "execution.cancel" => Invocation::new(
+            Some("cancel <execution-id>"),
+            Some("omen_cancel_execution"),
+            None,
+        ),
         "mutation.threadmoth" => Invocation::new(None, None, None),
         "composition.run" => Invocation::new(Some("action run"), None, None),
         "filesystem.read" => Invocation::new(None, None, None),
@@ -358,6 +363,25 @@ pub fn contract() -> MachineContract {
             bounds: "bounded output and timeout".into(),
             timeout: "caller supplied timeout".into(),
             examples: vec![json!({"argv":["cargo","check"],"result_identity":"Omen-generated execution_id; upstream references remain external_reference"})],
+        },
+        CapabilityDefinition {
+            id: "execution.cancel".into(),
+            invocation: invocation_for("execution.cancel"),
+            group: "execution".into(),
+            summary: "Request cancellation of a live brokered execution by canonical execution_id. Intent and proof are distinct: only observed physical death reports TerminationConfirmed; a stop that arrives before dispatch reports DispatchPrevented (no spawn, no tree-stop, no death claimed); unconfirmed stops report OutcomeUnknown; finished executions report AlreadyFinished without rewriting history.".into(),
+            input_schema: object_schema(
+                json!({"execution_id":{"type":"string","minLength":1}}),
+                &["execution_id"],
+            ),
+            output_schema: result.clone(),
+            effect_class: EffectClass::Mutate,
+            network_effect: NetworkEffect::None,
+            reversibility: Reversibility::Irreversible,
+            idempotent: true,
+            authority: "none".into(),
+            bounds: "one bounded cancel request; bounded terminal observation".into(),
+            timeout: "bounded stop grace plus bounded observation".into(),
+            examples: vec![json!({"execution_id":"exec_01K9F82A"})],
         },
         CapabilityDefinition {
             id: "mutation.threadmoth".into(),

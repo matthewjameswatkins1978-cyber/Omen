@@ -131,6 +131,19 @@ def _handle(message: dict[str, object], pending: list[dict[str, object]]) -> Non
             _ok(call_id, _tool_text(payload))
             _ok(call_id, _tool_text(payload))
             return
+        if name == "omen_cancel_execution":
+            exec_id = args.get("execution_id") if isinstance(args, dict) else None
+            _ok(
+                call_id,
+                _tool_text(
+                    {
+                        "execution_id": exec_id,
+                        "outcome": {"outcome": "TerminationConfirmed"},
+                        "detail": "fake stop confirmed",
+                    }
+                ),
+            )
+            return
         if name == "omen_orient" and MODE == "good-orient":
             _ok(
                 call_id,

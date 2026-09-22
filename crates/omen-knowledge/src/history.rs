@@ -23,7 +23,57 @@ pub enum HistoryStatus {
     Refused,
     TimedOut,
     Partial,
+    Cancelled,
     Unknown,
+}
+
+/// Durable broker history envelope: coarse presentation label PLUS exact
+/// physical runtime truth.
+///
+/// Repair A invariant: coarse history status != exact `RuntimeStatus`.
+/// The `status` field drives history/query presentation (stamped via the
+/// single `history_label` authority). The `runtime_status` field preserves
+/// the exact physical outcome verbatim for durable replay. Replay must use
+/// the exact field when present and must never reconstruct precision from
+/// the coarse label (`IoFailed -> FAILED -> Completed` is the canonical
+/// forbidden rewrite).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HistoryStatusEnvelope {
+    /// Coarse presentation label (`COMPLETED`, `FAILED`, ...).
+    pub status: String,
+    /// Exact physical runtime truth. `None` for rows recorded before the
+    /// exact field existed (legacy) — replay must not invent precision.
+    pub runtime_status: Option<omen_core::RuntimeStatus>,
+    /// Which surface stamped this record (`broker`, ...).
+    pub source: String,
+    /// Typed dispatch-prevention truth (Repair 2).
+    #[serde(default)]
+    pub dispatch_prevented: bool,
+}
+
+impl HistoryStatusEnvelope {
+    /// Stamp a broker record: coarse label from the single `history_label`
+    /// authority, exact runtime preserved verbatim.
+    pub fn broker(
+        runtime: omen_core::RuntimeStatus,
+        exit_code: Option<i32>,
+        dispatch_prevented: bool,
+    ) -> Self {
+        Self {
+            status: runtime.history_label(exit_code).to_string(),
+            runtime_status: Some(runtime),
+            source: "broker".to_string(),
+            dispatch_prevented,
+        }
+    }
+
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).expect("history envelope is JSON-serializable")
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        serde_json::from_str(raw).ok()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -199,10 +249,12 @@ fn parse_history_status(value: &str) -> Option<HistoryStatus> {
     match value {
         "COMPLETED" | "Completed" => Some(HistoryStatus::Completed),
         "FAILED" | "Failed" => Some(HistoryStatus::Failed),
+        "SPAWN_FAILED" | "CONTAINMENT_FAILED" | "IO_FAILED" => Some(HistoryStatus::Failed),
         "REFUSED" | "Refused" => Some(HistoryStatus::Refused),
         "TIMED_OUT" | "TimedOut" => Some(HistoryStatus::TimedOut),
+        "CANCELLED" | "Cancelled" => Some(HistoryStatus::Cancelled),
         "PARTIAL" | "Partial" => Some(HistoryStatus::Partial),
-        "UNKNOWN" | "Unknown" => Some(HistoryStatus::Unknown),
+        "OUTCOME_UNKNOWN" | "UNKNOWN" | "Unknown" => Some(HistoryStatus::Unknown),
         _ => None,
     }
 }

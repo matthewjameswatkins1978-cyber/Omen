@@ -30,6 +30,19 @@ impl Database {
     }
 
     /// Opens an existing SQLite database without creating or migrating state.
+    ///
+    /// E2 read-after-write contract: the reader MUST observe every committed
+    /// transaction, including frames still sitting in the WAL of a live
+    /// writer (the daemon holds its connection open for its whole lifetime).
+    /// Therefore this intentionally does NOT use `immutable=1` (which would
+    /// freeze the reader at whatever was checkpointed into the main file and
+    /// hide the daemon's un-checkpointed commits until daemon exit).
+    ///
+    /// Read-only + WAL is concurrency-safe: the reader takes SHARED locks and
+    /// reads committed WAL frames; it never writes, migrates, or creates
+    /// files. A bounded `busy_timeout` lets the reader ride out a writer's
+    /// checkpoint instead of failing instantly; expiry surfaces as an error
+    /// (control returns to the caller), never a hang.
     pub fn open_read_only(path: &Path) -> Result<Self, CoreError> {
         if !path.is_file() {
             return Err(CoreError::Internal(format!(
@@ -45,9 +58,9 @@ impl Database {
             .replace('\\', "/");
         let normalized = normalized.strip_prefix("//?/").unwrap_or(&normalized);
         let uri = if normalized.as_bytes().get(1) == Some(&b':') {
-            format!("file:///{normalized}?immutable=1")
+            format!("file:///{normalized}")
         } else {
-            format!("file://{normalized}?immutable=1")
+            format!("file://{normalized}")
         };
         let conn = Connection::open_with_flags(
             uri,
@@ -56,6 +69,10 @@ impl Database {
         .map_err(|e| {
             CoreError::Internal(format!("Failed to open SQLite database read-only: {e}"))
         })?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| {
+                CoreError::Internal(format!("Failed to set read-only busy timeout: {e}"))
+            })?;
         Ok(Self { conn })
     }
 
@@ -212,7 +229,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn immutable_read_only_open_uses_existing_database() {
+    fn read_only_open_uses_existing_database() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("state.sqlite");
         {
@@ -231,7 +248,48 @@ mod tests {
             )
             .unwrap();
         assert_eq!(generation, 7);
-        assert!(!path.with_extension("sqlite-wal").exists());
-        assert!(!path.with_extension("sqlite-shm").exists());
+    }
+
+    #[test]
+    fn read_only_reader_sees_live_writer_commits() {
+        // E2.1: the daemon writer connection stays open for its whole life
+        // with commits sitting in WAL. The read-only path must see them.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.sqlite");
+        let writer = Database::open(&path).unwrap();
+        writer
+            .conn()
+            .execute(
+                "INSERT INTO resource_generations (name, generation) VALUES ('fs:workspace', 7)",
+                [],
+            )
+            .unwrap();
+        let reader = Database::open_read_only(&path).unwrap();
+        let seen: i64 = reader
+            .conn()
+            .query_row(
+                "SELECT generation FROM resource_generations WHERE name = 'fs:workspace'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(seen, 7);
+        writer
+            .conn()
+            .execute(
+                "UPDATE resource_generations SET generation = 8 WHERE name = 'fs:workspace'",
+                [],
+            )
+            .unwrap();
+        let reader2 = Database::open_read_only(&path).unwrap();
+        let seen2: i64 = reader2
+            .conn()
+            .query_row(
+                "SELECT generation FROM resource_generations WHERE name = 'fs:workspace'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(seen2, 8);
     }
 }

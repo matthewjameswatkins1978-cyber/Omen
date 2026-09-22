@@ -229,3 +229,174 @@ async fn preflight_rejects_unsupported_assurance() {
         Err(e) => panic!("Unexpected error: {:?}", e),
     }
 }
+
+#[tokio::test]
+async fn cancel_mid_flight_kills_and_confirms_termination() {
+    use tokio::sync::watch;
+    let supervisor = ProcessSupervisor::new();
+    let gremlin = gremlin_exe();
+
+    let req = ExecutionRequest {
+        argv: vec![
+            gremlin.to_string_lossy().to_string(),
+            "--sleep-ms".into(),
+            "30000".into(),
+        ],
+        cwd: std::env::current_dir().unwrap(),
+        env: vec![],
+        stdin_mode: StdioMode::Closed,
+        stdin_payload: None,
+        timeout_ms: 60000,
+        inline_budget: 8192,
+        required_assurance: RequiredAssurance::default(),
+        secrets: vec![],
+    };
+
+    let (tx, rx) = watch::channel(false);
+    let handle = tokio::spawn(async move { supervisor.execute_cancelable(req, rx).await });
+    // Let the child actually start before requesting the stop.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    tx.send(true).expect("cancel flag must fire");
+    let output = tokio::time::timeout(std::time::Duration::from_secs(30), handle)
+        .await
+        .expect("cancel wait must be bounded")
+        .expect("worker task must not panic")
+        .expect("cancelable execute must return output");
+    assert_eq!(output.runtime_status, RuntimeStatus::Cancelled);
+    assert_eq!(output.process_exit.signal.as_deref(), Some("CANCELLED"));
+    assert_eq!(
+        output.adapter_classification,
+        AdapterClassification::Failure
+    );
+}
+
+#[tokio::test]
+async fn unfired_cancel_leaves_normal_completion_untouched() {
+    use tokio::sync::watch;
+    let supervisor = ProcessSupervisor::new();
+    let gremlin = gremlin_exe();
+
+    let req = ExecutionRequest {
+        argv: vec![
+            gremlin.to_string_lossy().to_string(),
+            "--stdout".into(),
+            "cancel-quiet".into(),
+        ],
+        cwd: std::env::current_dir().unwrap(),
+        env: vec![],
+        stdin_mode: StdioMode::Closed,
+        stdin_payload: None,
+        timeout_ms: 10000,
+        inline_budget: 8192,
+        required_assurance: RequiredAssurance::default(),
+        secrets: vec![],
+    };
+
+    let (_tx, rx) = watch::channel(false);
+    let output = supervisor.execute_cancelable(req, rx).await.unwrap();
+    assert_eq!(output.runtime_status, RuntimeStatus::Completed);
+    assert!(String::from_utf8_lossy(&output.stdout_all).contains("cancel-quiet"));
+}
+
+#[tokio::test]
+async fn prefired_cancel_never_spawns() {
+    use omen_core::BackendId;
+    use omen_core::EnforcementLevel;
+    use omen_engine::backend::ExecutionWaitFuture;
+    use omen_engine::{
+        BackendAvailability, BackendCapabilities, BackendDescriptor, BackendKind, ExecutionBackend,
+        ExecutionHandle, PtyExecutionHandle, PtyExecutionRequest,
+    };
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio::sync::watch;
+
+    struct NoSpawnHandle;
+    impl ExecutionHandle for NoSpawnHandle {
+        fn pid(&self) -> Option<u32> {
+            None
+        }
+        fn terminate_tree(&mut self) -> Result<(), CoreError> {
+            Ok(())
+        }
+        fn wait_bounded(self: Box<Self>, _timeout: Duration) -> ExecutionWaitFuture {
+            panic!("NoSpawn backend must never wait: nothing was spawned");
+        }
+        fn wait_cancelable(
+            self: Box<Self>,
+            _timeout: Duration,
+            _cancel: watch::Receiver<bool>,
+        ) -> ExecutionWaitFuture {
+            panic!("NoSpawn backend must never wait: nothing was spawned");
+        }
+    }
+
+    struct NoSpawnBackend {
+        spawns: Arc<AtomicUsize>,
+    }
+    impl ExecutionBackend for NoSpawnBackend {
+        fn id(&self) -> BackendId {
+            BackendId::native()
+        }
+        fn descriptor(&self) -> BackendDescriptor {
+            BackendDescriptor {
+                id: self.id(),
+                name: "NoSpawn".into(),
+                kind: BackendKind::NativeHost,
+                availability: BackendAvailability::Available,
+                capabilities: BackendCapabilities {
+                    filesystem: EnforcementLevel::Observed,
+                    network: EnforcementLevel::Observed,
+                    descendants: EnforcementLevel::Observed,
+                    symlink_escape: EnforcementLevel::Observed,
+                    pty: false,
+                },
+            }
+        }
+        fn spawn(
+            &self,
+            _req: &omen_engine::supervisor::ExecutionRequest,
+        ) -> Result<Box<dyn ExecutionHandle>, CoreError> {
+            self.spawns.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(NoSpawnHandle))
+        }
+        fn spawn_pty(
+            &self,
+            _req: &PtyExecutionRequest,
+        ) -> Result<Box<dyn PtyExecutionHandle>, CoreError> {
+            Err(CoreError::ExecutionFailed("NoSpawn has no PTY".into()))
+        }
+    }
+
+    let spawns = Arc::new(AtomicUsize::new(0));
+    let supervisor = ProcessSupervisor::with_backend(Arc::new(NoSpawnBackend {
+        spawns: spawns.clone(),
+    }));
+
+    let req = ExecutionRequest {
+        argv: vec!["anything".into()],
+        cwd: std::env::current_dir().unwrap(),
+        env: vec![],
+        stdin_mode: StdioMode::Closed,
+        stdin_payload: None,
+        timeout_ms: 10000,
+        inline_budget: 8192,
+        required_assurance: RequiredAssurance::default(),
+        secrets: vec![],
+    };
+
+    let (tx, rx) = watch::channel(false);
+    tx.send(true).expect("cancel flag must fire");
+    let output = supervisor.execute_cancelable(req, rx).await.unwrap();
+    assert_eq!(output.runtime_status, RuntimeStatus::Cancelled);
+    assert_eq!(
+        output.process_exit.signal.as_deref(),
+        Some("CANCELLED_BEFORE_DISPATCH")
+    );
+    assert_eq!(
+        spawns.load(Ordering::SeqCst),
+        0,
+        "pre-fired cancel must never spawn a physical process"
+    );
+}

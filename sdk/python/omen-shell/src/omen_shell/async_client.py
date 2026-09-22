@@ -561,6 +561,23 @@ class AsyncOmen:
             raise OmenProtocolError("omen_execution_status returned no object", raw={})
         return payload
 
+    async def cancel_execution(self, execution_id: str) -> JsonObject:
+        """Request cancellation of a live execution by canonical execution_id.
+
+        Intent and proof stay distinct end to end: only observed physical
+        death reports ``TerminationConfirmed``; unconfirmed stops report
+        ``OutcomeUnknown``; finished executions report ``AlreadyFinished``
+        without rewriting history. Returns the raw cancel record
+        (``execution_id`` / ``outcome`` / ``detail``) — Omen's truth, not a
+        Python reinterpretation.
+        """
+        if not isinstance(execution_id, str) or not execution_id:
+            raise OmenProtocolError("execution_id must be a non-empty string")
+        payload = await self._call_tool("omen_cancel_execution", {"execution_id": execution_id})
+        if not isinstance(payload, dict):
+            raise OmenProtocolError("omen_cancel_execution returned no object", raw={})
+        return payload
+
     # -- execution ----------------------------------------------------
 
     async def execute(
