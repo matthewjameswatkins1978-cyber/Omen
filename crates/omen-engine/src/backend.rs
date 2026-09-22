@@ -357,9 +357,31 @@ impl ExecutionBackend for NativeExecutionBackend {
         }
 
         // Stdio setup
+        //
+        // A physically closed pipe is not equivalent to "no interactive input":
+        // tools such as ripgrep can detect the pipe and switch to stdin-search
+        // semantics, producing a plausible empty result at EOF. Use the OS null
+        // device for genuinely closed input, and allocate a pipe only when Omen
+        // has bytes (or a stdin secret) to deliver.
+        let has_stdin_secret = req.secrets.iter().any(|secret| {
+            matches!(
+                secret.contract,
+                omen_core::SecretInjectionContract::Stdin
+            )
+        });
+        let has_stdin_payload = req
+            .stdin_payload
+            .as_ref()
+            .is_some_and(|payload| !payload.is_empty());
         match req.stdin_mode {
-            omen_core::StdioMode::Closed | omen_core::StdioMode::Inline => {
+            omen_core::StdioMode::Inline => {
                 cmd.stdin(std::process::Stdio::piped());
+            }
+            omen_core::StdioMode::Closed if has_stdin_payload || has_stdin_secret => {
+                cmd.stdin(std::process::Stdio::piped());
+            }
+            omen_core::StdioMode::Closed => {
+                cmd.stdin(std::process::Stdio::null());
             }
             omen_core::StdioMode::Inherit => {
                 cmd.stdin(std::process::Stdio::inherit());
