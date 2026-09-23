@@ -357,9 +357,9 @@ impl PtySession {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        let slave_res = tcsetwinsize(&self.observe_slave.as_fd(), ws)
+        let slave_res = tcsetwinsize(self.observe_slave.as_fd(), ws)
             .map_err(|e| io_err("tcsetwinsize_slave", e));
-        let _ = tcsetwinsize(&self.master.as_fd(), ws);
+        let _ = tcsetwinsize(self.master.as_fd(), ws);
         slave_res
     }
 
