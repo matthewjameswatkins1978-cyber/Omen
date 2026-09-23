@@ -577,19 +577,17 @@ fn omen_f_signal_faithful_exit_identity() {
     let _ = omen.wait_for_text("OMEN_COMPAT_READY", Duration::from_secs(15));
     let _ = omen.write_ctrl(0x03);
     let shell_alive = omen.try_wait_child().ok().flatten().is_none();
-    let mut results = Vec::new();
-    results.push(judge_shell_survives_foreground_sigint(
-        shell_alive,
-        shell.pid,
-    ));
     // ExitStatusPreservesSignalNumber for the grandchild is judged only when
     // Omen surfaces a typed signal; otherwise UNAVAILABLE (honest gap).
-    results.push(InvariantResult::new(
-        InvariantId::ExitStatusPreservesSignalNumber,
-        InvariantOutcome::Unavailable,
-        omen_compat::EvidenceGrade::Unavailable,
-        "Omen interactive handoff does not surface grandchild wait-signal identity to Compat without production instrumentation",
-    ));
+    let results = vec![
+        judge_shell_survives_foreground_sigint(shell_alive, shell.pid),
+        InvariantResult::new(
+            InvariantId::ExitStatusPreservesSignalNumber,
+            InvariantOutcome::Unavailable,
+            omen_compat::EvidenceGrade::Unavailable,
+            "Omen interactive handoff does not surface grandchild wait-signal identity to Compat without production instrumentation",
+        ),
+    ];
     let _ = omen.wait_for_text("\\O/", Duration::from_secs(10));
     print_report("signal-faithful", &results);
 }
