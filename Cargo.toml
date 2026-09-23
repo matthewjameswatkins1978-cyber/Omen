@@ -14,7 +14,7 @@ members = [
     "crates/omen-client",
     "crates/omen-cli",
     "crates/omen-agent",
-    "crates/omen-mcp",
+    "crates/omen-agent-adapter",    "crates/omen-mcp",
     "crates/omen-test-fixtures",
     "crates/omen-semantic",
     "crates/omen-compat",
@@ -25,7 +25,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.9.0-preview.14"
+version = "0.9.0-preview.15"
 edition = "2024"
 rust-version = "1.98.1"
 publish = false
@@ -45,6 +45,7 @@ omen-ipc = { path = "crates/omen-ipc", version = "0.9.0-preview.7" }
 omen-daemon = { path = "crates/omen-daemon", version = "0.9.0-preview.7" }
 omen-client = { path = "crates/omen-client", version = "0.9.0-preview.7" }
 omen-agent = { path = "crates/omen-agent", version = "0.9.0-preview.7" }
+omen-agent-adapter = { path = "crates/omen-agent-adapter", version = "0.9.0-preview.7" }
 omen-mcp = { path = "crates/omen-mcp", version = "0.9.0-preview.7" }
 omen-test-fixtures = { path = "crates/omen-test-fixtures", version = "0.9.0-preview.7" }
 omen-semantic = { path = "crates/omen-semantic", version = "0.9.0-preview.7" }

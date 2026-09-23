@@ -1,0 +1,28 @@
+[package]
+name = "omen-agent-adapter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+omen-agent = { workspace = true }
+omen-core = { workspace = true }
+tokio = { workspace = true }
+
+[[bin]]
+name = "omen-fixture-adapter"
+path = "src/bin/fixture_adapter.rs"
+
+[[bin]]
+name = "omen-mock-codex"
+path = "src/bin/mock_codex.rs"

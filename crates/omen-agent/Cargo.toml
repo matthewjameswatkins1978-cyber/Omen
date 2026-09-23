@@ -13,6 +13,7 @@ omen-knowledge = { workspace = true }
 omen-engine = { workspace = true }
 omen-ipc = { workspace = true }
 omen-client = { workspace = true }
+omen-agent-adapter = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

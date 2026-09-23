@@ -35,4 +35,5 @@ toml = { workspace = true }
 tempfile = { workspace = true }
 omen-daemon = { workspace = true }
 omen-test-fixtures = { workspace = true }
+omen-agent-adapter = { workspace = true }
 
