@@ -147,26 +147,29 @@ pub fn cmd_gc_apply(plan_file: &Path, json_mode: bool) -> Result<(), Box<dyn std
                     reason: format!("{d} became protected after plan"),
                 });
             }
-            // Recompute digest from the live file: identity must match.
+            // Recompute the CAS identity from the live path layout and
+            // require it to match the plan fingerprint: the file must
+            // still be the same addressed blob (not merely present).
             let raw = Path::new(&item.identity);
             let resolved = if raw.is_absolute() {
                 raw.to_path_buf()
             } else {
                 b.join(raw)
             };
-            match std::fs::read(&resolved) {
-                Ok(bytes) => {
-                    use sha2::{Digest, Sha256};
-                    let have = hex::encode(Sha256::digest(bytes));
-                    if have == d {
-                        Ok(omen_lifecycle::plan::Revalidate::Proceed)
-                    } else {
-                        Ok(omen_lifecycle::plan::Revalidate::Refuse {
-                            reason: "payload bytes changed after plan".to_string(),
-                        })
-                    }
+            match (
+                omen_lifecycle::gc::digest_from_cas_path(&resolved),
+                digest.strip_prefix("digest:"),
+            ) {
+                (Some(have), Some(want)) if have == want => {
+                    Ok(omen_lifecycle::plan::Revalidate::Proceed)
                 }
-                Err(_) => Ok(omen_lifecycle::plan::Revalidate::Proceed), // idempotent: already gone
+                (Some(_), Some(_)) => Ok(omen_lifecycle::plan::Revalidate::Refuse {
+                    reason: "payload identity changed after plan".to_string(),
+                }),
+                _ if !resolved.exists() => Ok(omen_lifecycle::plan::Revalidate::Proceed), // idempotent: already gone
+                _ => Ok(omen_lifecycle::plan::Revalidate::Refuse {
+                    reason: "plan item lacks digest fingerprint".to_string(),
+                }),
             }
         },
         &|item| omen_lifecycle::gc::apply_gc_item(&b, item),

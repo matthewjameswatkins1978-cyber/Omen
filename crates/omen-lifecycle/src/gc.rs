@@ -114,24 +114,31 @@ fn walk_files(dir: &Path) -> Vec<(String, u64, Option<u64>)> {
     out
 }
 
-/// Canonical `cas/sha256/ab/<hex...>` layout -> digest. Returns None for
-/// non-conforming paths (never invent precision).
-fn digest_from_cas_path(cas_root: &Path, path: &Path) -> Option<String> {
-    let rel = path.strip_prefix(cas_root).ok()?;
-    let mut parts: Vec<String> = rel
+/// Canonical `cas/sha256/ab/<hex...>` layout -> digest, from any path
+/// containing that layout (no root needed: scans for the `sha256` marker).
+/// Returns None for non-conforming paths (never invent precision).
+pub fn digest_from_cas_path(path: &Path) -> Option<String> {
+    let parts: Vec<String> = path
         .components()
         .map(|c| c.as_os_str().to_string_lossy().to_string())
         .collect();
-    if parts.len() < 3 || parts[0] != "sha256" {
+    let at = parts.iter().position(|p| p == "sha256")?;
+    let tail = &parts[at + 1..];
+    if tail.is_empty() {
         return None;
     }
-    parts.remove(0);
-    let hex: String = parts.concat();
+    let hex: String = tail.concat();
     if hex.len() >= 16 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
         Some(hex.to_lowercase())
     } else {
         None
     }
+}
+
+/// Canonical `cas/sha256/ab/<hex...>` layout under a root -> digest.
+fn digest_from_cas_root(cas_root: &Path, path: &Path) -> Option<String> {
+    let rel = path.strip_prefix(cas_root).ok()?;
+    digest_from_cas_path(rel)
 }
 
 /// Enumerate CAS blobs under `cas_root`, returning candidates that are
@@ -153,7 +160,7 @@ pub fn enumerate_candidates(
 
     let mut candidates = Vec::new();
     for (path, size, mtime) in walk_files(cas_root) {
-        let Some(digest) = digest_from_cas_path(cas_root, Path::new(&path)) else {
+        let Some(digest) = digest_from_cas_root(cas_root, Path::new(&path)) else {
             continue;
         };
         if is_live(&digest) {
@@ -180,7 +187,7 @@ pub fn enumerate_candidates(
     if let Some(budget) = policy.max_unprotected_evidence_bytes {
         let mut unprotected: Vec<(String, u64, Option<u64>, String)> = Vec::new();
         for (path, size, mtime) in walk_files(cas_root) {
-            if let Some(d) = digest_from_cas_path(cas_root, Path::new(&path))
+            if let Some(d) = digest_from_cas_root(cas_root, Path::new(&path))
                 && !is_live(&d)
             {
                 unprotected.push((path, size, mtime, d));
