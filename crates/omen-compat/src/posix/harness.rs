@@ -184,11 +184,12 @@ impl PtySession {
 
         set_nonblocking(master.as_fd()).map_err(|e| io_err("nonblock_master", e))?;
 
-        // Ensure ISIG on the shared tty so VINTR generates SIGINT (macOS
-        // default termios may differ from Linux).
+        // Ensure ICANON|ISIG on the shared tty so VINTR generates SIGINT
+        // (macOS default termios may differ from Linux).
         if let Ok(mut t) = rustix::termios::tcgetattr(observe_slave.as_fd()) {
             let mut modes = t.local_modes;
             modes.insert(rustix::termios::LocalModes::ISIG);
+            modes.insert(rustix::termios::LocalModes::ICANON);
             t.local_modes = modes;
             let _ = rustix::termios::tcsetattr(
                 observe_slave.as_fd(),
@@ -348,14 +349,21 @@ impl PtySession {
         }
     }
 
-    /// Observe winsize via `tcgetwinsize`.
+    /// Observe winsize via `tcgetwinsize` (slave first, master fallback).
     pub fn observe_winsize(&self) -> std::io::Result<PtyWinsize> {
-        let ws = rustix::termios::tcgetwinsize(self.observe_slave.as_fd())
-            .map_err(|e| io_err("tcgetwinsize", e))?;
-        Ok(PtyWinsize {
-            rows: ws.ws_row,
-            cols: ws.ws_col,
-        })
+        let from_fd = |fd: BorrowedFd<'_>| {
+            rustix::termios::tcgetwinsize(fd)
+                .map(|ws| PtyWinsize {
+                    rows: ws.ws_row,
+                    cols: ws.ws_col,
+                })
+                .map_err(|e| e.to_string())
+        };
+        match from_fd(self.observe_slave.as_fd()) {
+            Ok(ws) => Ok(ws),
+            Err(slave_err) => from_fd(self.master.as_fd())
+                .map_err(|e| io_err("tcgetwinsize", format!("slave={slave_err} master={e}"))),
+        }
     }
 
     /// Change PTY dimensions (kernel delivers SIGWINCH to the fg pgrp).
