@@ -20,7 +20,6 @@ omen-ipc = { workspace = true }
 omen-client = { workspace = true }
 omen-agent = { workspace = true }
 reedline = { workspace = true }
-fuzzy-matcher = { workspace = true }
 nu-ansi-term = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

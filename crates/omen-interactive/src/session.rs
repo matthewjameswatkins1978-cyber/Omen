@@ -462,6 +462,7 @@ impl InteractiveSession {
 
                 // Built-in shell navigation: cd modifies session.cwd while preserving workspace_root
                 if resolved_argv.first().map(|s| s.as_str()) == Some("cd") {
+                    debug_assert!(crate::commands::is_shell_intrinsic("cd"));
                     let target_path = if let Some(target) = resolved_argv.get(1) {
                         let p = std::path::PathBuf::from(target);
                         if p.is_absolute() { p } else { self.cwd.join(p) }

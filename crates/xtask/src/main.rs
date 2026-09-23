@@ -254,9 +254,12 @@ fn run_benchmarks() {
             validity: omen_core::ValidityState::Dirty,
         });
     }
+    for cmd in ["cargo", "git", "rg", "threadmoth"] {
+        hot_index.path_commands.push(cmd.to_string());
+    }
     for i in 0..20 {
         hot_index
-            .workspace_entries
+            .path_commands
             .push(format!("workspace_file_{i}.rs"));
     }
 
@@ -270,19 +273,18 @@ fn run_benchmarks() {
         ":",
         ":st",
         ":doc",
-        ":why",
+        ":wh",
         ":his",
         ":rer",
         ":in",
         "@",
-        "@fact://git",
-        "@fact://test",
+        "@fact.git",
+        "@fact.test",
         "@l",
         "@fa",
         "@er",
         "car",
-        "git",
-        "doc",
+        "gi",
         "thr",
         "work",
         "?",
@@ -294,7 +296,10 @@ fn run_benchmarks() {
         let t0 = Instant::now();
         let suggestions = completer.complete_items(q, q.len());
         let elapsed = t0.elapsed();
-        assert!(!suggestions.is_empty() || q == "?");
+        assert!(
+            !suggestions.is_empty() || q == "?",
+            "no candidates for {q:?}"
+        );
         completion_durations.push(elapsed);
     }
 

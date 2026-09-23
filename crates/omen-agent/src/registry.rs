@@ -1,3 +1,4 @@
+use crate::conformance::ProviderCapability;
 use crate::diagnostic_provider::DiagnosticAgentProvider;
 use crate::openai_responses::{
     OpenAiResponsesConfig, OpenAiResponsesProvider, openai_api_key_from_env,
@@ -50,13 +51,15 @@ pub fn openai_luna_descriptor(model: impl Into<String>, available: bool) -> Prov
         name: "OpenAI GPT-6 Luna".into(),
         model: Some(model.into()),
         credential_source: Some(openai_credential_source()),
+        // Canonical capability vocabulary only (see conformance module).
+        // Descriptor JSON is unchanged: plain strings, no branded spellings.
         capabilities: vec![
-            "reasoning".into(),
-            "structured-response".into(),
-            "failure-diagnosis".into(),
-            "navigation".into(),
-            "proposal".into(),
-            "tool-proposal".into(),
+            ProviderCapability::Reasoning.as_str().into(),
+            ProviderCapability::StructuredResponse.as_str().into(),
+            ProviderCapability::FailureDiagnosis.as_str().into(),
+            ProviderCapability::Navigation.as_str().into(),
+            ProviderCapability::Proposal.as_str().into(),
+            ProviderCapability::ToolProposal.as_str().into(),
         ],
         // Locally configured enough to attempt use; remote entitlement is not claimed.
         is_available: available,
@@ -87,11 +90,11 @@ impl ProviderRegistry {
             model: Some("deterministic".into()),
             credential_source: Some("none".into()),
             capabilities: vec![
-                "orientation".into(),
-                "failure-diagnosis".into(),
-                "navigation".into(),
-                "build-check".into(),
-                "deterministic".into(),
+                ProviderCapability::Orientation.as_str().into(),
+                ProviderCapability::FailureDiagnosis.as_str().into(),
+                ProviderCapability::Navigation.as_str().into(),
+                ProviderCapability::BuildCheck.as_str().into(),
+                ProviderCapability::Deterministic.as_str().into(),
             ],
             is_available: true,
         };
