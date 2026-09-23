@@ -78,8 +78,10 @@ pub enum Observation {
     },
     CleanupAttempted {
         method: String,
-        kill_succeeded: bool,
-        reaped: bool,
+        /// Non-waiting kill request accepted (not proof of termination).
+        kill_initiated: bool,
+        /// Root reaped within the cleanup bound.
+        root_reaped: bool,
     },
     /// Environment key applied to the child. Values are never retained.
     EnvApplied {

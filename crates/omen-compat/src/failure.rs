@@ -1,4 +1,6 @@
-use crate::core::{CommandSpec, Deadline, EvidenceGrade, ExitCause, OutputBounds, Platform};
+use crate::core::{
+    CommandSpec, Deadline, EnvPolicy, EvidenceGrade, ExitCause, OutputBounds, Platform, StdinSpec,
+};
 use crate::invariant::{InvariantId, InvariantResult};
 use crate::observation::Observation;
 use serde::{Deserialize, Serialize};
@@ -95,15 +97,54 @@ impl CommandEvidence {
     }
 }
 
+/// Why a replay cannot claim [`ReplayFidelity::Exact`].
+///
+/// Exactness is a factual claim: every required execution-affecting value
+/// must be retained and explicitly classified safe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayExactnessError {
+    /// Environment policy is not `Clear`; omitted values block Exact.
+    EnvPolicyNotClear,
+    /// Stdin is not `Closed`; omitted payload blocks Exact.
+    StdinNotClosed,
+    /// Specific cwd present; omitted path blocks Exact.
+    CwdSet,
+    /// Caller-supplied safe argv does not exactly match the recorded argv.
+    SafeArgvMismatch,
+}
+
+impl fmt::Display for ReplayExactnessError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ReplayExactnessError::EnvPolicyNotClear => {
+                f.write_str("env policy must be Clear for Exact replay")
+            }
+            ReplayExactnessError::StdinNotClosed => {
+                f.write_str("stdin must be Closed for Exact replay")
+            }
+            ReplayExactnessError::CwdSet => f.write_str("cwd must be unset for Exact replay"),
+            ReplayExactnessError::SafeArgvMismatch => {
+                f.write_str("safe argv must exactly equal recorded argv")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReplayExactnessError {}
+
 /// How much of the original execution state a replay record retains.
+///
+/// **Exact** means every execution-affecting value required to reproduce the
+/// fixture is persisted and explicitly classified safe — never a compliment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReplayFidelity {
-    /// Required values retained; safe for controlled fixtures without secrets.
+    /// All required execution-affecting values retained and explicitly safe.
     Exact,
-    /// Some required values retained; others intentionally omitted.
+    /// Some required values retained; not enough to guarantee exact reproduction.
     Partial,
-    /// Values intentionally omitted; not an exact replay.
+    /// Execution-affecting values intentionally omitted for safety.
     Redacted,
 }
 
@@ -127,6 +168,8 @@ pub struct ReplayDescriptor {
 
 impl ReplayDescriptor {
     /// Explicit redacted projection: counts, kinds, and key names only.
+    ///
+    /// Safe generic default when execution-affecting values are present.
     pub fn redacted(
         spec: &CommandSpec,
         fixture_mode: impl Into<String>,
@@ -149,15 +192,37 @@ impl ReplayDescriptor {
         }
     }
 
-    /// Controlled fixture replay: caller explicitly marks argv as safe.
-    pub fn exact_fixture(
+    /// Mechanically validated Exact fixture replay.
+    ///
+    /// M0 conservative rule — all must hold or `Err`:
+    /// - `EnvPolicy::Clear` (no omitted env values)
+    /// - `StdinSpec::Closed` (no omitted stdin payload)
+    /// - `cwd == None` (no omitted path)
+    /// - `safe_argv == spec.argv` (explicitly classified safe and exact)
+    ///
+    /// There is no API that accepts an arbitrary `CommandSpec` and blindly
+    /// emits [`ReplayFidelity::Exact`].
+    pub fn try_exact_fixture(
         spec: &CommandSpec,
         fixture_mode: impl Into<String>,
         expected_invariants: Vec<InvariantId>,
         safe_argv: Vec<String>,
-    ) -> Self {
+    ) -> Result<Self, ReplayExactnessError> {
+        if !matches!(spec.env, EnvPolicy::Clear) {
+            return Err(ReplayExactnessError::EnvPolicyNotClear);
+        }
+        if !matches!(spec.stdin, StdinSpec::Closed) {
+            return Err(ReplayExactnessError::StdinNotClosed);
+        }
+        if spec.cwd.is_some() {
+            return Err(ReplayExactnessError::CwdSet);
+        }
+        if safe_argv != spec.argv {
+            return Err(ReplayExactnessError::SafeArgvMismatch);
+        }
+
         let evidence = CommandEvidence::from_execution(spec).with_safe_argv(safe_argv.clone());
-        Self {
+        Ok(Self {
             program: evidence.program,
             argv: safe_argv,
             argv_count: evidence.argv_count,
@@ -170,16 +235,30 @@ impl ReplayDescriptor {
             fixture_mode: fixture_mode.into(),
             expected_invariants,
             fidelity: ReplayFidelity::Exact,
-        }
+        })
     }
 
+    /// Project evidence into a replay record.
+    ///
+    /// `ReplayFidelity::Exact` is only honored when the evidence itself
+    /// mechanically satisfies the M0 exactness preconditions; otherwise the
+    /// fidelity is demoted to [`ReplayFidelity::Redacted`] rather than
+    /// mislabelled.
     pub fn from_evidence(
         evidence: CommandEvidence,
         fixture_mode: impl Into<String>,
         expected_invariants: Vec<InvariantId>,
         fidelity: ReplayFidelity,
     ) -> Self {
-        let argv = evidence.argv_safe.clone().unwrap_or_default();
+        let fidelity = if fidelity == ReplayFidelity::Exact && !evidence_supports_exact(&evidence) {
+            ReplayFidelity::Redacted
+        } else {
+            fidelity
+        };
+        let argv = match fidelity {
+            ReplayFidelity::Exact => evidence.argv_safe.clone().unwrap_or_default(),
+            _ => Vec::new(),
+        };
         Self {
             program: evidence.program,
             argv,
@@ -195,6 +274,17 @@ impl ReplayDescriptor {
             fidelity,
         }
     }
+}
+
+/// M0 Exact preconditions checked against durable evidence structure only.
+fn evidence_supports_exact(evidence: &CommandEvidence) -> bool {
+    evidence.env_policy_kind == "clear"
+        && evidence.stdin_mode == "closed"
+        && evidence.cwd_policy == "inherit"
+        && evidence
+            .argv_safe
+            .as_ref()
+            .is_some_and(|argv| argv.len() == evidence.argv_count)
 }
 
 /// Replayable failure evidence. Secret-bearing execution state is projected

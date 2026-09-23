@@ -3,8 +3,8 @@
 use omen_compat::{
     Capability, CleanupOutcome, CommandEvidence, CommandSpec, Deadline, EnvPolicy, EvidenceGrade,
     ExitCause, FailureKind, InvariantId, InvariantOutcome, InvariantResult, Observation,
-    OutputBounds, Platform, ReplayDescriptor, ReplayFidelity, RunOutcome, StdinSpec, StreamKind,
-    StructuredFailure, declared_max_wall_ms,
+    OutputBounds, Platform, ReplayDescriptor, ReplayExactnessError, ReplayFidelity, RunOutcome,
+    StdinSpec, StreamKind, StructuredFailure, declared_max_wall_ms,
 };
 use std::time::Duration;
 
@@ -169,7 +169,7 @@ fn command_evidence_is_redacted_by_default() {
 #[test]
 fn replay_descriptor_redacted_and_exact_fixture() {
     let secret = "OMEN_TEST_SECRET_DO_NOT_LEAK_9f3a";
-    let spec = CommandSpec::new("omen-gremlin")
+    let hostile = CommandSpec::new("omen-gremlin")
         .arg("--exit")
         .arg("7")
         .env(EnvPolicy::InheritWith(vec![(
@@ -180,7 +180,7 @@ fn replay_descriptor_redacted_and_exact_fixture() {
         .timeout(Duration::from_millis(500));
 
     let redacted = ReplayDescriptor::redacted(
-        &spec,
+        &hostile,
         "exit-code",
         vec![
             InvariantId::ExitCausePreserved,
@@ -195,17 +195,153 @@ fn replay_descriptor_redacted_and_exact_fixture() {
     assert_eq!(redacted.expected_invariants.len(), 2);
     assert_eq!(redacted.stdin_mode, "closed");
 
-    let exact = ReplayDescriptor::exact_fixture(
-        &spec,
+    // Secret-bearing env must block Exact.
+    let blocked = ReplayDescriptor::try_exact_fixture(
+        &hostile,
         "exit-code",
         vec![InvariantId::ExitCausePreserved],
         vec!["--exit".into(), "7".into()],
     );
+    assert_eq!(
+        blocked.expect_err("env values must block Exact"),
+        ReplayExactnessError::EnvPolicyNotClear
+    );
+
+    // Safe controlled fixture: Clear env, Closed stdin, no cwd, safe argv.
+    let safe = CommandSpec::new("omen-gremlin")
+        .arg("--exit-code")
+        .arg("7")
+        .env(EnvPolicy::Clear)
+        .stdin(StdinSpec::Closed)
+        .timeout(Duration::from_millis(500));
+    let exact = ReplayDescriptor::try_exact_fixture(
+        &safe,
+        "exit-code",
+        vec![InvariantId::ExitCausePreserved],
+        vec!["--exit-code".into(), "7".into()],
+    )
+    .expect("safe fixture must be Exact");
     assert_eq!(exact.fidelity, ReplayFidelity::Exact);
-    assert_eq!(exact.argv, vec!["--exit".to_string(), "7".to_string()]);
+    assert_eq!(exact.argv, vec!["--exit-code".to_string(), "7".to_string()]);
     let json = serde_json::to_string(&exact).unwrap();
     assert!(!json.contains(secret));
     assert!(!json.contains("OPENAI_API_KEY="));
+}
+
+#[test]
+fn exact_replay_blocked_by_env_stdin_cwd_or_unsafe_argv() {
+    // B: env secret present
+    let with_env = CommandSpec::new("omen-gremlin")
+        .arg("--exit-code")
+        .arg("7")
+        .env(EnvPolicy::InheritWith(vec![(
+            "OPENAI_API_KEY".into(),
+            "s".into(),
+        )]))
+        .stdin(StdinSpec::Closed)
+        .timeout(Duration::from_millis(200));
+    assert_eq!(
+        ReplayDescriptor::try_exact_fixture(
+            &with_env,
+            "m",
+            vec![],
+            vec!["--exit-code".into(), "7".into()]
+        )
+        .unwrap_err(),
+        ReplayExactnessError::EnvPolicyNotClear
+    );
+
+    // C: stdin payload present
+    let with_stdin = CommandSpec::new("omen-gremlin")
+        .arg("--exit-code")
+        .arg("7")
+        .env(EnvPolicy::Clear)
+        .stdin(StdinSpec::Bytes(b"payload".to_vec()))
+        .timeout(Duration::from_millis(200));
+    assert_eq!(
+        ReplayDescriptor::try_exact_fixture(
+            &with_stdin,
+            "m",
+            vec![],
+            vec!["--exit-code".into(), "7".into()]
+        )
+        .unwrap_err(),
+        ReplayExactnessError::StdinNotClosed
+    );
+
+    // D: cwd present but omitted from exact material
+    let with_cwd = CommandSpec::new("omen-gremlin")
+        .arg("--exit-code")
+        .arg("7")
+        .cwd("/tmp/compat-exact")
+        .env(EnvPolicy::Clear)
+        .stdin(StdinSpec::Closed)
+        .timeout(Duration::from_millis(200));
+    assert_eq!(
+        ReplayDescriptor::try_exact_fixture(
+            &with_cwd,
+            "m",
+            vec![],
+            vec!["--exit-code".into(), "7".into()]
+        )
+        .unwrap_err(),
+        ReplayExactnessError::CwdSet
+    );
+
+    // E: argv not explicitly safe / mismatched
+    let safe_shape = CommandSpec::new("omen-gremlin")
+        .arg("--exit-code")
+        .arg("7")
+        .env(EnvPolicy::Clear)
+        .stdin(StdinSpec::Closed)
+        .timeout(Duration::from_millis(200));
+    assert_eq!(
+        ReplayDescriptor::try_exact_fixture(&safe_shape, "m", vec![], vec![]).unwrap_err(),
+        ReplayExactnessError::SafeArgvMismatch
+    );
+    assert_eq!(
+        ReplayDescriptor::try_exact_fixture(
+            &safe_shape,
+            "m",
+            vec![],
+            vec!["--exit-code".into(), "8".into()]
+        )
+        .unwrap_err(),
+        ReplayExactnessError::SafeArgvMismatch
+    );
+
+    // from_evidence must demote Exact when preconditions fail.
+    let hostile_evidence =
+        CommandEvidence::from_execution(&with_env).with_safe_argv(vec!["--exit-code".into()]);
+    let demoted =
+        ReplayDescriptor::from_evidence(hostile_evidence, "m", vec![], ReplayFidelity::Exact);
+    assert_eq!(demoted.fidelity, ReplayFidelity::Redacted);
+    assert!(demoted.argv.is_empty());
+}
+
+#[test]
+fn replay_fidelity_serialization_roundtrip() {
+    for fidelity in [
+        ReplayFidelity::Exact,
+        ReplayFidelity::Partial,
+        ReplayFidelity::Redacted,
+    ] {
+        let json = serde_json::to_string(&fidelity).unwrap();
+        let back: ReplayFidelity = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, fidelity);
+    }
+    assert_eq!(
+        serde_json::to_string(&ReplayFidelity::Exact).unwrap(),
+        "\"exact\""
+    );
+    assert_eq!(
+        serde_json::to_string(&ReplayFidelity::Partial).unwrap(),
+        "\"partial\""
+    );
+    assert_eq!(
+        serde_json::to_string(&ReplayFidelity::Redacted).unwrap(),
+        "\"redacted\""
+    );
 }
 
 #[test]
@@ -322,12 +458,15 @@ fn structured_failure_intentional_mismatch_is_replayable() {
     .stderr(RunOutcome::capture_summary(&outcome.stderr))
     .observations(outcome.observations.clone())
     .result(result.clone())
-    .replay(ReplayDescriptor::exact_fixture(
-        &spec,
-        "exit-code",
-        vec![InvariantId::ExitCausePreserved],
-        vec!["--exit".into(), "7".into()],
-    ))
+    .replay(
+        ReplayDescriptor::try_exact_fixture(
+            &spec,
+            "exit-code",
+            vec![InvariantId::ExitCausePreserved],
+            vec!["--exit".into(), "7".into()],
+        )
+        .expect("Clear+Closed+no-cwd fixture is Exact"),
+    )
     .minimal_reproducer("omen-gremlin --exit-code 7")
     .likely_subsystem("compat.runner.exit_cause")
     .output_bounds(outcome.bounds)

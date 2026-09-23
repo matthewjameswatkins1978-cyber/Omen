@@ -5,9 +5,10 @@
 //! ## Bounded I/O contract
 //!
 //! Every external-process wait, stdin delivery, stdout/stderr drain, and
-//! cleanup phase is bounded by an explicit scenario deadline plus cleanup and
-//! stream-drain allowances. `BOUNDED_WAIT_NO_HANG` checks actual elapsed
-//! wall-clock time against [`runner::declared_max_wall_ms`].
+//! cleanup phase is bounded by an explicit scenario deadline, non-waiting
+//! root kill initiation + bounded reap, and **one shared** post-root I/O
+//! completion window for stdin/stdout/stderr. `BOUNDED_WAIT_NO_HANG` checks
+//! actual elapsed wall-clock time against [`runner::declared_max_wall_ms`].
 //!
 //! ## Secret-safe durable evidence
 //!

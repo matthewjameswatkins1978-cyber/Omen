@@ -25,28 +25,47 @@ placeholders until their milestone.
 All external waits use Tokio cancellable I/O with three explicit layers:
 
 1. Scenario deadline (process wait + stdin delivery budget).
-2. Cleanup bound (root kill/reap after deadline).
-3. Stream-drain grace (stdout/stderr EOF after root completion; abort if not proven).
+2. Cleanup: non-waiting `start_kill()` then bounded root reap within
+   `CLEANUP_BOUND` (never `Child::kill().await`, which may wait for exit).
+3. **One shared** post-root I/O completion window (`IO_COMPLETION_GRACE`)
+   covering stdin, stdout, and stderr task completion and abort
+   acknowledgement concurrently — never a fresh full grace per task.
 
-`declared_max_wall_ms = deadline + cleanup + drain grace + scheduling tolerance`.
-`BOUNDED_WAIT_NO_HANG` fails if actual elapsed exceeds that maximum.
+```text
+declared_max_wall_ms
+  = deadline_ms
+  + CLEANUP_BOUND
+  + IO_COMPLETION_GRACE
+  + scheduling_tolerance
+```
+
+The implementation mechanically matches this formula. `BOUNDED_WAIT_NO_HANG`
+fails if actual elapsed exceeds that maximum.
 
 **Stream truth:** `truncated` (more bytes than retained), `eof_observed`
 (pipe EOF), and `drain_timed_out` (cancelled at grace) are distinct.
 Descendant-held pipes may leave `eof_observed=false` with
 `drain_timed_out=true`; that is not process failure.
+`DRAIN_BOTH_STREAMS_NO_DEADLOCK` means both streams were handled without
+deadlock — not that EOF was observed on both.
 
-**Root cleanup vs descendants:** timeout cleanup is `root_only=true`.
-Portable descendant containment is not claimed until POSIX groups / Windows
-job-object work.
+**Root cleanup vs descendants:** timeout cleanup is `root_only=true` with
+distinct `kill_attempted` / `kill_initiated` / `root_reaped` facts. Kill
+initiation is not termination. Portable descendant containment is not claimed
+until POSIX groups / Windows job-object work.
 
 ### Secret-safe durable evidence
 
 Execution may hold env values and stdin bytes transiently. Durable evidence
 uses `CommandEvidence` (counts, kinds, key names — no values), explicit
-`ReplayDescriptor::{redacted,exact_fixture}` with `ReplayFidelity`,
+`ReplayDescriptor::{redacted,try_exact_fixture}` with `ReplayFidelity`,
 `Observation::EnvApplied { key }` (no value), and `StreamSummary` without
 raw previews. Debug for `CommandSpec`/`EnvPolicy`/`StdinSpec` redacts values.
+
+`ReplayFidelity::Exact` is mechanically validated by `try_exact_fixture`:
+env must be `Clear`, stdin `Closed`, cwd unset, and safe argv exactly equal
+to recorded argv. Omission of any required value yields an error — never a
+mislabelled Exact. The safe generic projection remains `Redacted`.
 
 Fixture JSON reports remain limited to controlled Compat fixtures.
 

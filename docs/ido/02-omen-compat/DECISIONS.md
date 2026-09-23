@@ -54,3 +54,27 @@ Execution input and durable evidence are separate. `CommandSpec`, env values,
 stdin bytes, and arbitrary argv are not auto-persisted. Callers explicitly
 choose safe replay content and record `ReplayFidelity`. Stream summaries omit
 raw previews by default.
+
+## D2-010 — Cleanup initiation is not termination; one shared I/O grace
+
+Timeout cleanup uses non-waiting `start_kill()` then
+`timeout(CLEANUP_BOUND, wait())`. `Child::kill().await` is forbidden on that
+path because it may wait for process exit before the bound starts.
+`CleanupOutcome` keeps `kill_attempted`, `kill_initiated`, `root_reaped`,
+and `root_only` distinct — never collapsing kill-request into terminated, or
+root-reaped into descendant-tree-gone.
+
+Post-root stdin/stdout/stderr completion and abort acknowledgement share
+**one** absolute `IO_COMPLETION_GRACE` window (`tokio::join!` against a single
+deadline). Per-task grace clocks are forbidden; `declared_max_wall_ms =
+deadline + CLEANUP_BOUND + IO_COMPLETION_GRACE + tolerance` matches the
+implementation with no hidden additive waits.
+
+## D2-011 — Exact replay is a factual claim
+
+`ReplayFidelity::Exact` may only be produced by `try_exact_fixture` after
+mechanical validation (M0: `EnvPolicy::Clear`, `StdinSpec::Closed`,
+`cwd == None`, `safe_argv == argv`). Any omitted execution-affecting value
+blocks Exact. `from_evidence` demotes a requested Exact that fails those
+preconditions to `Redacted`. No heuristic secret scanning; explicit safe
+classification remains the model. The safe generic projection is `Redacted`.

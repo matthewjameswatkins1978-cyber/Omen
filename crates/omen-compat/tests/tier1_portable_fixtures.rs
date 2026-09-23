@@ -289,7 +289,8 @@ async fn demonstration_timeout_returns_bounded_with_cleanup() {
         outcome.exit_cause,
         Some(omen_compat::ExitCause::TimeoutKill)
     );
-    assert!(outcome.cleanup.attempted);
+    assert!(outcome.cleanup.kill_attempted);
+    assert!(outcome.cleanup.kill_initiated);
     assert!(
         outcome.cleanup.root_only,
         "cleanup must not claim tree kill"
@@ -483,7 +484,7 @@ async fn hostile_blocked_stdin_cannot_freeze_harness() {
         "deadline still governs"
     );
     assert!(
-        outcome.cleanup.attempted || !outcome.timed_out,
+        outcome.cleanup.kill_attempted || !outcome.timed_out,
         "cleanup recorded on timeout"
     );
     assert!(outcome.elapsed_ms <= outcome.declared_max_wall_ms);
@@ -508,7 +509,7 @@ async fn timeout_with_held_pipe_stays_within_declared_bound() {
     let max = Duration::from_millis(declared_max_wall_ms(spec.deadline.timeout_ms));
 
     assert!(outcome.timed_out);
-    assert!(outcome.cleanup.attempted);
+    assert!(outcome.cleanup.kill_attempted);
     assert!(outcome.cleanup.root_only);
     assert_pass(
         &outcome.check_bounded_wait_no_hang(),
@@ -544,6 +545,81 @@ async fn actual_elapsed_bound_is_enforced() {
     assert_eq!(
         outcome.check_bounded_wait_no_hang().outcome,
         InvariantOutcome::Pass
+    );
+}
+
+/// Timeout cleanup must not regress to Child::kill().await (structural proof).
+#[test]
+fn timeout_cleanup_source_uses_non_waiting_kill_initiation() {
+    let src = std::fs::read_to_string(workspace_root().join("crates/omen-compat/src/runner.rs"))
+        .expect("read runner.rs");
+    let forbidden: String = ["child", ".kill()", ".await"].join("");
+    assert!(
+        !src.contains(&forbidden),
+        "runner must not call Child kill-await in cleanup"
+    );
+    assert!(
+        src.contains("start_kill()"),
+        "runner must initiate kill via start_kill()"
+    );
+}
+
+/// Hostile all-I/O: stdin never completes, stdout/stderr held open.
+/// All three must resolve inside ONE shared completion window (not 3× grace).
+#[tokio::test]
+async fn hostile_all_streams_share_one_completion_window() {
+    let exe = gremlin_exe();
+    let started = Instant::now();
+    // Child sleeps without reading stdin and holds both output pipes.
+    let payload = vec![b'Q'; 256 * 1024];
+    let spec = base_spec(
+        &exe,
+        &["--sleep-bounded", "8000"],
+        Duration::from_millis(400),
+    )
+    .stdin(StdinSpec::Bytes(payload));
+    let outcome = bound("hostile_shared_completion", async {
+        run(&spec, &OutputBounds::default()).await
+    })
+    .await;
+    let elapsed = started.elapsed();
+    let max = Duration::from_millis(declared_max_wall_ms(spec.deadline.timeout_ms));
+    // Serial 3×grace would allow deadline + cleanup + 900ms + tol.
+    let serial_3x_max = Duration::from_millis(spec.deadline.timeout_ms + 500 + 900 + 75);
+
+    assert_pass(
+        &outcome.check_bounded_wait_no_hang(),
+        "BOUNDED_WAIT_NO_HANG",
+    );
+    assert!(outcome.timed_out);
+    assert!(outcome.cleanup.kill_attempted);
+    assert!(
+        elapsed <= max,
+        "elapsed {elapsed:?} > declared shared-window max {max:?}"
+    );
+    assert!(
+        elapsed < serial_3x_max,
+        "elapsed {elapsed:?} must fit shared window well under serial 3×grace {serial_3x_max:?}"
+    );
+    assert!(outcome.elapsed_ms <= outcome.declared_max_wall_ms);
+    // All three I/O tasks were governed by the same post-root window:
+    // stdin delivery recorded as bounded (or written), streams not claimed EOF.
+    assert!(
+        outcome.observations.iter().any(|o| matches!(
+            o,
+            omen_compat::Observation::StdinDeliveryBounded { .. }
+                | omen_compat::Observation::StdinWrote { .. }
+                | omen_compat::Observation::StdinClosed
+        )),
+        "stdin completion must be recorded under shared window"
+    );
+    assert!(
+        outcome.stdout.drain_timed_out || outcome.stdout.eof_observed,
+        "stdout resolved under shared window"
+    );
+    assert!(
+        outcome.stderr.drain_timed_out || outcome.stderr.eof_observed,
+        "stderr resolved under shared window"
     );
 }
 

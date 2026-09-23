@@ -8,20 +8,25 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 
-/// Bounded cleanup after scenario deadline (kill + reap).
+/// Bounded cleanup after scenario deadline (non-waiting kill init + bounded reap).
 pub const CLEANUP_BOUND: Duration = Duration::from_millis(500);
-/// Bounded grace for stdout/stderr EOF after root completion or kill.
-pub const STREAM_DRAIN_GRACE: Duration = Duration::from_millis(300);
+/// One shared post-root window covering stdin/stdout/stderr completion and
+/// task cancellation/abort acknowledgement. Never reset per task.
+pub const IO_COMPLETION_GRACE: Duration = Duration::from_millis(300);
 /// Small scheduling tolerance added to the declared wall-clock promise.
 pub const SCHEDULING_TOLERANCE_MS: u64 = 75;
 
-/// Declared maximum wall-clock outcome for a run with the given scenario deadline.
+/// Canonical declared maximum wall-clock formula.
 ///
-/// `scenario deadline + cleanup + stream-drain grace + scheduling tolerance`
+/// `deadline_ms + CLEANUP_BOUND + IO_COMPLETION_GRACE + SCHEDULING_TOLERANCE_MS`
+///
+/// `IO_COMPLETION_GRACE` is one shared budget for ALL post-root stdin,
+/// stdout, and stderr completion bookkeeping (including abort acknowledgement).
+/// No undocumented additive per-task waits.
 pub fn declared_max_wall_ms(deadline_ms: u64) -> u64 {
     deadline_ms
         + CLEANUP_BOUND.as_millis() as u64
-        + STREAM_DRAIN_GRACE.as_millis() as u64
+        + IO_COMPLETION_GRACE.as_millis() as u64
         + SCHEDULING_TOLERANCE_MS
 }
 
@@ -61,12 +66,17 @@ impl CapturedStream {
 
 /// Truthful record of post-deadline cleanup of the **root** process only.
 ///
-/// Does not claim descendant-tree termination.
+/// Distinguishes kill *initiation* from process termination. Does not claim
+/// descendant-tree termination.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct CleanupOutcome {
-    pub attempted: bool,
-    pub kill_succeeded: bool,
-    pub reaped: bool,
+    /// Kill initiation was attempted after the scenario deadline.
+    pub kill_attempted: bool,
+    /// Non-waiting kill request was accepted (`start_kill` Ok). Not proof
+    /// that the process has already terminated.
+    pub kill_initiated: bool,
+    /// Root process was reaped within `CLEANUP_BOUND`.
+    pub root_reaped: bool,
     /// Root-process cleanup only; descendants are not proven gone.
     pub root_only: bool,
     pub detail: String,
@@ -174,16 +184,41 @@ where
     }
 }
 
-/// Wait for a task up to `grace`, then abort and record bounded-out state.
-async fn finish_task<T>(handle: &mut JoinHandle<T>, grace: Duration) -> Option<T> {
-    match tokio::time::timeout(grace, &mut *handle).await {
+/// Wait for a task until a **shared absolute deadline**, then abort.
+///
+/// Abort acknowledgement uses only the remaining time on the same deadline —
+/// never a fresh per-task allowance outside the declared budget.
+async fn finish_task_until<T>(handle: &mut JoinHandle<T>, deadline: Instant) -> Option<T> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        handle.abort();
+        let ack = deadline.saturating_duration_since(Instant::now());
+        if !ack.is_zero() {
+            let _ = tokio::time::timeout(ack, &mut *handle).await;
+        }
+        return None;
+    }
+    match tokio::time::timeout(remaining, &mut *handle).await {
         Ok(Ok(value)) => Some(value),
         Ok(Err(_)) => None,
         Err(_) => {
             handle.abort();
-            let _ = tokio::time::timeout(Duration::from_millis(50), &mut *handle).await;
+            let ack = deadline.saturating_duration_since(Instant::now());
+            if !ack.is_zero() {
+                let _ = tokio::time::timeout(ack, &mut *handle).await;
+            }
             None
         }
+    }
+}
+
+async fn finish_optional_until<T>(
+    handle: &mut Option<JoinHandle<T>>,
+    deadline: Instant,
+) -> Option<T> {
+    match handle.as_mut() {
+        Some(task) => finish_task_until(task, deadline).await,
+        None => None,
     }
 }
 
@@ -703,30 +738,41 @@ pub async fn run(spec: &CommandSpec, bounds: &OutputBounds) -> RunOutcome {
             });
             observations.push(Observation::ProcessStillAlive { pid });
 
-            cleanup.attempted = true;
+            cleanup.kill_attempted = true;
             cleanup.root_only = true;
-            let kill_succeeded = child.kill().await.is_ok();
-            cleanup.kill_succeeded = kill_succeeded;
-            let reaped = matches!(
+            // Non-waiting kill initiation: Child::kill().await may itself wait
+            // for termination and would break CLEANUP_BOUND before reap starts.
+            let kill_initiated = child.start_kill().is_ok();
+            cleanup.kill_initiated = kill_initiated;
+            let root_reaped = matches!(
                 tokio::time::timeout(CLEANUP_BOUND, child.wait()).await,
                 Ok(Ok(_status))
             );
-            cleanup.reaped = reaped;
+            cleanup.root_reaped = root_reaped;
             cleanup.detail = format!(
-                "root_only=true kill_succeeded={kill_succeeded} reaped={reaped} cleanup_bound_ms={}",
+                "root_only=true kill_initiated={kill_initiated} root_reaped={root_reaped} cleanup_bound_ms={}",
                 CLEANUP_BOUND.as_millis()
             );
             exit_cause = Some(ExitCause::TimeoutKill);
             observations.push(Observation::CleanupAttempted {
-                method: "kill_then_bounded_reap_root_only".into(),
-                kill_succeeded,
-                reaped,
+                method: "start_kill_then_bounded_reap_root_only".into(),
+                kill_initiated,
+                root_reaped,
             });
         }
     }
 
-    // Bounded stdin completion after root exit/kill (pipe close unblocks write).
-    match finish_task(&mut stdin_task, STREAM_DRAIN_GRACE).await {
+    // One shared absolute post-root I/O completion window for stdin + stdout +
+    // stderr (including abort acknowledgement). Never reset the grace clock
+    // per task; total bookkeeping fits IO_COMPLETION_GRACE exactly.
+    let completion_deadline = Instant::now() + IO_COMPLETION_GRACE;
+    let (stdin_done, stdout_done, stderr_done) = tokio::join!(
+        finish_task_until(&mut stdin_task, completion_deadline),
+        finish_optional_until(&mut stdout_task, completion_deadline),
+        finish_optional_until(&mut stderr_task, completion_deadline),
+    );
+
+    match stdin_done {
         Some(StdinDelivery::Closed) => {}
         Some(StdinDelivery::Wrote(bytes)) => {
             observations.push(Observation::StdinWrote { bytes });
@@ -764,46 +810,36 @@ pub async fn run(spec: &CommandSpec, bounds: &OutputBounds) -> RunOutcome {
         }
     }
 
-    // Bounded stream drains: grace after root completion, then abort.
-    if let Some(mut task) = stdout_task.take() {
-        match finish_task(&mut task, STREAM_DRAIN_GRACE).await {
-            Some(captured) => {
-                record_stream_observations(StreamKind::Stdout, &captured, &mut observations);
-                outcome.stdout = captured;
-            }
-            None => {
-                let partial = CapturedStream {
-                    bytes: Vec::new(),
-                    total_bytes: 0,
-                    truncated: false,
-                    eof_observed: false,
-                    drain_complete: false,
-                    drain_timed_out: true,
-                };
-                record_stream_observations(StreamKind::Stdout, &partial, &mut observations);
-                outcome.stdout = partial;
-            }
-        }
+    if let Some(captured) = stdout_done {
+        record_stream_observations(StreamKind::Stdout, &captured, &mut observations);
+        outcome.stdout = captured;
+    } else if stdout_task.is_some() {
+        let partial = CapturedStream {
+            bytes: Vec::new(),
+            total_bytes: 0,
+            truncated: false,
+            eof_observed: false,
+            drain_complete: false,
+            drain_timed_out: true,
+        };
+        record_stream_observations(StreamKind::Stdout, &partial, &mut observations);
+        outcome.stdout = partial;
     }
-    if let Some(mut task) = stderr_task.take() {
-        match finish_task(&mut task, STREAM_DRAIN_GRACE).await {
-            Some(captured) => {
-                record_stream_observations(StreamKind::Stderr, &captured, &mut observations);
-                outcome.stderr = captured;
-            }
-            None => {
-                let partial = CapturedStream {
-                    bytes: Vec::new(),
-                    total_bytes: 0,
-                    truncated: false,
-                    eof_observed: false,
-                    drain_complete: false,
-                    drain_timed_out: true,
-                };
-                record_stream_observations(StreamKind::Stderr, &partial, &mut observations);
-                outcome.stderr = partial;
-            }
-        }
+
+    if let Some(captured) = stderr_done {
+        record_stream_observations(StreamKind::Stderr, &captured, &mut observations);
+        outcome.stderr = captured;
+    } else if stderr_task.is_some() {
+        let partial = CapturedStream {
+            bytes: Vec::new(),
+            total_bytes: 0,
+            truncated: false,
+            eof_observed: false,
+            drain_complete: false,
+            drain_timed_out: true,
+        };
+        record_stream_observations(StreamKind::Stderr, &partial, &mut observations);
+        outcome.stderr = partial;
     }
 
     outcome.exit_cause = if exit_cause.is_some() {
@@ -831,7 +867,26 @@ mod tests {
     fn declared_max_wall_ms_formula() {
         assert_eq!(
             declared_max_wall_ms(400),
-            400 + 500 + 300 + SCHEDULING_TOLERANCE_MS
+            400 + CLEANUP_BOUND.as_millis() as u64
+                + IO_COMPLETION_GRACE.as_millis() as u64
+                + SCHEDULING_TOLERANCE_MS
+        );
+        // One shared grace budget — not 3x per stream.
+        assert_eq!(IO_COMPLETION_GRACE, Duration::from_millis(300));
+    }
+
+    #[test]
+    fn runner_source_never_uses_unbounded_child_kill_await() {
+        let src = include_str!("runner.rs");
+        // Build needle so this test does not embed the forbidden form literally.
+        let forbidden: String = ["child", ".kill()", ".await"].join("");
+        assert!(
+            !src.contains(&forbidden),
+            "timeout cleanup must use start_kill() + bounded reap, not Child kill-await"
+        );
+        assert!(
+            src.contains("start_kill()"),
+            "non-waiting kill initiation must remain present"
         );
     }
 

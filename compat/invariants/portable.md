@@ -5,7 +5,7 @@ serialized identity must match these IDs or clearly preserve their meaning.
 
 | ID | Meaning | M0 evidence |
 | --- | --- | --- |
-| `BOUNDED_WAIT_NO_HANG` | Every scenario reaches a terminal outcome within the declared maximum wall-clock bound (deadline + cleanup + drain grace + tolerance). | Actual `elapsed_ms` ≤ `declared_max_wall_ms`; terminal exit or timeout. |
+| `BOUNDED_WAIT_NO_HANG` | Every scenario reaches a terminal outcome within the declared maximum wall-clock bound (`deadline + CLEANUP_BOUND + IO_COMPLETION_GRACE + tolerance`). | Actual `elapsed_ms` ≤ `declared_max_wall_ms`; terminal exit or timeout. |
 | `EXIT_CAUSE_PRESERVED` | Fixture-chosen ordinary exit code remains that exact code. | `ExitCause::Code` equality with Strong OS wait evidence. |
 | `DRAIN_BOTH_STREAMS_NO_DEADLOCK` | Harness drains stdout and stderr independently without deadlock. | Both stream totals recorded; run completes without timeout. EOF may be false if drain was bounded out — not claimed as complete. |
 | `DESCRIPTOR_CLOSURE_EARLY_EXIT` | Child exit while harness still owns stream handles does not hang the runner. | Exit observed; runner returns within declared bound. |
