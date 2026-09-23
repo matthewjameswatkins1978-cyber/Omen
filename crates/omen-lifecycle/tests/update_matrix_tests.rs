@@ -596,6 +596,12 @@ fn rollback_proof_binary_then_state() {
         back
     );
     assert_eq!(record.active_slot.as_deref(), Some(back.as_str()));
+    // Stable copies refreshed from the re-activated slot: the resolved
+    // product and the pointer never disagree.
+    assert_eq!(
+        std::fs::read(fx.base.join("bin").join(exe_name())).unwrap(),
+        b"fake-binary-A"
+    );
 
     // State rollback is separate: snapshot then restore.
     let snap = "snap_test1";

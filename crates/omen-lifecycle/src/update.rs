@@ -1099,6 +1099,14 @@ pub fn rollback_binary(
             "previous slot health check failed; active install untouched".to_string(),
         ));
     }
+    // Refresh the stable copies from the re-activated slot BEFORE the
+    // pointer moves, so the resolved product and the pointer never
+    // disagree. Failure leaves the current install untouched.
+    if let Err(e) = refresh_stable_copies(base, &slot) {
+        return Err(LifecycleError::Rollback(format!(
+            "stable copies would not refresh; active install untouched: {e}"
+        )));
+    }
     let current = record.active_slot.clone();
     record.active_slot = Some(prev.clone());
     record.previous_slot = current;
