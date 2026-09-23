@@ -192,6 +192,9 @@ pub(crate) fn reap_bounded(
 /// Run a helper child to completion under `deadline`, then reap it.
 /// Returns its exit status, or None on budget expiry (helper killed).
 /// The tree-kill helper going silent can never stall the updater.
+/// Production needs it only on Windows (supervised taskkill); tests on
+/// every platform exercise the bound through it.
+#[cfg(any(windows, test))]
 pub(crate) fn run_bounded_helper(
     mut helper: std::process::Child,
     deadline: Instant,
