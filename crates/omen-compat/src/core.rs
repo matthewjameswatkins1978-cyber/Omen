@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -91,7 +92,9 @@ impl Capability {
 }
 
 /// How the runner presents the child environment.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+///
+/// Values are execution state only. Debug never prints raw values.
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 pub enum EnvPolicy {
     /// Start from an empty environment and insert only the listed pairs.
@@ -103,8 +106,54 @@ pub enum EnvPolicy {
     Clear,
 }
 
+impl EnvPolicy {
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            EnvPolicy::AllowList(_) => "allow_list",
+            EnvPolicy::InheritWith(_) => "inherit_with",
+            EnvPolicy::Clear => "clear",
+        }
+    }
+
+    pub fn key_names(&self) -> Vec<String> {
+        match self {
+            EnvPolicy::AllowList(pairs) | EnvPolicy::InheritWith(pairs) => {
+                pairs.iter().map(|(k, _)| k.clone()).collect()
+            }
+            EnvPolicy::Clear => Vec::new(),
+        }
+    }
+
+    pub fn pairs(&self) -> &[(String, String)] {
+        match self {
+            EnvPolicy::AllowList(pairs) | EnvPolicy::InheritWith(pairs) => pairs,
+            EnvPolicy::Clear => &[],
+        }
+    }
+}
+
+impl fmt::Debug for EnvPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EnvPolicy::Clear => f.write_str("EnvPolicy::Clear"),
+            EnvPolicy::AllowList(pairs) => f
+                .debug_struct("EnvPolicy::AllowList")
+                .field("keys", &self.key_names())
+                .field("value_count", &pairs.len())
+                .finish(),
+            EnvPolicy::InheritWith(pairs) => f
+                .debug_struct("EnvPolicy::InheritWith")
+                .field("keys", &self.key_names())
+                .field("value_count", &pairs.len())
+                .finish(),
+        }
+    }
+}
+
 /// Child stdin presentation. No interactive scripting DSL in M0.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+///
+/// Byte payloads are execution state only. Debug never prints payload bytes.
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 pub enum StdinSpec {
     /// Close the child's stdin immediately (fixture observes EOF).
@@ -114,6 +163,36 @@ pub enum StdinSpec {
     Bytes(Vec<u8>),
     /// Leave the parent's stdin attached (only when an existing test needs it).
     Inherited,
+}
+
+impl StdinSpec {
+    pub fn mode_name(&self) -> &'static str {
+        match self {
+            StdinSpec::Closed => "closed",
+            StdinSpec::Bytes(_) => "bytes",
+            StdinSpec::Inherited => "inherited",
+        }
+    }
+
+    pub fn byte_length(&self) -> Option<usize> {
+        match self {
+            StdinSpec::Bytes(b) => Some(b.len()),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Debug for StdinSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StdinSpec::Closed => f.write_str("StdinSpec::Closed"),
+            StdinSpec::Inherited => f.write_str("StdinSpec::Inherited"),
+            StdinSpec::Bytes(b) => f
+                .debug_struct("StdinSpec::Bytes")
+                .field("len", &b.len())
+                .finish(),
+        }
+    }
 }
 
 /// Explicit bound for an external wait. Timeout is a failure bound, never a
@@ -147,7 +226,10 @@ impl Default for Deadline {
 
 /// Process invocation without shell-string ambiguity. `argv` holds arguments
 /// only; `program` is the executable.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// This is **execution state**. Do not embed it automatically in durable
+/// evidence; project it through [`crate::CommandEvidence`] instead.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandSpec {
     pub program: PathBuf,
     pub argv: Vec<String>,
@@ -155,6 +237,19 @@ pub struct CommandSpec {
     pub env: EnvPolicy,
     pub stdin: StdinSpec,
     pub deadline: Deadline,
+}
+
+impl fmt::Debug for CommandSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CommandSpec")
+            .field("program", &self.program)
+            .field("argv_count", &self.argv.len())
+            .field("cwd", &self.cwd)
+            .field("env", &self.env)
+            .field("stdin", &self.stdin)
+            .field("deadline", &self.deadline)
+            .finish()
+    }
 }
 
 impl CommandSpec {
@@ -329,3 +424,31 @@ pub struct ProcessTreeObservation {
 
 /// Convenience map type used by fixture reports.
 pub type JsonMap = BTreeMap<String, serde_json::Value>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_redacts_env_values_and_stdin_bytes() {
+        let secret_env = "OMEN_TEST_SECRET_DO_NOT_LEAK_9f3a";
+        let env = EnvPolicy::InheritWith(vec![("OPENAI_API_KEY".into(), secret_env.into())]);
+        let dbg = format!("{env:?}");
+        assert!(!dbg.contains(secret_env));
+        assert!(dbg.contains("OPENAI_API_KEY"));
+
+        let stdin = StdinSpec::Bytes(secret_env.as_bytes().to_vec());
+        let dbg = format!("{stdin:?}");
+        assert!(!dbg.contains(secret_env));
+        assert!(dbg.contains("len"));
+
+        let spec = CommandSpec::new("omen-gremlin")
+            .arg("--print-env")
+            .arg("OPENAI_API_KEY")
+            .env(env)
+            .stdin(StdinSpec::Bytes(secret_env.as_bytes().to_vec()));
+        let dbg = format!("{spec:?}");
+        assert!(!dbg.contains(secret_env));
+        assert!(dbg.contains("argv_count"));
+    }
+}

@@ -1,42 +1,78 @@
 use crate::core::{CommandSpec, EnvPolicy, EvidenceGrade, ExitCause, OutputBounds, StdinSpec};
+use crate::failure::StreamSummary;
 use crate::invariant::{InvariantId, InvariantOutcome, InvariantResult};
 use crate::observation::{Observation, StreamKind};
 use serde::{Deserialize, Serialize};
-use std::io::{Read, Write};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::process::{Child, Command};
+use tokio::task::JoinHandle;
 
-/// Default reaping bound after a timeout kill. Separate from the scenario
-/// deadline so cleanup is bounded but still truthfully attempted.
-const DEFAULT_REAP_TIMEOUT: Duration = Duration::from_secs(2);
-const POLL_INTERVAL: Duration = Duration::from_millis(5);
+/// Bounded cleanup after scenario deadline (kill + reap).
+pub const CLEANUP_BOUND: Duration = Duration::from_millis(500);
+/// Bounded grace for stdout/stderr EOF after root completion or kill.
+pub const STREAM_DRAIN_GRACE: Duration = Duration::from_millis(300);
+/// Small scheduling tolerance added to the declared wall-clock promise.
+pub const SCHEDULING_TOLERANCE_MS: u64 = 75;
+
+/// Declared maximum wall-clock outcome for a run with the given scenario deadline.
+///
+/// `scenario deadline + cleanup + stream-drain grace + scheduling tolerance`
+pub fn declared_max_wall_ms(deadline_ms: u64) -> u64 {
+    deadline_ms
+        + CLEANUP_BOUND.as_millis() as u64
+        + STREAM_DRAIN_GRACE.as_millis() as u64
+        + SCHEDULING_TOLERANCE_MS
+}
 
 /// Bounded capture for one stream.
+///
+/// Truncation, EOF, and drain cancellation are distinct facts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct CapturedStream {
     pub bytes: Vec<u8>,
+    /// Bytes observed on the wire before capture stopped.
     pub total_bytes: u64,
+    /// More bytes arrived than retained.
     pub truncated: bool,
+    /// Pipe EOF was observed on this stream.
+    pub eof_observed: bool,
+    /// Drain finished without being cancelled at the grace bound.
+    pub drain_complete: bool,
+    /// Drain was stopped at the declared grace bound (EOF not proven).
+    pub drain_timed_out: bool,
 }
 
 impl CapturedStream {
     pub fn as_lossy_string(&self) -> String {
         String::from_utf8_lossy(&self.bytes).into_owned()
     }
+
+    pub fn summary(&self) -> StreamSummary {
+        StreamSummary::from_captured(
+            self.bytes.len() as u64,
+            self.total_bytes,
+            self.truncated,
+            self.eof_observed,
+            self.drain_timed_out,
+        )
+    }
 }
 
-/// Truthful record of post-deadline cleanup.
+/// Truthful record of post-deadline cleanup of the **root** process only.
+///
+/// Does not claim descendant-tree termination.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct CleanupOutcome {
     pub attempted: bool,
     pub kill_succeeded: bool,
     pub reaped: bool,
+    /// Root-process cleanup only; descendants are not proven gone.
+    pub root_only: bool,
     pub detail: String,
 }
 
-/// Structured result of one bounded run. Always returned; never hangs past
-/// the deadline plus cleanup bound.
+/// Structured result of one bounded run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunOutcome {
     pub observations: Vec<Observation>,
@@ -47,9 +83,164 @@ pub struct RunOutcome {
     pub cleanup: CleanupOutcome,
     pub elapsed_ms: u64,
     pub deadline_ms: u64,
+    pub declared_max_wall_ms: u64,
     pub bounds: OutputBounds,
     pub harness_failed: bool,
     pub pid: Option<u32>,
+}
+
+enum StdinDelivery {
+    Closed,
+    Wrote(u64),
+    Failed { bytes: u64, detail: String },
+    TimedOut { bytes: u64 },
+}
+
+async fn deliver_stdin(
+    mut stdin: Option<tokio::process::ChildStdin>,
+    spec: &StdinSpec,
+    budget: Duration,
+) -> StdinDelivery {
+    match spec {
+        StdinSpec::Inherited => StdinSpec::inherited_delivery(),
+        StdinSpec::Closed => {
+            drop(stdin.take());
+            StdinDelivery::Closed
+        }
+        StdinSpec::Bytes(bytes) => {
+            let Some(mut sink) = stdin.take() else {
+                return StdinDelivery::Closed;
+            };
+            let attempted = bytes.len() as u64;
+            match tokio::time::timeout(budget, async {
+                sink.write_all(bytes).await?;
+                sink.flush().await?;
+                sink.shutdown().await?;
+                Ok::<(), std::io::Error>(())
+            })
+            .await
+            {
+                Ok(Ok(())) => StdinDelivery::Wrote(attempted),
+                Ok(Err(err)) => StdinDelivery::Failed {
+                    bytes: attempted,
+                    detail: err.to_string(),
+                },
+                Err(_) => {
+                    drop(sink);
+                    StdinDelivery::TimedOut { bytes: attempted }
+                }
+            }
+        }
+    }
+}
+
+impl StdinSpec {
+    fn inherited_delivery() -> StdinDelivery {
+        StdinDelivery::Closed
+    }
+}
+
+async fn drain_stream<R>(mut reader: R, limit: usize) -> CapturedStream
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut kept: Vec<u8> = Vec::with_capacity(limit.min(64 * 1024));
+    let mut total: u64 = 0;
+    let mut buf = [0u8; 16 * 1024];
+    let mut eof = false;
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) => {
+                eof = true;
+                break;
+            }
+            Ok(n) => {
+                total += n as u64;
+                if kept.len() < limit {
+                    let take = (limit - kept.len()).min(n);
+                    kept.extend_from_slice(&buf[..take]);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    CapturedStream {
+        bytes: kept,
+        total_bytes: total,
+        truncated: total > limit as u64,
+        eof_observed: eof,
+        drain_complete: eof,
+        drain_timed_out: false,
+    }
+}
+
+/// Wait for a task up to `grace`, then abort and record bounded-out state.
+async fn finish_task<T>(handle: &mut JoinHandle<T>, grace: Duration) -> Option<T> {
+    match tokio::time::timeout(grace, &mut *handle).await {
+        Ok(Ok(value)) => Some(value),
+        Ok(Err(_)) => None,
+        Err(_) => {
+            handle.abort();
+            let _ = tokio::time::timeout(Duration::from_millis(50), &mut *handle).await;
+            None
+        }
+    }
+}
+
+fn apply_env(cmd: &mut Command, policy: &EnvPolicy, observations: &mut Vec<Observation>) {
+    match policy {
+        EnvPolicy::Clear => {
+            cmd.env_clear();
+        }
+        EnvPolicy::AllowList(pairs) => {
+            cmd.env_clear();
+            for (key, value) in pairs {
+                cmd.env(key, value);
+                observations.push(Observation::EnvApplied { key: key.clone() });
+            }
+        }
+        EnvPolicy::InheritWith(pairs) => {
+            for (key, value) in pairs {
+                cmd.env(key, value);
+                observations.push(Observation::EnvApplied { key: key.clone() });
+            }
+        }
+    }
+}
+
+fn record_stream_observations(
+    kind: StreamKind,
+    captured: &CapturedStream,
+    observations: &mut Vec<Observation>,
+) {
+    match kind {
+        StreamKind::Stdout => observations.push(Observation::StdoutChunk {
+            bytes: captured.total_bytes,
+        }),
+        StreamKind::Stderr => observations.push(Observation::StderrChunk {
+            bytes: captured.total_bytes,
+        }),
+        StreamKind::Stdin => return,
+    }
+    if captured.truncated {
+        observations.push(Observation::OutputTruncated {
+            stream: kind,
+            kept_bytes: captured.bytes.len() as u64,
+            total_bytes: captured.total_bytes,
+        });
+    } else if captured.eof_observed {
+        observations.push(Observation::OutputComplete {
+            stream: kind,
+            total_bytes: captured.total_bytes,
+        });
+    }
+    if captured.drain_timed_out {
+        observations.push(Observation::StreamDrainBoundedOut {
+            stream: kind,
+            total_bytes_observed: captured.total_bytes,
+        });
+    }
+    observations.push(Observation::DescriptorClosed { stream: kind });
 }
 
 impl RunOutcome {
@@ -62,6 +253,7 @@ impl RunOutcome {
     }
 
     /// Locate the last single-line JSON object on stdout (fixture reports).
+    /// FixtureReport payloads remain limited to controlled Compat fixtures.
     pub fn fixture_report(&self) -> Option<serde_json::Value> {
         let text = self.stdout_lossy();
         for line in text.lines().rev() {
@@ -76,16 +268,12 @@ impl RunOutcome {
         None
     }
 
-    pub fn capture_summary(stream: &CapturedStream) -> crate::failure::StreamSummary {
-        crate::failure::StreamSummary::from_capture(
-            &stream.bytes,
-            stream.total_bytes,
-            stream.truncated,
-        )
+    pub fn capture_summary(stream: &CapturedStream) -> StreamSummary {
+        stream.summary()
     }
 
-    /// BOUNDED_WAIT_NO_HANG: the runner itself reached a terminal outcome
-    /// within the scenario deadline (plus bounded cleanup when timed out).
+    /// BOUNDED_WAIT_NO_HANG: verifies **actual elapsed wall-clock time**
+    /// against the declared maximum, not merely that a status flag exists.
     pub fn check_bounded_wait_no_hang(&self) -> InvariantResult {
         let invariant = InvariantId::BoundedWaitNoHang;
         if self.harness_failed {
@@ -96,14 +284,28 @@ impl RunOutcome {
             )
             .with_observations(self.observations.clone());
         }
+
+        let max = self.declared_max_wall_ms;
+        if self.elapsed_ms > max {
+            return InvariantResult::fail(
+                invariant,
+                EvidenceGrade::Strong,
+                format!(
+                    "elapsed {}ms exceeded declared maximum {}ms (deadline {}ms)",
+                    self.elapsed_ms, max, self.deadline_ms
+                ),
+            )
+            .with_observations(self.observations.clone());
+        }
+
         let reached_terminal = self.exit_cause.is_some() || self.timed_out;
         if reached_terminal {
             InvariantResult::pass(
                 invariant,
                 EvidenceGrade::Strong,
                 format!(
-                    "runner returned terminal outcome in {}ms (deadline {}ms)",
-                    self.elapsed_ms, self.deadline_ms
+                    "elapsed {}ms within declared maximum {}ms (deadline {}ms)",
+                    self.elapsed_ms, max, self.deadline_ms
                 ),
             )
             .with_observations(self.observations.clone())
@@ -159,8 +361,8 @@ impl RunOutcome {
         }
     }
 
-    /// DRAIN_BOTH_STREAMS_NO_DEADLOCK: both streams must be captured without
-    /// hanging. Truncation is allowed and must remain explicit.
+    /// DRAIN_BOTH_STREAMS_NO_DEADLOCK: both streams captured without hanging.
+    /// Does not claim EOF when drain was bounded out.
     pub fn check_drain_both_streams_no_deadlock(&self) -> InvariantResult {
         let invariant = InvariantId::DrainBothStreamsNoDeadlock;
         if self.harness_failed {
@@ -187,11 +389,18 @@ impl RunOutcome {
             )
             .with_observations(self.observations.clone());
         }
+        let eof_note = format!(
+            "stdout_eof={} stderr_eof={} stdout_drain_timed_out={} stderr_drain_timed_out={}",
+            self.stdout.eof_observed,
+            self.stderr.eof_observed,
+            self.stdout.drain_timed_out,
+            self.stderr.drain_timed_out
+        );
         InvariantResult::pass(
             invariant,
             EvidenceGrade::Strong,
             format!(
-                "both streams drained; stdout_total={} stderr_total={} truncated_out={} truncated_err={}",
+                "both streams drained without hang; stdout_total={} stderr_total={} truncated_out={} truncated_err={} {eof_note}",
                 self.stdout.total_bytes,
                 self.stderr.total_bytes,
                 self.stdout.truncated,
@@ -202,14 +411,25 @@ impl RunOutcome {
     }
 
     /// DESCRIPTOR_CLOSURE_EARLY_EXIT: child may exit while parent still holds
-    /// write handles; the runner must still return.
+    /// write handles; the runner must still return within the declared bound.
     pub fn check_descriptor_closure_early_exit(&self) -> InvariantResult {
         let invariant = InvariantId::DescriptorClosureEarlyExit;
+        if self.elapsed_ms > self.declared_max_wall_ms {
+            return InvariantResult::fail(
+                invariant,
+                EvidenceGrade::Strong,
+                format!(
+                    "elapsed {}ms exceeded declared maximum {}ms after early child exit",
+                    self.elapsed_ms, self.declared_max_wall_ms
+                ),
+            )
+            .with_observations(self.observations.clone());
+        }
         if self.timed_out {
             return InvariantResult::fail(
                 invariant,
                 EvidenceGrade::Strong,
-                "runner hung past deadline after early child exit (descriptor lifecycle)",
+                "runner hit deadline after early child exit (descriptor lifecycle)",
             )
             .with_observations(self.observations.clone());
         }
@@ -217,7 +437,7 @@ impl RunOutcome {
             Some(ExitCause::Code { .. }) => InvariantResult::pass(
                 invariant,
                 EvidenceGrade::Strong,
-                "child exited while harness retained stream ownership; runner returned",
+                "child exited while harness retained stream ownership; runner returned in bound",
             )
             .with_observations(self.observations.clone()),
             Some(other) => InvariantResult::pass(
@@ -316,8 +536,8 @@ impl RunOutcome {
         }
     }
 
-    /// ENV_RECORDED: child environment policy and fixture-observed dedicated
-    /// test value must match without dumping secrets.
+    /// ENV_RECORDED: dedicated probe matched in memory.
+    /// Durable reason strings never interpolate environment values.
     pub fn check_env_recorded(
         &self,
         expected_key: &str,
@@ -332,196 +552,46 @@ impl RunOutcome {
                 "timed out before fixture env report",
             );
         }
-        let applied = self.observations.iter().find_map(|obs| match obs {
-            Observation::EnvRecorded { key, value } if key == expected_key => Some(value.clone()),
-            _ => None,
-        });
+        let applied = self
+            .observations
+            .iter()
+            .any(|obs| matches!(obs, Observation::EnvApplied { key } if key == expected_key));
 
         match (applied, fixture_value) {
-            (Some(applied_val), Some(fixture_val))
-                if applied_val == expected_value && fixture_val == expected_value =>
-            {
-                InvariantResult::pass(
-                    invariant,
-                    EvidenceGrade::Strong,
-                    format!("{expected_key} applied and observed as dedicated test value"),
-                )
-                .with_observations(self.observations.clone())
-            }
-            (Some(applied_val), Some(fixture_val)) => InvariantResult::fail(
+            (true, Some(fixture_val)) if fixture_val == expected_value => InvariantResult::pass(
                 invariant,
                 EvidenceGrade::Strong,
-                format!(
-                    "env mismatch for {expected_key}: harness={applied_val} fixture={fixture_val} expected={expected_value}"
-                ),
-            ),
-            (Some(_), None) => InvariantResult::fail(
+                "dedicated environment probe value matched",
+            )
+            .with_observations(self.observations.clone()),
+            (true, Some(_)) => InvariantResult::fail(
+                invariant,
+                EvidenceGrade::Strong,
+                "dedicated environment probe value mismatched",
+            )
+            .with_observations(self.observations.clone()),
+            (true, None) => InvariantResult::fail(
                 invariant,
                 EvidenceGrade::Partial,
-                "harness recorded env application but fixture did not report the value",
+                "harness recorded env application but fixture did not report the probe",
             ),
-            (None, _) => InvariantResult::fail(
+            (false, _) => InvariantResult::fail(
                 invariant,
                 EvidenceGrade::Strong,
-                format!("harness never recorded EnvRecorded for {expected_key}"),
+                format!("harness never recorded EnvApplied for key {expected_key}"),
             ),
         }
     }
 }
 
-fn apply_env(cmd: &mut Command, policy: &EnvPolicy, observations: &mut Vec<Observation>) {
-    match policy {
-        EnvPolicy::Clear => {
-            cmd.env_clear();
-        }
-        EnvPolicy::AllowList(pairs) => {
-            cmd.env_clear();
-            for (key, value) in pairs {
-                cmd.env(key, value);
-                observations.push(Observation::EnvRecorded {
-                    key: key.clone(),
-                    value: value.clone(),
-                });
-            }
-        }
-        EnvPolicy::InheritWith(pairs) => {
-            for (key, value) in pairs {
-                cmd.env(key, value);
-                observations.push(Observation::EnvRecorded {
-                    key: key.clone(),
-                    value: value.clone(),
-                });
-            }
-        }
-    }
-}
-
-fn drain_reader<R: Read + Send + 'static>(
-    mut reader: R,
-    kind: StreamKind,
-    limit: usize,
-    tx: mpsc::Sender<(StreamKind, CapturedStream)>,
-) {
-    let mut kept: Vec<u8> = Vec::with_capacity(limit.min(64 * 1024));
-    let mut total: u64 = 0;
-    let mut chunk = [0u8; 16 * 1024];
-    loop {
-        match reader.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(n) => {
-                total += n as u64;
-                if kept.len() < limit {
-                    let take = (limit - kept.len()).min(n);
-                    kept.extend_from_slice(&chunk[..take]);
-                }
-            }
-            Err(_) => break,
-        }
-    }
-    let _ = tx.send((
-        kind,
-        CapturedStream {
-            bytes: kept,
-            total_bytes: total,
-            truncated: total > limit as u64,
-        },
-    ));
-}
-
-fn apply_captured(
-    kind: StreamKind,
-    captured: CapturedStream,
-    observations: &mut Vec<Observation>,
-    outcome: &mut RunOutcome,
-) {
-    match kind {
-        StreamKind::Stdout => {
-            observations.push(Observation::StdoutChunk {
-                bytes: captured.total_bytes,
-            });
-            if captured.truncated {
-                observations.push(Observation::OutputTruncated {
-                    stream: StreamKind::Stdout,
-                    kept_bytes: captured.bytes.len() as u64,
-                    total_bytes: captured.total_bytes,
-                });
-            } else {
-                observations.push(Observation::OutputComplete {
-                    stream: StreamKind::Stdout,
-                    total_bytes: captured.total_bytes,
-                });
-            }
-            observations.push(Observation::DescriptorClosed {
-                stream: StreamKind::Stdout,
-            });
-            outcome.stdout = captured;
-        }
-        StreamKind::Stderr => {
-            observations.push(Observation::StderrChunk {
-                bytes: captured.total_bytes,
-            });
-            if captured.truncated {
-                observations.push(Observation::OutputTruncated {
-                    stream: StreamKind::Stderr,
-                    kept_bytes: captured.bytes.len() as u64,
-                    total_bytes: captured.total_bytes,
-                });
-            } else {
-                observations.push(Observation::OutputComplete {
-                    stream: StreamKind::Stderr,
-                    total_bytes: captured.total_bytes,
-                });
-            }
-            observations.push(Observation::DescriptorClosed {
-                stream: StreamKind::Stderr,
-            });
-            outcome.stderr = captured;
-        }
-        StreamKind::Stdin => {}
-    }
-}
-
-fn collect_streams(
-    stream_rx: &mpsc::Receiver<(StreamKind, CapturedStream)>,
-    reader_handles: Vec<std::thread::JoinHandle<()>>,
-    observations: &mut Vec<Observation>,
-    outcome: &mut RunOutcome,
-) {
-    let expected = reader_handles.len();
-    let mut received = 0usize;
-    while received < expected {
-        match stream_rx.recv_timeout(Duration::from_millis(100)) {
-            Ok((kind, captured)) => {
-                received += 1;
-                apply_captured(kind, captured, observations, outcome);
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if received >= expected {
-                    break;
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-    }
-    while let Ok((kind, captured)) = stream_rx.try_recv() {
-        apply_captured(kind, captured, observations, outcome);
-    }
-    for handle in reader_handles {
-        let _ = handle.join();
-    }
-}
-
-fn try_wait_once(
-    child: &mut std::process::Child,
-) -> std::io::Result<Option<std::process::ExitStatus>> {
-    child.try_wait()
-}
-
-/// Spawn `spec` with independent stdout/stderr draining, explicit stdin
-/// policy, and a hard deadline. Never uses unbounded waits without a bound.
-pub fn run(spec: &CommandSpec, bounds: &OutputBounds) -> RunOutcome {
+/// Spawn `spec` with concurrent bounded stdin/stdout/stderr I/O.
+///
+/// All external waits are bounded by the scenario deadline, cleanup bound,
+/// and stream-drain grace. No unbounded join/read/write remains.
+pub async fn run(spec: &CommandSpec, bounds: &OutputBounds) -> RunOutcome {
     let started = Instant::now();
     let deadline_ms = spec.deadline.timeout_ms;
+    let declared_max = declared_max_wall_ms(deadline_ms);
     let mut observations: Vec<Observation> = Vec::new();
     let mut outcome = RunOutcome {
         observations: Vec::new(),
@@ -532,6 +602,7 @@ pub fn run(spec: &CommandSpec, bounds: &OutputBounds) -> RunOutcome {
         cleanup: CleanupOutcome::default(),
         elapsed_ms: 0,
         deadline_ms,
+        declared_max_wall_ms: declared_max,
         bounds: *bounds,
         harness_failed: false,
         pid: None,
@@ -548,21 +619,23 @@ pub fn run(spec: &CommandSpec, bounds: &OutputBounds) -> RunOutcome {
         return outcome;
     }
 
+    let scenario_deadline = spec.deadline.duration();
     let mut cmd = Command::new(&spec.program);
     cmd.args(&spec.argv);
+    cmd.kill_on_drop(true);
     if let Some(cwd) = &spec.cwd {
         cmd.current_dir(cwd);
     }
     apply_env(&mut cmd, &spec.env, &mut observations);
 
     let use_pipe_stdin = !matches!(spec.stdin, StdinSpec::Inherited);
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
     if use_pipe_stdin {
-        cmd.stdin(Stdio::piped());
+        cmd.stdin(std::process::Stdio::piped());
     }
 
-    let mut child = match cmd.spawn() {
+    let mut child: Child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {
             observations.push(Observation::HarnessFailed {
@@ -576,134 +649,162 @@ pub fn run(spec: &CommandSpec, bounds: &OutputBounds) -> RunOutcome {
         }
     };
 
-    let pid = child.id();
+    let pid = child.id().unwrap_or(0);
     outcome.pid = Some(pid);
     observations.push(Observation::ProcessSpawned { pid });
 
-    // Stdin policy first: Closed drops the writer (EOF); Bytes writes then drops.
-    match &spec.stdin {
-        StdinSpec::Inherited => {}
-        StdinSpec::Closed => {
-            drop(child.stdin.take());
-            observations.push(Observation::StdinClosed);
-            observations.push(Observation::DescriptorClosed {
-                stream: StreamKind::Stdin,
-            });
+    let stdin_handle_raw = if matches!(spec.stdin, StdinSpec::Closed) {
+        drop(child.stdin.take());
+        observations.push(Observation::StdinClosed);
+        observations.push(Observation::DescriptorClosed {
+            stream: StreamKind::Stdin,
+        });
+        None
+    } else {
+        child.stdin.take()
+    };
+    let stdout_raw = child.stdout.take();
+    let stderr_raw = child.stderr.take();
+
+    let stdin_spec = spec.stdin.clone();
+    let stdin_budget = scenario_deadline.min(Duration::from_secs(30));
+    let mut stdin_task = tokio::spawn(async move {
+        if matches!(stdin_spec, StdinSpec::Closed) {
+            return StdinDelivery::Closed;
         }
-        StdinSpec::Bytes(bytes) => {
-            if let Some(mut stdin) = child.stdin.take() {
-                let write_result = stdin.write_all(bytes).and_then(|_| stdin.flush());
-                let wrote = match write_result {
-                    Ok(()) => bytes.len() as u64,
-                    Err(err) => {
-                        observations.push(Observation::HarnessFailed {
-                            phase: "stdin".into(),
-                            detail: err.to_string(),
-                        });
-                        0
-                    }
-                };
-                drop(stdin);
-                observations.push(Observation::StdinWrote { bytes: wrote });
-                observations.push(Observation::DescriptorClosed {
-                    stream: StreamKind::Stdin,
-                });
-            }
-        }
-    }
+        deliver_stdin(stdin_handle_raw, &stdin_spec, stdin_budget).await
+    });
 
-    let (stream_tx, stream_rx) = mpsc::channel::<(StreamKind, CapturedStream)>();
-    let stdout_limit = bounds.max_stdout_bytes;
-    let stderr_limit = bounds.max_stderr_bytes;
+    let mut stdout_task =
+        stdout_raw.map(|stdout| tokio::spawn(drain_stream(stdout, bounds.max_stdout_bytes)));
+    let mut stderr_task =
+        stderr_raw.map(|stderr| tokio::spawn(drain_stream(stderr, bounds.max_stderr_bytes)));
 
-    let mut reader_handles = Vec::new();
-    if let Some(stdout) = child.stdout.take() {
-        let tx = stream_tx.clone();
-        reader_handles.push(std::thread::spawn(move || {
-            drain_reader(stdout, StreamKind::Stdout, stdout_limit, tx)
-        }));
-    }
-    if let Some(stderr) = child.stderr.take() {
-        let tx = stream_tx.clone();
-        reader_handles.push(std::thread::spawn(move || {
-            drain_reader(stderr, StreamKind::Stderr, stderr_limit, tx)
-        }));
-    }
-    drop(stream_tx);
-
-    let wait_deadline = started + spec.deadline.duration();
     let mut exit_cause: Option<ExitCause> = None;
     let mut timed_out = false;
     let mut cleanup = CleanupOutcome::default();
 
-    loop {
-        match try_wait_once(&mut child) {
-            Ok(Some(status)) => {
-                exit_cause = Some(ExitCause::from_exit_status(status));
-                break;
-            }
-            Ok(None) => {
-                if Instant::now() >= wait_deadline {
-                    timed_out = true;
-                    break;
-                }
-                std::thread::sleep(POLL_INTERVAL);
-            }
-            Err(err) => {
-                observations.push(Observation::HarnessFailed {
-                    phase: "wait".into(),
-                    detail: err.to_string(),
-                });
-                outcome.harness_failed = true;
-                break;
-            }
+    match tokio::time::timeout(scenario_deadline, child.wait()).await {
+        Ok(Ok(status)) => {
+            exit_cause = Some(ExitCause::from_exit_status(status));
+        }
+        Ok(Err(err)) => {
+            observations.push(Observation::HarnessFailed {
+                phase: "wait".into(),
+                detail: err.to_string(),
+            });
+            outcome.harness_failed = true;
+        }
+        Err(_) => {
+            timed_out = true;
+            observations.push(Observation::TimeoutObserved {
+                elapsed_ms: started.elapsed().as_millis() as u64,
+                deadline_ms,
+            });
+            observations.push(Observation::ProcessStillAlive { pid });
+
+            cleanup.attempted = true;
+            cleanup.root_only = true;
+            let kill_succeeded = child.kill().await.is_ok();
+            cleanup.kill_succeeded = kill_succeeded;
+            let reaped = matches!(
+                tokio::time::timeout(CLEANUP_BOUND, child.wait()).await,
+                Ok(Ok(_status))
+            );
+            cleanup.reaped = reaped;
+            cleanup.detail = format!(
+                "root_only=true kill_succeeded={kill_succeeded} reaped={reaped} cleanup_bound_ms={}",
+                CLEANUP_BOUND.as_millis()
+            );
+            exit_cause = Some(ExitCause::TimeoutKill);
+            observations.push(Observation::CleanupAttempted {
+                method: "kill_then_bounded_reap_root_only".into(),
+                kill_succeeded,
+                reaped,
+            });
         }
     }
 
-    if timed_out {
-        observations.push(Observation::TimeoutObserved {
-            elapsed_ms: started.elapsed().as_millis() as u64,
-            deadline_ms,
-        });
-        observations.push(Observation::ProcessStillAlive { pid });
-
-        cleanup.attempted = true;
-        let kill_succeeded = child.kill().is_ok();
-        cleanup.kill_succeeded = kill_succeeded;
-        let mut reaped = false;
-        let reap_deadline = Instant::now() + DEFAULT_REAP_TIMEOUT;
-        loop {
-            match try_wait_once(&mut child) {
-                Ok(Some(status)) => {
-                    reaped = true;
-                    // Keep TimeoutKill as the scenario cause; the kill exit
-                    // status is cleanup evidence, not a portable fixture code.
-                    let _ = status;
-                    break;
-                }
-                Ok(None) => {
-                    if Instant::now() >= reap_deadline {
-                        break;
-                    }
-                    std::thread::sleep(POLL_INTERVAL);
-                }
-                Err(_) => break,
-            }
+    // Bounded stdin completion after root exit/kill (pipe close unblocks write).
+    match finish_task(&mut stdin_task, STREAM_DRAIN_GRACE).await {
+        Some(StdinDelivery::Closed) => {}
+        Some(StdinDelivery::Wrote(bytes)) => {
+            observations.push(Observation::StdinWrote { bytes });
+            observations.push(Observation::DescriptorClosed {
+                stream: StreamKind::Stdin,
+            });
         }
-        cleanup.reaped = reaped;
-        cleanup.detail = format!(
-            "kill_succeeded={kill_succeeded} reaped={reaped} reap_timeout_ms={}",
-            DEFAULT_REAP_TIMEOUT.as_millis()
-        );
-        exit_cause = Some(ExitCause::TimeoutKill);
-        observations.push(Observation::CleanupAttempted {
-            method: "kill_then_bounded_reap".into(),
-            kill_succeeded,
-            reaped,
-        });
+        Some(StdinDelivery::Failed { bytes, detail }) => {
+            observations.push(Observation::StdinWrote { bytes });
+            observations.push(Observation::HarnessFailed {
+                phase: "stdin".into(),
+                detail,
+            });
+            observations.push(Observation::DescriptorClosed {
+                stream: StreamKind::Stdin,
+            });
+        }
+        Some(StdinDelivery::TimedOut { bytes }) => {
+            observations.push(Observation::StdinDeliveryBounded {
+                bytes_attempted: bytes,
+                completed: false,
+            });
+            observations.push(Observation::DescriptorClosed {
+                stream: StreamKind::Stdin,
+            });
+        }
+        None => {
+            observations.push(Observation::StdinDeliveryBounded {
+                bytes_attempted: spec.stdin.byte_length().unwrap_or(0) as u64,
+                completed: false,
+            });
+            observations.push(Observation::DescriptorClosed {
+                stream: StreamKind::Stdin,
+            });
+        }
     }
 
-    collect_streams(&stream_rx, reader_handles, &mut observations, &mut outcome);
+    // Bounded stream drains: grace after root completion, then abort.
+    if let Some(mut task) = stdout_task.take() {
+        match finish_task(&mut task, STREAM_DRAIN_GRACE).await {
+            Some(captured) => {
+                record_stream_observations(StreamKind::Stdout, &captured, &mut observations);
+                outcome.stdout = captured;
+            }
+            None => {
+                let partial = CapturedStream {
+                    bytes: Vec::new(),
+                    total_bytes: 0,
+                    truncated: false,
+                    eof_observed: false,
+                    drain_complete: false,
+                    drain_timed_out: true,
+                };
+                record_stream_observations(StreamKind::Stdout, &partial, &mut observations);
+                outcome.stdout = partial;
+            }
+        }
+    }
+    if let Some(mut task) = stderr_task.take() {
+        match finish_task(&mut task, STREAM_DRAIN_GRACE).await {
+            Some(captured) => {
+                record_stream_observations(StreamKind::Stderr, &captured, &mut observations);
+                outcome.stderr = captured;
+            }
+            None => {
+                let partial = CapturedStream {
+                    bytes: Vec::new(),
+                    total_bytes: 0,
+                    truncated: false,
+                    eof_observed: false,
+                    drain_complete: false,
+                    drain_timed_out: true,
+                };
+                record_stream_observations(StreamKind::Stderr, &partial, &mut observations);
+                outcome.stderr = partial;
+            }
+        }
+    }
 
     outcome.exit_cause = if exit_cause.is_some() {
         exit_cause
@@ -720,4 +821,52 @@ pub fn run(spec: &CommandSpec, bounds: &OutputBounds) -> RunOutcome {
     outcome.observations = observations;
     outcome.elapsed_ms = started.elapsed().as_millis() as u64;
     outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn declared_max_wall_ms_formula() {
+        assert_eq!(
+            declared_max_wall_ms(400),
+            400 + 500 + 300 + SCHEDULING_TOLERANCE_MS
+        );
+    }
+
+    #[test]
+    fn bounded_wait_checks_elapsed_not_just_flags() {
+        let deadline = 400u64;
+        let max = declared_max_wall_ms(deadline);
+        let mut ok = RunOutcome {
+            observations: vec![],
+            exit_cause: Some(ExitCause::code(0)),
+            stdout: CapturedStream::default(),
+            stderr: CapturedStream::default(),
+            timed_out: false,
+            cleanup: CleanupOutcome::default(),
+            elapsed_ms: max - 1,
+            deadline_ms: deadline,
+            declared_max_wall_ms: max,
+            bounds: OutputBounds::default(),
+            harness_failed: false,
+            pid: Some(1),
+        };
+        assert_eq!(
+            ok.check_bounded_wait_no_hang().outcome,
+            InvariantOutcome::Pass
+        );
+
+        ok.elapsed_ms = max + 1;
+        assert_eq!(
+            ok.check_bounded_wait_no_hang().outcome,
+            InvariantOutcome::Fail
+        );
+        assert!(
+            ok.check_bounded_wait_no_hang()
+                .reason
+                .contains("exceeded declared maximum")
+        );
+    }
 }

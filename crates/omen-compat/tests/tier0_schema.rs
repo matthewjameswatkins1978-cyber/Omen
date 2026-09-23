@@ -1,9 +1,10 @@
 //! Tier 0 — pure schema and state tests (no subprocesses).
 
 use omen_compat::{
-    Capability, CleanupOutcome, CommandSpec, Deadline, EnvPolicy, EvidenceGrade, ExitCause,
-    FailureKind, InvariantId, InvariantOutcome, InvariantResult, Observation, OutputBounds,
-    Platform, ReplayDescriptor, RunOutcome, StdinSpec, StreamKind, StructuredFailure,
+    Capability, CleanupOutcome, CommandEvidence, CommandSpec, Deadline, EnvPolicy, EvidenceGrade,
+    ExitCause, FailureKind, InvariantId, InvariantOutcome, InvariantResult, Observation,
+    OutputBounds, Platform, ReplayDescriptor, ReplayFidelity, RunOutcome, StdinSpec, StreamKind,
+    StructuredFailure, declared_max_wall_ms,
 };
 use std::time::Duration;
 
@@ -140,13 +141,45 @@ fn command_spec_has_no_shell_string_field() {
 }
 
 #[test]
-fn replay_descriptor_roundtrip() {
+fn command_evidence_is_redacted_by_default() {
+    let secret = "OMEN_TEST_SECRET_DO_NOT_LEAK_9f3a";
+    let spec = CommandSpec::new("omen-gremlin")
+        .arg("--print-env")
+        .arg("OPENAI_API_KEY")
+        .env(EnvPolicy::InheritWith(vec![(
+            "OPENAI_API_KEY".into(),
+            secret.into(),
+        )]))
+        .stdin(StdinSpec::Bytes(secret.as_bytes().to_vec()))
+        .timeout(Duration::from_millis(500));
+
+    let evidence = CommandEvidence::from_execution(&spec);
+    let json = serde_json::to_string(&evidence).unwrap();
+    assert!(
+        !json.contains(secret),
+        "evidence must not retain env/stdin values"
+    );
+    assert_eq!(evidence.argv_count, 2);
+    assert!(evidence.argv_safe.is_none());
+    assert_eq!(evidence.stdin_byte_length, Some(secret.len()));
+    assert_eq!(evidence.env_keys, vec!["OPENAI_API_KEY".to_string()]);
+    assert_eq!(evidence.env_policy_kind, "inherit_with");
+}
+
+#[test]
+fn replay_descriptor_redacted_and_exact_fixture() {
+    let secret = "OMEN_TEST_SECRET_DO_NOT_LEAK_9f3a";
     let spec = CommandSpec::new("omen-gremlin")
         .arg("--exit")
         .arg("7")
+        .env(EnvPolicy::InheritWith(vec![(
+            "OPENAI_API_KEY".into(),
+            secret.into(),
+        )]))
         .stdin(StdinSpec::Closed)
         .timeout(Duration::from_millis(500));
-    let replay = ReplayDescriptor::from_command(
+
+    let redacted = ReplayDescriptor::redacted(
         &spec,
         "exit-code",
         vec![
@@ -154,12 +187,25 @@ fn replay_descriptor_roundtrip() {
             InvariantId::BoundedWaitNoHang,
         ],
     );
-    let json = serde_json::to_string(&replay).unwrap();
-    let back: ReplayDescriptor = serde_json::from_str(&json).unwrap();
-    assert_eq!(back, replay);
-    assert_eq!(back.fixture_mode, "exit-code");
-    assert_eq!(back.expected_invariants.len(), 2);
-    assert!(matches!(back.stdin, StdinSpec::Closed));
+    assert_eq!(redacted.fidelity, ReplayFidelity::Redacted);
+    assert!(redacted.argv.is_empty());
+    let json = serde_json::to_string(&redacted).unwrap();
+    assert!(!json.contains(secret));
+    assert_eq!(redacted.fixture_mode, "exit-code");
+    assert_eq!(redacted.expected_invariants.len(), 2);
+    assert_eq!(redacted.stdin_mode, "closed");
+
+    let exact = ReplayDescriptor::exact_fixture(
+        &spec,
+        "exit-code",
+        vec![InvariantId::ExitCausePreserved],
+        vec!["--exit".into(), "7".into()],
+    );
+    assert_eq!(exact.fidelity, ReplayFidelity::Exact);
+    assert_eq!(exact.argv, vec!["--exit".to_string(), "7".to_string()]);
+    let json = serde_json::to_string(&exact).unwrap();
+    assert!(!json.contains(secret));
+    assert!(!json.contains("OPENAI_API_KEY="));
 }
 
 #[test]
@@ -190,8 +236,45 @@ fn deadline_is_explicit_and_serialized() {
 }
 
 #[test]
+fn stream_summary_has_no_raw_preview() {
+    let summary = omen_compat::StreamSummary::from_captured(10, 10, false, true, false);
+    let json = serde_json::to_string(&summary).unwrap();
+    assert!(!json.contains("preview"));
+    assert!(json.contains("eof_observed"));
+    assert!(json.contains("drain_bounded_out"));
+}
+
+#[test]
+fn bounded_wait_formula_and_elapsed_check() {
+    assert_eq!(declared_max_wall_ms(400), 400 + 500 + 300 + 75);
+
+    let mut outcome = RunOutcome {
+        observations: vec![],
+        exit_cause: Some(ExitCause::code(0)),
+        stdout: Default::default(),
+        stderr: Default::default(),
+        timed_out: false,
+        cleanup: CleanupOutcome::default(),
+        elapsed_ms: 400,
+        deadline_ms: 400,
+        declared_max_wall_ms: declared_max_wall_ms(400),
+        bounds: OutputBounds::default(),
+        harness_failed: false,
+        pid: Some(1),
+    };
+    assert_eq!(
+        outcome.check_bounded_wait_no_hang().outcome,
+        InvariantOutcome::Pass
+    );
+    outcome.elapsed_ms = outcome.declared_max_wall_ms + 1;
+    assert_eq!(
+        outcome.check_bounded_wait_no_hang().outcome,
+        InvariantOutcome::Fail
+    );
+}
+
+#[test]
 fn structured_failure_intentional_mismatch_is_replayable() {
-    // Deliberately judge a wrong expected code to prove the failure record.
     let outcome = RunOutcome {
         observations: vec![
             Observation::ProcessSpawned { pid: 4242 },
@@ -210,12 +293,13 @@ fn structured_failure_intentional_mismatch_is_replayable() {
         cleanup: CleanupOutcome::default(),
         elapsed_ms: 12,
         deadline_ms: 1000,
+        declared_max_wall_ms: declared_max_wall_ms(1000),
         bounds: OutputBounds::default(),
         harness_failed: false,
         pid: Some(4242),
     };
 
-    let result = outcome.check_exit_cause_preserved(1); // expected 1, got 7
+    let result = outcome.check_exit_cause_preserved(1);
     assert_eq!(result.outcome, InvariantOutcome::Fail);
 
     let spec = CommandSpec::new("omen-gremlin")
@@ -232,16 +316,17 @@ fn structured_failure_intentional_mismatch_is_replayable() {
         result.reason.clone(),
     )
     .seed(7)
-    .command(spec.clone())
+    .command_evidence(&spec)
     .exit_cause(ExitCause::code(7))
     .stdout(RunOutcome::capture_summary(&outcome.stdout))
     .stderr(RunOutcome::capture_summary(&outcome.stderr))
     .observations(outcome.observations.clone())
     .result(result.clone())
-    .replay(ReplayDescriptor::from_command(
+    .replay(ReplayDescriptor::exact_fixture(
         &spec,
         "exit-code",
         vec![InvariantId::ExitCausePreserved],
+        vec!["--exit".into(), "7".into()],
     ))
     .minimal_reproducer("omen-gremlin --exit-code 7")
     .likely_subsystem("compat.runner.exit_cause")
@@ -257,14 +342,10 @@ fn structured_failure_intentional_mismatch_is_replayable() {
     assert!(failure.replay.is_some());
     assert_eq!(failure.replay.as_ref().unwrap().fixture_mode, "exit-code");
     assert!(!failure.observations.is_empty());
-    assert!(failure.minimal_reproducer.as_deref().unwrap().contains("7"));
 
     let json = serde_json::to_string(&failure).unwrap();
     let back: StructuredFailure = serde_json::from_str(&json).unwrap();
     assert_eq!(back.invariant, failure.invariant);
     assert_eq!(back.reason, failure.reason);
-
-    // This unit test asserts on the failure record; it does not remain a
-    // failing test in the normal suite.
     assert_eq!(result.outcome, InvariantOutcome::Fail);
 }

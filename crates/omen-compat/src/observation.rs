@@ -21,6 +21,9 @@ impl StreamKind {
 }
 
 /// Evidence of what happened. Observations are not conclusions.
+///
+/// Durable observations must not retain secret-bearing execution values
+/// (environment values, stdin payloads, arbitrary stdout text).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Observation {
@@ -52,6 +55,10 @@ pub enum Observation {
     StdinWrote {
         bytes: u64,
     },
+    StdinDeliveryBounded {
+        bytes_attempted: u64,
+        completed: bool,
+    },
     DescriptorClosed {
         stream: StreamKind,
     },
@@ -64,17 +71,21 @@ pub enum Observation {
         stream: StreamKind,
         total_bytes: u64,
     },
+    /// Stream drain stopped at the declared grace bound without proving EOF.
+    StreamDrainBoundedOut {
+        stream: StreamKind,
+        total_bytes_observed: u64,
+    },
     CleanupAttempted {
         method: String,
         kill_succeeded: bool,
         reaped: bool,
     },
-    /// Non-secret environment facts observed or applied for the child.
-    EnvRecorded {
+    /// Environment key applied to the child. Values are never retained.
+    EnvApplied {
         key: String,
-        value: String,
     },
-    /// Single-line JSON (or token) report emitted by a fixture.
+    /// Controlled Compat fixture report (not arbitrary child JSON).
     FixtureReport {
         fixture: String,
         payload: serde_json::Value,
@@ -97,11 +108,13 @@ impl Observation {
             Observation::ProcessTreeObserved { .. } => "process_tree_observed",
             Observation::StdinClosed => "stdin_closed",
             Observation::StdinWrote { .. } => "stdin_wrote",
+            Observation::StdinDeliveryBounded { .. } => "stdin_delivery_bounded",
             Observation::DescriptorClosed { .. } => "descriptor_closed",
             Observation::OutputTruncated { .. } => "output_truncated",
             Observation::OutputComplete { .. } => "output_complete",
+            Observation::StreamDrainBoundedOut { .. } => "stream_drain_bounded_out",
             Observation::CleanupAttempted { .. } => "cleanup_attempted",
-            Observation::EnvRecorded { .. } => "env_recorded",
+            Observation::EnvApplied { .. } => "env_applied",
             Observation::FixtureReport { .. } => "fixture_report",
             Observation::HarnessFailed { .. } => "harness_failed",
         }

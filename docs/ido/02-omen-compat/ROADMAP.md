@@ -12,14 +12,20 @@ Implemented now:
 
 - **M0-A** core types (`Platform`, `Capability`, `CommandSpec`, `StdinSpec`,
   `Deadline`, `ExitCause`, `EnvPolicy`, `EvidenceGrade`) and a bounded
-  portable runner (argv spawn, independent stdout/stderr drain, explicit
-  stdin policy, timeout kill + bounded reap, explicit truncation).
+  portable runner (Tokio cancellable process I/O, independent stdout/stderr
+  drain with grace+abort, explicit stdin policy, timeout kill + bounded root
+  reap, explicit truncation vs EOF vs drain timeout).
 - **M0-B** observations, evidence grades, invariant results
   (PASS/FAIL/UNSUPPORTED/UNAVAILABLE/OPEN_DEFECT/INCONCLUSIVE), structured
-  failure records, replay descriptors, portable invariant judgments.
+  failure records via secret-safe `CommandEvidence`, replay descriptors with
+  `ReplayFidelity`, portable invariant judgments (elapsed-time aware).
 - **M0-C** portable `omen-gremlin` fixture modes (`--exit-code`,
   `--stdin-report`, `--dual-stream`, `--large-output`, `--sleep-bounded`,
-  `--spawn-child-portable`, `--compat-report`) and Tier 0/Tier 1 tests.
+  `--spawn-child-portable`, `--compat-report`, `--descendant-holds-stdout`,
+  `--ignore-stdin`) and Tier 0/Tier 1/secret-canary tests.
+
+Measurement-integrity repair: bounded I/O + secret-safe durable evidence
+laws documented in ARCHITECTURE and DECISIONS D2-008/D2-009.
 
 Still open for M0: POSIX process-group/TTY work, Windows ConPTY/console
 control, deeper process-tree containment, and any repair of production

@@ -40,3 +40,17 @@ explicit flushed fixture tokens when needed, not “sleep and hope.”
 `Strong` requires an appropriate independent mechanism (for example OS wait
 status for exit codes). Fixture prose alone is `Partial`/`Weak`. Unobservable
 platform facts are `Unavailable`.
+
+## D2-008 — Nothing in the harness may wait forever
+
+Process wait, stdin write, stdout/stderr drain, cleanup, and task join are
+all bounded. Tokio cancellable I/O is the mechanism. Detached blocked reader
+threads are forbidden. `BOUNDED_WAIT_NO_HANG` checks elapsed wall-clock time,
+not merely that a status flag exists.
+
+## D2-009 — Durable evidence is secret-safe by construction
+
+Execution input and durable evidence are separate. `CommandSpec`, env values,
+stdin bytes, and arbitrary argv are not auto-persisted. Callers explicitly
+choose safe replay content and record `ReplayFidelity`. Stream summaries omit
+raw previews by default.

@@ -2,6 +2,7 @@ use crate::core::{CommandSpec, Deadline, EvidenceGrade, ExitCause, OutputBounds,
 use crate::invariant::{InvariantId, InvariantResult};
 use crate::observation::Observation;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// Deterministic classification of a structured failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,74 +20,185 @@ pub enum FailureKind {
     Inconclusive,
 }
 
-/// Summary of a captured stream suitable for failure records (not a full dump).
+/// Summary of a captured stream for durable evidence.
+///
+/// Never includes raw textual output by default.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct StreamSummary {
     pub kept_bytes: u64,
     pub total_bytes: u64,
     pub truncated: bool,
-    pub preview: String,
+    pub eof_observed: bool,
+    pub drain_bounded_out: bool,
 }
 
 impl StreamSummary {
-    pub fn from_capture(kept: &[u8], total: u64, truncated: bool) -> Self {
-        let preview_limit = 200usize;
-        let preview = String::from_utf8_lossy(kept)
-            .chars()
-            .take(preview_limit)
-            .collect::<String>();
+    pub fn from_captured(
+        kept_bytes: u64,
+        total_bytes: u64,
+        truncated: bool,
+        eof_observed: bool,
+        drain_bounded_out: bool,
+    ) -> Self {
         Self {
-            kept_bytes: kept.len() as u64,
-            total_bytes: total,
+            kept_bytes,
+            total_bytes,
             truncated,
-            preview,
+            eof_observed,
+            drain_bounded_out,
         }
     }
 }
 
-/// Enough information to deterministically re-run a portable probe.
+/// Secret-safe projection of a process invocation for durable evidence.
+///
+/// Does not retain environment values, stdin bytes, or arbitrary argv.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandEvidence {
+    pub program: String,
+    pub argv_count: usize,
+    /// Explicitly classified-safe argument literals (opt-in only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argv_safe: Option<Vec<String>>,
+    pub cwd_policy: String,
+    pub env_policy_kind: String,
+    pub env_keys: Vec<String>,
+    pub stdin_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdin_byte_length: Option<usize>,
+    pub deadline: Deadline,
+}
+
+impl CommandEvidence {
+    /// Redacted by default: structure and counts only.
+    pub fn from_execution(spec: &CommandSpec) -> Self {
+        Self {
+            program: spec.program.display().to_string(),
+            argv_count: spec.argv.len(),
+            argv_safe: None,
+            cwd_policy: match &spec.cwd {
+                Some(_) => "set".to_string(),
+                None => "inherit".to_string(),
+            },
+            env_policy_kind: spec.env.kind_name().to_string(),
+            env_keys: spec.env.key_names(),
+            stdin_mode: spec.stdin.mode_name().to_string(),
+            stdin_byte_length: spec.stdin.byte_length(),
+            deadline: spec.deadline,
+        }
+    }
+
+    /// Caller explicitly marks argv literals as safe to persist.
+    pub fn with_safe_argv(mut self, argv: Vec<String>) -> Self {
+        self.argv_safe = Some(argv);
+        self
+    }
+}
+
+/// How much of the original execution state a replay record retains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayFidelity {
+    /// Required values retained; safe for controlled fixtures without secrets.
+    Exact,
+    /// Some required values retained; others intentionally omitted.
+    Partial,
+    /// Values intentionally omitted; not an exact replay.
+    Redacted,
+}
+
+/// Durable replay description. Never a blind clone of execution state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplayDescriptor {
     pub program: String,
     pub argv: Vec<String>,
+    pub argv_count: usize,
     pub cwd_policy: String,
-    pub env_policy: String,
-    pub stdin: crate::core::StdinSpec,
+    pub env_policy_kind: String,
+    pub env_keys: Vec<String>,
+    pub stdin_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdin_byte_length: Option<usize>,
     pub deadline: Deadline,
     pub fixture_mode: String,
     pub expected_invariants: Vec<InvariantId>,
+    pub fidelity: ReplayFidelity,
 }
 
 impl ReplayDescriptor {
-    pub fn from_command(
+    /// Explicit redacted projection: counts, kinds, and key names only.
+    pub fn redacted(
         spec: &CommandSpec,
         fixture_mode: impl Into<String>,
         expected_invariants: Vec<InvariantId>,
     ) -> Self {
-        let env_policy = match &spec.env {
-            crate::core::EnvPolicy::Clear => "clear".to_string(),
-            crate::core::EnvPolicy::AllowList(pairs) => format!("allow_list:{pairs:?}"),
-            crate::core::EnvPolicy::InheritWith(pairs) => format!("inherit_with:{pairs:?}"),
-        };
-        let cwd_policy = match &spec.cwd {
-            Some(path) => format!("set:{}", path.display()),
-            None => "inherit".to_string(),
-        };
+        let evidence = CommandEvidence::from_execution(spec);
         Self {
-            program: spec.program.display().to_string(),
-            argv: spec.argv.clone(),
-            cwd_policy,
-            env_policy,
-            stdin: spec.stdin.clone(),
-            deadline: spec.deadline,
+            program: evidence.program,
+            argv: Vec::new(),
+            argv_count: evidence.argv_count,
+            cwd_policy: evidence.cwd_policy,
+            env_policy_kind: evidence.env_policy_kind,
+            env_keys: evidence.env_keys,
+            stdin_mode: evidence.stdin_mode,
+            stdin_byte_length: evidence.stdin_byte_length,
+            deadline: evidence.deadline,
             fixture_mode: fixture_mode.into(),
             expected_invariants,
+            fidelity: ReplayFidelity::Redacted,
+        }
+    }
+
+    /// Controlled fixture replay: caller explicitly marks argv as safe.
+    pub fn exact_fixture(
+        spec: &CommandSpec,
+        fixture_mode: impl Into<String>,
+        expected_invariants: Vec<InvariantId>,
+        safe_argv: Vec<String>,
+    ) -> Self {
+        let evidence = CommandEvidence::from_execution(spec).with_safe_argv(safe_argv.clone());
+        Self {
+            program: evidence.program,
+            argv: safe_argv,
+            argv_count: evidence.argv_count,
+            cwd_policy: evidence.cwd_policy,
+            env_policy_kind: evidence.env_policy_kind,
+            env_keys: evidence.env_keys,
+            stdin_mode: evidence.stdin_mode,
+            stdin_byte_length: evidence.stdin_byte_length,
+            deadline: evidence.deadline,
+            fixture_mode: fixture_mode.into(),
+            expected_invariants,
+            fidelity: ReplayFidelity::Exact,
+        }
+    }
+
+    pub fn from_evidence(
+        evidence: CommandEvidence,
+        fixture_mode: impl Into<String>,
+        expected_invariants: Vec<InvariantId>,
+        fidelity: ReplayFidelity,
+    ) -> Self {
+        let argv = evidence.argv_safe.clone().unwrap_or_default();
+        Self {
+            program: evidence.program,
+            argv,
+            argv_count: evidence.argv_count,
+            cwd_policy: evidence.cwd_policy,
+            env_policy_kind: evidence.env_policy_kind,
+            env_keys: evidence.env_keys,
+            stdin_mode: evidence.stdin_mode,
+            stdin_byte_length: evidence.stdin_byte_length,
+            deadline: evidence.deadline,
+            fixture_mode: fixture_mode.into(),
+            expected_invariants,
+            fidelity,
         }
     }
 }
 
-/// Replayable failure evidence. Values are omitted when unknown rather than
-/// invented.
+/// Replayable failure evidence. Secret-bearing execution state is projected
+/// through [`CommandEvidence`], never embedded raw.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StructuredFailure {
     pub invariant: InvariantId,
@@ -98,7 +210,7 @@ pub struct StructuredFailure {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub command: Option<CommandSpec>,
+    pub command: Option<CommandEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline: Option<Deadline>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -166,9 +278,11 @@ impl StructuredFailureBuilder {
         self
     }
 
-    pub fn command(mut self, command: CommandSpec) -> Self {
-        self.failure.deadline = Some(command.deadline);
-        self.failure.command = Some(command);
+    /// Persist secret-safe command evidence only (never raw CommandSpec).
+    pub fn command_evidence(mut self, spec: &CommandSpec) -> Self {
+        let evidence = CommandEvidence::from_execution(spec);
+        self.failure.deadline = Some(evidence.deadline);
+        self.failure.command = Some(evidence);
         self
     }
 
@@ -219,5 +333,15 @@ impl StructuredFailureBuilder {
 
     pub fn build(self) -> StructuredFailure {
         self.failure
+    }
+}
+
+impl fmt::Display for ReplayFidelity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ReplayFidelity::Exact => f.write_str("exact"),
+            ReplayFidelity::Partial => f.write_str("partial"),
+            ReplayFidelity::Redacted => f.write_str("redacted"),
+        }
     }
 }

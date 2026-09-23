@@ -13,8 +13,25 @@ publish = false
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# Existing workspace dependency newly used by omen-compat for bounded
+# cancellable child I/O only (not a new third-party crate).
+tokio = { workspace = true, features = [
+    "process",
+    "io-util",
+    "time",
+    "rt",
+    "macros",
+    "sync",
+] }
 
 [dev-dependencies]
 omen-test-fixtures = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = [
+    "process",
+    "io-util",
+    "time",
+    "rt",
+    "macros",
+    "sync",
+] }

@@ -5,9 +5,10 @@
 
 use omen_compat::{
     CommandSpec, EnvPolicy, EvidenceGrade, InvariantId, InvariantOutcome, OutputBounds, StdinSpec,
-    run,
+    declared_max_wall_ms, run,
 };
 use omen_test_fixtures::{GREMLIN_BIN, INTEGRATION_TIMEOUT, run_with_test_timeout};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -31,7 +32,10 @@ fn gremlin_supports_compat_modes(exe: &Path) -> bool {
         .output()
         .map(|output| {
             let text = String::from_utf8_lossy(&output.stdout);
-            text.contains("stdin-report") && text.contains("exit-code")
+            text.contains("stdin-report")
+                && text.contains("exit-code")
+                && text.contains("descendant-holds-stdout")
+                && text.contains("ignore-stdin")
         })
         .unwrap_or(false)
 }
@@ -65,7 +69,6 @@ fn resolve_gremlin_exe() -> PathBuf {
         }
     }
 
-    // cargo check/clippy do not refresh bin artifacts; produce a real binary.
     build_gremlin();
     for candidate in [&exe, &fallback] {
         if candidate.exists() && gremlin_supports_compat_modes(candidate) {
@@ -90,13 +93,11 @@ fn assert_pass(result: &omen_compat::InvariantResult, label: &str) {
     );
 }
 
-async fn bound<T: Send + 'static>(name: &'static str, f: impl FnOnce() -> T + Send + 'static) -> T {
-    run_with_test_timeout(name, INTEGRATION_TIMEOUT, |_ctx| async move {
-        tokio::task::spawn_blocking(f)
-            .await
-            .expect("blocking worker panicked")
-    })
-    .await
+async fn bound<T, F>(name: &'static str, fut: F) -> T
+where
+    F: Future<Output = T>,
+{
+    run_with_test_timeout(name, INTEGRATION_TIMEOUT, |_ctx| fut).await
 }
 
 fn base_spec(exe: &Path, args: &[&str], timeout: Duration) -> CommandSpec {
@@ -104,8 +105,6 @@ fn base_spec(exe: &Path, args: &[&str], timeout: Duration) -> CommandSpec {
     for arg in args {
         spec = spec.arg(*arg);
     }
-    // Inherit parent env then override a dedicated probe variable so PATH and
-    // loader settings remain available while ENV_RECORDED stays secret-free.
     spec.cwd(workspace_root())
         .env(EnvPolicy::InheritWith(vec![(
             "OMEN_COMPAT_PROBE".into(),
@@ -117,11 +116,9 @@ fn base_spec(exe: &Path, args: &[&str], timeout: Duration) -> CommandSpec {
 #[tokio::test]
 async fn demonstration_exit_7_preserves_cause() {
     let exe = gremlin_exe();
-    let outcome = bound("demonstration_exit_7", move || {
-        run(
-            &base_spec(&exe, &["--exit-code", "7"], Duration::from_secs(5)),
-            &OutputBounds::default(),
-        )
+    let spec = base_spec(&exe, &["--exit-code", "7"], Duration::from_secs(5));
+    let outcome = bound("demonstration_exit_7", async {
+        run(&spec, &OutputBounds::default()).await
     })
     .await;
 
@@ -137,16 +134,15 @@ async fn demonstration_exit_7_preserves_cause() {
         "observation: child exited code 7; result: PASS"
     );
     assert_eq!(outcome.exit_cause, Some(omen_compat::ExitCause::code(7)));
+    assert!(outcome.elapsed_ms <= outcome.declared_max_wall_ms);
 }
 
 #[tokio::test]
 async fn demonstration_closed_stdin_eof_zero_bytes() {
     let exe = gremlin_exe();
-    let outcome = bound("demonstration_stdin_eof", move || {
-        run(
-            &base_spec(&exe, &["--stdin-report"], Duration::from_secs(5)),
-            &OutputBounds::default(),
-        )
+    let spec = base_spec(&exe, &["--stdin-report"], Duration::from_secs(5));
+    let outcome = bound("demonstration_stdin_eof", async {
+        run(&spec, &OutputBounds::default()).await
     })
     .await;
 
@@ -179,8 +175,8 @@ async fn demonstration_scripted_stdin_bytes_delivered_exactly() {
     let spec = base_spec(&exe, &["--stdin-report"], Duration::from_secs(5))
         .stdin(StdinSpec::Bytes(payload.clone()));
     let expected_len = payload.len() as u64;
-    let outcome = bound("demonstration_stdin_bytes", move || {
-        run(&spec, &OutputBounds::default())
+    let outcome = bound("demonstration_stdin_bytes", async {
+        run(&spec, &OutputBounds::default()).await
     })
     .await;
 
@@ -200,14 +196,13 @@ async fn demonstration_scripted_stdin_bytes_delivered_exactly() {
 #[tokio::test]
 async fn demonstration_dual_stream_drains_both_without_deadlock() {
     let exe = gremlin_exe();
-    let outcome = bound("demonstration_dual_stream", move || {
-        run(
-            &base_spec(&exe, &["--dual-stream"], Duration::from_secs(10)),
-            &OutputBounds {
-                max_stdout_bytes: 512 * 1024,
-                max_stderr_bytes: 512 * 1024,
-            },
-        )
+    let spec = base_spec(&exe, &["--dual-stream"], Duration::from_secs(10));
+    let bounds = OutputBounds {
+        max_stdout_bytes: 512 * 1024,
+        max_stderr_bytes: 512 * 1024,
+    };
+    let outcome = bound("demonstration_dual_stream", async {
+        run(&spec, &bounds).await
     })
     .await;
 
@@ -215,9 +210,10 @@ async fn demonstration_dual_stream_drains_both_without_deadlock() {
         &outcome.check_bounded_wait_no_hang(),
         "BOUNDED_WAIT_NO_HANG",
     );
-    let drain = outcome.check_drain_both_streams_no_deadlock();
-    assert_pass(&drain, "DRAIN_BOTH_STREAMS_NO_DEADLOCK");
-
+    assert_pass(
+        &outcome.check_drain_both_streams_no_deadlock(),
+        "DRAIN_BOTH_STREAMS_NO_DEADLOCK",
+    );
     assert!(
         outcome.stdout.total_bytes >= 300 * 1024,
         "stdout_total={}",
@@ -228,15 +224,14 @@ async fn demonstration_dual_stream_drains_both_without_deadlock() {
         "stderr_total={}",
         outcome.stderr.total_bytes
     );
-    assert!(
-        outcome.stdout_lossy().contains("DUAL_TICK"),
-        "stdout must contain interleaved ticks"
-    );
-    assert!(
-        outcome.stderr_lossy().contains("DUAL_TICK"),
-        "stderr must contain interleaved ticks"
-    );
+    assert!(outcome.stdout_lossy().contains("DUAL_TICK"));
+    assert!(outcome.stderr_lossy().contains("DUAL_TICK"));
     assert!(!outcome.timed_out);
+    assert!(
+        outcome.stdout.eof_observed,
+        "healthy dual-stream must observe stdout EOF"
+    );
+    assert!(outcome.stderr.eof_observed);
 }
 
 #[tokio::test]
@@ -246,11 +241,9 @@ async fn demonstration_large_output_completes_with_explicit_truncation() {
         max_stderr_bytes: 64 * 1024,
     };
     let exe = gremlin_exe();
-    let outcome = bound("demonstration_large_output", move || {
-        run(
-            &base_spec(&exe, &["--large-output"], Duration::from_secs(5)),
-            &bounds,
-        )
+    let spec = base_spec(&exe, &["--large-output"], Duration::from_secs(5));
+    let outcome = bound("demonstration_large_output", async {
+        run(&spec, &bounds).await
     })
     .await;
 
@@ -259,29 +252,16 @@ async fn demonstration_large_output_completes_with_explicit_truncation() {
         "BOUNDED_WAIT_NO_HANG",
     );
     assert!(!outcome.timed_out);
-    assert!(
-        outcome.stdout.total_bytes >= 256 * 1024,
-        "fixture should emit >=256KiB, got {}",
-        outcome.stdout.total_bytes
-    );
-    assert!(
-        outcome.stdout.truncated,
-        "truncation must be explicitly recorded"
-    );
-    assert!(
-        outcome.stdout.bytes.len() <= bounds.max_stdout_bytes,
-        "kept bytes must respect bound"
-    );
-    assert!(
-        outcome.observations.iter().any(|o| matches!(
-            o,
-            omen_compat::Observation::OutputTruncated {
-                stream: omen_compat::StreamKind::Stdout,
-                ..
-            }
-        )),
-        "OutputTruncated observation required"
-    );
+    assert!(outcome.stdout.total_bytes >= 256 * 1024);
+    assert!(outcome.stdout.truncated, "truncation must be explicit");
+    assert!(outcome.stdout.bytes.len() <= bounds.max_stdout_bytes);
+    assert!(outcome.observations.iter().any(|o| matches!(
+        o,
+        omen_compat::Observation::OutputTruncated {
+            stream: omen_compat::StreamKind::Stdout,
+            ..
+        }
+    )));
     assert_pass(
         &outcome.check_drain_both_streams_no_deadlock(),
         "DRAIN_BOTH_STREAMS_NO_DEADLOCK",
@@ -290,73 +270,67 @@ async fn demonstration_large_output_completes_with_explicit_truncation() {
 
 #[tokio::test]
 async fn demonstration_timeout_returns_bounded_with_cleanup() {
-    // Resolve fixture path before starting the elapsed clock so on-demand
-    // builds cannot skew the outer bound assertion.
     let exe = gremlin_exe();
     let started = Instant::now();
-    let outcome = bound("demonstration_timeout", move || {
-        run(
-            &base_spec(
-                &exe,
-                &["--sleep-bounded", "10000"],
-                Duration::from_millis(400),
-            ),
-            &OutputBounds::default(),
-        )
+    let spec = base_spec(
+        &exe,
+        &["--sleep-bounded", "10000"],
+        Duration::from_millis(400),
+    );
+    let outcome = bound("demonstration_timeout", async {
+        run(&spec, &OutputBounds::default()).await
     })
     .await;
 
     let elapsed = started.elapsed();
-    assert!(
-        elapsed < Duration::from_secs(8),
-        "outer suite must not hang; elapsed={elapsed:?}"
-    );
-    assert!(outcome.timed_out, "fixture exceeded deadline => timed_out");
+    assert!(elapsed < Duration::from_secs(8), "elapsed={elapsed:?}");
+    assert!(outcome.timed_out);
     assert_eq!(
         outcome.exit_cause,
         Some(omen_compat::ExitCause::TimeoutKill)
     );
+    assert!(outcome.cleanup.attempted);
     assert!(
-        outcome.cleanup.attempted,
-        "cleanup attempt must be recorded"
+        outcome.cleanup.root_only,
+        "cleanup must not claim tree kill"
     );
     assert!(
         outcome
             .observations
             .iter()
-            .any(|o| matches!(o, omen_compat::Observation::TimeoutObserved { .. })),
-        "TimeoutObserved required"
+            .any(|o| matches!(o, omen_compat::Observation::TimeoutObserved { .. }))
     );
     assert!(
         outcome
             .observations
             .iter()
-            .any(|o| matches!(o, omen_compat::Observation::CleanupAttempted { .. })),
-        "CleanupAttempted required"
+            .any(|o| matches!(o, omen_compat::Observation::CleanupAttempted { .. }))
     );
-
     assert_pass(
         &outcome.check_bounded_wait_no_hang(),
         "BOUNDED_WAIT_NO_HANG",
     );
-    let exit = outcome.check_exit_cause_preserved(7);
-    assert_eq!(exit.outcome, InvariantOutcome::Fail);
-    let drain = outcome.check_drain_both_streams_no_deadlock();
-    assert_ne!(drain.outcome, InvariantOutcome::Pass);
+    assert_eq!(
+        outcome.check_exit_cause_preserved(7).outcome,
+        InvariantOutcome::Fail
+    );
+    assert_ne!(
+        outcome.check_drain_both_streams_no_deadlock().outcome,
+        InvariantOutcome::Pass
+    );
+    assert!(outcome.elapsed_ms <= outcome.declared_max_wall_ms);
 }
 
 #[tokio::test]
 async fn demonstration_env_recorded_dedicated_test_variable() {
     let exe = gremlin_exe();
-    let outcome = bound("demonstration_env", move || {
-        run(
-            &base_spec(
-                &exe,
-                &["--print-env", "OMEN_COMPAT_PROBE"],
-                Duration::from_secs(5),
-            ),
-            &OutputBounds::default(),
-        )
+    let spec = base_spec(
+        &exe,
+        &["--print-env", "OMEN_COMPAT_PROBE"],
+        Duration::from_secs(5),
+    );
+    let outcome = bound("demonstration_env", async {
+        run(&spec, &OutputBounds::default()).await
     })
     .await;
 
@@ -365,10 +339,7 @@ async fn demonstration_env_recorded_dedicated_test_variable() {
         "BOUNDED_WAIT_NO_HANG",
     );
     let line = outcome.stdout_lossy();
-    assert!(
-        line.contains("OMEN_COMPAT_PROBE=m0-env"),
-        "fixture must observe dedicated value, got: {line}"
-    );
+    assert!(line.contains("OMEN_COMPAT_PROBE=m0-env"));
     let fixture_value = line
         .lines()
         .find_map(|l| l.strip_prefix("OMEN_COMPAT_PROBE="))
@@ -377,21 +348,22 @@ async fn demonstration_env_recorded_dedicated_test_variable() {
         outcome.check_env_recorded("OMEN_COMPAT_PROBE", "m0-env", fixture_value.as_deref());
     assert_pass(&result, "ENV_RECORDED");
 
+    // Durable observations store key only — never the value.
     for obs in &outcome.observations {
-        if let omen_compat::Observation::EnvRecorded { key, .. } = obs {
+        if let omen_compat::Observation::EnvApplied { key } = obs {
             assert_eq!(key, "OMEN_COMPAT_PROBE");
         }
     }
+    let obs_json = serde_json::to_string(&outcome.observations).unwrap();
+    assert!(!obs_json.contains("m0-env"));
 }
 
 #[tokio::test]
 async fn demonstration_portable_child_identity_reported() {
     let exe = gremlin_exe();
-    let outcome = bound("demonstration_portable_child", move || {
-        run(
-            &base_spec(&exe, &["--spawn-child-portable"], Duration::from_secs(5)),
-            &OutputBounds::default(),
-        )
+    let spec = base_spec(&exe, &["--spawn-child-portable"], Duration::from_secs(5));
+    let outcome = bound("demonstration_portable_child", async {
+        run(&spec, &OutputBounds::default()).await
     })
     .await;
 
@@ -403,14 +375,12 @@ async fn demonstration_portable_child_identity_reported() {
         .fixture_report()
         .expect("spawn-child-portable JSON report");
     assert_eq!(report["fixture"], "spawn-child-portable");
-    let child_pid = report["child_pid"].as_u64().expect("child_pid");
-    assert!(child_pid > 0);
+    assert!(report["child_pid"].as_u64().expect("child_pid") > 0);
     assert!(
         outcome
             .observations
             .iter()
-            .any(|o| matches!(o, omen_compat::Observation::ProcessSpawned { .. })),
-        "root spawn observation required"
+            .any(|o| matches!(o, omen_compat::Observation::ProcessSpawned { .. }))
     );
 }
 
@@ -419,16 +389,13 @@ async fn demonstration_exit_0_and_1_codes() {
     let exe = gremlin_exe();
     for code in [0_i32, 1_i32] {
         let expected = code;
-        let spec_exe = exe.clone();
-        let outcome = bound("demonstration_exit_codes", move || {
-            run(
-                &base_spec(
-                    &spec_exe,
-                    &["--exit-code", &expected.to_string()],
-                    Duration::from_secs(5),
-                ),
-                &OutputBounds::default(),
-            )
+        let spec = base_spec(
+            &exe,
+            &["--exit-code", &expected.to_string()],
+            Duration::from_secs(5),
+        );
+        let outcome = bound("demonstration_exit_codes", async {
+            run(&spec, &OutputBounds::default()).await
         })
         .await;
         assert_pass(
@@ -436,6 +403,148 @@ async fn demonstration_exit_0_and_1_codes() {
             "EXIT_CAUSE_PRESERVED",
         );
     }
+}
+
+/// A: root exits while descendant holds stdout/stderr — runner stays bounded.
+#[tokio::test]
+async fn hostile_descendant_holds_stdout_runner_stays_bounded() {
+    let exe = gremlin_exe();
+    let started = Instant::now();
+    let spec = base_spec(&exe, &["--descendant-holds-stdout"], Duration::from_secs(2));
+    let outcome = bound("hostile_descendant_holds", async {
+        run(&spec, &OutputBounds::default()).await
+    })
+    .await;
+    let elapsed = started.elapsed();
+    let max = Duration::from_millis(declared_max_wall_ms(spec.deadline.timeout_ms));
+
+    assert_pass(
+        &outcome.check_bounded_wait_no_hang(),
+        "BOUNDED_WAIT_NO_HANG",
+    );
+    assert!(elapsed <= max, "elapsed {elapsed:?} > declared {max:?}");
+    assert_eq!(
+        outcome.exit_cause,
+        Some(omen_compat::ExitCause::code(0)),
+        "root completion observed"
+    );
+    assert!(!outcome.timed_out);
+    // Descendant-held pipe: drain must not claim EOF if not observed.
+    if outcome.stdout.drain_timed_out || !outcome.stdout.eof_observed {
+        assert!(
+            !outcome.stdout.eof_observed || outcome.stdout.drain_timed_out,
+            "eof/drain truth must be consistent"
+        );
+        assert!(
+            outcome.observations.iter().any(|o| matches!(
+                o,
+                omen_compat::Observation::StreamDrainBoundedOut {
+                    stream: omen_compat::StreamKind::Stdout,
+                    ..
+                }
+            )) || outcome.stdout.eof_observed,
+            "bounded-out or honest EOF required"
+        );
+    }
+    assert_pass(
+        &outcome.check_descriptor_closure_early_exit(),
+        "DESCRIPTOR_CLOSURE_EARLY_EXIT",
+    );
+    assert!(outcome.elapsed_ms <= outcome.declared_max_wall_ms);
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "descendant must not orphan forever; suite finished in {elapsed:?}"
+    );
+}
+
+/// B: child does not read large stdin — delivery cannot freeze harness.
+#[tokio::test]
+async fn hostile_blocked_stdin_cannot_freeze_harness() {
+    let exe = gremlin_exe();
+    let started = Instant::now();
+    // Exceed ordinary pipe capacity (~64KiB) without gigabytes.
+    let payload = vec![b'Z'; 256 * 1024];
+    let spec = base_spec(&exe, &["--ignore-stdin"], Duration::from_millis(500))
+        .stdin(StdinSpec::Bytes(payload));
+    let outcome = bound("hostile_blocked_stdin", async {
+        run(&spec, &OutputBounds::default()).await
+    })
+    .await;
+    let elapsed = started.elapsed();
+    let max = Duration::from_millis(declared_max_wall_ms(spec.deadline.timeout_ms));
+
+    assert_pass(
+        &outcome.check_bounded_wait_no_hang(),
+        "BOUNDED_WAIT_NO_HANG",
+    );
+    assert!(elapsed <= max, "elapsed {elapsed:?} > declared {max:?}");
+    assert!(
+        outcome.timed_out || outcome.exit_cause.is_some(),
+        "deadline still governs"
+    );
+    assert!(
+        outcome.cleanup.attempted || !outcome.timed_out,
+        "cleanup recorded on timeout"
+    );
+    assert!(outcome.elapsed_ms <= outcome.declared_max_wall_ms);
+    assert!(elapsed < Duration::from_secs(8));
+}
+
+/// C: timeout + pipe held by sleeping child — both bounds remain.
+#[tokio::test]
+async fn timeout_with_held_pipe_stays_within_declared_bound() {
+    let exe = gremlin_exe();
+    let started = Instant::now();
+    let spec = base_spec(
+        &exe,
+        &["--sleep-bounded", "8000"],
+        Duration::from_millis(350),
+    );
+    let outcome = bound("timeout_held_pipe", async {
+        run(&spec, &OutputBounds::default()).await
+    })
+    .await;
+    let elapsed = started.elapsed();
+    let max = Duration::from_millis(declared_max_wall_ms(spec.deadline.timeout_ms));
+
+    assert!(outcome.timed_out);
+    assert!(outcome.cleanup.attempted);
+    assert!(outcome.cleanup.root_only);
+    assert_pass(
+        &outcome.check_bounded_wait_no_hang(),
+        "BOUNDED_WAIT_NO_HANG",
+    );
+    assert!(elapsed <= max, "elapsed {elapsed:?} > declared {max:?}");
+    assert!(outcome.elapsed_ms <= outcome.declared_max_wall_ms);
+}
+
+/// F: constructed outcome proves elapsed bound is enforced.
+#[tokio::test]
+async fn actual_elapsed_bound_is_enforced() {
+    let deadline = 200u64;
+    let mut outcome = omen_compat::RunOutcome {
+        observations: vec![],
+        exit_cause: Some(omen_compat::ExitCause::code(0)),
+        stdout: Default::default(),
+        stderr: Default::default(),
+        timed_out: false,
+        cleanup: Default::default(),
+        elapsed_ms: declared_max_wall_ms(deadline) + 10,
+        deadline_ms: deadline,
+        declared_max_wall_ms: declared_max_wall_ms(deadline),
+        bounds: OutputBounds::default(),
+        harness_failed: false,
+        pid: Some(1),
+    };
+    assert_eq!(
+        outcome.check_bounded_wait_no_hang().outcome,
+        InvariantOutcome::Fail
+    );
+    outcome.elapsed_ms = declared_max_wall_ms(deadline) - 1;
+    assert_eq!(
+        outcome.check_bounded_wait_no_hang().outcome,
+        InvariantOutcome::Pass
+    );
 }
 
 #[test]

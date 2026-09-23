@@ -1,8 +1,21 @@
 //! IDO No. 2 — Omen Compat.
 //!
 //! Portable measurement machinery for compatibility ground truth.
-//! Observations record what happened; invariants state what must be true;
-//! results judge whether observations satisfy invariants.
+//!
+//! ## Bounded I/O contract
+//!
+//! Every external-process wait, stdin delivery, stdout/stderr drain, and
+//! cleanup phase is bounded by an explicit scenario deadline plus cleanup and
+//! stream-drain allowances. `BOUNDED_WAIT_NO_HANG` checks actual elapsed
+//! wall-clock time against [`runner::declared_max_wall_ms`].
+//!
+//! ## Secret-safe durable evidence
+//!
+//! Execution may transiently hold environment values and stdin bytes.
+//! Durable structures ([`StructuredFailure`], [`ReplayDescriptor`],
+//! [`CommandEvidence`], [`Observation`]) retain structure and truth without
+//! automatically retaining those values. Stream summaries never include raw
+//! textual previews by default.
 //!
 //! Production Omen crates must never depend on this crate.
 

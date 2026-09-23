@@ -56,6 +56,15 @@ struct GremlinArgs {
     #[arg(long)]
     compat_report: bool,
 
+    /// Spawn a short-lived child that inherits stdout/stderr, then exit
+    /// promptly while the child keeps the pipe open for a bounded lifetime.
+    #[arg(long)]
+    descendant_holds_stdout: bool,
+
+    /// Never consume stdin; stay alive long enough to block a large writer.
+    #[arg(long)]
+    ignore_stdin: bool,
+
     #[arg(long)]
     hostile_terminal_escapes: bool,
 
@@ -167,6 +176,16 @@ fn main() {
         let _ = io::stdout().flush();
     }
 
+    if args.descendant_holds_stdout {
+        descendant_holds_stdout();
+        std::process::exit(args.exit);
+    }
+
+    if args.ignore_stdin {
+        ignore_stdin_bounded();
+        std::process::exit(args.exit);
+    }
+
     if args.echo_stdin {
         let mut buffer = String::new();
         let bytes_read = io::stdin().read_to_string(&mut buffer).unwrap_or(0);
@@ -253,6 +272,51 @@ fn main() {
     }
 
     std::process::exit(args.exit);
+}
+
+/// Spawn a child that inherits stdout/stderr, report identity, exit now.
+/// Child sleeps only 700ms so no long-lived orphan remains.
+fn descendant_holds_stdout() {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(err) => {
+            println!(
+                "{{\"fixture\":\"descendant-holds-stdout\",\"pid\":{},\"error\":\"{err}\"}}",
+                std::process::id()
+            );
+            let _ = io::stdout().flush();
+            return;
+        }
+    };
+    match Command::new(exe).arg("--sleep-ms").arg("700").spawn() {
+        Ok(child) => {
+            println!(
+                "{{\"fixture\":\"descendant-holds-stdout\",\"pid\":{},\"child_pid\":{}}}",
+                std::process::id(),
+                child.id()
+            );
+            let _ = io::stdout().flush();
+            // Root exits immediately; child keeps inherited pipes open ~700ms.
+        }
+        Err(err) => {
+            println!(
+                "{{\"fixture\":\"descendant-holds-stdout\",\"pid\":{},\"error\":\"{err}\"}}",
+                std::process::id()
+            );
+            let _ = io::stdout().flush();
+        }
+    }
+}
+
+/// Do not read stdin; emit READY and remain alive for a bounded window so a
+/// large parent write can block on a full pipe.
+fn ignore_stdin_bounded() {
+    println!(
+        "{{\"fixture\":\"ignore-stdin\",\"pid\":{},\"note\":\"not reading stdin\"}}",
+        std::process::id()
+    );
+    let _ = io::stdout().flush();
+    thread::sleep(Duration::from_millis(1200));
 }
 
 /// Read stdin to EOF (unless a TTY) and print one JSON line of facts.
