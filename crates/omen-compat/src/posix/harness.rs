@@ -303,14 +303,22 @@ impl PtySession {
         self.write_master(&[byte])
     }
 
-    /// Observe terminal foreground pgrp via `tcgetpgrp` on the master.
+    /// Observe terminal foreground pgrp via `tcgetpgrp`.
     ///
-    /// The harness observes from outside the child session. On Linux,
-    /// `TIOCGPGRP` on an `O_NOCTTY` slave fd opened by a non-session process
-    /// can yield ENOTTY; the master remains a valid observation surface.
+    /// Tries the slave observation fd first (session tty), then the master
+    /// (works on some Linux/WSL). Platform differences are not papered over:
+    /// both failures are returned to the caller.
     pub fn observe_foreground_pgrp(&self) -> std::io::Result<u32> {
-        let pid =
-            rustix::termios::tcgetpgrp(self.master.as_fd()).map_err(|e| io_err("tcgetpgrp", e))?;
+        let slave_err = match rustix::termios::tcgetpgrp(self.observe_slave.as_fd()) {
+            Ok(pid) => return Ok(pid.as_raw_nonzero().get() as u32),
+            Err(e) => e,
+        };
+        let pid = rustix::termios::tcgetpgrp(self.master.as_fd()).map_err(|e| {
+            io_err(
+                "tcgetpgrp_slave_and_master",
+                format!("slave={slave_err} master={e}"),
+            )
+        })?;
         Ok(pid.as_raw_nonzero().get() as u32)
     }
 
