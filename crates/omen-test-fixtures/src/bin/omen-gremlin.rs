@@ -716,17 +716,33 @@ fn run_posix_termios_dirty_exit() {
     println!("OMEN_COMPAT_DIRTYING");
     let _ = io::stdout().flush();
 
+    let mut applied = false;
     if let Ok(mut t) = tcgetattr(stdin_fd()) {
         // Controlled dirty subset: clear ICANON/ECHO/ISIG.
         let mut modes = t.local_modes;
         modes.remove(LocalModes::ICANON | LocalModes::ECHO | LocalModes::ISIG);
         t.local_modes = modes;
-        let _ = tcsetattr(stdin_fd(), OptionalActions::Now, &t);
+        for action in [
+            OptionalActions::Now,
+            OptionalActions::Flush,
+            OptionalActions::Drain,
+        ] {
+            if tcsetattr(stdin_fd(), action, &t).is_ok() {
+                applied = true;
+                break;
+            }
+        }
     }
-    println!("OMEN_COMPAT_DIRTY");
+    let verify = tcgetattr(stdin_fd())
+        .map(|t| {
+            !t.local_modes.contains(LocalModes::ICANON)
+                || !t.local_modes.contains(LocalModes::ECHO)
+                || !t.local_modes.contains(LocalModes::ISIG)
+        })
+        .unwrap_or(false);
+    println!("OMEN_COMPAT_DIRTY applied={applied} verify={verify}");
     let _ = io::stdout().flush();
-    // Abnormal exit is chosen by `--exit` (default 0; harness passes non-zero
-    // or uses SIGTERM from outside). Exit immediately without restoring.
+    // Abnormal exit is chosen by `--exit`. Exit without restoring.
 }
 
 /// Classify what the child observes on stdin without blocking.
