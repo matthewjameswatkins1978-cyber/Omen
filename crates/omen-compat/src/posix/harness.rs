@@ -236,7 +236,7 @@ impl PtySession {
                 self.transcript.bounded_out = true;
                 return Ok(self.transcript.clone());
             }
-            let slice = (outer - now).min(Duration::from_millis(PTY_POLL_SLICE_MS as u64));
+            let slice = (outer - now).min(Duration::from_millis(PTY_POLL_SLICE_MS));
             match poll_readable(self.master.as_fd(), slice)? {
                 PollOutcome::Timeout => continue,
                 PollOutcome::Hangup => {
@@ -344,7 +344,7 @@ impl PtySession {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        tcsetwinsize(&self.master.as_fd(), ws).map_err(|e| io_err("tcsetwinsize", e))
+        tcsetwinsize(self.master.as_fd(), ws).map_err(|e| io_err("tcsetwinsize", e))
     }
 
     /// Selected canonical termios snapshot from the slave.
