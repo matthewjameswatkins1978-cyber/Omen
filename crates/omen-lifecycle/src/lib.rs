@@ -14,14 +14,17 @@ pub mod diagnostics;
 pub mod doctor;
 pub mod error;
 pub mod gc;
+pub mod health;
 pub mod install;
 pub mod lock;
 pub mod migrate;
 pub mod pins;
 pub mod plan;
+pub mod release;
 pub mod render;
 pub mod repair;
 pub mod state;
+pub mod transport;
 pub mod uninstall;
 pub mod update;
 

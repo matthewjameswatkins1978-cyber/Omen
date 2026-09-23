@@ -97,6 +97,7 @@ fn make_release(dir: &Path, version: &str, git_sha: &str, tamper: bool) -> Relea
         package_sha256: package_sha,
         binary_sha256: binary_sha,
         package: format!("omen-{version}.zip"),
+        download_url: None,
         min_state_schema: 1,
         contract_version: "0.8".to_string(),
     };
@@ -358,6 +359,7 @@ fn source_sha_mismatch_means_malformed() {
         package_sha256: String::new(),
         binary_sha256: String::new(),
         package: "x".to_string(),
+        download_url: None,
         min_state_schema: 1,
         contract_version: "0.8".to_string(),
     };

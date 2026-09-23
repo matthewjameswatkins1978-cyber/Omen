@@ -9,6 +9,7 @@
 
 use crate::error::LifecycleError;
 use crate::install::{Channel, InstallRecord, Ownership};
+use crate::transport::ReleaseTransport;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -40,8 +41,12 @@ pub struct ReleaseMeta {
     pub channel: Channel,
     pub package_sha256: String,
     pub binary_sha256: String,
-    /// File name of the package under the source (directory source) or URL.
+    /// Package asset FILE NAME (directory source) or asset name (canonical).
     pub package: String,
+    /// Canonical download URL, bound at discovery from GitHub asset
+    /// metadata — never from manifest content. `None` for directory sources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_url: Option<String>,
     pub min_state_schema: u32,
     pub contract_version: String,
 }
@@ -103,85 +108,123 @@ pub fn fetch_index(source: &ReleaseSource) -> Result<ReleaseIndex, CheckOutcome>
                 detail: format!("releases.json invalid: {e}"),
             })
         }
-        ReleaseSource::CanonicalGithub => {
-            // Production path: GitHub releases API, bounded, no auth.
-            let url = "https://api.github.com/repos/matthewjameswatkins1978-cyber/Omen/releases";
-            let config = ureq::Agent::config_builder()
-                .timeout_global(Some(std::time::Duration::from_secs(20)))
-                .build();
-            let resp = ureq::Agent::new_with_config(config)
-                .get(url)
-                .header("User-Agent", "omen-update-check")
-                .header("Accept", "application/vnd.github+json")
-                .call();
-            match resp {
-                Ok(mut r) => {
-                    let v: serde_json::Value =
-                        r.body_mut()
-                            .read_json()
-                            .map_err(|e| CheckOutcome::MalformedMetadata {
-                                detail: format!("github api invalid json: {e}"),
-                            })?;
-                    parse_github_releases(&v)
-                }
-                Err(ureq::Error::StatusCode(403) | ureq::Error::StatusCode(429)) => {
-                    Err(CheckOutcome::AuthRateLimit {
-                        detail: "github api rate limited".to_string(),
-                    })
-                }
-                Err(e) => Err(CheckOutcome::NetworkUnavailable {
-                    detail: format!("github api unreachable: {e}"),
-                }),
-            }
-        }
+        // Canonical discovery never builds an index: use discover_canonical
+        // (per-release manifest, asset-bound). This arm exists so callers
+        // that only understand indexes fail loudly, never silently.
+        ReleaseSource::CanonicalGithub => Err(CheckOutcome::NetworkUnavailable {
+            detail: "canonical source requires manifest discovery, not an index".to_string(),
+        }),
     }
 }
 
-/// Parse GitHub release list into an index. Releases are expected to carry
-/// an `omen-releases.json` asset; without it the metadata is malformed
-/// (never guessed from tag names alone... tag supplies version, asset
-/// supplies digests; both required).
-#[allow(clippy::result_large_err)]
-fn parse_github_releases(v: &serde_json::Value) -> Result<ReleaseIndex, CheckOutcome> {
-    let mut releases = Vec::new();
-    let arr = v
-        .as_array()
-        .ok_or_else(|| CheckOutcome::MalformedMetadata {
-            detail: "github api did not return a list".to_string(),
-        })?;
-    for rel in arr {
-        let tag = rel.get("tag_name").and_then(|t| t.as_str()).unwrap_or("");
-        let version = tag.strip_prefix('v').unwrap_or(tag);
-        if version.is_empty() {
-            continue;
-        }
-        // Digest truth must come from the release payload, not the tag.
-        // Full asset parsing happens at download time; discovery records
-        // what the API gives us and marks provenance accordingly.
-        releases.push(ReleaseMeta {
-            version: version.to_string(),
-            git_sha: "".to_string(),
-            channel: if rel
-                .get("prerelease")
-                .and_then(|p| p.as_bool())
-                .unwrap_or(false)
-            {
-                Channel::Preview
-            } else {
-                Channel::Stable
-            },
-            package_sha256: "".to_string(),
-            binary_sha256: "".to_string(),
-            package: rel
-                .get("html_url")
-                .and_then(|u| u.as_str())
-                .unwrap_or("")
-                .to_string(),
-            min_state_schema: 0,
-            contract_version: "".to_string(),
-        });
+/// Map a transport failure onto the check taxonomy. Rate-limit signals
+/// stay distinct; everything else transport-shaped is NetworkUnavailable;
+/// manifest-shaped is MalformedMetadata. Never UpToDate.
+fn transport_outcome(e: LifecycleError) -> CheckOutcome {
+    let text = e.to_string();
+    if text.contains("rate-limited") {
+        CheckOutcome::AuthRateLimit { detail: text }
+    } else if text.contains("manifest") {
+        CheckOutcome::MalformedMetadata { detail: text }
+    } else {
+        CheckOutcome::NetworkUnavailable { detail: text }
     }
-    Ok(ReleaseIndex { releases })
+}
+
+/// Canonical discovery (Lucy repair B1): newest release on `channel`,
+/// validated per-release `omen-release.json`, package asset bound by exact
+/// name to GitHub asset metadata. Returns `Ok(None)` only when the channel
+/// has NO releases at all. A malformed newest release is MalformedMetadata
+/// — never skipped in favor of an older one, never UpToDate.
+#[allow(clippy::result_large_err)]
+pub fn discover_canonical(
+    channel: Channel,
+    transport: &dyn crate::transport::ReleaseTransport,
+) -> Result<Option<ReleaseMeta>, CheckOutcome> {
+    use crate::release::RELEASE_MANIFEST_ASSET;
+    let mut releases = transport.list_releases(20).map_err(transport_outcome)?;
+    // Newest-first: preview number desc, then tag for stability.
+    releases.sort_by(|a, b| {
+        preview_num(&tag_version(&b.tag))
+            .unwrap_or(0)
+            .cmp(&preview_num(&tag_version(&a.tag)).unwrap_or(0))
+            .then_with(|| b.tag.cmp(&a.tag))
+    });
+    let want_prerelease = channel == Channel::Preview;
+    let newest = releases.iter().find(|r| r.prerelease == want_prerelease);
+    let Some(rel) = newest else {
+        return Ok(None);
+    };
+    let malformed = |detail: String| CheckOutcome::MalformedMetadata { detail };
+
+    // Exactly one canonical manifest asset.
+    let manifests: Vec<_> = rel
+        .assets
+        .iter()
+        .filter(|a| a.name == RELEASE_MANIFEST_ASSET)
+        .collect();
+    if manifests.len() != 1 {
+        return Err(malformed(format!(
+            "release {} has {} {RELEASE_MANIFEST_ASSET} assets (want exactly 1)",
+            rel.tag,
+            manifests.len()
+        )));
+    }
+    let manifest_url = crate::release::validate_update_url(&manifests[0].browser_download_url)
+        .map_err(|e| malformed(e.to_string()))?;
+    let bytes = transport
+        .fetch_manifest_bytes(&manifest_url)
+        .map_err(transport_outcome)?;
+    let manifest = crate::release::ReleaseManifest::parse_strict(&bytes)
+        .map_err(|e| malformed(e.to_string()))?;
+
+    // Tag/manifest/channel binding.
+    let tag_v = tag_version(&rel.tag);
+    if manifest.version != tag_v {
+        return Err(malformed(format!(
+            "manifest version {} != release tag version {tag_v}",
+            manifest.version
+        )));
+    }
+    if (manifest.channel == Channel::Preview) != rel.prerelease {
+        return Err(malformed(format!(
+            "manifest channel {:?} != release prerelease={}",
+            manifest.channel, rel.prerelease
+        )));
+    }
+    // Package asset bound by exact name, exactly once. The download URL
+    // comes ONLY from this GitHub asset metadata.
+    let pkgs: Vec<_> = rel
+        .assets
+        .iter()
+        .filter(|a| a.name == manifest.package_asset)
+        .collect();
+    if pkgs.len() != 1 {
+        return Err(malformed(format!(
+            "release {} has {} assets named {} (want exactly 1)",
+            rel.tag,
+            pkgs.len(),
+            manifest.package_asset
+        )));
+    }
+    let download_url = crate::release::validate_update_url(&pkgs[0].browser_download_url)
+        .map_err(|e| malformed(e.to_string()))?;
+
+    Ok(Some(ReleaseMeta {
+        version: manifest.version,
+        git_sha: manifest.git_sha,
+        channel: manifest.channel,
+        package_sha256: manifest.package_sha256,
+        binary_sha256: manifest.binary_sha256,
+        package: manifest.package_asset,
+        download_url: Some(download_url),
+        min_state_schema: manifest.min_state_schema,
+        contract_version: manifest.machine_contract,
+    }))
+}
+
+fn tag_version(tag: &str) -> String {
+    tag.strip_prefix('v').unwrap_or(tag).to_string()
 }
 
 fn preview_num(v: &str) -> Option<u64> {
@@ -191,63 +234,79 @@ fn preview_num(v: &str) -> Option<u64> {
         .ok()
 }
 
+/// Shared candidate evaluation: version identity, provenance presence,
+/// contract and state-schema compatibility. Used by both sources.
+fn evaluate_candidate(current_version: &str, meta: &ReleaseMeta) -> CheckOutcome {
+    if meta.version == current_version {
+        CheckOutcome::UpToDate {
+            current: current_version.to_string(),
+        }
+    } else if meta.package_sha256.is_empty() || meta.git_sha.is_empty() {
+        CheckOutcome::MalformedMetadata {
+            detail: format!("release {} lacks digest provenance", meta.version),
+        }
+    } else if meta.contract_version != super::install::CONTRACT_VERSION {
+        CheckOutcome::IncompatibleCandidate {
+            candidate: meta.clone(),
+            reason: format!(
+                "candidate contract {} != runtime {}",
+                meta.contract_version,
+                super::install::CONTRACT_VERSION
+            ),
+        }
+    } else if meta.min_state_schema > crate::migrate::STATE_SCHEMA_VERSION {
+        CheckOutcome::IncompatibleCandidate {
+            candidate: meta.clone(),
+            reason: format!(
+                "candidate needs state schema {} > {}",
+                meta.min_state_schema,
+                crate::migrate::STATE_SCHEMA_VERSION
+            ),
+        }
+    } else {
+        CheckOutcome::Candidate {
+            current: current_version.to_string(),
+            candidate: meta.clone(),
+            compatible: true,
+            compat_note: "contract and state schema compatible".to_string(),
+        }
+    }
+}
+
 /// Read-only check: current version, channel, ownership, candidate +
 /// compatibility. Downloads nothing, migrates nothing, changes nothing.
+/// Canonical checks download ONLY the small release manifest.
 pub fn check_for_update(
     current_version: &str,
     channel: Channel,
     ownership: Ownership,
     source: &ReleaseSource,
 ) -> CheckReport {
-    let outcome = match fetch_index(source) {
-        Err(e) => e,
-        Ok(index) => {
-            let mut cands: Vec<&ReleaseMeta> = index
-                .releases
-                .iter()
-                .filter(|r| r.channel == channel)
-                .collect();
-            cands.sort_by_key(|r| preview_num(&r.version).unwrap_or(0));
-            match cands.into_iter().next_back() {
-                None => CheckOutcome::UpToDate {
+    let outcome = match source {
+        ReleaseSource::Directory(_) => match fetch_index(source) {
+            Err(e) => e,
+            Ok(index) => {
+                let mut cands: Vec<&ReleaseMeta> = index
+                    .releases
+                    .iter()
+                    .filter(|r| r.channel == channel)
+                    .collect();
+                cands.sort_by_key(|r| preview_num(&r.version).unwrap_or(0));
+                match cands.into_iter().next_back() {
+                    None => CheckOutcome::UpToDate {
+                        current: current_version.to_string(),
+                    },
+                    Some(meta) => evaluate_candidate(current_version, meta),
+                }
+            }
+        },
+        ReleaseSource::CanonicalGithub => {
+            match discover_canonical(channel, &crate::transport::GithubTransport) {
+                Err(e) => e,
+                Ok(None) => CheckOutcome::UpToDate {
                     current: current_version.to_string(),
                 },
-                Some(meta) => {
-                    if meta.version == current_version {
-                        CheckOutcome::UpToDate {
-                            current: current_version.to_string(),
-                        }
-                    } else if meta.package_sha256.is_empty() || meta.git_sha.is_empty() {
-                        CheckOutcome::MalformedMetadata {
-                            detail: format!("release {} lacks digest provenance", meta.version),
-                        }
-                    } else if meta.contract_version != super::install::CONTRACT_VERSION {
-                        CheckOutcome::IncompatibleCandidate {
-                            candidate: meta.clone(),
-                            reason: format!(
-                                "candidate contract {} != runtime {}",
-                                meta.contract_version,
-                                super::install::CONTRACT_VERSION
-                            ),
-                        }
-                    } else if meta.min_state_schema > crate::migrate::STATE_SCHEMA_VERSION {
-                        CheckOutcome::IncompatibleCandidate {
-                            candidate: meta.clone(),
-                            reason: format!(
-                                "candidate needs state schema {} > {}",
-                                meta.min_state_schema,
-                                crate::migrate::STATE_SCHEMA_VERSION
-                            ),
-                        }
-                    } else {
-                        CheckOutcome::Candidate {
-                            current: current_version.to_string(),
-                            candidate: meta.clone(),
-                            compatible: true,
-                            compat_note: "contract and state schema compatible".to_string(),
-                        }
-                    }
-                }
+                Ok(Some(meta)) => evaluate_candidate(current_version, &meta),
             }
         }
     };
@@ -414,33 +473,22 @@ impl HealthChecker for BinaryHealthCheck {
         staged_binary: &Path,
         expect: &ReleaseMeta,
     ) -> Result<HealthEvidence, LifecycleError> {
-        let out = std::process::Command::new(staged_binary)
-            .arg("--version")
-            .output()
-            .map_err(|e| {
-                LifecycleError::Health(format!("candidate binary would not launch: {e}"))
-            })?;
-        if !out.status.success() {
+        // Bounded interrogation: a stalled/corrupt candidate can never hang
+        // the update. Timeout, non-zero exit, and identity mismatches are
+        // all health failures with the previous slot preserved.
+        let probe = crate::health::probe_candidate_default(staged_binary)?;
+        if probe.timed_out {
+            return Err(LifecycleError::Health(format!(
+                "candidate health timed out after {:?}; process tree terminated and reaped",
+                probe.elapsed
+            )));
+        }
+        if !probe.exit_ok {
             return Err(LifecycleError::Health(
                 "candidate --version exited nonzero".to_string(),
             ));
         }
-        let text = String::from_utf8_lossy(&out.stdout).to_string();
-        // clap prints `<bin> <version> contract:<c> commit:<sha> ...`: the
-        // version is the first whitespace token shaped like a version
-        // (leading digit), not the first token (the binary name).
-        let version = text
-            .split_whitespace()
-            .find(|w| w.chars().next().is_some_and(|c| c.is_ascii_digit()))
-            .map(str::to_string);
-        let contract = text
-            .split_whitespace()
-            .find(|w| w.starts_with("contract:"))
-            .map(|w| w.trim_start_matches("contract:").to_string());
-        let sha = text
-            .split_whitespace()
-            .find(|w| w.starts_with("commit:"))
-            .map(|w| w.trim_start_matches("commit:").to_string());
+        let (version, contract, sha) = crate::health::parse_identity(&probe.stdout);
         if version.as_deref() != Some(expect.version.as_str()) {
             return Err(LifecycleError::Health(format!(
                 "candidate version mismatch: got {version:?}, want {}",
@@ -563,12 +611,44 @@ pub fn run_update(
             })?;
         }
         ReleaseSource::CanonicalGithub => {
-            return Err(fail_tx(
-                base,
-                &mut tx,
-                "download",
-                "canonical download requires release asset URL plumbing",
-            ));
+            // Production download: the exact asset bound at discovery.
+            // URL comes from ReleaseMeta.download_url (GitHub asset
+            // metadata), validated again here — fail closed on anything
+            // else. Streams to .part with ceiling + running hash; the part
+            // becomes candidate bytes only after complete transport.
+            let url = candidate.download_url.clone().unwrap_or_default();
+            if url.is_empty() {
+                return Err(fail_tx(
+                    base,
+                    &mut tx,
+                    "download",
+                    "canonical candidate lacks a bound download URL",
+                ));
+            }
+            if crate::release::validate_update_url(&url).is_err() {
+                return Err(fail_tx(
+                    base,
+                    &mut tx,
+                    "download",
+                    "canonical download URL not allowed",
+                ));
+            }
+            let part = downloads.join(format!("{}-{}.pkg.part", candidate.version, tx.tx_id));
+            let transport = crate::transport::GithubTransport;
+            match transport.download_package(&url, &part, crate::transport::MAX_PACKAGE_BYTES) {
+                Ok(_) => {
+                    if let Err(e) = std::fs::rename(&part, &package_path) {
+                        std::fs::remove_file(&part).ok();
+                        let msg = format!("promote partial package: {e}");
+                        return Err(fail_tx(base, &mut tx, "download", &msg));
+                    }
+                }
+                Err(e) => {
+                    std::fs::remove_file(&part).ok();
+                    let msg = e.to_string();
+                    return Err(fail_tx(base, &mut tx, "download", &msg));
+                }
+            }
         }
     }
     // Partial-download guard: size must be nonzero and match after verify.
