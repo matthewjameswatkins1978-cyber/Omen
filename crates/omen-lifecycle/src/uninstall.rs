@@ -124,6 +124,65 @@ pub struct RetainedItem {
     pub reason: String,
 }
 
+/// Revalidate one uninstall item at apply time: containment, live pin
+/// protection, and continued scope eligibility. Pins are re-checked live
+/// so newly pinned data survives a stale plan.
+pub fn revalidate_uninstall_item(
+    base: &Path,
+    scope: UninstallScope,
+    item: &crate::plan::PlannedItem,
+) -> crate::plan::Revalidate {
+    use crate::plan::Revalidate;
+    use crate::state::classify;
+    let rel = Path::new(&item.identity);
+    if rel.is_absolute()
+        || rel
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Revalidate::Refuse {
+            reason: format!("{} escapes the state base", item.identity),
+        };
+    }
+    let target = base.join(rel);
+    if !target.exists() && !target.is_symlink() {
+        return Revalidate::Proceed; // idempotent: already gone
+    }
+    // Live pin protection (race safety for the protection that matters).
+    if let Ok(pins) = crate::pins::load_pins(base).map(|s| s.pins)
+        && crate::pins::pin_identities_for_state_identity(&item.identity)
+            .iter()
+            .any(|p| pins.contains(p))
+    {
+        return Revalidate::Refuse {
+            reason: format!("{} pinned after plan", item.identity),
+        };
+    }
+    // Continued eligibility under the same scope.
+    let is_dir = target.is_dir();
+    let size = if is_dir {
+        None
+    } else {
+        std::fs::metadata(&target).map(|m| m.len()).ok()
+    };
+    let now = classify(rel, is_dir, size);
+    let class = retention_class(&item.identity, now.role);
+    let removable = match (scope, class) {
+        (UninstallScope::AppOnly, RetentionClass::Application) => true,
+        (UninstallScope::AppAndCache, RetentionClass::Application) => true,
+        (UninstallScope::AppAndCache, RetentionClass::Cache) => true,
+        (UninstallScope::Everything, _) => !matches!(now.disposal, crate::state::Disposal::Keep),
+        _ => false,
+    };
+    if removable {
+        Revalidate::Proceed
+    } else {
+        Revalidate::Refuse {
+            reason: format!("{} no longer eligible under {scope:?}", item.identity),
+        }
+    }
+}
+
 /// Apply one uninstall item (file/dir removal with containment).
 pub fn apply_uninstall_item(base: &Path, item: &PlannedItem) -> Result<String, LifecycleError> {
     crate::clean::apply_clean_item(base, item)
@@ -159,6 +218,38 @@ mod tests {
         // Retained entries are explicit.
         assert!(retained.iter().any(|r| r.identity.contains("state.sqlite")));
         assert!(retained.iter().any(|r| r.identity.contains("proof.json")));
+    }
+
+    #[test]
+    fn apply_removes_app_preserves_truth() {
+        let base = tempfile::tempdir().unwrap();
+        let b = base.path();
+        std::fs::create_dir_all(b.join("bin")).unwrap();
+        std::fs::write(b.join("bin").join("omen.exe"), b"bin").unwrap();
+        std::fs::create_dir_all(b.join("workspaces").join("ws_a")).unwrap();
+        std::fs::write(
+            b.join("workspaces").join("ws_a").join("state.sqlite"),
+            b"db",
+        )
+        .unwrap();
+        std::fs::create_dir_all(b.join("evidence")).unwrap();
+        std::fs::write(b.join("evidence").join("proof.json"), b"proof").unwrap();
+
+        let (plan, _) = uninstall_plan(b, UninstallScope::AppOnly);
+        let report = crate::plan::apply_plan(
+            &plan,
+            &|item| Ok(revalidate_uninstall_item(b, UninstallScope::AppOnly, item)),
+            &|item| apply_uninstall_item(b, item),
+        );
+        assert!(report.fully_applied());
+        assert!(!b.join("bin").join("omen.exe").exists());
+        assert!(
+            b.join("workspaces")
+                .join("ws_a")
+                .join("state.sqlite")
+                .is_file()
+        );
+        assert!(b.join("evidence").join("proof.json").is_file());
     }
 
     #[test]

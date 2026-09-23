@@ -682,10 +682,8 @@ pub fn cmd_uninstall(
     let report = omen_lifecycle::plan::apply_plan(
         &plan,
         &|item| {
-            Ok(omen_lifecycle::clean::revalidate_clean_item(
-                &b,
-                &std::collections::BTreeSet::new(),
-                item,
+            Ok(omen_lifecycle::uninstall::revalidate_uninstall_item(
+                &b, scope_v, item,
             ))
         },
         &|item| omen_lifecycle::uninstall::apply_uninstall_item(&b, item),
