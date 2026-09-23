@@ -124,7 +124,10 @@ fn control_stopped_state_is_observed() {
         .wait_for_text("OMEN_COMPAT_STOPPING", Duration::from_secs(5))
         .expect("STOPPING barrier");
 
-    let stopped = wait_stopped_bounded(session.child_pid(), Duration::from_secs(3));
+    // Direct kernel observation via waitpid(WUNTRACED) — all POSIX.
+    let stopped = session
+        .wait_stopped(Duration::from_secs(3))
+        .expect("wait_stopped");
     assert!(stopped, "fixture must enter real stopped state");
 
     let wait = PosixWaitState {
@@ -135,7 +138,7 @@ fn control_stopped_state_is_observed() {
         continued: false,
         exit_code: None,
         signal: None,
-        source: "linux_proc_stat".into(),
+        source: "waitpid_wuntraced".into(),
     };
     let result = judge_wait_observes_stopped(&wait);
     assert_eq!(result.outcome, InvariantOutcome::Pass);
@@ -238,17 +241,6 @@ fn control_winsize_set_and_read_roundtrip() {
     let ws = session.observe_winsize().expect("get size");
     assert_eq!((ws.rows, ws.cols), (30, 100));
     let _ = session.wait_child_exit(Duration::from_secs(3));
-}
-
-fn wait_stopped_bounded(pid: u32, budget: Duration) -> bool {
-    let deadline = Instant::now() + budget;
-    while Instant::now() < deadline {
-        if omen_compat::is_stopped(pid) {
-            return true;
-        }
-        std::thread::park_timeout(Duration::from_millis(25));
-    }
-    false
 }
 
 fn continue_process(pid: u32) {

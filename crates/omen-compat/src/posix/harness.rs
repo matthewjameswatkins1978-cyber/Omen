@@ -376,6 +376,29 @@ impl PtySession {
         }
     }
 
+    /// Bounded wait until the direct session child is observed STOPPED via
+    /// `waitpid(WUNTRACED)`. Works on all POSIX (does not reap exit).
+    pub fn wait_stopped(&mut self, budget: Duration) -> Result<bool, std::io::Error> {
+        use rustix::process::{WaitOptions, waitpid};
+        let outer = Instant::now() + budget.min(self.remaining());
+        let pid = rustix::process::Pid::from_raw(self.child_pid as i32)
+            .ok_or_else(|| std::io::Error::other("invalid child pid"))?;
+        loop {
+            match waitpid(Some(pid), WaitOptions::UNTRACED | WaitOptions::NOHANG) {
+                Ok(Some((_, status))) if status.stopped() => return Ok(true),
+                Ok(Some((_, status))) if status.exited() || status.signaled() => return Ok(false),
+                Ok(_) => {}
+                Err(e) if e == rustix::io::Errno::INTR => continue,
+                Err(e) => return Err(io_err("waitpid_untraced", e)),
+            }
+            let now = Instant::now();
+            if now >= outer {
+                return Ok(false);
+            }
+            std::thread::park_timeout(Duration::from_millis(25).min(outer - now));
+        }
+    }
+
     /// Non-blocking try_wait for the session child (None if still running).
     pub fn try_wait_child(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         self.child.try_wait()
