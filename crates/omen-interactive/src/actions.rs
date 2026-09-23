@@ -894,9 +894,7 @@ impl SemanticDispatcher {
                 })
             }
             other => {
-                println!(
-                    "Unknown Omen semantic action ':{other}'. Available: :status, :doctor, :tools, :orient, :capabilities, :describe, :how, :actions, :plan, :inspect, :why, :history, :show, :rerun, :services, :stop, :agent, :backend, :symbol, :def, :refs, :structure, :packages, :tasks"
-                );
+                println!("{}", crate::commands::unknown_action_message(other));
                 Ok(ProcessExit {
                     code: Some(1),
                     signal: None,

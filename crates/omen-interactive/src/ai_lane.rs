@@ -673,22 +673,11 @@ pub fn build_agent_context_with_workspace(
         }
     }
 
-    // Populate tools from shared completion context hot index
+    // Populate tools from shared completion context hot index (bounded PATH cache)
     if let Some(comp_lock) = comp_ctx
         && let Ok(c) = comp_lock.lock()
     {
-        ctx.available_tools = c.hot_index.known_tools.clone();
-    }
-
-    // Ensure canonical tools list is never decorative
-    if ctx.available_tools.is_empty() {
-        ctx.available_tools = vec![
-            "cargo".into(),
-            "git".into(),
-            "exec".into(),
-            "test".into(),
-            "fs".into(),
-        ];
+        ctx.available_tools = c.hot_index.path_commands.clone();
     }
 
     ctx
