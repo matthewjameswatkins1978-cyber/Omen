@@ -625,7 +625,16 @@ fn registry_machine_output_never_carries_secrets() {
             // The secret VALUE must never appear; the source label naming the
             // environment variable is allowed and expected.
             assert!(!json.contains("sk-g1-synthetic-secret"));
-            assert!(json.contains("environment:OPENAI_API_KEY") || desc.id == "diagnostic");
+            // Allowed credential shapes: none (diagnostic), environment label
+            // (Luna), or external-manager label (Codex reference route, G2).
+            // Labels name a source; values never appear (asserted above).
+            assert!(
+                json.contains("environment:OPENAI_API_KEY")
+                    || json.contains("codex-auth")
+                    || desc.id == "diagnostic",
+                "unexpected credential shape for {}: {json}",
+                desc.id
+            );
             let lower = json.to_lowercase();
             assert!(!lower.contains("secret\""));
             assert!(!lower.contains("bearer"));

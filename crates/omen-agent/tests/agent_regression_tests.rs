@@ -352,7 +352,11 @@ fn provider_registry_selects_configured_provider() {
         registry.register(custom_desc, mock_provider);
 
         let list = registry.list_providers();
-        assert_eq!(list.len(), 2);
+        // Environment-tolerant: codex registers whenever its binary
+        // resolves on PATH (G2 reference route), Luna when configured.
+        let ids: Vec<&str> = list.iter().map(|d| d.id.as_str()).collect();
+        assert!(ids.contains(&"diagnostic"));
+        assert!(ids.contains(&"mock_claude"));
 
         registry.set_active_provider("mock_claude").unwrap();
         assert_eq!(registry.active_descriptor().id, "mock_claude");
