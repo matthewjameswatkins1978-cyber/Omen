@@ -192,16 +192,16 @@ impl ReplayDescriptor {
         }
     }
 
-    /// Mechanically validated Exact fixture replay.
+    /// The **only** Exact-producing constructor.
     ///
-    /// M0 conservative rule — all must hold or `Err`:
+    /// Has original `CommandSpec` execution state and mechanically proves:
     /// - `EnvPolicy::Clear` (no omitted env values)
     /// - `StdinSpec::Closed` (no omitted stdin payload)
     /// - `cwd == None` (no omitted path)
     /// - `safe_argv == spec.argv` (explicitly classified safe and exact)
     ///
-    /// There is no API that accepts an arbitrary `CommandSpec` and blindly
-    /// emits [`ReplayFidelity::Exact`].
+    /// No other public path may manufacture [`ReplayFidelity::Exact`].
+    /// Evidence projections cannot claim Exact because they never see original argv.
     pub fn try_exact_fixture(
         spec: &CommandSpec,
         fixture_mode: impl Into<String>,
@@ -238,30 +238,19 @@ impl ReplayDescriptor {
         })
     }
 
-    /// Project evidence into a replay record.
+    /// Project secret-safe [`CommandEvidence`] into a **Redacted** replay record.
     ///
-    /// `ReplayFidelity::Exact` is only honored when the evidence itself
-    /// mechanically satisfies the M0 exactness preconditions; otherwise the
-    /// fidelity is demoted to [`ReplayFidelity::Redacted`] rather than
-    /// mislabelled.
-    pub fn from_evidence(
+    /// Cannot produce Exact: evidence deliberately omits original argv, so
+    /// exactness is unprovable here. Safe argv on the evidence is not copied
+    /// into `argv` (redaction keeps only counts/structure).
+    pub fn redacted_from_evidence(
         evidence: CommandEvidence,
         fixture_mode: impl Into<String>,
         expected_invariants: Vec<InvariantId>,
-        fidelity: ReplayFidelity,
     ) -> Self {
-        let fidelity = if fidelity == ReplayFidelity::Exact && !evidence_supports_exact(&evidence) {
-            ReplayFidelity::Redacted
-        } else {
-            fidelity
-        };
-        let argv = match fidelity {
-            ReplayFidelity::Exact => evidence.argv_safe.clone().unwrap_or_default(),
-            _ => Vec::new(),
-        };
         Self {
             program: evidence.program,
-            argv,
+            argv: Vec::new(),
             argv_count: evidence.argv_count,
             cwd_policy: evidence.cwd_policy,
             env_policy_kind: evidence.env_policy_kind,
@@ -271,20 +260,9 @@ impl ReplayDescriptor {
             deadline: evidence.deadline,
             fixture_mode: fixture_mode.into(),
             expected_invariants,
-            fidelity,
+            fidelity: ReplayFidelity::Redacted,
         }
     }
-}
-
-/// M0 Exact preconditions checked against durable evidence structure only.
-fn evidence_supports_exact(evidence: &CommandEvidence) -> bool {
-    evidence.env_policy_kind == "clear"
-        && evidence.stdin_mode == "closed"
-        && evidence.cwd_policy == "inherit"
-        && evidence
-            .argv_safe
-            .as_ref()
-            .is_some_and(|argv| argv.len() == evidence.argv_count)
 }
 
 /// Replayable failure evidence. Secret-bearing execution state is projected

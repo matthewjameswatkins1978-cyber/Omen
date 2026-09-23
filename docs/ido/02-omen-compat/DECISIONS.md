@@ -75,6 +75,14 @@ implementation with no hidden additive waits.
 `ReplayFidelity::Exact` may only be produced by `try_exact_fixture` after
 mechanical validation (M0: `EnvPolicy::Clear`, `StdinSpec::Closed`,
 `cwd == None`, `safe_argv == argv`). Any omitted execution-affecting value
-blocks Exact. `from_evidence` demotes a requested Exact that fails those
-preconditions to `Redacted`. No heuristic secret scanning; explicit safe
-classification remains the model. The safe generic projection is `Redacted`.
+blocks Exact. No heuristic secret scanning; explicit safe classification
+remains the model. The safe generic projection is `Redacted`.
+
+## D2-012 — Exact replay has one authority
+
+`ReplayFidelity::Exact` may only be produced by the mechanically validated
+`try_exact_fixture` path against original `CommandSpec` execution state.
+Secret-safe `CommandEvidence` projections cannot independently claim Exact:
+they never retain original argv, so same-length false argv cannot mint Exact.
+Evidence projection is `redacted_from_evidence` only (no caller-supplied
+fidelity argument). No second Exact constructor.

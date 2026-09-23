@@ -310,13 +310,27 @@ fn exact_replay_blocked_by_env_stdin_cwd_or_unsafe_argv() {
         ReplayExactnessError::SafeArgvMismatch
     );
 
-    // from_evidence must demote Exact when preconditions fail.
-    let hostile_evidence =
-        CommandEvidence::from_execution(&with_env).with_safe_argv(vec!["--exit-code".into()]);
-    let demoted =
-        ReplayDescriptor::from_evidence(hostile_evidence, "m", vec![], ReplayFidelity::Exact);
-    assert_eq!(demoted.fidelity, ReplayFidelity::Redacted);
-    assert!(demoted.argv.is_empty());
+    // False Exact attack: same-length wrong argv via evidence projection.
+    // CommandEvidence cannot prove argv equality against original execution.
+    let original = CommandSpec::new("omen-gremlin")
+        .arg("--exit-code")
+        .arg("7")
+        .env(EnvPolicy::Clear)
+        .stdin(StdinSpec::Closed)
+        .timeout(Duration::from_millis(200));
+    let false_safe_argv = vec!["completely".to_string(), "different".to_string()];
+    assert_eq!(false_safe_argv.len(), original.argv.len());
+    let evidence =
+        CommandEvidence::from_execution(&original).with_safe_argv(false_safe_argv.clone());
+    // No CommandEvidence-based API can produce Exact.
+    let projected = ReplayDescriptor::redacted_from_evidence(evidence, "m", vec![]);
+    assert_eq!(projected.fidelity, ReplayFidelity::Redacted);
+    assert!(projected.argv.is_empty());
+    // try_exact_fixture rejects same-length wrong argv against original spec.
+    assert_eq!(
+        ReplayDescriptor::try_exact_fixture(&original, "m", vec![], false_safe_argv).unwrap_err(),
+        ReplayExactnessError::SafeArgvMismatch
+    );
 }
 
 #[test]
@@ -342,6 +356,96 @@ fn replay_fidelity_serialization_roundtrip() {
         serde_json::to_string(&ReplayFidelity::Redacted).unwrap(),
         "\"redacted\""
     );
+}
+
+/// Structural authority: Exact is assigned only inside try_exact_fixture.
+#[test]
+fn exact_fidelity_has_single_source_authority() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/failure.rs"),
+    )
+    .expect("read failure.rs");
+
+    let exact_assign = "fidelity: ReplayFidelity::Exact";
+    let assignments = src.matches(exact_assign).count();
+    assert_eq!(
+        assignments, 1,
+        "ReplayFidelity::Exact must be assigned exactly once (try_exact_fixture)"
+    );
+
+    let try_pos = src
+        .find("pub fn try_exact_fixture")
+        .expect("try_exact_fixture must exist");
+    let assign_pos = src.find(exact_assign).expect("Exact assignment must exist");
+    // Next public constructor after try_exact_fixture's own signature.
+    let after_sig = try_pos + "pub fn try_exact_fixture".len();
+    let next_pub_fn = src[after_sig..]
+        .find("    pub fn ")
+        .map(|i| after_sig + i)
+        .unwrap_or(src.len());
+    assert!(
+        assign_pos > try_pos && assign_pos < next_pub_fn,
+        "Exact must only be assigned inside try_exact_fixture (try={try_pos} assign={assign_pos} next={next_pub_fn})"
+    );
+
+    assert!(
+        !src.contains("pub fn from_evidence("),
+        "caller-supplied fidelity constructor must not exist"
+    );
+    let redacted_pos = src
+        .find("pub fn redacted_from_evidence")
+        .expect("redacted_from_evidence must exist");
+    assert!(
+        !src[redacted_pos..].contains(exact_assign),
+        "redacted_from_evidence must not assign Exact"
+    );
+}
+
+/// Safe exact fixture serializes cleanly with validated argv.
+#[test]
+fn exact_fixture_serialization_preserves_validated_argv_without_secrets() {
+    let canary = "OMEN_TEST_SECRET_DO_NOT_LEAK_9f3a_ENV";
+    let spec = CommandSpec::new("omen-gremlin")
+        .arg("--exit-code")
+        .arg("7")
+        .env(EnvPolicy::Clear)
+        .stdin(StdinSpec::Closed)
+        .timeout(Duration::from_millis(200));
+    let exact = ReplayDescriptor::try_exact_fixture(
+        &spec,
+        "exit-code",
+        vec![InvariantId::ExitCausePreserved],
+        vec!["--exit-code".into(), "7".into()],
+    )
+    .expect("safe Exact");
+    let json = serde_json::to_string(&exact).unwrap();
+    assert!(json.contains("\"exact\""));
+    assert!(json.contains("--exit-code"));
+    assert!(!json.contains(canary));
+    assert!(!json.contains("payload"));
+    assert!(!json.contains("OPENAI_API_KEY"));
+
+    // Evidence projection of hostile env remains redacted and Exact-free.
+    let hostile = CommandSpec::new("omen-gremlin")
+        .arg("--exit-code")
+        .arg("7")
+        .env(EnvPolicy::InheritWith(vec![(
+            "OPENAI_API_KEY".into(),
+            canary.into(),
+        )]))
+        .stdin(StdinSpec::Closed)
+        .timeout(Duration::from_millis(200));
+    let projected = ReplayDescriptor::redacted_from_evidence(
+        CommandEvidence::from_execution(&hostile)
+            .with_safe_argv(vec!["completely".into(), "different".into()]),
+        "exit-code",
+        vec![],
+    );
+    assert_eq!(projected.fidelity, ReplayFidelity::Redacted);
+    assert!(projected.argv.is_empty());
+    let json = serde_json::to_string(&projected).unwrap();
+    assert!(!json.contains(canary));
+    assert!(!json.contains("completely"));
 }
 
 #[test]

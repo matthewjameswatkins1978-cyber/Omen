@@ -28,7 +28,8 @@ Measurement-integrity repairs: bounded I/O + secret-safe durable evidence
 laws (D2-008/D2-009); final truth-model repair — non-waiting kill initiation
 + bounded reap, one shared post-root I/O completion window matching
 `declared_max_wall_ms`, and mechanically validated `ReplayFidelity::Exact`
-(D2-010/D2-011).
+(D2-010/D2-011); Exact authority sealed to `try_exact_fixture` alone
+(D2-012).
 
 Still open for M0: POSIX process-group/TTY work, Windows ConPTY/console
 control, deeper process-tree containment, and any repair of production

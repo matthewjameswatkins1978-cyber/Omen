@@ -62,10 +62,13 @@ uses `CommandEvidence` (counts, kinds, key names — no values), explicit
 `Observation::EnvApplied { key }` (no value), and `StreamSummary` without
 raw previews. Debug for `CommandSpec`/`EnvPolicy`/`StdinSpec` redacts values.
 
-`ReplayFidelity::Exact` is mechanically validated by `try_exact_fixture`:
+`ReplayFidelity::Exact` is mechanically validated only by
+`try_exact_fixture` against original `CommandSpec`:
 env must be `Clear`, stdin `Closed`, cwd unset, and safe argv exactly equal
 to recorded argv. Omission of any required value yields an error — never a
-mislabelled Exact. The safe generic projection remains `Redacted`.
+mislabelled Exact. Evidence projections use `redacted_from_evidence` only
+and cannot claim Exact (one authority; see D2-012). The safe generic
+projection remains `Redacted`.
 
 Fixture JSON reports remain limited to controlled Compat fixtures.
 
