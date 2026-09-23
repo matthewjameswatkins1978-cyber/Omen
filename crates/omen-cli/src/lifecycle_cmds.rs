@@ -3,7 +3,7 @@
 //! one truth, human + machine renderings. Doctor itself stays observational;
 //! consequential commands require explicit `--apply` (clean excepted:
 //! conservative debris applies directly, `--plan` previews).
-use omen_knowledge::{Database, user_state_base_dir};
+use omen_knowledge::user_state_base_dir;
 use std::path::{Path, PathBuf};
 
 fn base() -> PathBuf {
@@ -75,54 +75,8 @@ pub fn cmd_clean(plan_only: bool, json_mode: bool) -> Result<(), Box<dyn std::er
 }
 
 // ------------------------------------------------------------------- gc ---
-/// Digests referenced by durable truth: artifacts table + fact_artifact
-/// links + receipts. Best-effort read-only; failure yields empty (GC then
-/// keeps more, never less... callers combine with pins).
-pub fn db_referenced_digests(workspace_db: &Path) -> std::collections::BTreeSet<String> {
-    let mut out = std::collections::BTreeSet::new();
-    let Ok(db) = Database::open_read_only(workspace_db) else {
-        return out;
-    };
-    if let Ok(mut stmt) = db.conn().prepare("SELECT digest FROM artifacts")
-        && let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0))
-    {
-        for d in rows.flatten() {
-            out.insert(d);
-        }
-    }
-    if let Ok(mut stmt) = db.conn().prepare("SELECT artifact_uri FROM fact_artifacts")
-        && let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0))
-    {
-        for u in rows.flatten() {
-            if let Some(d) = u.strip_prefix("artifact://") {
-                out.insert(d.to_string());
-            }
-        }
-    }
-    out
-}
-
 pub fn workspace_reachability(b: &Path) -> omen_lifecycle::gc::Reachability {
-    use omen_knowledge::{canonical_workspace_db_path_readonly, workspace_state_dir_path};
-    let mut reach = omen_lifecycle::gc::Reachability::default();
-    // All workspace DBs under the base (bounded scan).
-    let ws = b.join("workspaces");
-    if let Ok(rd) = std::fs::read_dir(&ws) {
-        for entry in rd.flatten().take(512) {
-            let db = entry.path().join("state.sqlite");
-            if db.is_file() {
-                for d in db_referenced_digests(&db) {
-                    reach.history_referenced.insert(d);
-                }
-            }
-        }
-    }
-    // Current-workspace DB via canonical authority (covers custom roots).
-    let _ = (
-        canonical_workspace_db_path_readonly,
-        workspace_state_dir_path,
-    );
-    reach
+    omen_lifecycle::gc::workspace_reachability(b)
 }
 
 pub fn cmd_gc_plan(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {

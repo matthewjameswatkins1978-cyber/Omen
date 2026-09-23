@@ -237,9 +237,50 @@ pub fn workspace_cas_candidates(
     out
 }
 
-/// Build the GC plan from candidates. Every candidate becomes a planned
-/// item with its digest fingerprint; history tombstoning is recorded in the
-/// consequence string.
+/// Digests referenced by durable truth: artifacts table + fact_artifact
+/// links. Best-effort read-only; failure yields empty (GC then keeps more,
+/// never less — callers combine with pins).
+pub fn db_referenced_digests(workspace_db: &Path) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let Ok(db) = omen_knowledge::Database::open_read_only(workspace_db) else {
+        return out;
+    };
+    if let Ok(mut stmt) = db.conn().prepare("SELECT digest FROM artifacts") {
+        if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+            for d in rows.flatten() {
+                out.insert(d);
+            }
+        }
+    }
+    if let Ok(mut stmt) = db.conn().prepare("SELECT artifact_uri FROM fact_artifacts") {
+        if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+            for u in rows.flatten() {
+                if let Some(d) = u.strip_prefix("artifact://") {
+                    out.insert(d.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Build reachability from every workspace DB under the base (bounded
+/// scan): digests referenced by durable truth are never GC candidates.
+pub fn workspace_reachability(base: &Path) -> Reachability {
+    let mut reach = Reachability::default();
+    let ws = base.join("workspaces");
+    if let Ok(rd) = std::fs::read_dir(&ws) {
+        for entry in rd.flatten().take(512) {
+            let db = entry.path().join("state.sqlite");
+            if db.is_file() {
+                for d in db_referenced_digests(&db) {
+                    reach.history_referenced.insert(d);
+                }
+            }
+        }
+    }
+    reach
+}
 pub fn gc_plan(candidates: &[GcCandidate]) -> ActionPlan {
     let items: Vec<PlannedItem> = candidates
         .iter()
@@ -425,5 +466,35 @@ mod tests {
             now_unix_secs(),
         );
         assert!(cands.is_empty());
+    }
+
+    #[test]
+    fn db_truth_reaches_gc() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("state.sqlite");
+        let db = omen_knowledge::Database::open(&db_path).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO artifacts (digest, size, media_type, producer, retention, blob_state, created_at, last_accessed_at) VALUES (?1, 7, 'text/plain', 'test', 'keep', 'stored', 't', 't')",
+                [HEX],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO facts (fact_id, resource_uri, value, validity, assurance, producer, created_at) VALUES ('f1', 'r', 'v', 'current', 'high', 'test', 't')",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO fact_artifacts (fact_id, artifact_uri) VALUES ('f1', 'artifact://deadbeef01')",
+                [],
+            )
+            .unwrap();
+        drop(db);
+        let got = db_referenced_digests(&db_path);
+        assert!(got.contains(HEX));
+        assert!(got.contains("deadbeef01"));
+        assert!(db_referenced_digests(&dir.path().join("missing.sqlite")).is_empty());
     }
 }
