@@ -181,11 +181,7 @@ fn control_sigint_control_fixture_receives_terminal_signal() {
     // Terminal-generated SIGINT via VINTR on the master (not kill(pid)).
     // Retry once: line-discipline delivery can race session setup on macOS.
     session.write_ctrl(0x03).expect("write VINTR");
-    if wait_exit_bounded(&mut session, Duration::from_millis(500))
-        .ok()
-        .flatten()
-        .is_none()
-    {
+    if wait_exit_bounded(&mut session, Duration::from_millis(500)).is_err() {
         let _ = session.write_ctrl(0x03);
     }
 
