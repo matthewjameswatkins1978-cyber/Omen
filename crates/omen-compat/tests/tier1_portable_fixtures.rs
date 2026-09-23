@@ -25,6 +25,26 @@ fn gremlin_exe() -> PathBuf {
     EXE.get_or_init(resolve_gremlin_exe).clone()
 }
 
+fn gremlin_supports_compat_modes(exe: &Path) -> bool {
+    std::process::Command::new(exe)
+        .arg("--help")
+        .output()
+        .map(|output| {
+            let text = String::from_utf8_lossy(&output.stdout);
+            text.contains("stdin-report") && text.contains("exit-code")
+        })
+        .unwrap_or(false)
+}
+
+fn build_gremlin() {
+    let build = std::process::Command::new("cargo")
+        .args(["build", "-p", "omen-test-fixtures", "--bin", "omen-gremlin"])
+        .current_dir(workspace_root())
+        .status()
+        .expect("on-demand gremlin build failed to start");
+    assert!(build.success(), "on-demand gremlin build failed");
+}
+
 fn resolve_gremlin_exe() -> PathBuf {
     let mut path = std::env::current_exe().expect("failed to get current_exe");
     path.pop();
@@ -37,30 +57,22 @@ fn resolve_gremlin_exe() -> PathBuf {
         GREMLIN_BIN
     };
     let exe = path.join(name);
-    if exe.exists() {
-        return exe;
-    }
-
     let fallback = workspace_root().join("target").join("debug").join(name);
-    if fallback.exists() {
-        return fallback;
+
+    for candidate in [&exe, &fallback] {
+        if candidate.exists() && gremlin_supports_compat_modes(candidate) {
+            return candidate.clone();
+        }
     }
 
-    let build = std::process::Command::new("cargo")
-        .args(["build", "-p", "omen-test-fixtures", "--bin", "omen-gremlin"])
-        .current_dir(workspace_root())
-        .status()
-        .expect("on-demand gremlin build failed to start");
-    assert!(build.success(), "on-demand gremlin build failed");
-
-    if exe.exists() {
-        return exe;
+    // cargo check/clippy do not refresh bin artifacts; produce a real binary.
+    build_gremlin();
+    for candidate in [&exe, &fallback] {
+        if candidate.exists() && gremlin_supports_compat_modes(candidate) {
+            return candidate.clone();
+        }
     }
-    assert!(
-        fallback.exists(),
-        "gremlin binary not found at {exe:?} or {fallback:?}"
-    );
-    fallback
+    panic!("omen-gremlin with Compat M0 modes not found at {exe:?} or {fallback:?}");
 }
 
 fn assert_pass(result: &omen_compat::InvariantResult, label: &str) {
@@ -92,8 +104,10 @@ fn base_spec(exe: &Path, args: &[&str], timeout: Duration) -> CommandSpec {
     for arg in args {
         spec = spec.arg(*arg);
     }
+    // Inherit parent env then override a dedicated probe variable so PATH and
+    // loader settings remain available while ENV_RECORDED stays secret-free.
     spec.cwd(workspace_root())
-        .env(EnvPolicy::AllowList(vec![(
+        .env(EnvPolicy::InheritWith(vec![(
             "OMEN_COMPAT_PROBE".into(),
             "m0-env".into(),
         )]))

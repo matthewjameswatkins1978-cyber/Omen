@@ -72,6 +72,11 @@ jobs:
       - name: Clippy Lints
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+      # cargo check/clippy do not refresh bin artifacts. Compat Tier 1 proofs
+      # need a real omen-gremlin with M0 modes before Verify Repository.
+      - name: Build Compat fixture binary
+        run: cargo build -p omen-test-fixtures --bin omen-gremlin
+
       - name: Verify JSON Schemas
         run: cargo run --package xtask -- verify-schemas
 
