@@ -33,6 +33,29 @@ struct GremlinArgs {
     #[arg(long)]
     report_stdin_topology: bool,
 
+    /// Read stdin to EOF and emit a single-line JSON report
+    /// (`{"fixture":"stdin-report",...}`) with byte count and EOF observation.
+    /// Skips consumption when stdin is a terminal so interactive runs never block.
+    #[arg(long)]
+    stdin_report: bool,
+
+    /// Interleave large flushed chunks on stdout and stderr to expose
+    /// sequential pipe-draining deadlocks.
+    #[arg(long)]
+    dual_stream: bool,
+
+    /// Emit more bytes than the Compat inline capture buffer (256 KiB pattern).
+    #[arg(long)]
+    large_output: bool,
+
+    /// Spawn one short-lived portable child and report identity as single-line JSON.
+    #[arg(long)]
+    spawn_child_portable: bool,
+
+    /// Emit a single-line JSON identity report and exit.
+    #[arg(long)]
+    compat_report: bool,
+
     #[arg(long)]
     hostile_terminal_escapes: bool,
 
@@ -51,7 +74,8 @@ struct GremlinArgs {
     #[arg(long)]
     write: Option<PathBuf>,
 
-    #[arg(long)]
+    /// Sleep before exit. Alias `--sleep-bounded` matches Compat M0 naming.
+    #[arg(long = "sleep-ms", alias = "sleep-bounded")]
     sleep_ms: Option<u64>,
 
     #[arg(long)]
@@ -60,7 +84,8 @@ struct GremlinArgs {
     #[arg(long)]
     lsp_mode: Option<String>,
 
-    #[arg(long, default_value_t = 0)]
+    /// Exit with this exact code. Alias `--exit-code` matches Compat M0 naming.
+    #[arg(long = "exit", alias = "exit-code", default_value_t = 0)]
     exit: i32,
 
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -114,6 +139,31 @@ fn main() {
 
     if args.report_stdin_topology {
         println!("STDIN_TOPOLOGY:{}", stdin_topology_json());
+        let _ = io::stdout().flush();
+    }
+
+    if args.stdin_report {
+        print_stdin_report();
+    }
+
+    if args.dual_stream {
+        dual_stream_burst();
+    }
+
+    if args.large_output {
+        large_output_burst();
+    }
+
+    if args.spawn_child_portable {
+        spawn_child_portable();
+    }
+
+    if args.compat_report {
+        println!(
+            "{{\"fixture\":\"compat-report\",\"pid\":{},\"exit\":{}}}",
+            std::process::id(),
+            args.exit
+        );
         let _ = io::stdout().flush();
     }
 
@@ -203,6 +253,99 @@ fn main() {
     }
 
     std::process::exit(args.exit);
+}
+
+/// Read stdin to EOF (unless a TTY) and print one JSON line of facts.
+fn print_stdin_report() {
+    let is_tty = io::stdin().is_terminal();
+    if is_tty {
+        println!(
+            "{{\"fixture\":\"stdin-report\",\"pid\":{},\"stdin_eof\":false,\"bytes_read\":0,\"note\":\"tty\"}}",
+            std::process::id()
+        );
+        let _ = io::stdout().flush();
+        return;
+    }
+    let mut buf = Vec::new();
+    let (bytes_read, eof) = match io::stdin().read_to_end(&mut buf) {
+        Ok(n) => (n, true),
+        Err(_) => (0, false),
+    };
+    println!(
+        "{{\"fixture\":\"stdin-report\",\"pid\":{},\"stdin_eof\":{eof},\"bytes_read\":{bytes_read}}}",
+        std::process::id()
+    );
+    let _ = io::stdout().flush();
+}
+
+/// Interleave flushed chunks on both streams so naive sequential draining
+/// deadlocks once pipe buffers fill.
+fn dual_stream_burst() {
+    // 24 * 16 KiB = 384 KiB per stream; well above typical 64 KiB pipe buffers.
+    let chunk = vec![b'X'; 16 * 1024];
+    let err_chunk = vec![b'Y'; 16 * 1024];
+    let mut out = io::stdout();
+    let mut err = io::stderr();
+    for i in 0..24 {
+        let _ = out.write_all(&chunk);
+        let _ = out.flush();
+        let _ = err.write_all(&err_chunk);
+        let _ = err.flush();
+        if i % 4 == 3 {
+            let _ = out.write_all(b"DUAL_TICK\n");
+            let _ = out.flush();
+            let _ = err.write_all(b"DUAL_TICK\n");
+            let _ = err.flush();
+        }
+    }
+}
+
+/// Emit 256 KiB so Compat's inline buffer must truncate explicitly.
+fn large_output_burst() {
+    let total = 256 * 1024usize;
+    let pattern = b"OMEN_COMPAT_LARGE_OUTPUT_PATTERN\n";
+    let mut out = io::stdout();
+    let mut written = 0usize;
+    while written < total {
+        let take = pattern.len().min(total - written);
+        let _ = out.write_all(&pattern[..take]);
+        written += take;
+    }
+    let _ = out.flush();
+}
+
+/// Spawn one short-lived child and report identity; wait so no zombie remains.
+fn spawn_child_portable() {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(err) => {
+            println!(
+                "{{\"fixture\":\"spawn-child-portable\",\"pid\":{},\"error\":\"{err}\"}}",
+                std::process::id()
+            );
+            let _ = io::stdout().flush();
+            return;
+        }
+    };
+    match Command::new(exe).arg("--sleep-ms").arg("250").spawn() {
+        Ok(mut child) => {
+            let child_id = child.id();
+            println!(
+                "{{\"fixture\":\"spawn-child-portable\",\"pid\":{},\"child_pid\":{child_id}}}",
+                std::process::id()
+            );
+            let _ = io::stdout().flush();
+            // Bounded wait: child sleeps only 250ms.
+            let _ = child.wait();
+        }
+        Err(err) => {
+            println!(
+                "{{\"fixture\":\"spawn-child-portable\",\"pid\":{},\"error\":\"{err}\"}}",
+                std::process::id()
+            );
+            let _ = io::stdout().flush();
+        }
+    }
 }
 
 /// Classify what the child observes on stdin without blocking.
