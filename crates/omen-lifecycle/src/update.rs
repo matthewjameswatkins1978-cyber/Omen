@@ -426,7 +426,13 @@ impl HealthChecker for BinaryHealthCheck {
             ));
         }
         let text = String::from_utf8_lossy(&out.stdout).to_string();
-        let version = text.split_whitespace().next().map(str::to_string);
+        // clap prints `<bin> <version> contract:<c> commit:<sha> ...`: the
+        // version is the first whitespace token shaped like a version
+        // (leading digit), not the first token (the binary name).
+        let version = text
+            .split_whitespace()
+            .find(|w| w.chars().next().is_some_and(|c| c.is_ascii_digit()))
+            .map(str::to_string);
         let contract = text
             .split_whitespace()
             .find(|w| w.starts_with("contract:"))
@@ -610,6 +616,41 @@ pub fn run_update(
         );
     };
     let staged_binary = extracted_dir.join(exe_name());
+    // Manifest binding: the extracted manifest must name this candidate
+    // (version + SHA), so a swapped/mislabeled package cannot stage.
+    // Daemon binary follows with its own digest when the manifest carries one.
+    let staged_manifest = extracted_dir.join("manifest.json");
+    let mut staged_daemon: Option<PathBuf> = None;
+    if staged_manifest.is_file() {
+        let mbytes =
+            std::fs::read(&staged_manifest).map_err(|e| LifecycleError::Io(e.to_string()))?;
+        let m: serde_json::Value =
+            serde_json::from_slice(&mbytes).map_err(|e| LifecycleError::Manifest(e.to_string()))?;
+        let mg = m.get("git_sha").and_then(|v| v.as_str()).unwrap_or("");
+        let mv = m
+            .get("preview_version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if mg != candidate.git_sha || mv != candidate.version {
+            return fail_tx(
+                base,
+                &mut tx,
+                "verify",
+                "staged manifest does not name this candidate",
+            );
+        }
+        let daemon_file = if cfg!(windows) { "omend.exe" } else { "omend" };
+        let dq = extracted_dir.join(daemon_file);
+        if dq.is_file() {
+            if let Some(want) = m.get("daemon_binary_sha256").and_then(|v| v.as_str()) {
+                let have = sha256_file(&dq)?;
+                if have != want {
+                    return fail_tx(base, &mut tx, "verify", "daemon checksum mismatch");
+                }
+            }
+            staged_daemon = Some(dq);
+        }
+    }
     if !staged_binary.is_file() {
         return fail_tx(
             base,
@@ -683,6 +724,12 @@ pub fn run_update(
     tx.candidate_slot = Some(slot_name.clone());
     tx.stage = TxStage::Staged;
     save_tx(base, &tx)?;
+    // Sibling daemon follows the slot when the package carried a verified one.
+    if let Some(dq) = staged_daemon.as_ref() {
+        let daemon_file = if cfg!(windows) { "omend.exe" } else { "omend" };
+        std::fs::copy(dq, slot.join(daemon_file))
+            .map_err(|e| LifecycleError::Stage(e.to_string()))?;
+    }
 
     // Migrate (checkpointed; non-destructive v1 ensure).
     if hooks.fail_migrate {
@@ -730,8 +777,17 @@ pub fn run_update(
     save_tx(base, &tx)?;
 
     // Activate: smallest atomic pointer swap. Previous slot preserved.
+    // BEFORE the pointer moves, the stable `bin/` copies refresh from the
+    // verified slot (rename-swap; the running image may hold a `.bak`
+    // until exit — classified CleanSafe). If the refresh fails, the
+    // previous pointer AND previous stable copies are both intact: fail
+    // closed with no half-active product.
     if hooks.fail_activate {
         return fail_tx(base, &mut tx, "activate", "injected activation failure");
+    }
+    if let Err(e) = refresh_stable_copies(base, &slot) {
+        let msg = e.to_string();
+        return fail_tx(base, &mut tx, "activate", &msg);
     }
     record.previous_slot.clone_from(&record.active_slot);
     record.active_slot = Some(slot_name.clone());
@@ -772,6 +828,46 @@ fn fail_tx(
         "activate" => LifecycleError::Activate(detail.to_string()),
         _ => LifecycleError::Io(detail.to_string()),
     })
+}
+
+/// Refresh the stable `bin/` copies from a verified slot (rename-swap).
+/// Windows locks a running image: the previous copy moves to `.bak` first
+/// so the swap never mutates a live binary in place; a `.bak` that cannot
+/// be deleted (still-executing image) lingers and is CleanSafe debris for
+/// the next clean. Verifies bytes after placement.
+fn refresh_stable_copies(base: &Path, slot: &Path) -> Result<(), LifecycleError> {
+    let bin = base.join("bin");
+    std::fs::create_dir_all(&bin).map_err(|e| LifecycleError::Io(e.to_string()))?;
+    let names: &[&str] = if cfg!(windows) {
+        &["omen.exe", "omend.exe"]
+    } else {
+        &["omen", "omend"]
+    };
+    for name in names {
+        let src = slot.join(name);
+        if !src.is_file() {
+            continue;
+        }
+        let dest = bin.join(name);
+        if dest.exists() {
+            let bak = bin.join(format!("{name}.bak"));
+            std::fs::remove_file(&bak).ok();
+            std::fs::rename(&dest, &bak).map_err(|e| {
+                LifecycleError::Activate(format!("stable {name} swap failed (is it running?): {e}"))
+            })?;
+        }
+        std::fs::copy(&src, &dest).map_err(|e| LifecycleError::Activate(e.to_string()))?;
+        let want = sha256_file(&src)?;
+        let have = sha256_file(&dest)?;
+        if want != have {
+            return Err(LifecycleError::Activate(format!(
+                "stable {name} bytes differ after refresh"
+            )));
+        }
+        // Best-effort .bak cleanup; a locked image keeps its .bak until exit.
+        std::fs::remove_file(bin.join(format!("{name}.bak"))).ok();
+    }
+    Ok(())
 }
 
 fn quarantine_candidate(base: &Path, tx: &UpdateTransaction) -> Result<(), LifecycleError> {

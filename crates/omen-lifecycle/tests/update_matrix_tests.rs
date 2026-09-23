@@ -75,7 +75,13 @@ fn make_release(dir: &Path, version: &str, git_sha: &str, tamper: bool) -> Relea
         use std::io::Write;
         w.write_all(&binary_bytes).unwrap();
         w.start_file("manifest.json", opts).unwrap();
-        w.write_all(br#"{"package":"test"}"#).unwrap();
+        let manifest = serde_json::json!({
+            "preview_version": version,
+            "git_sha": git_sha,
+            "binary_sha256": binary_sha,
+        });
+        w.write_all(serde_json::to_vec(&manifest).unwrap().as_slice())
+            .unwrap();
         w.finish().unwrap();
     }
     let mut pkg_bytes = std::fs::read(&pkg_path).unwrap();
@@ -221,6 +227,75 @@ fn checksum_mismatch_fails_closed() {
     );
     // Quarantined, no half-active candidate.
     assert!(fx.base.join("update").join("quarantine").is_dir());
+}
+
+#[test]
+fn swapped_manifest_fails_closed() {
+    // Package bytes intact but the inner manifest names a different build:
+    // staging must refuse the mislabeled package.
+    let fx = setup();
+    let meta = make_release(
+        &fx.source,
+        "0.9.0-preview.16",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        false,
+    );
+    let pkg = fx.source.join(&meta.package);
+    {
+        let mut zip = zip::ZipArchive::new(std::fs::File::open(&pkg).unwrap()).unwrap();
+        let mut names: Vec<String> = (0..zip.len())
+            .map(|i| zip.by_index(i).unwrap().name().to_string())
+            .collect();
+        names.retain(|n| n != "manifest.json");
+        let mut out = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(std::io::Cursor::new(&mut out));
+            for n in &names {
+                let mut f = zip.by_name(n).unwrap();
+                let mut data = Vec::new();
+                use std::io::Read;
+                f.read_to_end(&mut data).unwrap();
+                w.start_file(n, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                use std::io::Write;
+                w.write_all(&data).unwrap();
+            }
+            w.start_file("manifest.json", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            let evil = serde_json::json!({"preview_version": "0.9.0-preview.16", "git_sha": "cccccccccccccccccccccccccccccccccccccccc"});
+            use std::io::Write;
+            w.write_all(serde_json::to_vec(&evil).unwrap().as_slice())
+                .unwrap();
+            w.finish().unwrap();
+        }
+        std::fs::write(&pkg, &out).unwrap();
+    }
+    // Recompute the package digest so the checksum passes and the binding is tested.
+    let mut meta2 = meta.clone();
+    meta2.package_sha256 = sha_hex(&std::fs::read(&pkg).unwrap());
+    let index = serde_json::json!({"releases": [meta2.clone()]});
+    std::fs::write(
+        fx.source.join("releases.json"),
+        serde_json::to_vec_pretty(&index).unwrap(),
+    )
+    .unwrap();
+    let mut record = load_record(&fx);
+    let health = StubHealth {
+        ok: true,
+        version: meta2.version.clone(),
+        sha: meta2.git_sha.clone(),
+    };
+    let err = update::run_update(
+        &fx.base,
+        &mut record,
+        meta2,
+        &ReleaseSource::Directory(fx.source.clone()),
+        &good_hooks(),
+        &health,
+    )
+    .unwrap_err();
+    assert_eq!(err.phase(), "verify");
+    assert_eq!(load_record(&fx).version, "0.9.0-preview.15");
 }
 
 #[test]

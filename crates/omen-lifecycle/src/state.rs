@@ -155,7 +155,18 @@ pub fn classify(relative: &Path, is_dir: bool, size_bytes: Option<u64>) -> State
         return item;
     }
     // Active-slot pointer and managed binaries/slots: required app bytes.
+    // Stale `.bak` copies left by the rename-swap activator are debris.
     if rel == "bin/active.json" || rel.starts_with("versions/") || first == "bin" {
+        if file_name.ends_with(".bak") {
+            return StateItem {
+                identity: rel,
+                role: StateRole::Cache,
+                size_bytes,
+                protection: Protection::Unprotected,
+                retention: RetentionReason::None,
+                disposal: Disposal::CleanSafe,
+            };
+        }
         let mut item = StateItem::keep(rel, StateRole::Runtime, RetentionReason::Required);
         item.size_bytes = size_bytes;
         return item;

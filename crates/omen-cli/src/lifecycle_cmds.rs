@@ -353,12 +353,14 @@ pub fn cmd_update_check(json_mode: bool) -> Result<(), Box<dyn std::error::Error
 
 pub fn cmd_update_apply(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
     let b = base();
-    let mut record = omen_lifecycle::install::load_install_record(&b)?.ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "no install record: unmanaged install; update refused",
-        )
-    })?;
+    let mut record = match omen_lifecycle::install::load_install_record(&b)? {
+        Some(r) => r,
+        // Adoption (H item 83): a pre-H conveyor install (state/installed.json
+        // with a healthy slot) is Omen provenance. Adopt it into a runtime
+        // record instead of stranding a valid install. Package-manager and
+        // unknown layouts have no such file and stay refused.
+        None => adopt_conveyor_state(&b)?,
+    };
     if !record.owner.self_update_allowed() {
         let msg = if record.owner == omen_lifecycle::install::Ownership::PackageManager {
             omen_lifecycle::install::manager_guidance(record.owner_name.as_deref())
@@ -460,6 +462,91 @@ pub fn cmd_channel(set: Option<String>, json_mode: bool) -> Result<(), Box<dyn s
         println!("[info] channel: {ch:?}");
     }
     Ok(())
+}
+
+/// Adopt a pre-H conveyor install into a runtime record. Fails when there
+/// is no conveyor state or the recorded slot is unhealthy — adoption never
+/// guesses.
+fn adopt_conveyor_state(
+    b: &Path,
+) -> Result<omen_lifecycle::install::InstallRecord, Box<dyn std::error::Error>> {
+    let state_path = b.join("state").join("installed.json");
+    let bytes = std::fs::read(&state_path).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no install record and no conveyor state: unmanaged install; update refused",
+        )
+    })?;
+    let state: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("conveyor state unreadable: {e}"),
+        )
+    })?;
+    let slot = state
+        .get("active_slot")
+        .and_then(|s| s.as_str())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "conveyor state has no active slot; refusing to guess",
+            )
+        })?;
+    if slot.contains('/') || slot.contains('\\') || slot.contains("..") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "conveyor slot escapes; refused",
+        )
+        .into());
+    }
+    let exe = if cfg!(windows) { "omen.exe" } else { "omen" };
+    if !b.join("versions").join(slot).join(exe).is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "conveyor active slot binary missing; refusing to adopt a broken install",
+        )
+        .into());
+    }
+    let active = state
+        .get("active")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let get = |k: &str| {
+        active
+            .get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let mut record = omen_lifecycle::install::InstallRecord::new(
+        omen_lifecycle::install::Ownership::Omen,
+        omen_lifecycle::install::user_channel(b),
+        &get("preview_version"),
+        &get("git_sha"),
+    );
+    if record.version.is_empty() || record.git_sha.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "conveyor manifest lacks version identity; refusing to adopt",
+        )
+        .into());
+    }
+    record.active_slot = Some(slot.to_string());
+    record.previous_slot = state
+        .get("previous_slot")
+        .and_then(|s| s.as_str())
+        .map(str::to_string);
+    let pkg = get("package_sha256");
+    let bin = get("binary_sha256");
+    record.package_sha256 = if pkg.is_empty() { None } else { Some(pkg) };
+    record.binary_sha256 = if bin.is_empty() { None } else { Some(bin) };
+    omen_lifecycle::install::save_install_record(b, &record)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    if omen_lifecycle::update::read_active_pointer(b).is_none() {
+        omen_lifecycle::update::write_active_pointer(b, slot)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    }
+    Ok(record)
 }
 
 // ------------------------------------------------------------- rollback ---

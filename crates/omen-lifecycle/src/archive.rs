@@ -15,6 +15,11 @@ use std::path::{Path, PathBuf};
 pub const ALLOWED_PACKAGE_FILES: &[&str] =
     &["omen", "omen.exe", "omend", "omend.exe", "manifest.json"];
 
+/// The conveyor ships a small acceptance fixture alongside the binaries.
+/// `fixture/` entries are data, never executables, and stay allowlisted as
+/// a subtree; binaries and the manifest must sit at top level.
+pub const ALLOWED_FIXTURE_PREFIX: &str = "fixture/";
+
 /// Validate one zip entry name. Returns the safe relative path or a
 /// refusal naming the exact problem.
 pub fn validate_entry_name(name: &str) -> Result<PathBuf, LifecycleError> {
@@ -68,7 +73,18 @@ pub fn validate_entry_list(names: &[&str]) -> Result<(), LifecycleError> {
         let rel = validate_entry_name(name)?;
         let flat = rel.to_string_lossy().replace('\\', "/");
         let file = flat.rsplit('/').next().unwrap_or("");
-        if !ALLOWED_PACKAGE_FILES.contains(&file) {
+        let is_fixture_data = flat.starts_with(ALLOWED_FIXTURE_PREFIX);
+        let is_top_level_binary = !flat.contains('/') && ALLOWED_PACKAGE_FILES.contains(&file);
+        // Executables anywhere below top level are never legitimate
+        // placement — including inside the fixture data subtree.
+        if flat.contains('/')
+            && (file == "omen" || file == "omen.exe" || file == "omend" || file == "omend.exe")
+        {
+            return Err(LifecycleError::Stage(format!(
+                "archive rejects nested executable: {name}"
+            )));
+        }
+        if !(is_top_level_binary || is_fixture_data) {
             return Err(LifecycleError::Stage(format!(
                 "archive rejects unexpected file placement: {name}"
             )));
@@ -179,6 +195,25 @@ mod tests {
         assert!(validate_entry_list(&["omen.exe"]).is_err());
         assert!(validate_entry_list(&["manifest.json"]).is_err());
         assert!(validate_entry_list(&["omen.exe", "manifest.json"]).is_ok());
+    }
+
+    #[test]
+    fn conveyor_layout_accepted_nested_exe_rejected() {
+        // The real Preview package shape: top-level binaries + manifest +
+        // acceptance fixture data.
+        assert!(
+            validate_entry_list(&[
+                "omen.exe",
+                "omend.exe",
+                "manifest.json",
+                "fixture/Cargo.toml",
+                "fixture/Cargo.lock",
+                "fixture/src/lib.rs",
+            ])
+            .is_ok()
+        );
+        assert!(validate_entry_list(&["omen.exe", "manifest.json", "fixture/omen.exe"]).is_err());
+        assert!(validate_entry_list(&["omen.exe", "manifest.json", "sub/manifest.json"]).is_err());
     }
 
     #[test]
