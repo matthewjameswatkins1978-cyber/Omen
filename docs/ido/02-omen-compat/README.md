@@ -1,7 +1,7 @@
 # IDO No. 2 — Omen Compat
 
-Status: **M0 portable measurement machinery in progress (M0-A/B/C tranche);
-not M0-complete; V1 foundation incomplete**.
+Status: **M0 portable foundation accepted (M0-A/B/C); POSIX truth tranche
+(M0-D/G) in progress; not M0-complete; V1 foundation incomplete**.
 
 Omen Compat is Omen's bounded compatibility laboratory. It is kept in the
 Omen repository so each Omen revision carries the compatible corpus and
@@ -11,12 +11,12 @@ subsystem with a one-way observation boundary.
 ## Canonical filing
 
 ```text
-crates/omen-compat/             portable harness (M0 core/runner/invariants)
+crates/omen-compat/             portable harness + POSIX PTY truth layer
 compat/scenarios/               declarative cases
 compat/golden/                  approved real-tool targets
-compat/invariants/              behavioural truth definitions (see portable.md)
+compat/invariants/              portable.md + posix.md behavioural truths
 compat/fixtures/                small probe programs and inputs
-docs/ido/02-omen-compat/       design, history, decisions, roadmap
+docs/ido/02-omen-compat/       design, history, decisions, roadmap, defects
 CI artifacts                    large traces and generated diagnostics
 ```
 
@@ -36,9 +36,9 @@ or Omen's existing authorities.
 4. Keep committed cases minimal and deterministic. Large traces, recordings,
    matrices, and dumps are CI artifacts.
 5. Application-facing harness expansion beyond the authorized M0 portable
-   tranche still requires an explicit IDO decision and matching evidence plan.
-   PTY/ConPTY, signal/job-control probes, golden apps, and automatic repair
-   remain out of scope until separately approved.
+   and POSIX truth tranches still requires an explicit IDO decision and
+   matching evidence plan. Golden apps and automatic repair remain out of
+   scope until separately approved.
 
 ## V1 and deferred scope
 

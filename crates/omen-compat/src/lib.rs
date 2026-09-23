@@ -31,10 +31,14 @@ pub mod core;
 pub mod failure;
 pub mod invariant;
 pub mod observation;
+#[cfg(unix)]
+pub mod posix;
 pub mod runner;
 
 pub use core::*;
 pub use failure::*;
 pub use invariant::*;
 pub use observation::*;
+#[cfg(unix)]
+pub use posix::*;
 pub use runner::*;

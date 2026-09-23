@@ -12,6 +12,9 @@ serialized identity must match these IDs or clearly preserve their meaning.
 | `ZERO_UNSCRIPTED_INPUT_WRITES` | `StdinSpec::Closed` writes no hidden input; fixture sees EOF and 0 bytes. | Fixture `stdin-report` JSON: `stdin_eof=true`, `bytes_read=0`. |
 | `ENV_RECORDED` | Dedicated fixture-observed probe matched; no secret dump in durable evidence. | In-memory compare of probe value; durable `EnvApplied { key }` only. |
 
+POSIX job-control / TTY invariants (M0-D/G) live in
+[`posix.md`](posix.md). Portable IDs above remain M0-A/B/C evidence.
+
 Stream truth distinguishes `truncated`, `eof_observed`, and `drain_timed_out`.
 Root-process cleanup is never labelled as descendant containment.
 

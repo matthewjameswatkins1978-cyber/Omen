@@ -97,3 +97,28 @@ authority. Serialization records a claim. Deserialization does not prove it.
 (and Partial, if ever used) may still round-trip generically. A future
 trusted Exact restore path would need explicit revalidation against
 execution evidence — out of M0 scope.
+
+## D2-014 — POSIX truth is measurement, not repair
+
+M0-D/G adds a bounded PTY harness, POSIX fixture modes, typed POSIX
+observations, and job-control invariants. Production Omen is never modified
+in this branch. A failing Omen invariant with reproducible evidence is
+successful Compat work: record FAIL / OPEN_DEFECT in the defect ledger,
+keep the harness green, and leave `repair = NOT ATTEMPTED`.
+
+## D2-015 — Controlling terminal is established, then observed
+
+Opening a PTY slave is not proof of controlling-terminal ownership. The
+harness establishes session (`setsid`), controlling terminal
+(`TIOCSCTTY`), and foreground pgrp (`tcsetpgrp`) in the child before exec,
+then independently observes via `tcgetpgrp` / `tcgetsid` / Linux `/proc`.
+Calibration against a known fixture must pass before judging Omen.
+
+## D2-016 — POSIX waits and PTY reads are bounded hostile I/O
+
+Every PTY poll/read uses an explicit slice and scenario deadline. Every
+process wait, stop/continue observation, SIGWINCH wait, and cleanup is
+bounded. Sleeps are not sequencing primitives; readiness uses fixture
+barriers (`OMEN_COMPAT_READY`, `OMEN_COMPAT_STOPPING`, …) and OS wait
+state. A PTY remaining open after process transitions is treated as hostile
+I/O, never an unbounded read.

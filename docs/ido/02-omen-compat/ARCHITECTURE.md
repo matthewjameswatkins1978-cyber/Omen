@@ -77,6 +77,30 @@ prove it). Redacted records still round-trip.
 
 Fixture JSON reports remain limited to controlled Compat fixtures.
 
+### POSIX PTY / job-control layer (M0-D/G)
+
+`crates/omen-compat/src/posix/` is `cfg(unix)`-gated measurement code:
+
+- **Harness:** real PTY pair (`openpt`/`grantpt`/`unlockpt`/`ptsname`),
+  child establishes `setsid` + `TIOCSCTTY` + `tcsetpgrp` before exec;
+  observation slave opened `O_NOCTTY`. Bounded non-blocking master reads
+  (`poll` + transcript cap). Cleanup is non-waiting kill + bounded reap.
+- **Observations:** `PosixProcessIdentity`, `PosixTerminalState`,
+  `PosixWaitState`, signal-mask fixture reports — facts only.
+- **Judges:** thirteen invariants in `compat/invariants/posix.md`.
+- **Linux `/proc`:** explicit Linux evidence (`linux_proc`); never claimed
+  on non-Linux platforms (UNAVAILABLE instead).
+- **Tiers:** POSIX CONTROL calibrates the instrument without Omen; POSIX
+  OMEN runs the real shell. Control failures stop product judgment.
+
+Two topologies stay distinct: (A) interactive shell foreground job under
+the outer PTY; (B) daemon-created private PTY session. M0-D/G certifies A.
+
+Windows: workspace still builds; POSIX scenarios are `cfg(unix)` or
+explicitly UNSUPPORTED — never fake POSIX semantics.
+
+Production Omen is not repaired in this layer (D2-014).
+
 ## Evidence layers
 
 - Invariants state what must be true.

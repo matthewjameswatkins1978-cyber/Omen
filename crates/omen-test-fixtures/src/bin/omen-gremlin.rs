@@ -80,6 +80,26 @@ struct GremlinArgs {
     #[arg(long)]
     pty_echo: bool,
 
+    /// POSIX: report machine-readable process/TTY identity as one JSON line.
+    #[arg(long)]
+    posix_report: bool,
+
+    /// POSIX: report READY, stop self with SIGSTOP, report CONTINUED, exit.
+    #[arg(long)]
+    posix_stop_report: bool,
+
+    /// POSIX: report READY, wait for SIGINT, report delivery, exit boundedly.
+    #[arg(long)]
+    posix_sigint_report: bool,
+
+    /// POSIX: report READY + winsize, wait for SIGWINCH, report new size, exit.
+    #[arg(long)]
+    posix_winch_report: bool,
+
+    /// POSIX: dirty selected termios flags then exit with `--exit` (abnormal).
+    #[arg(long)]
+    posix_termios_dirty_exit: bool,
+
     #[arg(long)]
     write: Option<PathBuf>,
 
@@ -267,6 +287,45 @@ fn main() {
         }
     }
 
+    #[cfg(unix)]
+    {
+        if args.posix_report {
+            run_posix_report();
+            std::process::exit(args.exit);
+        }
+        if args.posix_stop_report {
+            run_posix_stop_report();
+            std::process::exit(args.exit);
+        }
+        if args.posix_sigint_report {
+            run_posix_sigint_report();
+            std::process::exit(args.exit);
+        }
+        if args.posix_winch_report {
+            run_posix_winch_report(args.exit);
+        }
+        if args.posix_termios_dirty_exit {
+            run_posix_termios_dirty_exit();
+            std::process::exit(args.exit);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let requested_posix = args.posix_report
+            || args.posix_stop_report
+            || args.posix_sigint_report
+            || args.posix_winch_report
+            || args.posix_termios_dirty_exit;
+        if requested_posix {
+            println!(
+                "{{\"fixture\":\"posix-unsupported\",\"pid\":{},\"platform\":\"windows\"}}",
+                std::process::id()
+            );
+            let _ = io::stdout().flush();
+            std::process::exit(64);
+        }
+    }
+
     if let Some(ms) = args.sleep_ms {
         thread::sleep(Duration::from_millis(ms));
     }
@@ -410,6 +469,264 @@ fn spawn_child_portable() {
             let _ = io::stdout().flush();
         }
     }
+}
+
+#[cfg(unix)]
+fn posix_identity_json() -> String {
+    use rustix::process::{getpgid, getpid, getppid, getsid};
+    use std::io::IsTerminal;
+    use std::os::fd::BorrowedFd;
+
+    fn stdin_fd() -> BorrowedFd<'static> {
+        // SAFETY: fd 0 remains open for the process lifetime in fixture modes.
+        unsafe { BorrowedFd::borrow_raw(0) }
+    }
+    fn stdout_fd() -> BorrowedFd<'static> {
+        unsafe { BorrowedFd::borrow_raw(1) }
+    }
+
+    let pid = getpid();
+    let ppid = getppid();
+    let pgrp = getpgid(None).ok();
+    let sid = getsid(None).ok();
+    let stdin_tty = io::stdin().is_terminal();
+    let stdout_tty = io::stdout().is_terminal();
+    let stderr_tty = io::stderr().is_terminal();
+
+    let fg = rustix::termios::tcgetpgrp(stdin_fd())
+        .ok()
+        .map(|p| p.as_raw_nonzero().get())
+        .or_else(|| {
+            rustix::termios::tcgetpgrp(stdout_fd())
+                .ok()
+                .map(|p| p.as_raw_nonzero().get())
+        });
+
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((0, 0));
+    let mut icanon = None;
+    let mut echo = None;
+    let mut isig = None;
+    if let Ok(t) = rustix::termios::tcgetattr(stdin_fd()) {
+        icanon = Some(t.local_modes.contains(rustix::termios::LocalModes::ICANON));
+        echo = Some(t.local_modes.contains(rustix::termios::LocalModes::ECHO));
+        isig = Some(t.local_modes.contains(rustix::termios::LocalModes::ISIG));
+    }
+
+    let (blocked, ignored, caught) = posix_signal_masks();
+
+    format!(
+        "{{\"fixture\":\"posix-report\",\"pid\":{},\"ppid\":{},\"pgrp\":{},\"sid\":{},\"stdin_isatty\":{stdin_tty},\"stdout_isatty\":{stdout_tty},\"stderr_isatty\":{stderr_tty},\"terminal_foreground_pgrp\":{},\"winsize_rows\":{rows},\"winsize_cols\":{cols},\"icanon\":{},\"echo\":{},\"isig\":{},\"blocked\":{},\"ignored\":{},\"caught\":{}}}",
+        pid,
+        ppid.map(|p| p.as_raw_nonzero().get()).unwrap_or(-1),
+        pgrp.map(|p| p.as_raw_nonzero().get()).unwrap_or(-1),
+        sid.map(|p| p.as_raw_nonzero().get()).unwrap_or(-1),
+        fg.map(|f| f).unwrap_or(-1),
+        opt_bool(icanon),
+        opt_bool(echo),
+        opt_bool(isig),
+        json_str_array(&blocked),
+        json_str_array(&ignored),
+        json_str_array(&caught),
+    )
+}
+
+#[cfg(unix)]
+fn opt_bool(v: Option<bool>) -> String {
+    v.map(|b| b.to_string()).unwrap_or_else(|| "null".into())
+}
+
+#[cfg(unix)]
+fn json_str_array(items: &[String]) -> String {
+    let parts: Vec<String> = items
+        .iter()
+        .map(|s| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect();
+    format!("[{}]", parts.join(","))
+}
+
+/// Report blocked/ignored/caught signal names via `/proc/self/status` on Linux.
+/// Empty vectors on platforms without that file (UNAVAILABLE, not guessed).
+#[cfg(unix)]
+fn posix_signal_masks() -> (Vec<String>, Vec<String>, Vec<String>) {
+    let mut blocked = Vec::new();
+    let mut ignored = Vec::new();
+    let mut caught = Vec::new();
+    if let Ok(text) = std::fs::read_to_string("/proc/self/status") {
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("SigBlk:") {
+                blocked = decode_sigmask_hex(rest.trim());
+            } else if let Some(rest) = line.strip_prefix("SigIgn:") {
+                ignored = decode_sigmask_hex(rest.trim());
+            } else if let Some(rest) = line.strip_prefix("SigCgt:") {
+                caught = decode_sigmask_hex(rest.trim());
+            }
+        }
+    }
+    (blocked, ignored, caught)
+}
+
+#[cfg(unix)]
+fn decode_sigmask_hex(hex: &str) -> Vec<String> {
+    let Ok(bits) = u64::from_str_radix(hex, 16) else {
+        return Vec::new();
+    };
+    const NAMES: &[(i32, &str)] = &[
+        (1, "SIGHUP"),
+        (2, "SIGINT"),
+        (3, "SIGQUIT"),
+        (4, "SIGILL"),
+        (5, "SIGTRAP"),
+        (6, "SIGABRT"),
+        (7, "SIGBUS"),
+        (8, "SIGFPE"),
+        (9, "SIGKILL"),
+        (10, "SIGUSR1"),
+        (11, "SIGSEGV"),
+        (12, "SIGUSR2"),
+        (13, "SIGPIPE"),
+        (14, "SIGALRM"),
+        (15, "SIGTERM"),
+        (17, "SIGCHLD"),
+        (18, "SIGCONT"),
+        (19, "SIGSTOP"),
+        (20, "SIGTSTP"),
+        (21, "SIGTTIN"),
+        (22, "SIGTTOU"),
+        (23, "SIGURG"),
+        (24, "SIGXCPU"),
+        (25, "SIGXFSZ"),
+        (26, "SIGVTALRM"),
+        (27, "SIGPROF"),
+        (28, "SIGWINCH"),
+        (29, "SIGIO"),
+        (30, "SIGPWR"),
+        (31, "SIGSYS"),
+    ];
+    NAMES
+        .iter()
+        .filter(|(n, _)| {
+            if *n >= 32 {
+                return false;
+            }
+            bits & (1u64 << (n - 1)) != 0
+        })
+        .map(|(_, name)| name.to_string())
+        .collect()
+}
+
+#[cfg(unix)]
+fn run_posix_report() {
+    let json = posix_identity_json();
+    println!("OMEN_COMPAT_READY");
+    println!("{json}");
+    let _ = io::stdout().flush();
+}
+
+#[cfg(unix)]
+fn run_posix_stop_report() {
+    use rustix::process::{Signal, getpid, kill_process};
+
+    println!("OMEN_COMPAT_READY");
+    println!("{}", posix_identity_json());
+    let _ = io::stdout().flush();
+    println!("OMEN_COMPAT_STOPPING");
+    let _ = io::stdout().flush();
+    // Real stop: SIGSTOP is not catchable; execution resumes on SIGCONT.
+    let _ = kill_process(getpid(), Signal::STOP);
+    println!("OMEN_COMPAT_CONTINUED");
+    let _ = io::stdout().flush();
+}
+
+#[cfg(unix)]
+fn run_posix_sigint_report() {
+    println!("OMEN_COMPAT_READY");
+    println!("{}", posix_identity_json());
+    let _ = io::stdout().flush();
+    // Default SIGINT disposition terminates with signal 2 (signal-faithful).
+    // Sleep only as a wait for an external signal under test; outer harness
+    // bounds the scenario deadline.
+    loop {
+        std::thread::sleep(Duration::from_secs(3600));
+    }
+}
+
+#[cfg(unix)]
+fn run_posix_winch_report(exit_code: i32) {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((0, 0));
+    println!("OMEN_COMPAT_READY");
+    println!(
+        "{{\"fixture\":\"posix-winch-report\",\"pid\":{},\"winsize_rows\":{rows},\"winsize_cols\":{cols}}}",
+        std::process::id()
+    );
+    let _ = io::stdout().flush();
+    println!("OMEN_COMPAT_SIGWINCH_WAIT");
+    let _ = io::stdout().flush();
+
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(err) => {
+            eprintln!("winch runtime: {err}");
+            std::process::exit(exit_code);
+        }
+    };
+    rt.block_on(async {
+        let mut winch = match signal(SignalKind::window_change()) {
+            Ok(s) => s,
+            Err(err) => {
+                eprintln!("winch signal: {err}");
+                return;
+            }
+        };
+        // Bounded by outer harness; also hard-bound here at 10s.
+        match tokio::time::timeout(Duration::from_secs(10), winch.recv()).await {
+            Ok(Some(())) => {
+                let (c, r) = crossterm::terminal::size().unwrap_or((0, 0));
+                println!("OMEN_COMPAT_SIGWINCH");
+                println!(
+                    "{{\"fixture\":\"posix-winch-report\",\"signal\":\"SIGWINCH\",\"winsize_rows\":{r},\"winsize_cols\":{c}}}"
+                );
+                let _ = io::stdout().flush();
+            }
+            _ => {
+                println!("OMEN_COMPAT_SIGWINCH_TIMEOUT");
+                let _ = io::stdout().flush();
+            }
+        }
+    });
+    std::process::exit(exit_code);
+}
+
+#[cfg(unix)]
+fn run_posix_termios_dirty_exit() {
+    use rustix::termios::{LocalModes, OptionalActions, tcgetattr, tcsetattr};
+    use std::os::fd::BorrowedFd;
+
+    fn stdin_fd() -> BorrowedFd<'static> {
+        unsafe { BorrowedFd::borrow_raw(0) }
+    }
+
+    println!("OMEN_COMPAT_READY");
+    println!("{}", posix_identity_json());
+    let _ = io::stdout().flush();
+    println!("OMEN_COMPAT_DIRTYING");
+    let _ = io::stdout().flush();
+
+    if let Ok(mut t) = tcgetattr(stdin_fd()) {
+        // Controlled dirty subset: clear ICANON/ECHO/ISIG.
+        let mut modes = t.local_modes;
+        modes.remove(LocalModes::ICANON | LocalModes::ECHO | LocalModes::ISIG);
+        t.local_modes = modes;
+        let _ = tcsetattr(stdin_fd(), OptionalActions::Now, &t);
+    }
+    println!("OMEN_COMPAT_DIRTY");
+    let _ = io::stdout().flush();
+    // Abnormal exit is chosen by `--exit` (default 0; harness passes non-zero
+    // or uses SIGTERM from outside). Exit immediately without restoring.
 }
 
 /// Classify what the child observes on stdin without blocking.

@@ -32,9 +32,25 @@ laws (D2-008/D2-009); final truth-model repair — non-waiting kill initiation
 (D2-012); Exact sealed at the type boundary — private fields + controlled
 deserialization rejects Exact (D2-013).
 
-Still open for M0: POSIX process-group/TTY work, Windows ConPTY/console
-control, deeper process-tree containment, and any repair of production
-defects discovered by the instrument.
+### M0 POSIX tranche (M0-D/G) — implemented subset
+
+- **M0-D** bounded POSIX PTY harness (`crates/omen-compat/src/posix/`),
+  session / controlling-terminal / foreground-pgrp establishment, typed
+  observations (`PosixProcessIdentity`, `PosixTerminalState`,
+  `PosixWaitState`), Linux `/proc` observer, and invariant judges for the
+  thirteen job-control / TTY IDs in `compat/invariants/posix.md`.
+- **M0-G** `omen-gremlin` POSIX modes (`--posix-report`,
+  `--posix-stop-report`, `--posix-sigint-report`, `--posix-winch-report`,
+  `--posix-termios-dirty-exit`), Tier POSIX CONTROL calibration tests, and
+  Tier POSIX OMEN scenarios (foreground topology, exit reacquisition, stop,
+  Ctrl-C, signal mask, SIGWINCH, termios recovery, zombie observation).
+- Decisions D2-014 (measurement not repair), D2-015 (establish then
+  observe controlling terminal), D2-016 (bounded hostile PTY I/O).
+- Defect ledger: `POSIX_M0_DEFECTS.md`.
+
+Still open for M0: Windows ConPTY/console control, deeper process-tree
+containment, and any repair of production defects discovered by the
+instrument (separate tranche).
 
 ## M1 — Deterministic Compat foundation
 

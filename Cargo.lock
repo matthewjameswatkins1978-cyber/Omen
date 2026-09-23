@@ -1093,6 +1093,7 @@ name = "omen-compat"
 version = "0.9.0-preview.15"
 dependencies = [
  "omen-test-fixtures",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
@@ -1283,6 +1284,7 @@ version = "0.9.0-preview.15"
 dependencies = [
  "clap",
  "crossterm",
+ "rustix",
  "serde_json",
  "tokio",
 ]

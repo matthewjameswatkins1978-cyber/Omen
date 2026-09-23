@@ -1,0 +1,2 @@
+OMEN_COMPAT_READY
+{"fixture":"posix-report","pid":1543,"ppid":1518,"pgrp":1543,"sid":1518,"stdin_isatty":false,"stdout_isatty":false,"stderr_isatty":false,"terminal_foreground_pgrp":-1,"winsize_rows":24,"winsize_cols":80,"icanon":null,"echo":null,"isig":null,"blocked":[],"ignored":["SIGPIPE"],"caught":["SIGBUS","SIGSEGV"]}

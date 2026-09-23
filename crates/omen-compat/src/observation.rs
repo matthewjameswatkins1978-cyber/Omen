@@ -92,6 +92,44 @@ pub enum Observation {
         fixture: String,
         payload: serde_json::Value,
     },
+    /// POSIX process identity observed via OS/syscall or `/proc` (Linux).
+    PosixProcessIdentity {
+        pid: u32,
+        ppid: Option<u32>,
+        pgrp: Option<u32>,
+        session_id: Option<u32>,
+        source: String,
+    },
+    /// Terminal foreground process-group and related TTY facts.
+    PosixTerminalState {
+        foreground_pgrp: Option<u32>,
+        session_id: Option<u32>,
+        is_controlling_terminal: Option<bool>,
+        rows: Option<u16>,
+        cols: Option<u16>,
+        icanon: Option<bool>,
+        echo: Option<bool>,
+        isig: Option<bool>,
+        source: String,
+    },
+    /// Wait-state classification (exited / signaled / stopped / continued).
+    PosixWaitState {
+        pid: u32,
+        exited: bool,
+        signaled: bool,
+        stopped: bool,
+        continued: bool,
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+        source: String,
+    },
+    /// Signal mask/disposition facts reported by a controlled fixture.
+    PosixSignalMaskReport {
+        fixture: String,
+        blocked: Vec<String>,
+        ignored: Vec<String>,
+        source: String,
+    },
     HarnessFailed {
         phase: String,
         detail: String,
@@ -118,6 +156,10 @@ impl Observation {
             Observation::CleanupAttempted { .. } => "cleanup_attempted",
             Observation::EnvApplied { .. } => "env_applied",
             Observation::FixtureReport { .. } => "fixture_report",
+            Observation::PosixProcessIdentity { .. } => "posix_process_identity",
+            Observation::PosixTerminalState { .. } => "posix_terminal_state",
+            Observation::PosixWaitState { .. } => "posix_wait_state",
+            Observation::PosixSignalMaskReport { .. } => "posix_signal_mask_report",
             Observation::HarnessFailed { .. } => "harness_failed",
         }
     }

@@ -35,3 +35,14 @@ tokio = { workspace = true, features = [
     "macros",
     "sync",
 ] }
+
+# Existing workspace dependency (already used by omen-engine/omen-ipc).
+# Newly used by omen-compat for POSIX PTY/termios/process observation only.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.0", features = [
+    "process",
+    "fs",
+    "pty",
+    "termios",
+    "event",
+] }
