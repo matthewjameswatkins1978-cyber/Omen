@@ -16,3 +16,7 @@ sdk/python/omen-shell/.venv/
 .coverage
 htmlcov/
 clean-env/
+
+.omen/
+.config/
+
