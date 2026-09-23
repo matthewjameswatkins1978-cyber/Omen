@@ -184,6 +184,19 @@ impl PtySession {
 
         set_nonblocking(master.as_fd()).map_err(|e| io_err("nonblock_master", e))?;
 
+        // Ensure ISIG on the shared tty so VINTR generates SIGINT (macOS
+        // default termios may differ from Linux).
+        if let Ok(mut t) = rustix::termios::tcgetattr(observe_slave.as_fd()) {
+            let mut modes = t.local_modes;
+            modes.insert(rustix::termios::LocalModes::ISIG);
+            t.local_modes = modes;
+            let _ = rustix::termios::tcsetattr(
+                observe_slave.as_fd(),
+                rustix::termios::OptionalActions::Now,
+                &t,
+            );
+        }
+
         Ok(Self {
             master,
             observe_slave,

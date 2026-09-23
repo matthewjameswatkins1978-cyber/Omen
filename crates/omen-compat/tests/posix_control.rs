@@ -160,16 +160,29 @@ fn control_stopped_state_is_observed() {
 
 #[test]
 fn control_sigint_control_fixture_receives_terminal_signal() {
-    let mut session = spawn(&["--posix-sigint-report"], Duration::from_secs(10));
+    let mut session = spawn(&["--posix-sigint-report"], Duration::from_secs(15));
     session
         .wait_for_text("OMEN_COMPAT_READY", Duration::from_secs(5))
         .expect("READY");
+
+    // Wait until the child is terminal foreground so VINTR targets it.
+    let child = session.child_pid();
+    let fg_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if session.observe_foreground_pgrp().ok() == Some(child) {
+            break;
+        }
+        if Instant::now() >= fg_deadline {
+            break;
+        }
+        std::thread::park_timeout(Duration::from_millis(25));
+    }
 
     // Terminal-generated SIGINT via VINTR on the master (not kill(pid)).
     session.write_ctrl(0x03).expect("write VINTR");
 
     let status =
-        wait_exit_bounded(&mut session, Duration::from_secs(5)).expect("sigint fixture must exit");
+        wait_exit_bounded(&mut session, Duration::from_secs(8)).expect("sigint fixture must exit");
     use std::os::unix::process::ExitStatusExt;
     assert_eq!(
         status.signal(),
