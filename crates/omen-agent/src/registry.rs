@@ -1,3 +1,6 @@
+use crate::codex::{
+    CODEX_PROVIDER_ID, CodexAdapter, CodexRouteConfig, codex_descriptor, resolve_codex_exe,
+};
 use crate::conformance::ProviderCapability;
 use crate::diagnostic_provider::DiagnosticAgentProvider;
 use crate::openai_responses::{
@@ -115,6 +118,22 @@ impl ProviderRegistry {
             let luna_provider: Arc<dyn AgentProvider> =
                 Arc::new(TimeoutProvider::new(Arc::new(luna), DEFAULT_AGENT_TIMEOUT));
             map.insert(OPENAI_LUNA_ID.into(), (desc, luna_provider));
+        }
+
+        // Register the Codex external reference route whenever its binary is
+        // resolvable on PATH. Resolution is filesystem-only (no spawn, no
+        // network, no credits): availability means "installed enough to
+        // attempt use". Account validity remains runtime truth discovered at
+        // use time (AuthenticationRequired), never claimed at startup.
+        if let Some(codex_exe) = resolve_codex_exe() {
+            let parent_env: Vec<(String, String)> = std::env::vars().collect();
+            let codex = CodexAdapter::new(CodexRouteConfig::new(codex_exe, parent_env));
+            let desc = codex_descriptor(true);
+            let codex_provider: Arc<dyn AgentProvider> = Arc::new(TimeoutProvider::new(
+                Arc::new(codex),
+                crate::codex::CODEX_ROUTE_TIMEOUT,
+            ));
+            map.insert(CODEX_PROVIDER_ID.into(), (desc, codex_provider));
         }
 
         Self {

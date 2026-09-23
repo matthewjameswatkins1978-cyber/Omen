@@ -989,6 +989,7 @@ version = "0.9.0-preview.14"
 dependencies = [
  "chrono",
  "hex",
+ "omen-agent-adapter",
  "omen-client",
  "omen-core",
  "omen-daemon",
@@ -1004,6 +1005,20 @@ dependencies = [
  "tokio",
  "tracing",
  "ureq",
+]
+
+[[package]]
+name = "omen-agent-adapter"
+version = "0.9.0-preview.14"
+dependencies = [
+ "hex",
+ "omen-agent",
+ "omen-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -1142,6 +1157,7 @@ dependencies = [
  "nu-ansi-term",
  "omen-adapters",
  "omen-agent",
+ "omen-agent-adapter",
  "omen-atlas",
  "omen-client",
  "omen-core",
