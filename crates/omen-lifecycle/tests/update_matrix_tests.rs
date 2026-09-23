@@ -56,6 +56,10 @@ fn sha_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+fn exe_name() -> &'static str {
+    if cfg!(windows) { "omen.exe" } else { "omen" }
+}
+
 /// Build a fixture source dir with one release. Returns (meta, source dir).
 /// `tamper` corrupts the package bytes AFTER the manifest digests are
 /// computed (checksum-mismatch case).
@@ -67,7 +71,7 @@ fn make_release(dir: &Path, version: &str, git_sha: &str, tamper: bool) -> Relea
         let f = std::fs::File::create(&pkg_path).unwrap();
         let mut w = zip::ZipWriter::new(f);
         let opts = zip::write::SimpleFileOptions::default();
-        w.start_file("omen.exe", opts).unwrap();
+        w.start_file(exe_name(), opts).unwrap();
         use std::io::Write;
         w.write_all(&binary_bytes).unwrap();
         w.start_file("manifest.json", opts).unwrap();
@@ -114,7 +118,7 @@ fn setup() -> Fx {
     record.active_slot = Some("0.9.0-preview.15-aaaaaaa".to_string());
     let slot = base.join("versions").join("0.9.0-preview.15-aaaaaaa");
     std::fs::create_dir_all(&slot).unwrap();
-    std::fs::write(slot.join("omen.exe"), b"fake-binary-A").unwrap();
+    std::fs::write(slot.join(exe_name()), b"fake-binary-A").unwrap();
     omen_lifecycle::install::save_install_record(&base, &record).unwrap();
     update::write_active_pointer(&base, "0.9.0-preview.15-aaaaaaa").unwrap();
     Fx {
@@ -171,7 +175,7 @@ fn good_update_end_to_end() {
         fx.base
             .join("versions")
             .join("0.9.0-preview.15-aaaaaaa")
-            .join("omen.exe")
+            .join(exe_name())
             .is_file()
     );
     // Active pointer truthful.
