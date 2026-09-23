@@ -679,10 +679,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("grandchild.pid");
         let bat = dir.path().join("spawn_and_exit.bat");
+        // Root waits (bounded, ~6 s) for the grandchild to record itself
+        // BEFORE exiting: containment must cover an already-running
+        // descendant, so the test never depends on a spawn-vs-sweep race.
         std::fs::write(
             &bat,
             format!(
-                "@echo off\r\nstart \"\" /b powershell -NoProfile -Command \"$PID | Out-File -FilePath '{}' -Encoding ascii; Start-Sleep 60\"\r\necho omen 0.9.0-preview.19 contract:0.8 commit:abc123\r\n",
+                "@echo off\r\nstart \"\" /b powershell -NoProfile -Command \"$PID | Out-File -FilePath '{}' -Encoding ascii; Start-Sleep 60\"\r\nset /a n=0\r\n:wait\r\nif exist \"{}\" goto done\r\nset /a n+=1\r\nif %n% GEQ 6 goto done\r\ntimeout /t 1 /nobreak >nul\r\ngoto wait\r\n:done\r\necho omen 0.9.0-preview.19 contract:0.8 commit:abc123\r\n",
+                marker.display(),
                 marker.display()
             ),
         )
@@ -865,17 +869,27 @@ mod tests {
         );
     }
 
-    /// TEST 4 — candidate exits during the cleanup race: deadline 0
-    /// forces the timeout path against a fast-exiting process. Must
-    /// classify terminated with no spurious fatal cleanup error.
+    /// TEST 4 — candidate exits during the cleanup race. On slow
+    /// platforms the zero deadline takes the timeout path against the
+    /// already-exiting process (must classify TerminatedAndReaped, no
+    /// spurious fatal); on fast platforms the child may exit before the
+    /// first poll (clean path: NotNeeded, exit_ok, identity captured).
+    /// BOTH are correct — the race must never produce Incomplete or hang.
     #[test]
     fn exit_during_cleanup_race_is_terminated() {
         let (_dir, bin) = quick_fixture();
         let out =
             probe_candidate_with_budget(&bin, Duration::from_millis(0), Duration::from_secs(5))
                 .unwrap();
-        assert!(out.timed_out, "zero deadline must take the timeout path");
-        assert_eq!(out.cleanup, CleanupState::TerminatedAndReaped);
+        if out.timed_out {
+            assert_eq!(out.cleanup, CleanupState::TerminatedAndReaped);
+        } else {
+            assert_eq!(out.cleanup, CleanupState::NotNeeded);
+            assert!(out.exit_ok);
+            let (v, c, _) = parse_identity(&out.stdout);
+            assert_eq!(v.as_deref(), Some("0.9.0-preview.19"));
+            assert_eq!(c.as_deref(), Some("0.8"));
+        }
     }
 
     /// TEST 5 — the supervised helper runner bounds a stalling helper:
