@@ -245,19 +245,19 @@ pub fn db_referenced_digests(workspace_db: &Path) -> BTreeSet<String> {
     let Ok(db) = omen_knowledge::Database::open_read_only(workspace_db) else {
         return out;
     };
-    if let Ok(mut stmt) = db.conn().prepare("SELECT digest FROM artifacts") {
-        if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
-            for d in rows.flatten() {
-                out.insert(d);
-            }
+    if let Ok(mut stmt) = db.conn().prepare("SELECT digest FROM artifacts")
+        && let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0))
+    {
+        for d in rows.flatten() {
+            out.insert(d);
         }
     }
-    if let Ok(mut stmt) = db.conn().prepare("SELECT artifact_uri FROM fact_artifacts") {
-        if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
-            for u in rows.flatten() {
-                if let Some(d) = u.strip_prefix("artifact://") {
-                    out.insert(d.to_string());
-                }
+    if let Ok(mut stmt) = db.conn().prepare("SELECT artifact_uri FROM fact_artifacts")
+        && let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0))
+    {
+        for u in rows.flatten() {
+            if let Some(d) = u.strip_prefix("artifact://") {
+                out.insert(d.to_string());
             }
         }
     }
