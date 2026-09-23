@@ -112,33 +112,56 @@ pub fn is_full_sha(s: &str) -> bool {
 
 /// Hosts an update may talk to. Manifest content can NEVER add hosts:
 /// download URLs come only from GitHub release-asset metadata, and every
-/// hop of the transport must satisfy this predicate.
+/// hop of the transport must satisfy this predicate BEFORE contact.
+///
+/// Narrow by construction: the exact registries Omen uses
+/// (`github.com`, `api.github.com`), the `*.githubusercontent.com`
+/// family observed serving release assets (`objects`, `raw`), and the
+/// authenticated-asset host `release-assets.githubusercontent.com`.
+/// There is deliberately NO S3 form: no S3 hop has ever been observed in
+/// Omen's release traffic, and breadth "just in case" is forbidden. If
+/// real GitHub traffic ever needs another host, the transport refuses
+/// loudly naming the hop — evidence first, allowlist second.
 pub fn is_update_host(host: &str) -> bool {
     let h = host.to_lowercase();
     h == "github.com"
         || h == "api.github.com"
-        || h == "objects.githubusercontent.com"
-        || h.ends_with(".githubusercontent.com")
         || h == "release-assets.githubusercontent.com"
-        || (h.ends_with(".s3.amazonaws.com") && h.contains("github"))
+        || h == "objects.githubusercontent.com"
+        || h == "raw.githubusercontent.com"
+        || h.ends_with(".githubusercontent.com")
 }
 
-/// HTTPS URL whose host passes [`is_update_host`]. Refuses anything else,
-/// including credentials-in-URL, ports, and non-https schemes.
-pub fn validate_update_url(raw: &str) -> Result<String, LifecycleError> {
+/// Parse + validate an update URL with the `url` crate (WHATWG parse —
+/// no hand-split authority logic). Returns the parsed URL or a refusal
+/// naming the defect. EVERY destination is validated BEFORE contact.
+///
+/// Refused: unparseable input, relative URLs, scheme-relative bypass
+/// (`//evil/...` fails absolute parse), non-https schemes, missing or
+/// disallowed hosts, any userinfo (`user@github.com` — the old
+/// `split('@')` logic accepted this; the parser exposes `username()` so
+/// it is now refused by construction), any explicit port, and
+/// encoded-host confusion (the parser rejects `%` in special-scheme
+/// hosts; IDNA is normalized before the allowlist check).
+pub fn validate_update_url(raw: &str) -> Result<url::Url, LifecycleError> {
     let url = raw.trim();
-    let rest = url.strip_prefix("https://").ok_or_else(|| {
-        LifecycleError::Manifest(format!("update URL must be https: {}", shorten(url)))
-    })?;
-    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let host = host.split('@').next_back().unwrap_or("");
-    if host.is_empty() || !is_update_host(host) {
-        return Err(LifecycleError::Manifest(format!(
-            "update URL host not allowed: {}",
-            shorten(url)
-        )));
+    let bad = |why: &str| {
+        LifecycleError::Manifest(format!("update URL refused ({why}): {}", shorten(url)))
+    };
+    let u = url::Url::parse(url).map_err(|_| bad("unparseable"))?;
+    if u.scheme() != "https" {
+        return Err(bad("scheme must be https"));
     }
-    Ok(url.to_string())
+    if !u.username().is_empty() || u.password().is_some() {
+        return Err(bad("userinfo forbidden"));
+    }
+    if u.port().is_some() {
+        return Err(bad("explicit port forbidden"));
+    }
+    match u.host_str() {
+        Some(host) if is_update_host(host) => Ok(u),
+        _ => Err(bad("host not allowed")),
+    }
 }
 
 fn shorten(url: &str) -> String {
@@ -200,7 +223,29 @@ mod tests {
     fn url_allowlist() {
         assert!(validate_update_url("https://github.com/a/b/releases/download/v1/x.zip").is_ok());
         assert!(validate_update_url("https://objects.githubusercontent.com/a/b?x=1").is_ok());
+        assert!(
+            validate_update_url("https://api.github.com/repos/o/r/releases?per_page=20").is_ok()
+        );
+        assert!(
+            validate_update_url("https://release-assets.githubusercontent.com/1/x?token=y").is_ok()
+        );
         assert!(validate_update_url("https://evil.example/x.zip").is_err());
         assert!(validate_update_url("http://github.com/x").is_err());
+        // The old split('@') logic accepted this; the parser must not.
+        assert!(validate_update_url("https://user@github.com/a/b.zip").is_err());
+        assert!(validate_update_url("https://user:pass@github.com/a/b.zip").is_err());
+        // WHATWG normalizes the DEFAULT port away (port() == None), so an
+        // explicit :443 is canonically identical to no port — harmless, no
+        // smuggling. A non-default explicit port is refused.
+        assert!(validate_update_url("https://github.com:443/a/b.zip").is_ok());
+        assert!(validate_update_url("https://github.com:8443/a/b.zip").is_err());
+        assert!(validate_update_url("//github.com/a/b.zip").is_err());
+        assert!(validate_update_url("/relative/path.zip").is_err());
+        assert!(validate_update_url("https://%65vil.example/x.zip").is_err());
+        assert!(validate_update_url("https://github-cloud.s3.amazonaws.com/x.zip").is_err());
+        assert!(validate_update_url("https://notgithub.com/x.zip").is_err());
+        assert!(validate_update_url("https://github.com.evil.example/x.zip").is_err());
+        assert!(validate_update_url("not a url at all").is_err());
+        assert!(validate_update_url("").is_err());
     }
 }

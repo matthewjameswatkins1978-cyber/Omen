@@ -1,11 +1,15 @@
-//! Canonical release transport (Lucy repair B1).
+//! Canonical release transport (Lucy repair B1, hardened Preview 18).
 //!
 //! The ONLY production update source is GitHub Releases. A
 //! [`ReleaseTransport`] abstracts the wire so tests run against a fake
 //! without network, while production uses [`GithubTransport`]:
 //! - API + manifest fetches: bounded timeouts, manifest byte ceiling.
-//! - Redirects: followed (max 5), then EVERY hop is audited against the
-//!   [`crate::release::is_update_host`] allowlist. One bad hop refuses.
+//! - Redirects: NEVER followed automatically (`max_redirects(0)`).
+//!   [`follow_manual`] resolves each `Location` with the `url` crate and
+//!   [`crate::release::validate_update_url`]s the destination BEFORE any
+//!   contact. A forbidden hop is never requested — not "requested then
+//!   rejected". Max 5 follows, then refusal; loops refused via a visited
+//!   set.
 //! - Package download: streamed to `.part` with a byte ceiling and a
 //!   running SHA-256; the part is renamed only after complete transport
 //!   AND digest match; any failure removes the part.
@@ -61,51 +65,140 @@ pub struct GithubTransport;
 
 impl GithubTransport {
     fn agent(&self, timeout_secs: u64) -> ureq::Agent {
+        // max_redirects(0): ureq never follows on its own; the 3xx
+        // response is always returned so OUR loop validates each hop
+        // before contact. There is no post-hoc audit because there is
+        // nothing to audit after the fact — forbidden hosts are never
+        // requested.
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(std::time::Duration::from_secs(timeout_secs)))
-            .max_redirects(MAX_REDIRECTS)
-            .max_redirects_will_error(true)
-            .save_redirect_history(true)
+            .max_redirects(0)
             .build();
         ureq::Agent::new_with_config(config)
     }
 
-    /// GET with redirect-chain audit. Returns (final_url, status, body).
-    /// Every hop including the final URL must satisfy the host allowlist.
-    fn get_audited(
+    /// Single GET with NO redirect following. One request, one response.
+    fn request_one(
         &self,
         agent: &ureq::Agent,
-        url: &str,
-    ) -> Result<(String, u16, ureq::Body), LifecycleError> {
-        use ureq::ResponseExt;
-        let start = crate::release::validate_update_url(url)
-            .map_err(|e| LifecycleError::Download(e.to_string()))?;
+        url: &url::Url,
+    ) -> Result<HopOutcome, LifecycleError> {
         let mut resp = agent
-            .get(&start)
+            .get(url.as_str())
             .header("User-Agent", "omen-update")
             .header("Accept", "application/vnd.github+json")
             .call()
             .map_err(|e| map_ureq("api", e))?;
         let status = resp.status().as_u16();
-        // Audit the full redirect chain (request + hops + final).
-        if let Some(history) = resp.get_redirect_history() {
-            for uri in history {
-                let hop = uri.to_string();
-                if crate::release::validate_update_url(&hop).is_err() {
-                    return Err(LifecycleError::Download(format!(
-                        "redirect leaves update hosts: {}",
-                        shorten(&hop)
-                    )));
-                }
-            }
-            let final_url = resp.get_uri().to_string();
-            let body = std::mem::replace(resp.body_mut(), empty_body());
-            Ok((final_url, status, body))
-        } else {
-            let body = std::mem::replace(resp.body_mut(), empty_body());
-            Ok((start, status, body))
-        }
+        let location = resp
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let body = std::mem::replace(resp.body_mut(), empty_body());
+        Ok(HopOutcome {
+            status,
+            location,
+            body,
+        })
     }
+
+    /// GET with bounded MANUAL redirect handling. Returns the final
+    /// validated URL, its status, and its body.
+    fn get_manual(
+        &self,
+        agent: &ureq::Agent,
+        url: &str,
+    ) -> Result<(url::Url, u16, ureq::Body), LifecycleError> {
+        let start = crate::release::validate_update_url(url)
+            .map_err(|e| LifecycleError::Download(e.to_string()))?;
+        let agent_ref = agent;
+        let (final_url, hop) = follow_manual(&start, |next| self.request_one(agent_ref, next))?;
+        Ok((final_url, hop.status, hop.body))
+    }
+}
+
+/// One unfollowed HTTP response: status, optional redirect target, body.
+pub struct HopOutcome {
+    pub status: u16,
+    pub location: Option<String>,
+    pub body: ureq::Body,
+}
+
+impl std::fmt::Debug for HopOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HopOutcome")
+            .field("status", &self.status)
+            .field("location", &self.location)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Statuses our loop treats as redirects (the agent-followed set; other
+/// 3xx like 300/304/305 are returned as-is and refused downstream by the
+/// callers' 2xx checks).
+fn is_followable_redirect(status: u16) -> bool {
+    matches!(status, 301 | 302 | 303 | 307 | 308)
+}
+
+/// Bounded manual redirect loop. `fetch` performs EXACTLY ONE request and
+/// returns its outcome; this loop validates every destination BEFORE
+/// calling `fetch` for it:
+///
+/// validate(start) -> fetch -> [3xx? resolve Location against the
+/// current URL, validate destination, fetch] -> final.
+///
+/// Guarantees: at most [`MAX_REDIRECTS`] follows (then refusal);
+/// redirect loops refused via a visited set; a missing `Location` on a
+/// redirect refused; the forbidden-host fetch is never invoked (the
+/// hostile test asserts request count == 0, not contacted-then-rejected).
+pub fn follow_manual<F>(
+    start: &url::Url,
+    mut fetch: F,
+) -> Result<(url::Url, HopOutcome), LifecycleError>
+where
+    F: FnMut(&url::Url) -> Result<HopOutcome, LifecycleError>,
+{
+    let mut current = start.clone();
+    let mut visited = vec![start.to_string()];
+    for _ in 0..=MAX_REDIRECTS {
+        let hop = fetch(&current)?;
+        if !is_followable_redirect(hop.status) {
+            return Ok((current, hop));
+        }
+        let raw_loc = hop.location.as_deref().ok_or_else(|| {
+            LifecycleError::Download(format!(
+                "redirect without Location from {}",
+                shorten(current.as_str())
+            ))
+        })?;
+        // Resolve relative Locations against the current URL (WHATWG
+        // join — no string concatenation). Scheme-relative
+        // `//evil/...` resolves, then FAILS validation below.
+        let next = current.join(raw_loc).map_err(|_| {
+            LifecycleError::Download(format!(
+                "unresolvable redirect target from {}",
+                shorten(current.as_str())
+            ))
+        })?;
+        // Validate BEFORE contact. This is the security boundary.
+        let next = crate::release::validate_update_url(next.as_str()).map_err(|_| {
+            LifecycleError::Download(format!(
+                "redirect leaves update hosts: {}",
+                shorten(next.as_str())
+            ))
+        })?;
+        if visited.contains(&next.to_string()) {
+            return Err(LifecycleError::Download(
+                "redirect loop detected".to_string(),
+            ));
+        }
+        visited.push(next.to_string());
+        current = next;
+    }
+    Err(LifecycleError::Download(format!(
+        "too many redirects (>{MAX_REDIRECTS})"
+    )))
 }
 
 fn empty_body() -> ureq::Body {
@@ -139,7 +232,7 @@ impl ReleaseTransport for GithubTransport {
         let agent = self.agent(METADATA_TIMEOUT_SECS);
         let url =
             "https://api.github.com/repos/matthewjameswatkins1978-cyber/Omen/releases?per_page=20";
-        let (_, status, mut body) = self.get_audited(&agent, url)?;
+        let (_, status, mut body) = self.get_manual(&agent, url)?;
         if status == 403 || status == 429 {
             return Err(LifecycleError::Download(
                 "api: registry rate-limited/forbidden (no retry in H)".to_string(),
@@ -197,7 +290,7 @@ impl ReleaseTransport for GithubTransport {
 
     fn fetch_manifest_bytes(&self, url: &str) -> Result<Vec<u8>, LifecycleError> {
         let agent = self.agent(METADATA_TIMEOUT_SECS);
-        let (_, status, mut body) = self.get_audited(&agent, url)?;
+        let (_, status, mut body) = self.get_manual(&agent, url)?;
         if !(200..300).contains(&status) {
             return Err(LifecycleError::Download(format!(
                 "manifest: status {status}"
@@ -223,7 +316,7 @@ impl ReleaseTransport for GithubTransport {
         ceiling: u64,
     ) -> Result<String, LifecycleError> {
         let agent = self.agent(DOWNLOAD_TIMEOUT_SECS);
-        let (_, status, body) = self.get_audited(&agent, url)?;
+        let (_, status, body) = self.get_manual(&agent, url)?;
         if !(200..300).contains(&status) {
             return Err(LifecycleError::Download(format!(
                 "package: status {status}"
@@ -293,7 +386,10 @@ pub fn stream_reader_to_part(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
     use std::io::Cursor;
+    use std::rc::Rc;
 
     #[test]
     fn stream_hashes_and_caps() {
@@ -335,5 +431,176 @@ mod tests {
         let err = stream_reader_to_part(&mut big, &part3, 16).unwrap_err();
         assert_eq!(err.phase(), "download");
         assert!(!part3.exists());
+    }
+
+    /// Deterministic redirect fixture: a scripted wire. Each URL maps to
+    /// (status, location); EVERY invocation is recorded in the contact
+    /// log. There is no network — the security property under test is
+    /// which URLs the loop ASKS to contact.
+    struct ScriptedWire {
+        routes: HashMap<String, (u16, Option<String>)>,
+        contacted: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl ScriptedWire {
+        fn fetch(&self, url: &url::Url) -> Result<HopOutcome, LifecycleError> {
+            self.contacted.borrow_mut().push(url.to_string());
+            match self.routes.get(url.as_str()) {
+                Some((status, loc)) => Ok(HopOutcome {
+                    status: *status,
+                    location: loc.clone(),
+                    body: empty_body(),
+                }),
+                None => Err(LifecycleError::Download("wire: no route".to_string())),
+            }
+        }
+
+        fn contacts_to(&self, host: &str) -> usize {
+            self.contacted
+                .borrow()
+                .iter()
+                .filter(|u| {
+                    url::Url::parse(u)
+                        .ok()
+                        .and_then(|p| p.host_str().map(str::to_string))
+                        .as_deref()
+                        == Some(host)
+                })
+                .count()
+        }
+    }
+
+    fn wire(routes: &[(&str, u16, Option<&str>)]) -> ScriptedWire {
+        ScriptedWire {
+            routes: routes
+                .iter()
+                .map(|(u, s, l)| (u.to_string(), (*s, l.map(str::to_string))))
+                .collect(),
+            contacted: Rc::new(RefCell::new(Vec::new())),
+        }
+    }
+
+    fn start(url: &str) -> url::Url {
+        crate::release::validate_update_url(url).expect("fixture start must validate")
+    }
+
+    #[test]
+    fn forbidden_redirect_is_never_contacted() {
+        // approved -> redirect -> forbidden. The assertion that matters:
+        // the forbidden host sees ZERO requests (refused BEFORE contact,
+        // not contacted-then-rejected).
+        let w = wire(&[
+            (
+                "https://github.com/o/r/releases/download/v18/pkg.zip",
+                302,
+                Some("https://evil.example/pwned.zip"),
+            ),
+            ("https://evil.example/pwned.zip", 200, None),
+        ]);
+        let err = follow_manual(
+            &start("https://github.com/o/r/releases/download/v18/pkg.zip"),
+            |u| w.fetch(u),
+        )
+        .unwrap_err();
+        assert_eq!(err.phase(), "download");
+        assert_eq!(
+            w.contacts_to("evil.example"),
+            0,
+            "forbidden host contacted!"
+        );
+        assert_eq!(
+            w.contacted.borrow().len(),
+            1,
+            "only the start URL is fetched"
+        );
+    }
+
+    #[test]
+    fn approved_chain_succeeds_relative_resolves() {
+        let w = wire(&[
+            (
+                "https://github.com/o/r/releases/download/v18/pkg.zip",
+                302,
+                Some("https://objects.githubusercontent.com/a/b?x=1"),
+            ),
+            (
+                "https://objects.githubusercontent.com/a/b?x=1",
+                301,
+                Some("/a/c?x=1"),
+            ),
+            ("https://objects.githubusercontent.com/a/c?x=1", 200, None),
+        ]);
+        let (final_url, hop) = follow_manual(
+            &start("https://github.com/o/r/releases/download/v18/pkg.zip"),
+            |u| w.fetch(u),
+        )
+        .unwrap();
+        assert_eq!(hop.status, 200);
+        assert_eq!(
+            final_url.as_str(),
+            "https://objects.githubusercontent.com/a/c?x=1"
+        );
+        assert_eq!(w.contacted.borrow().len(), 3);
+    }
+
+    #[test]
+    fn too_many_redirects_refuses() {
+        // 6 chained redirects exceeds MAX_REDIRECTS (5).
+        let mut routes = vec![];
+        for i in 0..7 {
+            routes.push((
+                format!("https://github.com/hop{i}"),
+                302,
+                Some(format!("https://github.com/hop{}", i + 1)),
+            ));
+        }
+        let owned: Vec<(String, u16, Option<String>)> = routes.into_iter().collect();
+        let refs: Vec<(&str, u16, Option<&str>)> = owned
+            .iter()
+            .map(|(a, b, c)| (a.as_str(), *b, c.as_deref()))
+            .collect();
+        let w = wire(&refs);
+        let err = follow_manual(&start("https://github.com/hop0"), |u| w.fetch(u)).unwrap_err();
+        assert!(err.to_string().contains("too many redirects"));
+        assert_eq!(w.contacted.borrow().len(), (MAX_REDIRECTS + 1) as usize);
+    }
+
+    #[test]
+    fn redirect_loop_is_bounded() {
+        let w = wire(&[
+            (
+                "https://github.com/loop-a",
+                302,
+                Some("https://github.com/loop-b"),
+            ),
+            (
+                "https://github.com/loop-b",
+                302,
+                Some("https://github.com/loop-a"),
+            ),
+        ]);
+        let err = follow_manual(&start("https://github.com/loop-a"), |u| w.fetch(u)).unwrap_err();
+        assert!(err.to_string().contains("loop"));
+        assert!(w.contacted.borrow().len() <= (MAX_REDIRECTS + 1) as usize);
+    }
+
+    #[test]
+    fn hostile_location_forms_refused_before_contact() {
+        for bad_loc in [
+            "http://github.com/downgrade.zip",
+            "https://user@github.com/x.zip",
+            "https://github.com:8443/x.zip",
+            "//evil.example/x.zip",
+            "https://evil.example/x.zip",
+        ] {
+            let w = wire(&[("https://github.com/o/r/start.zip", 302, Some(bad_loc))]);
+            let err = follow_manual(&start("https://github.com/o/r/start.zip"), |u| w.fetch(u))
+                .unwrap_err();
+            assert_eq!(err.phase(), "download", "{bad_loc}");
+            assert_eq!(w.contacted.borrow().len(), 1, "{bad_loc}");
+        }
+        // Redirect without Location is a refusal, not a hang.
+        let w = wire(&[("https://github.com/o/r/noloc.zip", 302, None)]);
+        assert!(follow_manual(&start("https://github.com/o/r/noloc.zip"), |u| w.fetch(u)).is_err());
     }
 }

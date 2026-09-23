@@ -269,7 +269,8 @@ fn staller() -> (PathBuf, Vec<String>) {
 }
 
 /// Run the probe against an arbitrary argv (test-only seam): replicate the
-/// production spawn flags with a custom program.
+/// production spawn flags with a custom program, but drive cleanup through
+/// the SAME bounded primitive production uses (no unbounded replicas).
 fn probe_argv(
     program: &Path,
     args: &[String],
@@ -295,18 +296,14 @@ fn probe_argv(
             }
         }
     };
-    if timed_out {
-        #[cfg(windows)]
-        {
-            let _ = std::process::Command::new("taskkill")
-                .args(["/PID", &child.id().to_string(), "/T", "/F"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
-        let _ = child.kill();
-        let _ = child.wait();
-    }
+    let cleanup = if timed_out {
+        omen_lifecycle::health::terminate_bounded(
+            &mut child,
+            omen_lifecycle::health::CLEANUP_BUDGET,
+        )
+    } else {
+        omen_lifecycle::health::CleanupState::NotNeeded
+    };
     let exit_ok = child
         .try_wait()
         .unwrap()
@@ -328,17 +325,22 @@ fn probe_argv(
         stdout,
         stderr,
         elapsed: start.elapsed(),
+        cleanup,
     }
 }
 
-// TEST I — stalled candidate: bounded timeout, truthful, reaped.
+// TEST I — stalled candidate: bounded timeout, bounded cleanup, reaped.
 #[test]
 fn health_timeout_bounded() {
     let (prog, args) = staller();
     let t0 = std::time::Instant::now();
     let out = probe_argv(&prog, &args, std::time::Duration::from_secs(2));
     assert!(out.timed_out);
-    assert!(t0.elapsed() < std::time::Duration::from_secs(15));
+    assert_eq!(
+        out.cleanup,
+        omen_lifecycle::health::CleanupState::TerminatedAndReaped
+    );
+    assert!(t0.elapsed() < std::time::Duration::from_secs(2 + 3 + 5));
     // Reaped: a second wait is a no-op, no zombie handling needed here.
     assert!(!out.exit_ok);
 }

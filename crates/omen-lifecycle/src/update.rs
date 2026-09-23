@@ -171,6 +171,7 @@ pub fn discover_canonical(
         )));
     }
     let manifest_url = crate::release::validate_update_url(&manifests[0].browser_download_url)
+        .map(|u| u.to_string())
         .map_err(|e| malformed(e.to_string()))?;
     let bytes = transport
         .fetch_manifest_bytes(&manifest_url)
@@ -208,6 +209,7 @@ pub fn discover_canonical(
         )));
     }
     let download_url = crate::release::validate_update_url(&pkgs[0].browser_download_url)
+        .map(|u| u.to_string())
         .map_err(|e| malformed(e.to_string()))?;
 
     Ok(Some(ReleaseMeta {
@@ -478,6 +480,15 @@ impl HealthChecker for BinaryHealthCheck {
         // all health failures with the previous slot preserved.
         let probe = crate::health::probe_candidate_default(staged_binary)?;
         if probe.timed_out {
+            // Cleanup outcome is truth, not decoration: an unconfirmed
+            // cleanup fails the transaction with the previous slot
+            // preserved — activation is forbidden either way.
+            if let crate::health::CleanupState::CleanupIncomplete(why) = &probe.cleanup {
+                return Err(LifecycleError::Health(format!(
+                    "candidate health timed out after {:?}; cleanup could not be confirmed ({why}); previous slot preserved",
+                    probe.elapsed
+                )));
+            }
             return Err(LifecycleError::Health(format!(
                 "candidate health timed out after {:?}; process tree terminated and reaped",
                 probe.elapsed
