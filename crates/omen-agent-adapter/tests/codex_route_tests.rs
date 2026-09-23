@@ -470,6 +470,7 @@ impl PathGuard {
         }
     }
 
+    #[cfg(windows)]
     fn set_override(value: &str) -> Self {
         let previous_path = std::env::var("PATH").ok();
         let previous_override = std::env::var("OMEN_CODEX_EXE").ok();
