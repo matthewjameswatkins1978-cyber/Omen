@@ -65,9 +65,17 @@ impl CodexRouteConfig {
     }
 }
 
-/// Resolves the Codex executable via PATH without spawning anything.
-/// `None` means the route is not installed; registry construction stays cheap.
+/// Resolves the Codex executable without spawning anything.
+/// Order: OMEN_CODEX_EXE override, codex.exe on PATH, npm-shim vendor exe
+/// (Windows), npm shim itself. `None` means the route is not installed;
+/// registry construction stays cheap.
 pub fn resolve_codex_exe() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("OMEN_CODEX_EXE") {
+        let explicit = PathBuf::from(path);
+        if explicit.is_file() {
+            return Some(explicit);
+        }
+    }
     let file = if cfg!(windows) { "codex.exe" } else { "codex" };
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
@@ -78,8 +86,45 @@ pub fn resolve_codex_exe() -> Option<PathBuf> {
         if candidate.is_file() {
             return Some(candidate);
         }
+        // Windows npm installs ship only shims (codex.cmd) on PATH; the
+        // real binary lives under the package vendor directory. Prefer the
+        // real exe when it resolves uniquely, else spawn the shim itself
+        // (CreateProcess executes .cmd; argv forwarding is verbatim).
+        if cfg!(windows) {
+            let shim = dir.join("codex.cmd");
+            if shim.is_file() {
+                return Some(resolve_npm_shim_target(&shim).unwrap_or(shim));
+            }
+        }
     }
     None
+}
+
+/// Resolves an npm `codex.cmd` shim to its vendored codex.exe when the
+/// install layout yields exactly one candidate; ambiguous or changed
+/// layouts return None so the caller falls back to the shim itself.
+fn resolve_npm_shim_target(shim: &Path) -> Option<PathBuf> {
+    let base = shim
+        .parent()?
+        .join("node_modules")
+        .join("@openai")
+        .join("codex")
+        .join("node_modules")
+        .join("@openai");
+    let mut hits = Vec::new();
+    for package in std::fs::read_dir(&base).ok()? {
+        let package = package.ok()?;
+        if !package.file_name().to_string_lossy().starts_with("codex-") {
+            continue;
+        }
+        for target in std::fs::read_dir(package.path().join("vendor")).ok()? {
+            let exe = target.ok()?.path().join("bin").join("codex.exe");
+            if exe.is_file() {
+                hits.push(exe);
+            }
+        }
+    }
+    if hits.len() == 1 { hits.pop() } else { None }
 }
 
 /// Explicit probe (spawns `codex --version` + reads exe bytes). Use-time or
@@ -216,16 +261,18 @@ impl CodexAdapter {
                 "omen_contract": "0.8",
             })),
             "omen.describe_capability" => {
-                let name = tool_request
-                    .input
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                match describe_capability(name) {
-                    Some(description) => {
-                        Ok(serde_json::json!({"name": name, "description": description}))
+                // Positional args channel (the strict output schema has no
+                // free-form input object): args[0] is the capability name.
+                let name = tool_request.args.first().map(|s| s.as_str()).unwrap_or("");
+                if name.len() > 128 {
+                    Err("capability name too long".into())
+                } else {
+                    match describe_capability(name) {
+                        Some(description) => {
+                            Ok(serde_json::json!({"name": name, "description": description}))
+                        }
+                        None => Err(format!("unknown capability {name:?}")),
                     }
-                    None => Err(format!("unknown capability {name:?}")),
                 }
             }
             _ => Err("unreachable: allowlist checked above".into()),
@@ -244,12 +291,19 @@ impl CodexAdapter {
         parsed: &CodexFinal,
         _round: &CodexRound,
     ) -> Result<AgentResponse, AgentError> {
-        if let Some(argv) = &parsed.proposal_argv {
-            if argv.is_empty() || argv.len() > 12 || argv.iter().any(|a| a.len() > 1024) {
-                return Err(AgentError::Rejected(
-                    "codex proposal_argv failed bounds (1..=12 entries, each <=1024)".into(),
-                ));
-            }
+        let proposal: Option<&Vec<String>> = match &parsed.proposal_argv {
+            Some(argv) if !argv.is_empty() => Some(argv),
+            _ => None,
+        };
+        let proposal_valid = proposal
+            .map(|argv| argv.len() <= 12 && !argv.iter().any(|a| a.len() > 1024))
+            .unwrap_or(true);
+        if !proposal_valid {
+            return Err(AgentError::Rejected(
+                "codex proposal_argv failed bounds (1..=12 entries, each <=1024)".into(),
+            ));
+        }
+        if let Some(argv) = proposal {
             // Proposal data only: admission happens elsewhere or never.
             return Ok(AgentResponse {
                 kind: AgentResponseKind::Proposal,
@@ -412,18 +466,19 @@ pub fn codex_final_schema() -> String {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "title": "OmenCodexFinal",
         "type": "object",
-        "required": ["message"],
+        "required": ["message", "tool_requests", "proposal_argv"],
+        "additionalProperties": false,
         "properties": {
             "message": {"type": "string", "maxLength": 8000},
             "tool_requests": {
                 "type": "array", "maxItems": 4,
                 "items": {
                     "type": "object",
-                    "required": ["tool"],
+                    "required": ["tool", "operation", "args"],
+                    "additionalProperties": false,
                     "properties": {
                         "tool": {"type": "string", "maxLength": 128},
                         "operation": {"type": "string", "maxLength": 128},
-                        "input": {"type": "object"},
                         "args": {"type": "array", "maxItems": 8, "items": {"type": "string", "maxLength": 512}}
                     }
                 }
@@ -446,11 +501,13 @@ pub fn build_codex_prompt(
     let mut prompt = String::new();
     prompt.push_str("You are Codex operating as a reasoning route inside Omen. Omen is the substrate: you translate and propose; consequential actions execute only through Omen. Your sandbox is read-only: do not attempt filesystem or shell mutations yourself; express intent ONLY in the structured final message.\n");
     prompt.push_str("Omen contract 0.8. Allowlisted Omen operations you may request via tool_requests (all else -> proposal_argv data):\n");
-    prompt.push_str("- omen.workspace_status {}: returns workspace_root, cwd, omen_contract.\n");
     prompt.push_str(
-        "- omen.describe_capability {\"name\": \"reasoning|tools|...\"}: returns a description.\n",
+        "- omen.workspace_status with args []: returns workspace_root, cwd, omen_contract.\n",
     );
-    prompt.push_str("Final message MUST be JSON: {\"message\": \"...\", \"tool_requests\": [{\"tool\": \"...\", \"input\": {...}}], \"proposal_argv\": [...] | null}. ");
+    prompt.push_str(
+        "- omen.describe_capability with args [name] (reasoning|tools|deterministic|orientation): returns a description.\n",
+    );
+    prompt.push_str("Final message MUST be JSON: {\"message\": \"...\", \"tool_requests\": [{\"tool\": \"...\", \"operation\": \"...\", \"args\": [...]}], \"proposal_argv\": [...] | null}. ");
     prompt.push_str("Use tool_requests ONLY for the two operations above. Use proposal_argv ONLY to propose a command for Omen to consider (it will NOT run without admission). Otherwise both stay empty/null.\n");
     prompt.push_str(&format!(
         "Workspace root: {}. Session cwd: {}.\n",
@@ -470,6 +527,7 @@ pub fn build_codex_prompt(
         }
         prompt.push_str("\nNow produce your final JSON message answering the original task: ");
         prompt.push_str(&truncate_text(&request.prompt, 500));
+        prompt.push_str("\nYour tool phase is OVER: emit \"tool_requests\": [] and \"proposal_argv\": null. Do not request further operations for any reason.");
     }
     prompt.push('\n');
     truncate_text(&prompt, CODEX_BOOTSTRAP_BUDGET_BYTES)
@@ -505,9 +563,12 @@ fn check_codex_final(parsed: CodexFinal) -> Result<CodexFinal, AgentError> {
             return Err(AgentError::Rejected("codex tool name too long".into()));
         }
     }
-    if let Some(argv) = &parsed.proposal_argv
-        && (argv.len() > 12 || argv.iter().any(|a| a.len() > 1024))
-    {
+    let proposal_valid = parsed
+        .proposal_argv
+        .as_ref()
+        .map(|argv| argv.is_empty() || (argv.len() <= 12 && !argv.iter().any(|a| a.len() > 1024)))
+        .unwrap_or(true);
+    if !proposal_valid {
         return Err(AgentError::Rejected(
             "codex proposal_argv failed bounds".into(),
         ));
