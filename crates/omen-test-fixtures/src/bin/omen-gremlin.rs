@@ -520,7 +520,7 @@ fn posix_identity_json() -> String {
         ppid.map(|p| p.as_raw_nonzero().get()).unwrap_or(-1),
         pgrp.map(|p| p.as_raw_nonzero().get()).unwrap_or(-1),
         sid.map(|p| p.as_raw_nonzero().get()).unwrap_or(-1),
-        fg.map(|f| f).unwrap_or(-1),
+        fg.unwrap_or(-1),
         opt_bool(icanon),
         opt_bool(echo),
         opt_bool(isig),
