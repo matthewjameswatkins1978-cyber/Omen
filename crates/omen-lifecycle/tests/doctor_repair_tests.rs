@@ -13,6 +13,10 @@ use std::path::PathBuf;
 const SYNTH: &str = "sk-h-test-SYNTHETIC-0000";
 const SYNTH2: &str = "h-secret-plant-SYNTHETIC-1111";
 
+fn exe_name() -> &'static str {
+    if cfg!(windows) { "omen.exe" } else { "omen" }
+}
+
 fn base_fixture() -> (tempfile::TempDir, PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path().join("state");
@@ -38,9 +42,9 @@ fn doctor_observes_broken_pointer_and_repairs_when_safe() {
     omen_lifecycle::update::write_active_pointer(&base, "ghost-slot").unwrap();
     let slot = base.join("versions").join("only-slot");
     std::fs::create_dir_all(&slot).unwrap();
-    std::fs::write(slot.join("omen.exe"), b"bin").unwrap();
+    std::fs::write(slot.join(exe_name()), b"bin").unwrap();
 
-    let exe = base.join("versions").join("only-slot").join("omen.exe");
+    let exe = base.join("versions").join("only-slot").join(exe_name());
     let report = doctor::run_doctor(&input(&base, &exe));
     assert!(
         report
@@ -89,9 +93,9 @@ fn repair_refuses_ambiguous_pointer() {
     for s in ["slot-a", "slot-b"] {
         let slot = base.join("versions").join(s);
         std::fs::create_dir_all(&slot).unwrap();
-        std::fs::write(slot.join("omen.exe"), b"bin").unwrap();
+        std::fs::write(slot.join(exe_name()), b"bin").unwrap();
     }
-    let exe = base.join("versions").join("slot-a").join("omen.exe");
+    let exe = base.join("versions").join("slot-a").join(exe_name());
     let report = doctor::run_doctor(&input(&base, &exe));
     let (rplan, refused) = omen_lifecycle::repair::repair_plan(&base, &report);
     assert!(refused.iter().any(|r| r.id == "repoint-active"));
@@ -122,7 +126,7 @@ fn corruption_matrix_classification() {
         b"{\"schema_version\": 1, TRUNCATED",
     )
     .unwrap();
-    let exe = base.join("omen.exe");
+    let exe = base.join(exe_name());
     std::fs::write(&exe, b"bin").unwrap();
     let report = doctor::run_doctor(&input(&base, &exe));
     assert!(
@@ -160,7 +164,7 @@ fn corruption_matrix_classification() {
 #[test]
 fn path_integration_gap_becomes_explicit_repair_intent() {
     let (_tmp, base) = base_fixture();
-    let exe = base.join("omen.exe");
+    let exe = base.join(exe_name());
     std::fs::write(&exe, b"bin").unwrap();
     let mut report = doctor::run_doctor(&input(&base, &exe));
     // Simulate the PATH finding without depending on machine PATH state.
@@ -227,7 +231,7 @@ fn synthetic_secrets_never_leak() {
         format!("saw {SYNTH} today"),
     )
     .unwrap();
-    let exe = base.join("omen.exe");
+    let exe = base.join(exe_name());
     std::fs::write(&exe, b"bin").unwrap();
     let report = doctor::run_doctor(&input(&base, &exe));
     let machine = doctor::machine_json(&report);
