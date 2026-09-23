@@ -25,6 +25,43 @@ fn gremlin_exe() -> PathBuf {
     path
 }
 
+/// Serializes tests that mutate OPENAI_API_KEY in the process environment.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct EnvGuard {
+    previous: Option<String>,
+}
+
+impl EnvGuard {
+    fn set(key: &str, value: Option<&str>) -> Self {
+        let previous = std::env::var(key).ok();
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+        Self { previous }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.previous {
+                Some(v) => std::env::set_var("OPENAI_API_KEY", v),
+                None => std::env::remove_var("OPENAI_API_KEY"),
+            }
+        }
+    }
+}
+
+fn with_openai_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = EnvGuard::set("OPENAI_API_KEY", value);
+    f()
+}
+
 /// A mock provider that counts invocations to prove zero token consumption.
 #[derive(Default)]
 struct CountingAgentProvider {
@@ -299,34 +336,78 @@ fn large_artifact_is_handle_only_until_requested() {
 
 #[test]
 fn provider_registry_selects_configured_provider() {
-    let registry = ProviderRegistry::new();
-    assert_eq!(registry.active_descriptor().id, "diagnostic");
+    with_openai_env(None, || {
+        let registry = ProviderRegistry::new();
+        assert_eq!(registry.active_descriptor().id, "diagnostic");
 
-    let custom_desc = ProviderDescriptor {
-        id: "mock_claude".into(),
-        name: "Mock Anthropic Provider".into(),
-        model: Some("claude-3-7-sonnet".into()),
-        credential_source: Some("environment:ANTHROPIC_API_KEY".into()),
-        capabilities: vec!["reasoning".into(), "code".into()],
-        is_available: true,
-    };
-    let mock_provider: Arc<dyn AgentProvider> = Arc::new(CountingAgentProvider::default());
-    registry.register(custom_desc, mock_provider);
+        let custom_desc = ProviderDescriptor {
+            id: "mock_claude".into(),
+            name: "Mock Anthropic Provider".into(),
+            model: Some("claude-3-7-sonnet".into()),
+            credential_source: Some("environment:ANTHROPIC_API_KEY".into()),
+            capabilities: vec!["reasoning".into(), "code".into()],
+            is_available: true,
+        };
+        let mock_provider: Arc<dyn AgentProvider> = Arc::new(CountingAgentProvider::default());
+        registry.register(custom_desc, mock_provider);
 
-    let list = registry.list_providers();
-    assert_eq!(list.len(), 2);
+        let list = registry.list_providers();
+        assert_eq!(list.len(), 2);
 
-    registry.set_active_provider("mock_claude").unwrap();
-    assert_eq!(registry.active_descriptor().id, "mock_claude");
-    assert_eq!(
-        registry.active_descriptor().model.as_deref(),
-        Some("claude-3-7-sonnet")
-    );
+        registry.set_active_provider("mock_claude").unwrap();
+        assert_eq!(registry.active_descriptor().id, "mock_claude");
+        assert_eq!(
+            registry.active_descriptor().model.as_deref(),
+            Some("claude-3-7-sonnet")
+        );
 
-    let status = registry.status_text();
-    assert!(status.contains("mock_claude"));
-    assert!(status.contains("claude-3-7-sonnet"));
-    assert!(!status.contains("API_KEY=")); // Must never print secrets
+        let status = registry.status_text();
+        assert!(status.contains("mock_claude"));
+        assert!(status.contains("claude-3-7-sonnet"));
+        assert!(!status.contains("API_KEY=")); // Must never print secrets
+    });
+}
+
+#[test]
+fn provider_registry_registers_openai_luna_when_credential_present() {
+    with_openai_env(Some("sk-registry-test-key-not-real"), || {
+        let registry = ProviderRegistry::new();
+
+        let list = registry.list_providers();
+        let luna = list
+            .iter()
+            .find(|p| p.id == "openai-luna")
+            .expect("openai-luna must be registered when OPENAI_API_KEY is set");
+        assert_eq!(luna.name, "OpenAI GPT-6 Luna");
+        assert_eq!(luna.model.as_deref(), Some("gpt-6-luna"));
+        assert_eq!(
+            luna.credential_source.as_deref(),
+            Some("environment:OPENAI_API_KEY")
+        );
+        assert!(luna.is_available);
+
+        // Status and debug surfaces must never echo the key material.
+        registry.set_active_provider("openai-luna").unwrap();
+        let status = registry.status_text();
+        assert!(!status.contains("sk-registry-test-key-not-real"));
+        assert!(!status.contains("Bearer"));
+        let active = registry.active_descriptor();
+        let debug = format!("{active:?}");
+        assert!(!debug.contains("sk-registry-test-key-not-real"));
+    });
+}
+
+#[test]
+fn provider_registry_omits_openai_luna_without_credential() {
+    with_openai_env(None, || {
+        let registry = ProviderRegistry::new();
+        let list = registry.list_providers();
+        assert!(
+            !list.iter().any(|p| p.id == "openai-luna"),
+            "openai-luna must not appear when credential is absent"
+        );
+        assert_eq!(registry.active_descriptor().id, "diagnostic");
+    });
 }
 
 #[test]
