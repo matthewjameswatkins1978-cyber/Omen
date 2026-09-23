@@ -49,7 +49,13 @@ Omen gives humans and AI the same workspace through different interfaces, while 
 - `crates/omen-ui`: Terminal capability detection, prompt rendering, progressive diagnostics (Levels 0–3), semantic blocks (OSC 7/8/133).
 - `crates/omen-cli`: The unified `omen` CLI, daemon manager, MCP runner, and interactive shell binary.
 - `crates/omen-test-fixtures`: Hostile testing fixtures (`omen-gremlin`).
+- `crates/omen-compat`: IDO No. 2 compatibility scaffold; production crates do not depend on it.
 - `crates/xtask`: Portable repository automation tasks.
+
+IDO No. 2 filing is separated into the implementation scaffold at
+`crates/omen-compat/`, the compatibility corpus under `compat/`, and design
+history under `docs/ido/02-omen-compat/`. Large generated traces remain CI
+artifacts rather than Git content.
 
 ## Release Roadmap — The Road to 1.0
 

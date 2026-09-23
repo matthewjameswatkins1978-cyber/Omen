@@ -1083,6 +1083,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "omen-compat"
+version = "0.9.0-preview.12"
+dependencies = [
+ "omen-test-fixtures",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "omen-core"
 version = "0.9.0-preview.12"
 dependencies = [

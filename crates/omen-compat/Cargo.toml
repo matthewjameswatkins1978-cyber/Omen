@@ -1,0 +1,20 @@
+[package]
+name = "omen-compat"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+# Test-only observation boundary for IDO No. 2. Production crates must never
+# depend on this crate.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+omen-test-fixtures = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }

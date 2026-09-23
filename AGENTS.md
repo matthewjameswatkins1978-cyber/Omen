@@ -35,6 +35,36 @@ Do not blur these boundaries. Never create competing policy, replay, approval, o
 
 ## 3. Standing AI-First Engineering Rules
 
+### IDO No. 2 — Omen Compat filing boundary
+
+Omen Compat is a separate, non-production compatibility subsystem inside this
+repository. Its canonical locations are:
+
+- `crates/omen-compat/`: the Rust harness for compatibility measurement. The
+  authorized M0 portable tranche (core types, bounded runner, portable
+  invariants, gremlin fixtures) is in scope; PTY/ConPTY, application adapters,
+  automatic repair, and other deferred work still require explicit approval.
+- `compat/`: committed, small compatibility knowledge only. Put declarative
+  scenarios in `scenarios/`, behavioural targets in `golden/`, invariant
+  definitions in `invariants/`, and small purpose-built inputs in `fixtures/`.
+- `docs/ido/02-omen-compat/`: design, decisions, reviews, roadmap, and
+  evidence policy. These documents are not executable scenarios or runtime
+  configuration.
+
+The production Omen runtime must never depend on `omen-compat`; the dependency
+direction is Compat observing Omen, not Omen importing Compat. Do not put
+application-specific runtime hacks, shims, probes, or generated traces in
+production crates. Large traces, recordings, matrices, and diagnostic dumps
+belong in CI artifacts; a confirmed defect may add only a minimal reproducer
+or regression scenario to `compat/`.
+
+IDO No. 2 V1 is the bounded architecture and deterministic harness boundary:
+small fixtures, explicit invariants, scenario execution, structured results,
+and evidence-preserving diagnosis. Automatic repair, arbitrary application
+learning, broad fuzzing, golden-app expansion, and production shims are
+deferred until separately approved. Do not implement Omen Compat functionality
+or app-specific compatibility behaviour as part of an unrelated Omen change.
+
 Runtime-facing fixes require Preview Conveyor installation and proof before
 external acceptance. Do not hand-roll release, install, or proof PowerShell;
 use `cargo xtask preview` unless debugging the conveyor itself.
