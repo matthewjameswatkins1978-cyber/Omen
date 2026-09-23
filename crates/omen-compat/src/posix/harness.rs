@@ -126,7 +126,9 @@ impl PtySession {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        tcsetwinsize(&master, ws).map_err(|e| io_err("tcsetwinsize_master", e))?;
+        // Best-effort on master (macOS may reject TIOCSWINSZ on master);
+        // slave set is authoritative for child-visible size.
+        let _ = tcsetwinsize(&master, ws);
 
         // Observation fd: O_NOCTTY so the harness never acquires the slave ctty.
         let observe_slave = rustix::fs::open(
@@ -336,6 +338,9 @@ impl PtySession {
     }
 
     /// Change PTY dimensions (kernel delivers SIGWINCH to the fg pgrp).
+    ///
+    /// Sets on slave first (child-visible); master set is best-effort
+    /// (macOS may reject TIOCSWINSZ on the master).
     pub fn set_winsize(&self, size: PtyWinsize) -> std::io::Result<()> {
         use rustix::termios::{Winsize, tcsetwinsize};
         let ws = Winsize {
@@ -344,7 +349,10 @@ impl PtySession {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        tcsetwinsize(self.master.as_fd(), ws).map_err(|e| io_err("tcsetwinsize", e))
+        let slave_res = tcsetwinsize(&self.observe_slave.as_fd(), ws)
+            .map_err(|e| io_err("tcsetwinsize_slave", e));
+        let _ = tcsetwinsize(&self.master.as_fd(), ws);
+        slave_res
     }
 
     /// Selected canonical termios snapshot from the slave.

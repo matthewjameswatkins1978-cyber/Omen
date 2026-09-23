@@ -72,11 +72,13 @@ fn spawn(args: &[&str], deadline: Duration) -> PtySession {
 #[test]
 fn control_pty_is_tty_and_session_coherent() {
     let deadline = Duration::from_secs(8);
-    let mut session = spawn(&["--posix-report"], deadline);
+    // Hold the child stopped so identity/fg observations race neither exit
+    // nor session teardown.
+    let mut session = spawn(&["--posix-stop-report"], deadline);
     let t0 = Instant::now();
     let transcript = session
-        .wait_for_text("\"fixture\":\"posix-report\"", Duration::from_secs(5))
-        .expect("posix-report JSON barrier");
+        .wait_for_text("OMEN_COMPAT_STOPPING", Duration::from_secs(5))
+        .expect("STOPPING barrier");
     assert!(t0.elapsed() < deadline, "outer bound");
 
     let fg = session.observe_foreground_pgrp().expect("tcgetpgrp");
@@ -99,21 +101,26 @@ fn control_pty_is_tty_and_session_coherent() {
         "fixture sid must match session leader: {t}"
     );
 
+    continue_process(session.child_pid());
+    let _ = session.wait_for_text("OMEN_COMPAT_CONTINUED", Duration::from_secs(5));
     let status = session
         .wait_child_exit(Duration::from_secs(3))
         .expect("wait exit")
         .expect("child must exit");
-    assert!(status.success(), "posix-report exit: {status:?}");
+    assert!(status.success(), "posix-stop-report exit: {status:?}");
 }
 
 #[test]
 fn control_foreground_pgrp_observation_works() {
-    let mut session = spawn(&["--posix-report"], Duration::from_secs(8));
+    // Keep the child alive (stopped) so fg observation is not racing exit.
+    let mut session = spawn(&["--posix-stop-report"], Duration::from_secs(8));
     session
-        .wait_for_text("OMEN_COMPAT_READY", Duration::from_secs(5))
-        .expect("READY");
+        .wait_for_text("OMEN_COMPAT_STOPPING", Duration::from_secs(5))
+        .expect("STOPPING barrier");
     let fg = session.observe_foreground_pgrp().expect("tcgetpgrp");
     assert_eq!(fg, session.child_pid());
+    continue_process(session.child_pid());
+    let _ = session.wait_for_text("OMEN_COMPAT_CONTINUED", Duration::from_secs(5));
     let _ = session.wait_child_exit(Duration::from_secs(3));
 }
 
