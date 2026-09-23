@@ -162,7 +162,8 @@ pub fn extract_validated(archive: &Path, dest: &Path) -> Result<Vec<PathBuf>, Li
             )));
         }
         let mut f = std::fs::File::create(&out).map_err(|e| LifecycleError::Io(e.to_string()))?;
-        std::io::copy(&mut entry, &mut f).map_err(|e| LifecycleError::Io(e.to_string()))?;
+        std::io::copy(&mut entry, &mut f)
+            .map_err(|e| LifecycleError::Stage(format!("archive payload unreadable: {e}")))?;
         extracted.push(rel);
     }
     Ok(extracted)

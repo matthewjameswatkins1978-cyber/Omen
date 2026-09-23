@@ -544,7 +544,12 @@ pub fn run_update(
 
     // Download.
     if hooks.fail_download {
-        return fail_tx(base, &mut tx, "download", "injected download failure");
+        return Err(fail_tx(
+            base,
+            &mut tx,
+            "download",
+            "injected download failure",
+        ));
     }
     let downloads = base.join("update").join("downloads");
     std::fs::create_dir_all(&downloads).map_err(|e| LifecycleError::Io(e.to_string()))?;
@@ -558,12 +563,12 @@ pub fn run_update(
             })?;
         }
         ReleaseSource::CanonicalGithub => {
-            return fail_tx(
+            return Err(fail_tx(
                 base,
                 &mut tx,
                 "download",
                 "canonical download requires release asset URL plumbing",
-            );
+            ));
         }
     }
     // Partial-download guard: size must be nonzero and match after verify.
@@ -572,48 +577,89 @@ pub fn run_update(
         .unwrap_or(0);
     if dl_len == 0 {
         std::fs::remove_file(&package_path).ok();
-        return fail_tx(
+        return Err(fail_tx(
             base,
             &mut tx,
             "download",
             "interrupted download: empty package discarded",
-        );
+        ));
     }
     tx.stage = TxStage::Downloaded;
     save_tx(base, &tx)?;
 
+    // Every subsequent failure — explicit or unexpected I/O — records
+    // through fail_tx with the phase derived from the persisted stage. No
+    // silent transaction death, no unrecorded partial candidate.
+    if let Err(e) = run_stages(
+        base,
+        record,
+        &candidate,
+        &package_path,
+        hooks,
+        health,
+        &mut tx,
+    ) {
+        if tx.stage == TxStage::Failed {
+            return Err(e); // already recorded by an explicit fail_tx inside
+        }
+        let phase = phase_for_stage(tx.stage);
+        let msg = e.to_string();
+        return Err(fail_tx(base, &mut tx, phase, &msg));
+    }
+
+    // Post-activation cleanup: downloads + staging for this tx (quarantine
+    // only on failure paths).
+    let stage_dir = base.join("update").join("staging").join(&tx.tx_id);
+    std::fs::remove_file(&package_path).ok();
+    std::fs::remove_dir_all(&stage_dir).ok();
+    Ok(tx)
+}
+
+/// Verify -> compat -> snapshot -> stage -> migrate -> health -> activate.
+/// Explicit stage failures record themselves via fail_tx; unexpected errors
+/// propagate to the caller, which records them against the persisted stage.
+#[allow(clippy::too_many_arguments)]
+fn run_stages(
+    base: &Path,
+    record: &mut InstallRecord,
+    candidate: &ReleaseMeta,
+    package_path: &Path,
+    hooks: &FailureHooks,
+    health: &dyn HealthChecker,
+    tx: &mut UpdateTransaction,
+) -> Result<(), LifecycleError> {
     // Verify: package checksum, then extraction, then binary checksum.
     if hooks.fail_verify {
-        return fail_tx(base, &mut tx, "verify", "injected checksum failure");
+        return Err(fail_tx(base, tx, "verify", "injected checksum failure"));
     }
-    let actual_pkg = sha256_file(&package_path)?;
+    let actual_pkg = sha256_file(package_path)?;
     if actual_pkg != candidate.package_sha256 {
-        return fail_tx(
+        return Err(fail_tx(
             base,
-            &mut tx,
+            tx,
             "verify",
             &format!(
                 "checksum mismatch: got {actual_pkg}, want {}",
                 candidate.package_sha256
             ),
-        );
+        ));
     }
     let stage_dir = base.join("update").join("staging").join(&tx.tx_id);
     // Package may be a zip archive or an already-extracted directory.
 
-    let extracted_dir: PathBuf = if is_zip(&package_path) {
+    let extracted_dir: PathBuf = if is_zip(package_path) {
         std::fs::create_dir_all(&stage_dir).map_err(|e| LifecycleError::Io(e.to_string()))?;
-        crate::archive::extract_validated(&package_path, &stage_dir)?;
+        crate::archive::extract_validated(package_path, &stage_dir)?;
         stage_dir.clone()
     } else if package_path.is_dir() {
-        package_path.clone()
+        package_path.to_path_buf()
     } else {
-        return fail_tx(
+        return Err(fail_tx(
             base,
-            &mut tx,
+            tx,
             "verify",
             "package is neither zip nor directory",
-        );
+        ));
     };
     let staged_binary = extracted_dir.join(exe_name());
     // Manifest binding: the extracted manifest must name this candidate
@@ -632,12 +678,12 @@ pub fn run_update(
             .and_then(|v| v.as_str())
             .unwrap_or("");
         if mg != candidate.git_sha || mv != candidate.version {
-            return fail_tx(
+            return Err(fail_tx(
                 base,
-                &mut tx,
+                tx,
                 "verify",
                 "staged manifest does not name this candidate",
-            );
+            ));
         }
         let daemon_file = if cfg!(windows) { "omend.exe" } else { "omend" };
         let dq = extracted_dir.join(daemon_file);
@@ -645,61 +691,71 @@ pub fn run_update(
             if let Some(want) = m.get("daemon_binary_sha256").and_then(|v| v.as_str()) {
                 let have = sha256_file(&dq)?;
                 if have != want {
-                    return fail_tx(base, &mut tx, "verify", "daemon checksum mismatch");
+                    return Err(fail_tx(base, tx, "verify", "daemon checksum mismatch"));
                 }
             }
             staged_daemon = Some(dq);
         }
     }
     if !staged_binary.is_file() {
-        return fail_tx(
+        return Err(fail_tx(
             base,
-            &mut tx,
+            tx,
             "verify",
             "staged binary missing after extraction",
-        );
+        ));
     }
     let actual_bin = sha256_file(&staged_binary)?;
     if actual_bin != candidate.binary_sha256 {
-        return fail_tx(
+        return Err(fail_tx(
             base,
-            &mut tx,
+            tx,
             "verify",
             &format!(
                 "binary checksum mismatch: got {actual_bin}, want {}",
                 candidate.binary_sha256
             ),
-        );
+        ));
     }
     tx.stage = TxStage::Verified;
-    save_tx(base, &tx)?;
+    save_tx(base, tx)?;
 
     // Compat inspect.
     if hooks.fail_compat {
-        return fail_tx(base, &mut tx, "compat", "injected incompatibility");
+        return Err(fail_tx(base, tx, "compat", "injected incompatibility"));
     }
     if candidate.contract_version != super::install::CONTRACT_VERSION {
-        return fail_tx(base, &mut tx, "compat", "candidate contract incompatible");
+        return Err(fail_tx(
+            base,
+            tx,
+            "compat",
+            "candidate contract incompatible",
+        ));
     }
     if candidate.min_state_schema > crate::migrate::STATE_SCHEMA_VERSION {
-        return fail_tx(base, &mut tx, "compat", "candidate state schema too new");
+        return Err(fail_tx(
+            base,
+            tx,
+            "compat",
+            "candidate state schema too new",
+        ));
     }
     tx.stage = TxStage::CompatChecked;
-    save_tx(base, &tx)?;
+    save_tx(base, tx)?;
 
     // Snapshot (install record + active pointer + workspace DB list).
     if hooks.fail_snapshot {
-        return fail_tx(base, &mut tx, "snapshot", "injected snapshot failure");
+        return Err(fail_tx(base, tx, "snapshot", "injected snapshot failure"));
     }
     let snapshot_id = format!("snap_{}", &tx.tx_id[3..]);
     take_snapshot(base, &snapshot_id)?;
     tx.snapshot_id = Some(snapshot_id);
     tx.stage = TxStage::SnapshotTaken;
-    save_tx(base, &tx)?;
+    save_tx(base, tx)?;
 
     // Stage: copy verified binary into an immutable versioned slot.
     if hooks.fail_stage {
-        return fail_tx(base, &mut tx, "stage", "injected staging failure");
+        return Err(fail_tx(base, tx, "stage", "injected staging failure"));
     }
     let slot = slot_dir(base, &candidate.version, &candidate.git_sha);
     let slot_name = slot
@@ -714,16 +770,16 @@ pub fn run_update(
     let placed = sha256_file(&slot_binary)?;
     if placed != candidate.binary_sha256 {
         std::fs::remove_dir_all(&slot).ok();
-        return fail_tx(
+        return Err(fail_tx(
             base,
-            &mut tx,
+            tx,
             "stage",
             "slot bytes differ after copy; slot removed",
-        );
+        ));
     }
     tx.candidate_slot = Some(slot_name.clone());
     tx.stage = TxStage::Staged;
-    save_tx(base, &tx)?;
+    save_tx(base, tx)?;
     // Sibling daemon follows the slot when the package carried a verified one.
     if let Some(dq) = staged_daemon.as_ref() {
         let daemon_file = if cfg!(windows) { "omend.exe" } else { "omend" };
@@ -733,7 +789,7 @@ pub fn run_update(
 
     // Migrate (checkpointed; non-destructive v1 ensure).
     if hooks.fail_migrate {
-        return fail_tx(base, &mut tx, "migrate", "injected migration failure");
+        return Err(fail_tx(base, tx, "migrate", "injected migration failure"));
     }
     {
         let cp = crate::migrate::MigrationCheckpoint {
@@ -760,21 +816,21 @@ pub fn run_update(
         crate::migrate::save_checkpoint(base, &done)?;
     }
     tx.stage = TxStage::Migrated;
-    save_tx(base, &tx)?;
+    save_tx(base, tx)?;
 
     // Health check (deterministic, no LLM).
     if hooks.fail_health {
-        return fail_tx(base, &mut tx, "health", "injected health failure");
+        return Err(fail_tx(base, tx, "health", "injected health failure"));
     }
-    health.check(&slot_binary, &candidate).inspect_err(|e| {
+    health.check(&slot_binary, candidate).inspect_err(|e| {
         let msg = e.to_string();
-        let _ = quarantine_candidate(base, &tx);
+        let _ = quarantine_candidate(base, tx);
         tx.stage = TxStage::Failed;
         tx.failure = Some(format!("health: {msg}"));
-        let _ = save_tx(base, &tx);
+        let _ = save_tx(base, tx);
     })?;
     tx.stage = TxStage::HealthChecked;
-    save_tx(base, &tx)?;
+    save_tx(base, tx)?;
 
     // Activate: smallest atomic pointer swap. Previous slot preserved.
     // BEFORE the pointer moves, the stable `bin/` copies refresh from the
@@ -783,11 +839,11 @@ pub fn run_update(
     // previous pointer AND previous stable copies are both intact: fail
     // closed with no half-active product.
     if hooks.fail_activate {
-        return fail_tx(base, &mut tx, "activate", "injected activation failure");
+        return Err(fail_tx(base, tx, "activate", "injected activation failure"));
     }
     if let Err(e) = refresh_stable_copies(base, &slot) {
         let msg = e.to_string();
-        return fail_tx(base, &mut tx, "activate", &msg);
+        return Err(fail_tx(base, tx, "activate", &msg));
     }
     record.previous_slot.clone_from(&record.active_slot);
     record.active_slot = Some(slot_name.clone());
@@ -798,26 +854,32 @@ pub fn run_update(
     crate::install::save_install_record(base, record)?;
     write_active_pointer(base, &slot_name)?;
     tx.stage = TxStage::Activated;
-    save_tx(base, &tx)?;
-
-    // Post-activation cleanup: downloads + staging for this tx (quarantine
-    // only on failure paths).
-    std::fs::remove_file(&package_path).ok();
-    std::fs::remove_dir_all(&stage_dir).ok();
-    Ok(tx)
+    save_tx(base, tx)?;
+    Ok(())
 }
 
-fn fail_tx(
-    base: &Path,
-    tx: &mut UpdateTransaction,
-    stage: &str,
-    detail: &str,
-) -> Result<UpdateTransaction, LifecycleError> {
+/// Derive the failing phase name from the last persisted stage, so
+/// unexpected errors are recorded against the phase that was running.
+fn phase_for_stage(stage: TxStage) -> &'static str {
+    match stage {
+        TxStage::Discovered => "download",
+        TxStage::Downloaded => "verify",
+        TxStage::Verified => "compat",
+        TxStage::CompatChecked => "snapshot",
+        TxStage::SnapshotTaken => "stage",
+        TxStage::Staged => "migrate",
+        TxStage::Migrated => "health",
+        TxStage::HealthChecked => "activate",
+        TxStage::Activated | TxStage::RolledBack | TxStage::Failed => "activate",
+    }
+}
+
+fn fail_tx(base: &Path, tx: &mut UpdateTransaction, stage: &str, detail: &str) -> LifecycleError {
     tx.stage = TxStage::Failed;
     tx.failure = Some(format!("{stage}: {detail}"));
     let _ = quarantine_candidate(base, tx);
     let _ = save_tx(base, tx);
-    Err(match stage {
+    match stage {
         "download" => LifecycleError::Download(detail.to_string()),
         "verify" => LifecycleError::Verify(detail.to_string()),
         "compat" => LifecycleError::Compat(detail.to_string()),
@@ -827,7 +889,7 @@ fn fail_tx(
         "health" => LifecycleError::Health(detail.to_string()),
         "activate" => LifecycleError::Activate(detail.to_string()),
         _ => LifecycleError::Io(detail.to_string()),
-    })
+    }
 }
 
 /// Refresh the stable `bin/` copies from a verified slot (rename-swap).
@@ -877,6 +939,17 @@ fn quarantine_candidate(base: &Path, tx: &UpdateTransaction) -> Result<(), Lifec
         let src = base.join("update").join(name).join(&tx.tx_id);
         if src.exists() {
             let _ = std::fs::rename(&src, q.join(name));
+        }
+    }
+    // The downloaded package file carries the tx id in its name
+    // (`<version>-<txid>.pkg`): move it into quarantine too, so no partial
+    // candidate lingers in downloads/.
+    if let Ok(rd) = std::fs::read_dir(base.join("update").join("downloads")) {
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.contains(&tx.tx_id) {
+                let _ = std::fs::rename(entry.path(), q.join(&name));
+            }
         }
     }
     Ok(())

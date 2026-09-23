@@ -299,6 +299,54 @@ fn swapped_manifest_fails_closed() {
 }
 
 #[test]
+fn corrupt_archive_records_failure_and_quarantines() {
+    // Truncated zip: magic intact, central directory broken. The failure
+    // must be RECORDED (tx Failed) with the partial candidate quarantined —
+    // never a silent transaction death with stale CandidateStaged state.
+    let fx = setup();
+    let meta = make_release(
+        &fx.source,
+        "0.9.0-preview.16",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        false,
+    );
+    let pkg = fx.source.join(&meta.package);
+    let mut bytes = std::fs::read(&pkg).unwrap();
+    bytes.truncate(bytes.len() / 2);
+    std::fs::write(&pkg, &bytes).unwrap();
+    let mut meta2 = meta.clone();
+    meta2.package_sha256 = sha_hex(&std::fs::read(&pkg).unwrap());
+    let mut record = load_record(&fx);
+    let health = StubHealth {
+        ok: true,
+        version: meta2.version.clone(),
+        sha: meta2.git_sha.clone(),
+    };
+    let err = update::run_update(
+        &fx.base,
+        &mut record,
+        meta2,
+        &ReleaseSource::Directory(fx.source.clone()),
+        &good_hooks(),
+        &health,
+    )
+    .unwrap_err();
+    // Truncated mid-extraction: structural verification fails (phase
+    // verify: the persisted stage was Downloaded).
+    assert_eq!(err.phase(), "verify");
+    // Failure recorded: no open transaction masquerades as staged.
+    let states = update::classify_update_restart(&fx.base);
+    assert!(
+        states
+            .iter()
+            .all(|s| matches!(s, update::UpdateRestart::PreviousStillActive { .. }))
+    );
+    // Partial candidate quarantined.
+    assert!(fx.base.join("update").join("quarantine").is_dir());
+    assert_eq!(load_record(&fx).version, "0.9.0-preview.15");
+}
+
+#[test]
 fn source_sha_mismatch_means_malformed() {
     // A release whose manifest lacks digest provenance is malformed, never
     // "up to date".
