@@ -462,6 +462,87 @@ pub fn cmd_channel(set: Option<String>, json_mode: bool) -> Result<(), Box<dyn s
     Ok(())
 }
 
+// ------------------------------------------------------------- rollback ---
+pub fn cmd_rollback(
+    binary: bool,
+    state: Option<String>,
+    json_mode: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let b = base();
+    if !binary && state.is_none() {
+        eprintln!(
+            "specify --binary (previous slot) or --state <snapshot-id>; the two are separate truths"
+        );
+        std::process::exit(2);
+    }
+    if binary {
+        let mut record = omen_lifecycle::install::load_install_record(&b)?.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no install record: nothing to roll back",
+            )
+        })?;
+        let launcher = omen_lifecycle::update::ProcessLauncher;
+        match omen_lifecycle::update::rollback_binary(&b, &mut record, &launcher) {
+            Ok(slot) => {
+                if json_mode {
+                    machine_msg(
+                        "ok",
+                        "binary rolled back",
+                        serde_json::json!({"active_slot": slot}),
+                    );
+                } else {
+                    println!("[ok] binary rolled back to slot {slot}");
+                    println!("state untouched: binary rollback is not state rollback");
+                }
+            }
+            Err(e) => {
+                if json_mode {
+                    machine_msg(
+                        "fail",
+                        "rollback refused",
+                        serde_json::json!({"error": e.to_string()}),
+                    );
+                } else {
+                    println!("[fail] rollback refused: {e}");
+                }
+                std::process::exit(1);
+            }
+        }
+    }
+    if let Some(snap) = state {
+        match omen_lifecycle::update::rollback_state(&b, &snap) {
+            Ok(restored) => {
+                if json_mode {
+                    machine_msg(
+                        "ok",
+                        "state restored",
+                        serde_json::json!({"restored": restored}),
+                    );
+                } else {
+                    println!("[ok] state restored from {snap}:");
+                    for r in &restored {
+                        println!("  - {r}");
+                    }
+                }
+            }
+            Err(e) => {
+                if json_mode {
+                    machine_msg(
+                        "fail",
+                        "state rollback refused",
+                        serde_json::json!({"error": e.to_string()}),
+                    );
+                } else {
+                    println!("[fail] state rollback refused: {e}");
+                }
+                std::process::exit(1);
+            }
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------- setup ---
 pub fn cmd_setup(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Setup is optional and idempotent: sane defaults, deferrable choices.

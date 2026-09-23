@@ -82,6 +82,8 @@ enum Commands {
     Repair(RepairArgs),
     /// Check for updates or apply an Omen-owned update transaction
     Update(UpdateArgs),
+    /// Roll back to the previous healthy slot (binary) or a snapshot (state)
+    Rollback(RollbackArgs),
     /// Show or set the user release channel (stable|preview)
     Channel(ChannelArgs),
     /// Optional first-run setup (idempotent; never required for install)
@@ -555,6 +557,16 @@ struct UpdateArgs {
 struct ChannelArgs {
     /// Set channel: stable|preview (omit to show current)
     set: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct RollbackArgs {
+    /// Roll back application bytes to the previous healthy slot
+    #[arg(long)]
+    binary: bool,
+    /// Roll back state from a snapshot id (see update transactions)
+    #[arg(long)]
+    state: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -1670,6 +1682,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(Commands::Channel(args)) => {
             lifecycle_cmds::cmd_channel(args.set, json_mode)?;
+        }
+        Some(Commands::Rollback(args)) => {
+            lifecycle_cmds::cmd_rollback(args.binary, args.state, json_mode)?;
         }
         Some(Commands::Setup) => {
             lifecycle_cmds::cmd_setup(json_mode)?;
