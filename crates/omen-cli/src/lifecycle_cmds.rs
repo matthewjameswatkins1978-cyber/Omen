@@ -541,10 +541,10 @@ fn adopt_conveyor_state(
     record.package_sha256 = if pkg.is_empty() { None } else { Some(pkg) };
     record.binary_sha256 = if bin.is_empty() { None } else { Some(bin) };
     omen_lifecycle::install::save_install_record(b, &record)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     if omen_lifecycle::update::read_active_pointer(b).is_none() {
         omen_lifecycle::update::write_active_pointer(b, slot)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
     }
     Ok(record)
 }
