@@ -70,6 +70,11 @@ mislabelled Exact. Evidence projections use `redacted_from_evidence` only
 and cannot claim Exact (one authority; see D2-012). The safe generic
 projection remains `Redacted`.
 
+**Type seal (D2-013):** `ReplayDescriptor` fields are private; there is no
+public fidelity setter or struct-literal forge. Generic `Deserialize`
+rejects `Exact` (serialization records a claim; deserialization does not
+prove it). Redacted records still round-trip.
+
 Fixture JSON reports remain limited to controlled Compat fixtures.
 
 ## Evidence layers

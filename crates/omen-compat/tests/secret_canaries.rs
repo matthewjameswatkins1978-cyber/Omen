@@ -54,12 +54,17 @@ fn stdin_secret_canary_absent_from_evidence_and_replay() {
         &serde_json::to_string(&CommandEvidence::from_execution(&spec)).unwrap(),
     );
     let redacted = ReplayDescriptor::redacted(&spec, "mode", vec![]);
-    assert_eq!(redacted.fidelity, ReplayFidelity::Redacted);
-    assert!(redacted.argv.is_empty());
+    assert_eq!(redacted.fidelity(), ReplayFidelity::Redacted);
+    assert!(redacted.argv().is_empty());
     assert_clean(
         "ReplayDescriptor redacted",
         &serde_json::to_string(&redacted).unwrap(),
     );
+    // Round-trip remains possible for Redacted (no Exact claim).
+    let back: ReplayDescriptor =
+        serde_json::from_str(&serde_json::to_string(&redacted).unwrap()).unwrap();
+    assert_eq!(back.fidelity(), ReplayFidelity::Redacted);
+    assert_eq!(back, redacted);
 }
 
 #[test]

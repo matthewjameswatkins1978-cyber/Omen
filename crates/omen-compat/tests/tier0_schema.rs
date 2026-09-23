@@ -187,13 +187,13 @@ fn replay_descriptor_redacted_and_exact_fixture() {
             InvariantId::BoundedWaitNoHang,
         ],
     );
-    assert_eq!(redacted.fidelity, ReplayFidelity::Redacted);
-    assert!(redacted.argv.is_empty());
+    assert_eq!(redacted.fidelity(), ReplayFidelity::Redacted);
+    assert!(redacted.argv().is_empty());
     let json = serde_json::to_string(&redacted).unwrap();
     assert!(!json.contains(secret));
-    assert_eq!(redacted.fixture_mode, "exit-code");
-    assert_eq!(redacted.expected_invariants.len(), 2);
-    assert_eq!(redacted.stdin_mode, "closed");
+    assert_eq!(redacted.fixture_mode(), "exit-code");
+    assert_eq!(redacted.expected_invariants().len(), 2);
+    assert_eq!(redacted.stdin_mode(), "closed");
 
     // Secret-bearing env must block Exact.
     let blocked = ReplayDescriptor::try_exact_fixture(
@@ -221,8 +221,11 @@ fn replay_descriptor_redacted_and_exact_fixture() {
         vec!["--exit-code".into(), "7".into()],
     )
     .expect("safe fixture must be Exact");
-    assert_eq!(exact.fidelity, ReplayFidelity::Exact);
-    assert_eq!(exact.argv, vec!["--exit-code".to_string(), "7".to_string()]);
+    assert_eq!(exact.fidelity(), ReplayFidelity::Exact);
+    assert_eq!(
+        exact.argv(),
+        vec!["--exit-code".to_string(), "7".to_string()]
+    );
     let json = serde_json::to_string(&exact).unwrap();
     assert!(!json.contains(secret));
     assert!(!json.contains("OPENAI_API_KEY="));
@@ -324,8 +327,8 @@ fn exact_replay_blocked_by_env_stdin_cwd_or_unsafe_argv() {
         CommandEvidence::from_execution(&original).with_safe_argv(false_safe_argv.clone());
     // No CommandEvidence-based API can produce Exact.
     let projected = ReplayDescriptor::redacted_from_evidence(evidence, "m", vec![]);
-    assert_eq!(projected.fidelity, ReplayFidelity::Redacted);
-    assert!(projected.argv.is_empty());
+    assert_eq!(projected.fidelity(), ReplayFidelity::Redacted);
+    assert!(projected.argv().is_empty());
     // try_exact_fixture rejects same-length wrong argv against original spec.
     assert_eq!(
         ReplayDescriptor::try_exact_fixture(&original, "m", vec![], false_safe_argv).unwrap_err(),
@@ -358,13 +361,35 @@ fn replay_fidelity_serialization_roundtrip() {
     );
 }
 
-/// Structural authority: Exact is assigned only inside try_exact_fixture.
+/// Type seal: no public fidelity field; Exact assigned only in try_exact_fixture.
 #[test]
 fn exact_fidelity_has_single_source_authority() {
     let src = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/failure.rs"),
     )
     .expect("read failure.rs");
+
+    assert!(
+        !src.contains("pub fidelity"),
+        "fidelity field must not be public"
+    );
+    assert!(
+        !src.contains("pub fn set_fidelity")
+            && !src.contains("pub fn with_fidelity")
+            && !src.contains("pub fn make_exact")
+            && !src.contains("pub fn unchecked_exact"),
+        "no public Exact setter/constructor may exist"
+    );
+    assert!(
+        !src.contains("pub fn from_evidence("),
+        "caller-supplied fidelity constructor must not exist"
+    );
+    assert!(src.contains("pub fn try_exact_fixture"));
+    assert!(src.contains("pub fn redacted_from_evidence"));
+    assert!(
+        src.contains("Exact replay requires validation against original CommandSpec"),
+        "custom Deserialize must reject Exact with explicit reason"
+    );
 
     let exact_assign = "fidelity: ReplayFidelity::Exact";
     let assignments = src.matches(exact_assign).count();
@@ -377,7 +402,6 @@ fn exact_fidelity_has_single_source_authority() {
         .find("pub fn try_exact_fixture")
         .expect("try_exact_fixture must exist");
     let assign_pos = src.find(exact_assign).expect("Exact assignment must exist");
-    // Next public constructor after try_exact_fixture's own signature.
     let after_sig = try_pos + "pub fn try_exact_fixture".len();
     let next_pub_fn = src[after_sig..]
         .find("    pub fn ")
@@ -387,18 +411,117 @@ fn exact_fidelity_has_single_source_authority() {
         assign_pos > try_pos && assign_pos < next_pub_fn,
         "Exact must only be assigned inside try_exact_fixture (try={try_pos} assign={assign_pos} next={next_pub_fn})"
     );
+}
 
+/// Raw JSON claiming Exact is rejected by generic deserialization.
+#[test]
+fn raw_json_exact_is_rejected() {
+    let spec = CommandSpec::new("omen-gremlin")
+        .arg("--exit-code")
+        .arg("7")
+        .env(EnvPolicy::Clear)
+        .stdin(StdinSpec::Closed)
+        .timeout(Duration::from_millis(200));
+    let redacted = ReplayDescriptor::redacted(&spec, "exit-code", vec![]);
+    let mut json: serde_json::Value = serde_json::to_value(&redacted).expect("serialize redacted");
+    json["fidelity"] = serde_json::json!("exact");
+    let text = serde_json::to_string(&json).unwrap();
+    let err = serde_json::from_str::<ReplayDescriptor>(&text)
+        .expect_err("raw Exact JSON must be rejected");
+    let msg = err.to_string();
     assert!(
-        !src.contains("pub fn from_evidence("),
-        "caller-supplied fidelity constructor must not exist"
+        msg.contains("Exact replay requires validation against original CommandSpec"),
+        "error must explain Exact requires validation: {msg}"
     );
-    let redacted_pos = src
-        .find("pub fn redacted_from_evidence")
-        .expect("redacted_from_evidence must exist");
-    assert!(
-        !src[redacted_pos..].contains(exact_assign),
-        "redacted_from_evidence must not assign Exact"
-    );
+}
+
+/// Trusted in-memory Exact can serialize; generic Deserialize cannot restore it.
+#[test]
+fn serialized_valid_exact_cannot_generic_deserialize() {
+    let spec = CommandSpec::new("omen-gremlin")
+        .arg("--exit-code")
+        .arg("7")
+        .env(EnvPolicy::Clear)
+        .stdin(StdinSpec::Closed)
+        .timeout(Duration::from_millis(200));
+    let exact = ReplayDescriptor::try_exact_fixture(
+        &spec,
+        "exit-code",
+        vec![InvariantId::ExitCausePreserved],
+        vec!["--exit-code".into(), "7".into()],
+    )
+    .expect("safe Exact");
+    assert_eq!(exact.fidelity(), ReplayFidelity::Exact);
+    let json = serde_json::to_string(&exact).unwrap();
+    assert!(json.contains("\"fidelity\":\"exact\""));
+    let err = serde_json::from_str::<ReplayDescriptor>(&json)
+        .expect_err("serialized Exact must not generic-deserialize");
+    assert!(err.to_string().contains("Exact replay requires validation"));
+}
+
+/// Nested Exact inside StructuredFailure fails closed on generic deserialize.
+#[test]
+fn structured_failure_nested_exact_deserialize_fails_closed() {
+    let spec = CommandSpec::new("omen-gremlin")
+        .arg("--exit-code")
+        .arg("7")
+        .env(EnvPolicy::Clear)
+        .stdin(StdinSpec::Closed)
+        .timeout(Duration::from_millis(200));
+    let exact = ReplayDescriptor::try_exact_fixture(
+        &spec,
+        "exit-code",
+        vec![InvariantId::ExitCausePreserved],
+        vec!["--exit-code".into(), "7".into()],
+    )
+    .expect("safe Exact");
+    let failure = StructuredFailure::builder(
+        InvariantId::ExitCausePreserved,
+        Platform::current(),
+        "nested_exact",
+        FailureKind::Contradiction,
+        EvidenceGrade::Strong,
+        "nested exact must fail closed",
+    )
+    .replay(exact)
+    .build();
+    let json = serde_json::to_string(&failure).unwrap();
+    assert!(json.contains("\"fidelity\":\"exact\""));
+    let err = serde_json::from_str::<StructuredFailure>(&json)
+        .expect_err("nested Exact must fail closed");
+    assert!(err.to_string().contains("Exact replay requires validation"));
+}
+
+/// Redacted StructuredFailure still round-trips generically.
+#[test]
+fn structured_failure_redacted_replay_roundtrip() {
+    let spec = CommandSpec::new("omen-gremlin")
+        .arg("--exit-code")
+        .arg("7")
+        .env(EnvPolicy::Clear)
+        .stdin(StdinSpec::Closed)
+        .timeout(Duration::from_millis(200));
+    let failure = StructuredFailure::builder(
+        InvariantId::ExitCausePreserved,
+        Platform::current(),
+        "redacted_roundtrip",
+        FailureKind::Contradiction,
+        EvidenceGrade::Strong,
+        "redacted replay round-trip",
+    )
+    .replay(ReplayDescriptor::redacted(
+        &spec,
+        "exit-code",
+        vec![InvariantId::ExitCausePreserved],
+    ))
+    .build();
+    let json = serde_json::to_string(&failure).unwrap();
+    let back: StructuredFailure = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.invariant, failure.invariant);
+    let replay = back.replay.as_ref().expect("replay present");
+    assert_eq!(replay.fidelity(), ReplayFidelity::Redacted);
+    assert_eq!(replay.fixture_mode(), "exit-code");
+    assert_eq!(back, failure);
 }
 
 /// Safe exact fixture serializes cleanly with validated argv.
@@ -441,8 +564,8 @@ fn exact_fixture_serialization_preserves_validated_argv_without_secrets() {
         "exit-code",
         vec![],
     );
-    assert_eq!(projected.fidelity, ReplayFidelity::Redacted);
-    assert!(projected.argv.is_empty());
+    assert_eq!(projected.fidelity(), ReplayFidelity::Redacted);
+    assert!(projected.argv().is_empty());
     let json = serde_json::to_string(&projected).unwrap();
     assert!(!json.contains(canary));
     assert!(!json.contains("completely"));
@@ -562,15 +685,11 @@ fn structured_failure_intentional_mismatch_is_replayable() {
     .stderr(RunOutcome::capture_summary(&outcome.stderr))
     .observations(outcome.observations.clone())
     .result(result.clone())
-    .replay(
-        ReplayDescriptor::try_exact_fixture(
-            &spec,
-            "exit-code",
-            vec![InvariantId::ExitCausePreserved],
-            vec!["--exit".into(), "7".into()],
-        )
-        .expect("Clear+Closed+no-cwd fixture is Exact"),
-    )
+    .replay(ReplayDescriptor::redacted(
+        &spec,
+        "exit-code",
+        vec![InvariantId::ExitCausePreserved],
+    ))
     .minimal_reproducer("omen-gremlin --exit-code 7")
     .likely_subsystem("compat.runner.exit_cause")
     .output_bounds(outcome.bounds)
@@ -583,12 +702,17 @@ fn structured_failure_intentional_mismatch_is_replayable() {
     assert!(failure.reason.contains("observed 7"));
     assert_eq!(failure.exit_cause, Some(ExitCause::code(7)));
     assert!(failure.replay.is_some());
-    assert_eq!(failure.replay.as_ref().unwrap().fixture_mode, "exit-code");
+    assert_eq!(failure.replay.as_ref().unwrap().fixture_mode(), "exit-code");
     assert!(!failure.observations.is_empty());
 
+    // Generic round-trip uses Redacted replay (Exact cannot re-enter trusted type).
     let json = serde_json::to_string(&failure).unwrap();
     let back: StructuredFailure = serde_json::from_str(&json).unwrap();
     assert_eq!(back.invariant, failure.invariant);
     assert_eq!(back.reason, failure.reason);
+    assert_eq!(
+        back.replay.as_ref().unwrap().fidelity(),
+        ReplayFidelity::Redacted
+    );
     assert_eq!(result.outcome, InvariantOutcome::Fail);
 }

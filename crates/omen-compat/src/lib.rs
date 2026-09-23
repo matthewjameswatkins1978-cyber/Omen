@@ -18,6 +18,13 @@
 //! automatically retaining those values. Stream summaries never include raw
 //! textual previews by default.
 //!
+//! ## Exact replay type seal
+//!
+//! [`ReplayDescriptor`] fields are private. The sole trusted Exact constructor
+//! is [`ReplayDescriptor::try_exact_fixture`]. Generic deserialization rejects
+//! [`ReplayFidelity::Exact`]: serialization records a claim; deserialization
+//! does not prove it.
+//!
 //! Production Omen crates must never depend on this crate.
 
 pub mod core;

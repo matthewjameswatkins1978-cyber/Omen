@@ -86,3 +86,14 @@ Secret-safe `CommandEvidence` projections cannot independently claim Exact:
 they never retain original argv, so same-length false argv cannot mint Exact.
 Evidence projection is `redacted_from_evidence` only (no caller-supplied
 fidelity argument). No second Exact constructor.
+
+## D2-013 — Exact is sealed at the type boundary
+
+`ReplayDescriptor` fields are private: public callers cannot set `fidelity`
+or forge a descriptor with a struct literal. Generic deserialization cannot
+create Exact — raw bytes are untrusted; persistence is not semantic
+authority. Serialization records a claim. Deserialization does not prove it.
+`try_exact_fixture` remains the single trusted Exact constructor. Redacted
+(and Partial, if ever used) may still round-trip generically. A future
+trusted Exact restore path would need explicit revalidation against
+execution evidence — out of M0 scope.

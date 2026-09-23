@@ -149,27 +149,154 @@ pub enum ReplayFidelity {
 }
 
 /// Durable replay description. Never a blind clone of execution state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Fields are private: external callers cannot forge fidelity or construct
+/// an Exact claim with a struct literal. The sole trusted Exact constructor
+/// is [`ReplayDescriptor::try_exact_fixture`].
+///
+/// Serialization records a claim. Deserialization does not prove it —
+/// generic [`Deserialize`] rejects [`ReplayFidelity::Exact`].
+///
+/// ```compile_fail
+/// fn forge(mut replay: omen_compat::ReplayDescriptor) {
+///     replay.fidelity = omen_compat::ReplayFidelity::Exact;
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn forge_literal() -> omen_compat::ReplayDescriptor {
+///     omen_compat::ReplayDescriptor {
+///         program: "omen-gremlin".into(),
+///         argv: vec![],
+///         argv_count: 0,
+///         cwd_policy: "inherit".into(),
+///         env_policy_kind: "clear".into(),
+///         env_keys: vec![],
+///         stdin_mode: "closed".into(),
+///         stdin_byte_length: None,
+///         deadline: omen_compat::Deadline::default(),
+///         fixture_mode: "m".into(),
+///         expected_invariants: vec![],
+///         fidelity: omen_compat::ReplayFidelity::Exact,
+///     }
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ReplayDescriptor {
-    pub program: String,
-    pub argv: Vec<String>,
-    pub argv_count: usize,
-    pub cwd_policy: String,
-    pub env_policy_kind: String,
-    pub env_keys: Vec<String>,
-    pub stdin_mode: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stdin_byte_length: Option<usize>,
-    pub deadline: Deadline,
-    pub fixture_mode: String,
-    pub expected_invariants: Vec<InvariantId>,
-    pub fidelity: ReplayFidelity,
+    program: String,
+    argv: Vec<String>,
+    argv_count: usize,
+    cwd_policy: String,
+    env_policy_kind: String,
+    env_keys: Vec<String>,
+    stdin_mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stdin_byte_length: Option<usize>,
+    deadline: Deadline,
+    fixture_mode: String,
+    expected_invariants: Vec<InvariantId>,
+    fidelity: ReplayFidelity,
+}
+
+/// Private wire form for controlled deserialization (not part of the public API).
+#[derive(Deserialize)]
+struct ReplayDescriptorWire {
+    program: String,
+    argv: Vec<String>,
+    argv_count: usize,
+    cwd_policy: String,
+    env_policy_kind: String,
+    env_keys: Vec<String>,
+    stdin_mode: String,
+    #[serde(default)]
+    stdin_byte_length: Option<usize>,
+    deadline: Deadline,
+    fixture_mode: String,
+    expected_invariants: Vec<InvariantId>,
+    fidelity: ReplayFidelity,
+}
+
+impl<'de> Deserialize<'de> for ReplayDescriptor {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ReplayDescriptorWire::deserialize(deserializer)?;
+        match wire.fidelity {
+            ReplayFidelity::Exact => Err(serde::de::Error::custom(
+                "Exact replay requires validation against original CommandSpec",
+            )),
+            fidelity => Ok(Self {
+                program: wire.program,
+                argv: wire.argv,
+                argv_count: wire.argv_count,
+                cwd_policy: wire.cwd_policy,
+                env_policy_kind: wire.env_policy_kind,
+                env_keys: wire.env_keys,
+                stdin_mode: wire.stdin_mode,
+                stdin_byte_length: wire.stdin_byte_length,
+                deadline: wire.deadline,
+                fixture_mode: wire.fixture_mode,
+                expected_invariants: wire.expected_invariants,
+                fidelity,
+            }),
+        }
+    }
 }
 
 impl ReplayDescriptor {
+    pub fn fidelity(&self) -> ReplayFidelity {
+        self.fidelity
+    }
+
+    pub fn program(&self) -> &str {
+        &self.program
+    }
+
+    pub fn argv(&self) -> &[String] {
+        &self.argv
+    }
+
+    pub fn argv_count(&self) -> usize {
+        self.argv_count
+    }
+
+    pub fn cwd_policy(&self) -> &str {
+        &self.cwd_policy
+    }
+
+    pub fn env_policy_kind(&self) -> &str {
+        &self.env_policy_kind
+    }
+
+    pub fn env_keys(&self) -> &[String] {
+        &self.env_keys
+    }
+
+    pub fn stdin_mode(&self) -> &str {
+        &self.stdin_mode
+    }
+
+    pub fn stdin_byte_length(&self) -> Option<usize> {
+        self.stdin_byte_length
+    }
+
+    pub fn deadline(&self) -> Deadline {
+        self.deadline
+    }
+
+    pub fn fixture_mode(&self) -> &str {
+        &self.fixture_mode
+    }
+
+    pub fn expected_invariants(&self) -> &[InvariantId] {
+        &self.expected_invariants
+    }
+
     /// Explicit redacted projection: counts, kinds, and key names only.
     ///
     /// Safe generic default when execution-affecting values are present.
+    /// Always [`ReplayFidelity::Redacted`].
     pub fn redacted(
         spec: &CommandSpec,
         fixture_mode: impl Into<String>,
@@ -200,8 +327,8 @@ impl ReplayDescriptor {
     /// - `cwd == None` (no omitted path)
     /// - `safe_argv == spec.argv` (explicitly classified safe and exact)
     ///
-    /// No other public path may manufacture [`ReplayFidelity::Exact`].
-    /// Evidence projections cannot claim Exact because they never see original argv.
+    /// No other public path may manufacture a trusted [`ReplayFidelity::Exact`]
+    /// inside a [`ReplayDescriptor`]. Generic deserialization also rejects Exact.
     pub fn try_exact_fixture(
         spec: &CommandSpec,
         fixture_mode: impl Into<String>,
