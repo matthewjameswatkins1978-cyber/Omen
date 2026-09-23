@@ -19,6 +19,12 @@ allow = [
     "ISC",
     "CC0-1.0",
 ]
+exceptions = [
+    # TLS constant-time primitives used by rustls.
+    { crate = "subtle", allow = ["BSD-3-Clause"] },
+    # Mozilla trust-store data used by ureq's rustls transport.
+    { crate = "webpki-roots", allow = ["CDLA-Permissive-2.0"] },
+]
 confidence-threshold = 0.8
 
 [licenses.private]
