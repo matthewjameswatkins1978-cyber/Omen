@@ -536,22 +536,32 @@ impl Drop for JobGuard {
     }
 }
 
+/// Convert a raw PID to rustix's non-zero Pid (None only for 0, which a
+/// live child never is).
+#[cfg(unix)]
+fn pid_of(raw: u32) -> Option<rustix::process::Pid> {
+    rustix::process::Pid::from_raw(raw as i32)
+}
+
 /// Unix group SIGKILL, best-effort (already-exited races report ESRCH —
 /// that is success, not failure).
 #[cfg(unix)]
 fn group_kill(pid: u32) {
-    let pgid = rustix::process::Pid::from_raw(pid as i32);
-    let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::KILL);
+    if let Some(pgid) = pid_of(pid) {
+        let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::KILL);
+    }
 }
 
-/// Poll until the process group is empty (killpg to an empty group fails
-/// ESRCH — re-sending KILL to dying members is harmless) or `deadline`
-/// passes. Bounded confirmation — never a wait.
+/// Poll until the process group is empty (signal-0 probe reports ESRCH
+/// once every member is gone) or `deadline` passes. Bounded confirmation
+/// — never a wait.
 #[cfg(unix)]
 fn poll_group_empty(pid: u32, deadline: Instant) -> bool {
-    let pgid = rustix::process::Pid::from_raw(pid as i32);
+    let Some(pgid) = pid_of(pid) else {
+        return true;
+    };
     loop {
-        match rustix::process::kill_process_group(pgid, rustix::process::Signal::KILL) {
+        match rustix::process::test_kill_process_group(pgid) {
             Err(rustix::io::Errno::SRCH) => return true,
             _ => {
                 if Instant::now() >= deadline {
@@ -747,10 +757,9 @@ mod tests {
 
     #[cfg(unix)]
     fn pid_runs(pid: u32) -> bool {
-        // Signal 0 to our own fixture descendant: existence check only,
-        // never a wait.
-        let p = rustix::process::Pid::from_raw(pid as i32);
-        rustix::process::kill(p, rustix::process::Signal::from_raw(0)).is_ok()
+        // Signal-0 existence probe (test_kill_process): check only, never
+        // a wait.
+        pid_of(pid).is_some_and(|p| rustix::process::test_kill_process(p).is_ok())
     }
 
     fn kill_pid_hygiene(pid: u32) {
@@ -760,8 +769,9 @@ mod tests {
             .output();
         #[cfg(unix)]
         {
-            let p = rustix::process::Pid::from_raw(pid as i32);
-            let _ = rustix::process::kill(p, rustix::process::Signal::KILL);
+            if let Some(p) = pid_of(pid) {
+                let _ = rustix::process::kill_process(p, rustix::process::Signal::KILL);
+            }
         }
     }
 
