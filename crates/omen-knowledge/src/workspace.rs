@@ -28,9 +28,14 @@ pub fn resolve_workspace_dir(root: &Path) -> PathBuf {
     ws_dir
 }
 
-/// Computes the workspace state directory without creating it.
-pub fn workspace_state_dir_path(root: &Path) -> PathBuf {
-    let base_dir = if let Ok(custom) = env::var("OMEN_STATE_HOME") {
+/// Canonical user-level Omen state base directory.
+///
+/// Single semantic authority for "where Omen keeps machine-local state":
+/// `$OMEN_STATE_HOME` > `$LOCALAPPDATA/Omen` > `$HOME/.omen` >
+/// `./.omen-state`. Pure: creates nothing. Lifecycle classification,
+/// install records, pins, and update staging all derive from this root.
+pub fn user_state_base_dir() -> PathBuf {
+    if let Ok(custom) = env::var("OMEN_STATE_HOME") {
         PathBuf::from(custom)
     } else if let Ok(local_app_data) = env::var("LOCALAPPDATA") {
         PathBuf::from(local_app_data).join("Omen")
@@ -38,7 +43,12 @@ pub fn workspace_state_dir_path(root: &Path) -> PathBuf {
         PathBuf::from(home).join(".omen")
     } else {
         PathBuf::from(".omen-state")
-    };
+    }
+}
+
+/// Computes the workspace state directory without creating it.
+pub fn workspace_state_dir_path(root: &Path) -> PathBuf {
+    let base_dir = user_state_base_dir();
 
     base_dir
         .join("workspaces")

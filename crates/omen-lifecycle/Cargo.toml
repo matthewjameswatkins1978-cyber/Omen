@@ -1,0 +1,26 @@
+[package]
+name = "omen-lifecycle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+description = "Omen 0.9-H product lifecycle: state roles, clean/GC, install ownership, channels, transactional update, doctor/repair, uninstall, degraded rendering."
+
+[dependencies]
+omen-core = { workspace = true }
+omen-knowledge = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+chrono = { workspace = true }
+zip = { workspace = true }
+fs2 = { workspace = true }
+ureq = { workspace = true }
+rusqlite = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

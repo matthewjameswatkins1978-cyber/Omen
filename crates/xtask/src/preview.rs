@@ -718,10 +718,44 @@ fn install(_root: &Path, artifact: Option<PathBuf>) -> Result<(), String> {
     }
     let mut s = read_state();
     s.previous_slot = s.active_slot.take();
-    s.active_slot = Some(slot);
-    s.active = Some(manifest);
+    s.active_slot = Some(slot.clone());
+    s.active = Some(manifest.clone());
     s.ci_green = false;
     write_state(&s)?;
+    // H runtime provenance: the conveyor placement IS an Omen-owned managed
+    // install, so record canonical ownership for `omen doctor/update`.
+    // Channel is preserved when the user already chose one; default Preview.
+    // Slot ids are opaque: runtime update/rollback flows resolve
+    // `versions/<slot>/omen(.exe)` and never re-derive the name.
+    {
+        let base = omen_lifecycle::state::state_base_dir();
+        let prev_record = omen_lifecycle::install::load_install_record(&base)
+            .ok()
+            .flatten();
+        let channel = prev_record
+            .as_ref()
+            .map(|r| r.channel)
+            .unwrap_or(omen_lifecycle::install::Channel::Preview);
+        let mut record = omen_lifecycle::install::InstallRecord::new(
+            omen_lifecycle::install::Ownership::Omen,
+            channel,
+            &manifest.preview_version,
+            &manifest.git_sha,
+        );
+        record.active_slot = Some(slot.clone());
+        record.previous_slot = prev_record
+            .as_ref()
+            .and_then(|r| r.active_slot.clone())
+            .or(s.previous_slot.clone());
+        record.package_sha256 = Some(manifest.package_sha256.clone());
+        record.binary_sha256 = Some(manifest.binary_sha256.clone());
+        if let Err(e) = omen_lifecycle::install::save_install_record(&base, &record) {
+            return Err(fail("OMEN_INSTALL_RECORD_FAILED", e));
+        }
+        if let Err(e) = omen_lifecycle::update::write_active_pointer(&base, &slot) {
+            return Err(fail("OMEN_INSTALL_RECORD_FAILED", e));
+        }
+    }
     println!("INSTALLED: {}", stable.display());
     Ok(())
 }
