@@ -343,3 +343,290 @@ fn descriptor_names_codex_truthfully() {
     assert!(desc.credential_source.unwrap().contains("codex-auth"));
     assert!(!desc.capabilities.iter().any(|c| c.contains("codex")));
 }
+
+// ---------- Lucy repair: probe isolation, probe bound, resolver ----------
+
+const PROBE_SECRET_A: &str = "sk-codex-SYNTHETIC-NEVER-LEAK";
+const PROBE_SECRET_B: &str = "synthetic-codex-secret";
+
+fn version_env_path() -> PathBuf {
+    std::env::temp_dir().join("omen-mock-codex-version-env.txt")
+}
+
+fn version_pid_path() -> PathBuf {
+    std::env::temp_dir().join("omen-mock-codex-version-pid.txt")
+}
+
+/// TEST 1 — the probe child receives the allowlisted environment only.
+/// Parent carries OPENAI_API_KEY + synthetic secret; the fake records what
+/// actually arrived. Secrets must be absent; approved entries present.
+#[test]
+fn probe_child_env_is_isolated_by_canonical_policy() {
+    let _guard = MOCK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = std::fs::remove_file(version_env_path());
+    let parent = parent_env(None);
+    assert!(parent.iter().any(|(k, _)| k == "OPENAI_API_KEY"));
+    let probe =
+        probe_codex(&mock_exe(), &parent, &codex_env_policy()).expect("isolated probe succeeds");
+    assert_eq!(probe.version, "mock-codex 0.0.0");
+    assert!(!probe.exe_digest.is_empty());
+    let dump =
+        std::fs::read_to_string(version_env_path()).expect("mock --version records its child env");
+    assert!(
+        !dump.contains(PROBE_SECRET_A) && !dump.contains(PROBE_SECRET_B),
+        "secret value reached the probe child: {dump}"
+    );
+    assert!(dump.contains("OPENAI_API_KEY=MISSING"));
+    assert!(dump.contains("OMEN_SYNTHETIC_SECRET=MISSING"));
+    assert!(dump.contains("PATH=") && !dump.contains("PATH=MISSING"));
+    assert!(dump.contains("NO_COLOR=1"), "{dump}");
+    let _ = std::fs::remove_file(version_env_path());
+}
+
+/// The shared helper used by probe AND route drops secrets identically.
+#[test]
+fn codex_child_env_helper_is_the_single_boundary() {
+    let parent = parent_env(None);
+    let env = codex_child_env(&parent, &codex_env_policy());
+    EnvPolicy::assert_no_secret_leak(&env, &[PROBE_SECRET_A, PROBE_SECRET_B]).unwrap();
+    assert!(!env.iter().any(|(k, _)| k == "OPENAI_API_KEY"));
+    assert!(env.iter().any(|(k, _)| k == "USERPROFILE"));
+}
+
+#[cfg(windows)]
+fn process_gone(pid: u32) -> bool {
+    // Read-only check: tasklist lists; nothing here terminates anything.
+    match std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .output()
+    {
+        Ok(o) => !String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")),
+        Err(_) => true,
+    }
+}
+
+#[cfg(not(windows))]
+fn process_gone(pid: u32) -> bool {
+    std::process::Command::new("ps")
+        .args(["-p", &pid.to_string()])
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+}
+
+/// TEST 2 — a stalled `codex --version` fails closed inside the bound:
+/// truthful Timeout, no retry, no lingering process.
+#[test]
+fn probe_stall_fails_closed_with_no_lingering_process() {
+    let _guard = MOCK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { std::env::set_var("OMB_MOCK_CODEX_TRANSCRIPT", "version-stall") };
+    let _ = std::fs::remove_file(version_pid_path());
+    // Test-only relay so the stall knob reaches the mock; production code
+    // paths use the unextended canonical policy.
+    let mut policy = codex_env_policy();
+    policy.allow_vars.push("OMB_MOCK_CODEX_TRANSCRIPT".into());
+    let parent = parent_env(None);
+    let bound = Duration::from_secs(3);
+    let started = std::time::Instant::now();
+    let err = probe_codex_with_timeout(&mock_exe(), &parent, &policy, bound).unwrap_err();
+    let elapsed = started.elapsed();
+    assert!(matches!(err, AgentError::Timeout(_)), "{err:?}");
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "probe escaped its bound: {elapsed:?}"
+    );
+    // No retry: exactly one stalled child was started (pid file written
+    // once, truncating) and it must be gone after the bounded kill.
+    let pid: u32 = std::fs::read_to_string(version_pid_path())
+        .expect("stalled mock records its pid")
+        .trim()
+        .parse()
+        .expect("pid parses");
+    let gone_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !process_gone(pid) && std::time::Instant::now() < gone_deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(process_gone(pid), "stalled probe child still alive");
+    unsafe { std::env::remove_var("OMB_MOCK_CODEX_TRANSCRIPT") };
+    let _ = std::fs::remove_file(version_pid_path());
+}
+
+struct PathGuard {
+    previous_path: Option<String>,
+    previous_override: Option<String>,
+}
+
+impl PathGuard {
+    fn set_path(value: &str) -> Self {
+        let previous_path = std::env::var("PATH").ok();
+        let previous_override = std::env::var("OMEN_CODEX_EXE").ok();
+        unsafe {
+            std::env::set_var("PATH", value);
+            std::env::remove_var("OMEN_CODEX_EXE");
+        }
+        Self {
+            previous_path,
+            previous_override,
+        }
+    }
+
+    fn set_override(value: &str) -> Self {
+        let previous_path = std::env::var("PATH").ok();
+        let previous_override = std::env::var("OMEN_CODEX_EXE").ok();
+        unsafe {
+            std::env::set_var("OMEN_CODEX_EXE", value);
+        }
+        Self {
+            previous_path,
+            previous_override,
+        }
+    }
+}
+
+impl Drop for PathGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.previous_path {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+            match &self.previous_override {
+                Some(v) => std::env::set_var("OMEN_CODEX_EXE", v),
+                None => std::env::remove_var("OMEN_CODEX_EXE"),
+            }
+        }
+    }
+}
+
+fn unique_probe_dir(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "g2-probe-resolve-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[cfg(windows)]
+fn vendor_exe(dir: &std::path::Path, package: &str, target: &str) -> PathBuf {
+    let exe = dir
+        .join("node_modules")
+        .join("@openai")
+        .join("codex")
+        .join("node_modules")
+        .join("@openai")
+        .join(package)
+        .join("vendor")
+        .join(target)
+        .join("bin")
+        .join("codex.exe");
+    std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+    std::fs::write(&exe, b"fake").unwrap();
+    exe
+}
+
+/// TEST 3.1 — a real codex.exe on PATH resolves directly.
+#[test]
+fn resolver_prefers_real_exe_on_path() {
+    let _guard = MOCK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = unique_probe_dir("real");
+    let exe_name = if cfg!(windows) { "codex.exe" } else { "codex" };
+    let exe = dir.join(exe_name);
+    std::fs::write(&exe, b"fake").unwrap();
+    let _paths = PathGuard::set_path(dir.to_str().unwrap());
+    assert_eq!(resolve_codex_exe(), Some(exe));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// TEST 3.2 — shim + exactly one vendored exe resolves to the real exe.
+#[cfg(windows)]
+#[test]
+fn resolver_uses_unique_vendored_exe_behind_shim() {
+    let _guard = MOCK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = unique_probe_dir("vendored");
+    std::fs::write(dir.join("codex.cmd"), b"@echo off").unwrap();
+    let real = vendor_exe(&dir, "codex-win32-x64", "x64");
+    let _paths = PathGuard::set_path(dir.to_str().unwrap());
+    assert_eq!(resolve_codex_exe(), Some(real));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// TEST 3.3 — shim with no vendored exe fails closed (never the shim).
+#[cfg(windows)]
+#[test]
+fn resolver_fails_closed_when_vendored_exe_missing() {
+    let _guard = MOCK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = unique_probe_dir("novendor");
+    std::fs::write(dir.join("codex.cmd"), b"@echo off").unwrap();
+    let _paths = PathGuard::set_path(dir.to_str().unwrap());
+    assert_eq!(resolve_codex_exe(), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// TEST 3.4 — shim with ambiguous vendored layout fails closed.
+#[cfg(windows)]
+#[test]
+fn resolver_fails_closed_when_vendored_layout_ambiguous() {
+    let _guard = MOCK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = unique_probe_dir("ambiguous");
+    std::fs::write(dir.join("codex.cmd"), b"@echo off").unwrap();
+    vendor_exe(&dir, "codex-win32-x64", "x64");
+    vendor_exe(&dir, "codex-win32-x64", "arm64");
+    let _paths = PathGuard::set_path(dir.to_str().unwrap());
+    assert_eq!(resolve_codex_exe(), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// TEST 4 — structural proof: resolution never yields a command script,
+/// via PATH shims, ambiguous layouts, or an explicit override.
+#[cfg(windows)]
+#[test]
+fn resolver_never_returns_command_script() {
+    let _guard = MOCK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for tag in ["cmd-only", "cmd-ambiguous"] {
+        let dir = unique_probe_dir(tag);
+        let shim = dir.join("codex.cmd");
+        std::fs::write(&shim, b"@echo off").unwrap();
+        if tag == "cmd-ambiguous" {
+            vendor_exe(&dir, "codex-win32-x64", "x64");
+            vendor_exe(&dir, "codex-win32-x64", "arm64");
+        }
+        {
+            let _paths = PathGuard::set_path(dir.to_str().unwrap());
+            let got = resolve_codex_exe();
+            assert!(got.is_none(), "resolver must fail closed, got {got:?}");
+        }
+        // Explicit override pointing at a script is equally refused.
+        {
+            let _paths = PathGuard::set_override(shim.to_str().unwrap());
+            unsafe { std::env::set_var("PATH", "") };
+            let got = resolve_codex_exe();
+            assert!(
+                got.is_none(),
+                "override must not yield a command script, got {got:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    // Belt and braces across every case above: no .cmd/.bat ever escapes.
+    let dir = unique_probe_dir("ext-scan");
+    std::fs::write(dir.join("codex.cmd"), b"@echo off").unwrap();
+    std::fs::write(dir.join("codex.bat"), b"@echo off").unwrap();
+    let _paths = PathGuard::set_path(dir.to_str().unwrap());
+    if let Some(p) = resolve_codex_exe() {
+        let ext = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        assert!(
+            ext != "cmd" && ext != "bat",
+            "command script escaped: {p:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

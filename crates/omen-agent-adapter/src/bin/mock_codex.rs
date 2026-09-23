@@ -8,8 +8,18 @@
 use std::io::Write;
 
 fn main() {
-    // Like the real binary, --version is auth-free and transcript-free.
+    // Like the real binary, --version is auth-free and transcript-free,
+    // except two test-only modes selected via the transcript knob:
+    // "version-stall" sleeps past any probe deadline (timeout test), and
+    // every --version records an env snapshot to a fixed temp path so probe
+    // isolation tests can audit the child environment deterministically.
     if std::env::args().any(|a| a == "--version") {
+        if std::env::var("OMB_MOCK_CODEX_TRANSCRIPT").as_deref() == Ok("version-stall") {
+            let _ = std::fs::write(version_pid_path(), std::process::id().to_string());
+            std::thread::sleep(std::time::Duration::from_secs(120));
+            return;
+        }
+        record_version_env();
         println!("mock-codex 0.0.0");
         return;
     }
@@ -87,6 +97,39 @@ fn main() {
             std::process::exit(2);
         }
     }
+}
+
+/// Fixed temp path where `--version` records the child environment it
+/// actually received. Fixed (not relayed via env) because the probe under
+/// test only forwards the production allowlist — the control knob could
+/// never arrive any other way.
+fn version_env_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("omen-mock-codex-version-env.txt")
+}
+
+fn version_pid_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("omen-mock-codex-version-pid.txt")
+}
+
+/// Records secret-shaped keys (must be absent under the probe policy) and
+/// approved keys (must arrive) for the probe isolation test to audit.
+fn record_version_env() {
+    let mut lines = Vec::new();
+    for key in [
+        "OPENAI_API_KEY",
+        "OMEN_SYNTHETIC_SECRET",
+        "PATH",
+        "SystemRoot",
+        "USERPROFILE",
+        "TEMP",
+        "NO_COLOR",
+    ] {
+        match std::env::var(key) {
+            Ok(v) => lines.push(format!("{key}={v}")),
+            Err(_) => lines.push(format!("{key}=MISSING")),
+        }
+    }
+    let _ = std::fs::write(version_env_path(), lines.join("\n"));
 }
 
 fn count_file_lines() -> usize {

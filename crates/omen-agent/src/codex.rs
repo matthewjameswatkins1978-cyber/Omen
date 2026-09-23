@@ -18,6 +18,8 @@ use crate::provider::{
 };
 use omen_agent_adapter::{EnvPolicy, codex_env_policy, fingerprint_pairs, sha256_hex};
 use std::future::Future;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
@@ -29,6 +31,9 @@ use std::time::Duration;
 pub const CODEX_PROVIDER_ID: &str = "codex";
 /// Codex routes are agentic and out-of-process; ceiling is generous but explicit.
 pub const CODEX_ROUTE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Probe ceiling: `codex --version` must answer promptly. A broken or
+/// hijacked executable fails closed instead of stalling the request path.
+pub const CODEX_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Hard cap on total captured Codex stdout (JSONL events).
 pub const CODEX_MAX_OUTPUT_BYTES: usize = 512 * 1024;
 /// Bootstrap prompt budget: Codex must not need a giant manual.
@@ -66,13 +71,18 @@ impl CodexRouteConfig {
 }
 
 /// Resolves the Codex executable without spawning anything.
-/// Order: OMEN_CODEX_EXE override, codex.exe on PATH, npm-shim vendor exe
-/// (Windows), npm shim itself. `None` means the route is not installed;
+/// Order: OMEN_CODEX_EXE override, codex.exe on PATH, vendored real exe
+/// behind an npm shim (Windows). `None` means the route is not installed;
 /// registry construction stays cheap.
+///
+/// Executable boundary is argv-only with no shell-command semantics: a
+/// `.cmd`/`.bat` script is NEVER returned. When only a shim is present or
+/// vendored resolution is ambiguous, resolution fails closed so the caller
+/// reports the route unavailable instead of executing a command script.
 pub fn resolve_codex_exe() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("OMEN_CODEX_EXE") {
         let explicit = PathBuf::from(path);
-        if explicit.is_file() {
+        if has_executable_boundary(&explicit) && explicit.is_file() {
             return Some(explicit);
         }
     }
@@ -83,26 +93,38 @@ pub fn resolve_codex_exe() -> Option<PathBuf> {
             continue;
         }
         let candidate = dir.join(file);
-        if candidate.is_file() {
+        if has_executable_boundary(&candidate) && candidate.is_file() {
             return Some(candidate);
         }
         // Windows npm installs ship only shims (codex.cmd) on PATH; the
-        // real binary lives under the package vendor directory. Prefer the
-        // real exe when it resolves uniquely, else spawn the shim itself
-        // (CreateProcess executes .cmd; argv forwarding is verbatim).
+        // real binary lives under the package vendor directory. Use the
+        // real exe when it resolves uniquely; otherwise KEEP SCANNING and
+        // ultimately fail closed. The shim itself is never returned.
         if cfg!(windows) {
             let shim = dir.join("codex.cmd");
-            if shim.is_file() {
-                return Some(resolve_npm_shim_target(&shim).unwrap_or(shim));
+            if shim.is_file()
+                && let Some(real) = resolve_npm_shim_target(&shim)
+            {
+                return Some(real);
             }
         }
     }
     None
 }
 
+/// True unless the path ends in a command-script extension. One shared
+/// gate: neither OMEN_CODEX_EXE nor PATH scanning may yield `.cmd`/`.bat`.
+fn has_executable_boundary(path: &Path) -> bool {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) => !ext.eq_ignore_ascii_case("cmd") && !ext.eq_ignore_ascii_case("bat"),
+        None => true,
+    }
+}
+
 /// Resolves an npm `codex.cmd` shim to its vendored codex.exe when the
 /// install layout yields exactly one candidate; ambiguous or changed
-/// layouts return None so the caller falls back to the shim itself.
+/// layouts return None so the caller keeps scanning / fails closed and
+/// never executes the shim itself.
 fn resolve_npm_shim_target(shim: &Path) -> Option<PathBuf> {
     let base = shim
         .parent()?
@@ -127,25 +149,105 @@ fn resolve_npm_shim_target(shim: &Path) -> Option<PathBuf> {
     if hits.len() == 1 { hits.pop() } else { None }
 }
 
+/// Shared helper: the exact child environment for EVERY Codex process Omen
+/// launches — probe and reasoning route alike. `env_clear` plus the
+/// canonical [`codex_env_policy`]: only approved passthrough entries plus
+/// Omen-set literals cross. Codex authentication stays Codex-owned: no
+/// credential value (OPENAI_API_KEY, provider keys, synthetic secrets) is
+/// ever injected or inherited.
+pub fn codex_child_env(
+    parent_env: &[(String, String)],
+    policy: &EnvPolicy,
+) -> Vec<(String, String)> {
+    policy.build_env(parent_env, &["codex-auth".to_string()])
+}
+
+/// Shared helper: a `codex --version` probe command under the same
+/// environment doctrine as the main route. No shell, no batch execution.
+fn new_codex_probe_command(
+    exe: &Path,
+    parent_env: &[(String, String)],
+    policy: &EnvPolicy,
+) -> std::process::Command {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--version");
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    cmd.env_clear();
+    for (k, v) in codex_child_env(parent_env, policy) {
+        cmd.env(k, v);
+    }
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(0x08000000);
+    }
+    cmd
+}
+
 /// Explicit probe (spawns `codex --version` + reads exe bytes). Use-time or
-/// explicit diagnostics only — never at startup.
+/// explicit diagnostics only — never at startup. Isolated and bounded like
+/// the main route: allowlisted env, explicit deadline, kill on expiry.
 #[derive(Debug, Clone)]
 pub struct CodexProbe {
     pub version: String,
     pub exe_digest: String,
 }
 
-pub fn probe_codex(exe: &Path) -> Result<CodexProbe, AgentError> {
+pub fn probe_codex(
+    exe: &Path,
+    parent_env: &[(String, String)],
+    policy: &EnvPolicy,
+) -> Result<CodexProbe, AgentError> {
+    probe_codex_with_timeout(exe, parent_env, policy, CODEX_PROBE_TIMEOUT)
+}
+
+pub fn probe_codex_with_timeout(
+    exe: &Path,
+    parent_env: &[(String, String)],
+    policy: &EnvPolicy,
+    timeout: Duration,
+) -> Result<CodexProbe, AgentError> {
     let exe_bytes = std::fs::read(exe).map_err(|e| AgentError::ProviderUnavailable {
         provider: CODEX_PROVIDER_ID.into(),
         message: format!("codex executable unreadable: {e}"),
     })?;
-    let out = std::process::Command::new(exe)
-        .arg("--version")
-        .output()
+    let mut child = new_codex_probe_command(exe, parent_env, policy)
+        .spawn()
         .map_err(|e| AgentError::ProviderUnavailable {
             provider: CODEX_PROVIDER_ID.into(),
             message: format!("codex --version spawn failed: {e}"),
+        })?;
+    // Bounded wait WITHOUT hiding it in a worker thread: poll try_wait
+    // against an explicit deadline. The child is already exited when we
+    // proceed, so wait_with_output only drains the OS pipe buffer (64 KiB
+    // class) — time and memory both bounded.
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    kill_probe_tree(&mut child);
+                    let _ = child.wait();
+                    return Err(AgentError::Timeout(timeout));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => {
+                kill_probe_tree(&mut child);
+                return Err(AgentError::ProviderUnavailable {
+                    provider: CODEX_PROVIDER_ID.into(),
+                    message: format!("codex --version wait failed: {e}"),
+                });
+            }
+        }
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| AgentError::ProviderUnavailable {
+            provider: CODEX_PROVIDER_ID.into(),
+            message: format!("codex --version output failed: {e}"),
         })?;
     if !out.status.success() {
         return Err(AgentError::ProviderUnavailable {
@@ -154,9 +256,44 @@ pub fn probe_codex(exe: &Path) -> Result<CodexProbe, AgentError> {
         });
     }
     Ok(CodexProbe {
-        version: String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        version: truncate_text(&String::from_utf8_lossy(&out.stdout), 512)
+            .trim()
+            .to_string(),
         exe_digest: sha256_hex(&exe_bytes),
     })
+}
+
+/// Best-effort kill of a hung probe child (tree on Windows). Synchronous
+/// and bounded: the taskkill helper is itself polled against a short
+/// deadline, never waited on blindly.
+fn kill_probe_tree(child: &mut std::process::Child) {
+    #[cfg(windows)]
+    {
+        let pid = child.id();
+        if let Ok(mut killer) = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(0x08000000)
+            .spawn()
+        {
+            let helper_deadline = std::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                match killer.try_wait() {
+                    Ok(Some(_)) | Err(_) => break,
+                    Ok(None) => {
+                        if std::time::Instant::now() >= helper_deadline {
+                            let _ = killer.kill();
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                }
+            }
+        }
+    }
+    let _ = child.kill();
 }
 
 pub struct CodexAdapter {
@@ -192,7 +329,11 @@ impl CodexAdapter {
         if let Some(probe) = guard.clone() {
             return Ok(probe);
         }
-        let probe = probe_codex(&self.config.exe)?;
+        let probe = probe_codex(
+            &self.config.exe,
+            &self.config.parent_env,
+            &self.config.env_policy,
+        )?;
         *guard = Some(probe.clone());
         Ok(probe)
     }
@@ -336,10 +477,7 @@ impl CodexAdapter {
         // The output schema travels via temp file (argv stays a path, not content).
         let schema_path = write_temp_schema(schema)?;
         let cwd = pick_codex_cwd(request);
-        let env = self
-            .config
-            .env_policy
-            .build_env(&self.config.parent_env, &["codex-auth".to_string()]);
+        let env = codex_child_env(&self.config.parent_env, &self.config.env_policy);
         let mut argv: Vec<String> = vec![
             "exec".into(),
             "--json".into(),
