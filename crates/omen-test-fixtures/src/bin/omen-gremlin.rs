@@ -88,9 +88,15 @@ struct GremlinArgs {
     #[arg(long)]
     posix_stop_report: bool,
 
-    /// POSIX: report READY, wait for SIGINT, report delivery, exit boundedly.
+    /// POSIX: report READY, wait for SIGINT with default disposition
+    /// (signal-faithful termination; control path).
     #[arg(long)]
     posix_sigint_report: bool,
+
+    /// POSIX: report READY, install minimal SIGINT handler, emit
+    /// `OMEN_COMPAT_SIGINT` receipt marker on delivery, exit boundedly.
+    #[arg(long)]
+    posix_sigint_observe: bool,
 
     /// POSIX: report READY + winsize, wait for SIGWINCH, report new size, exit.
     #[arg(long)]
@@ -301,6 +307,10 @@ fn main() {
             run_posix_sigint_report();
             std::process::exit(args.exit);
         }
+        if args.posix_sigint_observe {
+            run_posix_sigint_observe(args.exit);
+            std::process::exit(args.exit);
+        }
         if args.posix_winch_report {
             run_posix_winch_report(args.exit);
         }
@@ -314,6 +324,7 @@ fn main() {
         let requested_posix = args.posix_report
             || args.posix_stop_report
             || args.posix_sigint_report
+            || args.posix_sigint_observe
             || args.posix_winch_report
             || args.posix_termios_dirty_exit;
         if requested_posix {
@@ -648,6 +659,57 @@ fn run_posix_sigint_report() {
     loop {
         std::thread::sleep(Duration::from_secs(3600));
     }
+}
+
+/// Minimal SIGINT receipt observer for routing evidence only.
+///
+/// Announces READY only after the SIGINT handler is installed, emits bounded
+/// marker `OMEN_COMPAT_SIGINT` on actual receipt, then exits. Does not claim
+/// signal-faithful termination (that remains `--posix-sigint-report`).
+#[cfg(unix)]
+fn run_posix_sigint_observe(exit_code: i32) {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(err) => {
+            eprintln!("sigint-observe runtime: {err}");
+            std::process::exit(exit_code);
+        }
+    };
+    rt.block_on(async {
+        // Install the handler BEFORE announcing ARMED so readiness means
+        // "ready to observe receipt", not "about to install".
+        let mut sigint = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(err) => {
+                eprintln!("sigint-observe signal: {err}");
+                return;
+            }
+        };
+        println!("OMEN_COMPAT_READY");
+        println!("{}", posix_identity_json());
+        let _ = io::stdout().flush();
+        println!("OMEN_COMPAT_SIGINT_ARMED");
+        let _ = io::stdout().flush();
+
+        // Bounded by outer harness; also hard-bound here at 10s.
+        match tokio::time::timeout(Duration::from_secs(10), sigint.recv()).await {
+            Ok(Some(())) => {
+                // Leading newline: ECHO of VINTR (^C) must not glue onto the
+                // marker line, or exact-line receipt matching fails.
+                println!("\nOMEN_COMPAT_SIGINT");
+                let _ = io::stdout().flush();
+            }
+            _ => {
+                println!("\nOMEN_COMPAT_SIGINT_TIMEOUT");
+                let _ = io::stdout().flush();
+            }
+        }
+    });
 }
 
 #[cfg(unix)]

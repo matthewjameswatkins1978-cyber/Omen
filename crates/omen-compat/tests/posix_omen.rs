@@ -1,18 +1,24 @@
 //! Tier POSIX OMEN — real Omen shell under the calibrated PTY.
 //!
-//! Product compatibility results may be FAIL / OPEN_DEFECT while the harness
-//! itself remains green. Outer watchdog bounds every scenario.
-//! Production Omen is never repaired here.
+//! Product compatibility results may be FAIL / INCONCLUSIVE / OPEN_DEFECT
+//! while the harness itself remains green. Outer watchdog bounds every
+//! scenario. Production Omen is never repaired here.
+//!
+//! Evidence model (D2-017): no fabricated job identity; reacquisition
+//! requires proven prior handoff; VINTR ≠ SIGINT delivery; `/proc` stopped
+//! is not Omen wait-path observation.
 
 #![cfg(unix)]
 
 use omen_compat::{
-    InvariantId, InvariantOutcome, InvariantResult, PosixProcessIdentity, PosixTerminalState,
-    PtySession, PtyWinsize, TermiosSnapshot, judge_child_signal_mask_unblocked,
+    EvidenceGrade, HandoffEvidence, InvariantId, InvariantOutcome, InvariantResult,
+    JobStoppedObserved, ParseEvidenceError, PosixProcessIdentity, PosixTerminalState, PtySession,
+    PtyWinsize, SigintReceiptObservation, TermiosSnapshot, judge_child_signal_mask_unblocked,
     judge_job_has_distinct_pgrp, judge_job_shares_session, judge_no_zombie_children,
     judge_shell_regains_tty_after_exit, judge_shell_regains_tty_after_stop,
     judge_shell_survives_foreground_sigint, judge_sigint_targets_foreground_job,
     judge_sigwinch_async_delivered, judge_terminal_fg_is_job, judge_termios_restored,
+    parse_posix_report, topology_results_missing_identity,
 };
 use std::path::PathBuf;
 use std::time::Duration;
@@ -130,9 +136,6 @@ fn spawn_omen(cwd: &std::path::Path) -> Option<PtySession> {
 }
 
 fn wait_prompt(session: &mut PtySession) -> bool {
-    // Prompt sigil is readiness only; topology comes from OS observations.
-    // Also accept reedline DSR timeout errors as "shell is running" evidence
-    // when the sigil never appears (platform/DSR gap → still measure later).
     match session.wait_for_text("\\O/", Duration::from_secs(15)) {
         Ok(t) => t.contains("\\O/"),
         Err(_) => false,
@@ -147,6 +150,8 @@ fn shell_identity(session: &PtySession) -> PosixProcessIdentity {
             return id;
         }
     }
+    // Harness established setsid + tcsetpgrp(self) before exec: session
+    // leader identity is a harness fact, not a fabricated job identity.
     PosixProcessIdentity {
         pid,
         ppid: None,
@@ -218,11 +223,10 @@ fn omen_a_foreground_process_topology() {
     let ready = wait_has(&mut omen, "OMEN_COMPAT_READY", Duration::from_secs(15));
     let mut results = Vec::new();
     if !ready {
-        // Interactive handoff did not run the fixture — record product gap.
         results.push(InvariantResult::new(
             InvariantId::ShellJobHasDistinctProcessGroup,
             InvariantOutcome::OpenDefect,
-            omen_compat::EvidenceGrade::Partial,
+            EvidenceGrade::Partial,
             "interactive handoff path did not produce fixture READY within bound; cannot prove distinct job pgrp",
         ));
         print_report("foreground-job", &results);
@@ -231,28 +235,53 @@ fn omen_a_foreground_process_topology() {
     }
 
     let text = omen.transcript().as_lossy();
-    let job = parse_posix_report(&text).unwrap_or(PosixProcessIdentity {
-        pid: 0,
-        ppid: Some(shell.pid),
-        pgrp: Some(shell.pgrp.unwrap_or(shell.pid)),
-        session_id: shell.session_id,
-        source: "fallback_same_as_shell".into(),
-    });
+    let job = match parse_posix_report(&text) {
+        Ok(job) => job,
+        Err(err) => {
+            // Missing/malformed identity: never invent pid/pgrp/sid.
+            assert!(matches!(
+                err,
+                ParseEvidenceError::Missing | ParseEvidenceError::Malformed { .. }
+            ));
+            results.extend(topology_results_missing_identity(&err));
+            print_report("foreground-job", &results);
+            // No STRONG topology result may be present.
+            for r in &results {
+                assert_ne!(
+                    r.evidence_grade,
+                    EvidenceGrade::Strong,
+                    "STRONG topology result forbidden without fixture identity: {r:?}"
+                );
+            }
+            assert!(omen.child_pid() > 0);
+            return;
+        }
+    };
 
+    let term_job = terminal_state(&omen);
     results.push(judge_job_shares_session(&shell, &job));
     results.push(judge_job_has_distinct_pgrp(&shell, &job));
-    let term_job = terminal_state(&omen);
-    results.push(judge_terminal_fg_is_job(&term_job, &job));
+    results.push(judge_terminal_fg_is_job(&term_job, &shell, &job));
+
+    let handoff =
+        HandoffEvidence::try_from_observations(shell.pgrp, job.pgrp, term_job.foreground_pgrp);
 
     let _ = omen.wait_for_text("\\O/", Duration::from_secs(15));
     let term_after = terminal_state(&omen);
-    results.push(judge_shell_regains_tty_after_exit(&term_after, &shell));
+    match &handoff {
+        Some(h) => results.push(judge_shell_regains_tty_after_exit(h, &term_after, &shell)),
+        None => results.push(InvariantResult::inconclusive(
+            InvariantId::ShellRegainsTtyAfterJobExit,
+            EvidenceGrade::Partial,
+            "handoff evidence incomplete (shell/job/fg-during); reacquisition dependency blocked",
+        )),
+    }
 
     print_report("foreground-job", &results);
     assert!(!results.is_empty());
 }
 
-/// Scenario B — normal exit + shell tty reacquisition.
+/// Scenario B — normal exit + shell tty reacquisition (requires handoff).
 #[test]
 fn omen_b_exit_reacquisition() {
     let Some(mut omen) = spawn_omen(&workspace_root()) else {
@@ -270,13 +299,56 @@ fn omen_b_exit_reacquisition() {
 
     write_line(
         &mut omen,
-        &format!("{} --compat-report --exit 0", gremlin_exe().display()),
+        &format!("--interactive {} --posix-report", gremlin_exe().display()),
     );
-    let _ = omen.wait_for_text("compat-report", Duration::from_secs(15));
-    let _ = omen.wait_for_text("\\O/", Duration::from_secs(15));
+    let ready = wait_has(&mut omen, "OMEN_COMPAT_READY", Duration::from_secs(15));
+    let mut handoff: Option<HandoffEvidence> = None;
+    let mut results = Vec::new();
+    if ready {
+        let text = omen.transcript().as_lossy();
+        match parse_posix_report(&text) {
+            Ok(job) => {
+                let fg_during = omen.observe_foreground_pgrp().ok();
+                handoff = HandoffEvidence::try_from_observations(shell.pgrp, job.pgrp, fg_during);
+            }
+            Err(err) => {
+                results.push(InvariantResult::inconclusive(
+                    InvariantId::ShellRegainsTtyAfterJobExit,
+                    EvidenceGrade::Partial,
+                    format!("missing fixture identity; reacquisition dependency blocked: {err}"),
+                ));
+            }
+        }
+    } else {
+        results.push(InvariantResult::inconclusive(
+            InvariantId::ShellRegainsTtyAfterJobExit,
+            EvidenceGrade::Partial,
+            "interactive handoff did not announce READY; no proven prior handoff",
+        ));
+    }
 
+    let _ = omen.wait_for_text("\\O/", Duration::from_secs(15));
     let post = terminal_state(&omen);
-    let results = vec![judge_shell_regains_tty_after_exit(&post, &shell)];
+    match &handoff {
+        Some(h) if h.is_proven() => {
+            results.push(judge_shell_regains_tty_after_exit(h, &post, &shell));
+        }
+        Some(h) => results.push(InvariantResult::inconclusive(
+            InvariantId::ShellRegainsTtyAfterJobExit,
+            EvidenceGrade::Partial,
+            format!(
+                "dependency blocked: prior handoff not distinct (shell_pgrp={} job_pgrp={} fg_during={}); \
+                 raw current ownership fg_after={:?}",
+                h.shell_pgrp, h.job_pgrp, h.terminal_fg_during_job, post.foreground_pgrp
+            ),
+        )),
+        None if results.is_empty() => results.push(InvariantResult::inconclusive(
+            InvariantId::ShellRegainsTtyAfterJobExit,
+            EvidenceGrade::Partial,
+            "no proven prior distinct handoff; reacquisition dependency blocked",
+        )),
+        None => {}
+    }
     print_report("exit-reacquisition", &results);
     assert!(omen.child_pid() > 0);
 }
@@ -305,52 +377,81 @@ fn omen_c_stopped_foreground_job() {
 
     let mut results = Vec::new();
     if stopping {
+        // Capture handoff evidence while the job is stopped / before prompt.
+        let fg_during = omen.observe_foreground_pgrp().ok();
+        let job_pgrp = {
+            let text = omen.transcript().as_lossy();
+            parse_posix_report(&text).ok().and_then(|j| j.pgrp)
+        };
+        let handoff = HandoffEvidence::try_from_observations(shell.pgrp, job_pgrp, fg_during);
+
         let got_prompt = omen
             .wait_for_text("\\O/", Duration::from_secs(6))
             .map(|t| t.contains("\\O/"))
             .unwrap_or(false);
         let term = terminal_state(&omen);
-        if got_prompt {
-            results.push(judge_shell_regains_tty_after_stop(&term, &shell));
-        } else {
-            results.push(InvariantResult::new(
+        match &handoff {
+            Some(h) if h.is_proven() && got_prompt => {
+                results.push(judge_shell_regains_tty_after_stop(h, &term, &shell));
+            }
+            Some(h) => results.push(InvariantResult::inconclusive(
                 InvariantId::ShellRegainsTtyAfterJobStop,
-                InvariantOutcome::Inconclusive,
-                omen_compat::EvidenceGrade::Partial,
-                "fixture stopped; prompt did not return within bound",
-            ));
+                EvidenceGrade::Partial,
+                format!(
+                    "dependency blocked: prior handoff not proven (shell={} job={} fg_during={:?})",
+                    h.shell_pgrp, h.job_pgrp, h.terminal_fg_during_job
+                ),
+            )),
+            None => results.push(InvariantResult::inconclusive(
+                InvariantId::ShellRegainsTtyAfterJobStop,
+                EvidenceGrade::Partial,
+                "no proven prior distinct handoff; reacquisition dependency blocked",
+            )),
         }
+
+        // Process-stopped fact (STRONG) from /proc is NOT wait-path evidence.
         #[cfg(target_os = "linux")]
         {
-            let observed = omen_compat::direct_children(omen.child_pid())
+            let stopped_pids: Vec<u32> = omen_compat::direct_children(omen.child_pid())
                 .into_iter()
-                .any(omen_compat::is_stopped);
-            results.push(InvariantResult::new(
+                .filter(|c| omen_compat::is_stopped(*c))
+                .collect();
+            if let Some(&pid) = stopped_pids.first() {
+                let obs = JobStoppedObserved {
+                    pid,
+                    source: "linux_proc".into(),
+                };
+                println!(
+                    "FACT\tJOB_PROCESS_STOPPED\tSTRONG\t{}",
+                    judge_job_stopped_note(&obs)
+                );
+                let _ = obs.observation();
+            }
+            // Omen wait-path STOP observation is unavailable without product
+            // instrumentation — never PASS from /proc alone.
+            results.push(InvariantResult::inconclusive(
                 InvariantId::WaitObservesStoppedState,
-                if observed {
-                    InvariantOutcome::Pass
-                } else {
-                    InvariantOutcome::Inconclusive
-                },
-                omen_compat::EvidenceGrade::Strong,
-                format!("linux /proc direct-child stopped observation={observed}"),
+                EvidenceGrade::Partial,
+                "no Omen wait/job-control path observation of STOPPED; /proc process fact recorded separately",
             ));
         }
         #[cfg(not(target_os = "linux"))]
         {
-            results.push(InvariantResult::new(
+            results.push(InvariantResult::unavailable(
                 InvariantId::WaitObservesStoppedState,
-                InvariantOutcome::Unavailable,
-                omen_compat::EvidenceGrade::Unavailable,
                 "external stopped-state observation unavailable without Linux /proc",
             ));
         }
     } else {
-        results.push(InvariantResult::new(
+        results.push(InvariantResult::inconclusive(
             InvariantId::WaitObservesStoppedState,
-            InvariantOutcome::Inconclusive,
-            omen_compat::EvidenceGrade::Partial,
+            EvidenceGrade::Partial,
             "fixture did not report STOPPING within bound",
+        ));
+        results.push(InvariantResult::inconclusive(
+            InvariantId::ShellRegainsTtyAfterJobStop,
+            EvidenceGrade::Partial,
+            "no stop barrier; reacquisition dependency blocked",
         ));
     }
 
@@ -369,7 +470,14 @@ fn omen_c_stopped_foreground_job() {
     print_report("stop", &results);
 }
 
-/// Scenario E — terminal Ctrl-C.
+fn judge_job_stopped_note(obs: &JobStoppedObserved) -> String {
+    format!(
+        "pid={} source={} (process fact only; not Omen wait-path)",
+        obs.pid, obs.source
+    )
+}
+
+/// Scenario E — terminal Ctrl-C with observed SIGINT delivery.
 #[test]
 fn omen_e_terminal_ctrl_c() {
     let Some(mut omen) = spawn_omen(&workspace_root()) else {
@@ -382,11 +490,17 @@ fn omen_e_terminal_ctrl_c() {
     write_line(
         &mut omen,
         &format!(
-            "--interactive {} --posix-sigint-report",
+            "--interactive {} --posix-sigint-observe",
             gremlin_exe().display()
         ),
     );
-    let ready = wait_has(&mut omen, "OMEN_COMPAT_READY", Duration::from_secs(15));
+    // READY alone is not identity; wait for the posix-report JSON line too.
+    let ready = wait_has(&mut omen, "OMEN_COMPAT_READY", Duration::from_secs(15))
+        && wait_has(
+            &mut omen,
+            "\"fixture\":\"posix-report\"",
+            Duration::from_secs(10),
+        );
     let mut results = Vec::new();
     if !ready {
         let shell_alive = omen.try_wait_child().ok().flatten().is_none();
@@ -394,18 +508,85 @@ fn omen_e_terminal_ctrl_c() {
             shell_alive,
             shell.pid,
         ));
-        results.push(InvariantResult::new(
+        results.push(InvariantResult::inconclusive(
             InvariantId::TerminalSigintTargetsForegroundJob,
-            InvariantOutcome::OpenDefect,
-            omen_compat::EvidenceGrade::Partial,
-            "interactive handoff did not announce fixture READY; Ctrl-C routing to job unproven",
+            EvidenceGrade::Partial,
+            "interactive handoff did not announce fixture READY+identity; no job identity for routing",
         ));
         print_report("ctrl-c", &results);
         return;
     }
 
-    let fg_job = omen.observe_foreground_pgrp().ok();
-    omen.write_ctrl(0x03).expect("inject VINTR");
+    // Observe fixture identity, shell pgrp, and terminal fg BEFORE injection.
+    let text = omen.transcript().as_lossy();
+    let job = match parse_posix_report(&text) {
+        Ok(job) => job,
+        Err(err) => {
+            let shell_alive = omen.try_wait_child().ok().flatten().is_none();
+            results.push(judge_shell_survives_foreground_sigint(
+                shell_alive,
+                shell.pid,
+            ));
+            results.push(InvariantResult::inconclusive(
+                InvariantId::TerminalSigintTargetsForegroundJob,
+                EvidenceGrade::Partial,
+                format!("missing fixture identity before VINTR; routing unproven: {err}"),
+            ));
+            print_report("ctrl-c", &results);
+            return;
+        }
+    };
+    let fg_before = omen.observe_foreground_pgrp().ok();
+    let job_pgrp = job.pgrp;
+    let fixture_pid_observed = job.pid > 0;
+    let job_pgrp_observed = job_pgrp.is_some();
+    let fg_observed = fg_before.is_some();
+    println!(
+        "FACT\tCTRLC_PRE\tfixture_pid={fixture_pid_observed} fixture_pgrp={job_pgrp_observed} fg_observed={fg_observed} shell_pgrp={:?} job_pgrp={job_pgrp:?} fg_before={fg_before:?}",
+        shell.pgrp
+    );
+
+    // Inject VINTR only after identity/fg observations. One bounded retry:
+    // line-discipline delivery can race interactive handoff setup.
+    let mut vintr_ok = omen.write_ctrl(0x03).is_ok();
+    let _ = omen.pump_until(
+        |t| {
+            t.as_lossy().lines().any(|l| {
+                l.trim() == "OMEN_COMPAT_SIGINT" || l.trim() == "OMEN_COMPAT_SIGINT_TIMEOUT"
+            })
+        },
+        Duration::from_millis(600),
+    );
+    if !transcript_has_line(&omen.transcript().as_lossy(), "OMEN_COMPAT_SIGINT") {
+        vintr_ok |= omen.write_ctrl(0x03).is_ok();
+    }
+    println!("FACT\tVINTR_INJECTED\t{vintr_ok}");
+
+    // Delivery must come from an independent exact-line observation
+    // (`OMEN_COMPAT_SIGINT`), never hard-coded. ARMED/TIMEOUT share the
+    // prefix but are not equal lines.
+    let _ = omen.pump_until(
+        |t| {
+            t.as_lossy().lines().any(|l| {
+                l.trim() == "OMEN_COMPAT_SIGINT" || l.trim() == "OMEN_COMPAT_SIGINT_TIMEOUT"
+            })
+        },
+        Duration::from_secs(8),
+    );
+    let receipt_observed = transcript_has_line(&omen.transcript().as_lossy(), "OMEN_COMPAT_SIGINT");
+    println!("FACT\tSIGINT_RECEIPT\t{receipt_observed}");
+
+    let receipt = if receipt_observed {
+        SigintReceiptObservation::Observed {
+            source: "fixture_omen_compat_sigint_marker".into(),
+        }
+    } else if vintr_ok {
+        SigintReceiptObservation::InjectedNotObserved
+    } else {
+        SigintReceiptObservation::Unavailable {
+            reason: "VINTR write failed".into(),
+        }
+    };
 
     let shell_alive = omen.try_wait_child().ok().flatten().is_none();
     results.push(judge_shell_survives_foreground_sigint(
@@ -413,14 +594,18 @@ fn omen_e_terminal_ctrl_c() {
         shell.pid,
     ));
     results.push(judge_sigint_targets_foreground_job(
-        true,
         shell_alive,
         shell.pgrp,
-        fg_job,
-        fg_job,
+        job_pgrp,
+        fg_before,
+        &receipt,
     ));
     let _ = omen.wait_for_text("\\O/", Duration::from_secs(10));
     print_report("ctrl-c", &results);
+}
+
+fn transcript_has_line(text: &str, needle: &str) -> bool {
+    text.lines().any(|l| l.trim() == needle)
 }
 
 /// Scenario G — signal-mask/disposition child report.
@@ -472,7 +657,7 @@ fn omen_h_sigwinch_on_foreground_job() {
         let results = vec![InvariantResult::new(
             InvariantId::SigwinchAsyncDeliveredToForegroundPgrpOnResize,
             InvariantOutcome::OpenDefect,
-            omen_compat::EvidenceGrade::Partial,
+            EvidenceGrade::Partial,
             "interactive handoff did not start winch fixture within bound",
         )];
         print_report("sigwinch", &results);
@@ -559,8 +744,6 @@ fn omen_j_no_zombie_children_after_normal_exit() {
 /// Scenario F — signal-faithful exit identity (fixture SIGINT path).
 #[test]
 fn omen_f_signal_faithful_exit_identity() {
-    // Calibration already proves signal-faithful SIGINT on the control path.
-    // Through Omen we record whether the shell surfaces the same identity.
     let Some(mut omen) = spawn_omen(&workspace_root()) else {
         eprintln!("SKIP: omen binary not built");
         return;
@@ -581,33 +764,13 @@ fn omen_f_signal_faithful_exit_identity() {
     // Omen surfaces a typed signal; otherwise UNAVAILABLE (honest gap).
     let results = vec![
         judge_shell_survives_foreground_sigint(shell_alive, shell.pid),
-        InvariantResult::new(
+        InvariantResult::unavailable(
             InvariantId::ExitStatusPreservesSignalNumber,
-            InvariantOutcome::Unavailable,
-            omen_compat::EvidenceGrade::Unavailable,
             "Omen interactive handoff does not surface grandchild wait-signal identity to Compat without production instrumentation",
         ),
     ];
     let _ = omen.wait_for_text("\\O/", Duration::from_secs(10));
     print_report("signal-faithful", &results);
-}
-
-fn parse_posix_report(text: &str) -> Option<PosixProcessIdentity> {
-    for line in text.lines().rev() {
-        let line = line.trim();
-        if !line.contains("\"fixture\":\"posix-report\"") {
-            continue;
-        }
-        let v: serde_json::Value = serde_json::from_str(line).ok()?;
-        return Some(PosixProcessIdentity {
-            pid: v["pid"].as_u64()? as u32,
-            ppid: v["ppid"].as_i64().map(|x| x as u32).filter(|&x| x > 0),
-            pgrp: v["pgrp"].as_i64().map(|x| x as u32).filter(|&x| x > 0),
-            session_id: v["sid"].as_i64().map(|x| x as u32).filter(|&x| x > 0),
-            source: "fixture_posix_report".into(),
-        });
-    }
-    None
 }
 
 fn parse_json_str_array(text: &str, key: &str) -> Vec<String> {

@@ -40,13 +40,20 @@ deserialization rejects Exact (D2-013).
   `PosixWaitState`), Linux `/proc` observer, and invariant judges for the
   thirteen job-control / TTY IDs in `compat/invariants/posix.md`.
 - **M0-G** `omen-gremlin` POSIX modes (`--posix-report`,
-  `--posix-stop-report`, `--posix-sigint-report`, `--posix-winch-report`,
+  `--posix-stop-report`, `--posix-sigint-report`,
+  `--posix-sigint-observe`, `--posix-winch-report`,
   `--posix-termios-dirty-exit`), Tier POSIX CONTROL calibration tests, and
   Tier POSIX OMEN scenarios (foreground topology, exit reacquisition, stop,
-  Ctrl-C, signal mask, SIGWINCH, termios recovery, zombie observation).
+  Ctrl-C with observed delivery, signal mask, SIGWINCH, termios recovery,
+  zombie observation) plus measurement-integrity regressions
+  (`posix_evidence.rs`).
 - Decisions D2-014 (measurement not repair), D2-015 (establish then
-  observe controlling terminal), D2-016 (bounded hostile PTY I/O).
-- Defect ledger: `POSIX_M0_DEFECTS.md`.
+  observe controlling terminal), D2-016 (bounded hostile PTY I/O),
+  D2-017 (dependent claims never exceed observed evidence — no fabricated
+  identity; reacquisition requires proven prior handoff; VINTR ≠ SIGINT
+  delivery; `/proc` stopped ≠ Omen wait-path observation).
+- Defect ledger: `POSIX_M0_DEFECTS.md` (M0-002 regraded INCONCLUSIVE;
+  M0-003 kept UNAVAILABLE as observability gap).
 
 Still open for M0: Windows ConPTY/console control, deeper process-tree
 containment, and any repair of production defects discovered by the

@@ -2,11 +2,20 @@
 //!
 //! OBSERVATION ≠ INVARIANT ≠ RESULT. Fixtures emit facts; only this layer
 //! (and portable `RunOutcome` checks) produce PASS/FAIL/… results.
+//!
+//! Evidence-model laws (IDO No. 2 measurement-integrity repair):
+//! - Never invent identity; missing fixture evidence stays missing.
+//! - Reacquisition and distinct fg ownership require a proven prior handoff.
+//! - VINTR injection ≠ SIGINT delivery; delivery must be observed.
+//! - `/proc` stopped is a process fact, not Omen wait-path observation.
 
 use crate::core::EvidenceGrade;
 use crate::invariant::{InvariantId, InvariantResult};
 use crate::posix::harness::TermiosSnapshot;
-use crate::posix::observe::{PosixProcessIdentity, PosixTerminalState, PosixWaitState};
+use crate::posix::observe::{
+    HandoffEvidence, JobStoppedObserved, PosixProcessIdentity, PosixTerminalState, PosixWaitState,
+    SigintReceiptObservation,
+};
 
 /// Judge: foreground job remains in the shell's session.
 pub fn judge_job_shares_session(
@@ -56,86 +65,191 @@ pub fn judge_job_has_distinct_pgrp(
     }
 }
 
-/// Judge: while the job owns the terminal, fg pgrp == job pgrp.
+/// Judge: while a **distinct** job owns the terminal, fg pgrp == job pgrp.
+///
+/// `terminal_fg == job_pgrp == shell_pgrp` is a raw equality fact only.
+/// It does **not** prove distinct job ownership; that case is INCONCLUSIVE.
 pub fn judge_terminal_fg_is_job(
     term: &PosixTerminalState,
+    shell: &PosixProcessIdentity,
     job: &PosixProcessIdentity,
 ) -> InvariantResult {
     let inv = InvariantId::TerminalForegroundPgrpIsJob;
-    match (term.foreground_pgrp, job.pgrp) {
-        (Some(fg), Some(jp)) if fg == jp => InvariantResult::pass(
+    match (term.foreground_pgrp, shell.pgrp, job.pgrp) {
+        (Some(fg), Some(sp), Some(jp)) if sp == jp => InvariantResult::inconclusive(
+            inv,
+            EvidenceGrade::Partial,
+            format!(
+                "raw fact: terminal fg={fg} equals job pgrp={jp} equals shell pgrp={sp}; \
+                 no distinct job ownership transition to prove"
+            ),
+        )
+        .with_observations(vec![
+            term.observation(),
+            shell.observation(),
+            job.observation(),
+        ]),
+        (Some(fg), Some(_sp), Some(jp)) if fg == jp => InvariantResult::pass(
             inv,
             EvidenceGrade::Strong,
-            format!("terminal fg={fg} equals job pgrp={jp}"),
+            format!("terminal fg={fg} equals distinct job pgrp={jp}"),
         )
-        .with_observations(vec![term.observation(), job.observation()]),
-        (Some(fg), Some(jp)) => InvariantResult::fail(
+        .with_observations(vec![
+            term.observation(),
+            shell.observation(),
+            job.observation(),
+        ]),
+        (Some(fg), Some(_sp), Some(jp)) => InvariantResult::fail(
             inv,
             EvidenceGrade::Strong,
             format!("terminal fg={fg} differs from job pgrp={jp}"),
         )
-        .with_observations(vec![term.observation(), job.observation()]),
-        _ => InvariantResult::unavailable(inv, "terminal fg or job pgrp missing")
-            .with_observations(vec![term.observation(), job.observation()]),
+        .with_observations(vec![
+            term.observation(),
+            shell.observation(),
+            job.observation(),
+        ]),
+        _ => InvariantResult::unavailable(inv, "terminal fg, shell pgrp, or job pgrp missing")
+            .with_observations(vec![
+                term.observation(),
+                shell.observation(),
+                job.observation(),
+            ]),
     }
 }
 
 /// Judge: after job stop, shell regains terminal foreground before prompt.
+///
+/// PASS requires a proven prior distinct foreground handoff. When
+/// `job_pgrp == shell_pgrp` (or handoff links are missing), reacquisition is
+/// dependency-blocked / INCONCLUSIVE — never PASS from
+/// `fg_after == shell_pgrp` alone.
 pub fn judge_shell_regains_tty_after_stop(
+    handoff: &HandoffEvidence,
     term_after: &PosixTerminalState,
     shell: &PosixProcessIdentity,
 ) -> InvariantResult {
-    let inv = InvariantId::ShellRegainsTtyAfterJobStop;
-    match (term_after.foreground_pgrp, shell.pgrp) {
-        (Some(fg), Some(sp)) if fg == sp => InvariantResult::pass(
-            inv,
-            EvidenceGrade::Strong,
-            format!("after stop, terminal fg={fg} equals shell pgrp={sp}"),
-        )
-        .with_observations(vec![term_after.observation(), shell.observation()]),
-        (Some(fg), Some(sp)) => InvariantResult::fail(
-            inv,
-            EvidenceGrade::Strong,
-            format!("after stop, terminal fg={fg} still not shell pgrp={sp}"),
-        )
-        .with_observations(vec![term_after.observation(), shell.observation()]),
-        _ => InvariantResult::unavailable(inv, "fg or shell pgrp missing after stop")
-            .with_observations(vec![term_after.observation(), shell.observation()]),
-    }
+    judge_reacquisition(
+        InvariantId::ShellRegainsTtyAfterJobStop,
+        "stop",
+        handoff,
+        term_after,
+        shell,
+    )
 }
 
 /// Judge: after job exit, shell regains terminal foreground before prompt.
+///
+/// Same handoff dependency as [`judge_shell_regains_tty_after_stop`].
 pub fn judge_shell_regains_tty_after_exit(
+    handoff: &HandoffEvidence,
     term_after: &PosixTerminalState,
     shell: &PosixProcessIdentity,
 ) -> InvariantResult {
-    let inv = InvariantId::ShellRegainsTtyAfterJobExit;
-    match (term_after.foreground_pgrp, shell.pgrp) {
-        (Some(fg), Some(sp)) if fg == sp => InvariantResult::pass(
+    judge_reacquisition(
+        InvariantId::ShellRegainsTtyAfterJobExit,
+        "exit",
+        handoff,
+        term_after,
+        shell,
+    )
+}
+
+fn judge_reacquisition(
+    inv: InvariantId,
+    event: &str,
+    handoff: &HandoffEvidence,
+    term_after: &PosixTerminalState,
+    shell: &PosixProcessIdentity,
+) -> InvariantResult {
+    if !handoff.is_proven() {
+        let raw = match (term_after.foreground_pgrp, shell.pgrp) {
+            (Some(fg), Some(sp)) => format!(
+                "raw current ownership after {event}: terminal fg={fg}, shell pgrp={sp} \
+                 (equal={})",
+                fg == sp
+            ),
+            _ => format!("raw current ownership after {event}: incomplete fg/shell pgrp"),
+        };
+        return InvariantResult::inconclusive(
+            inv,
+            EvidenceGrade::Partial,
+            format!(
+                "dependency blocked: no proven prior distinct foreground handoff \
+                 (shell_pgrp={} job_pgrp={} fg_during_job={}); {raw}",
+                handoff.shell_pgrp, handoff.job_pgrp, handoff.terminal_fg_during_job
+            ),
+        );
+    }
+    let shell_pgrp = shell.pgrp.unwrap_or(handoff.shell_pgrp);
+    match term_after.foreground_pgrp {
+        Some(fg) if fg == shell_pgrp => InvariantResult::pass(
             inv,
             EvidenceGrade::Strong,
-            format!("after exit, terminal fg={fg} equals shell pgrp={sp}"),
-        )
-        .with_observations(vec![term_after.observation(), shell.observation()]),
-        (Some(fg), Some(sp)) => InvariantResult::fail(
+            format!(
+                "after {event}, terminal fg={fg} equals shell pgrp={shell_pgrp}; \
+                 prior distinct handoff proven (job_pgrp={})",
+                handoff.job_pgrp
+            ),
+        ),
+        Some(fg) => InvariantResult::fail(
             inv,
             EvidenceGrade::Strong,
-            format!("after exit, terminal fg={fg} still not shell pgrp={sp}"),
-        )
-        .with_observations(vec![term_after.observation(), shell.observation()]),
-        _ => InvariantResult::unavailable(inv, "fg or shell pgrp missing after exit")
-            .with_observations(vec![term_after.observation(), shell.observation()]),
+            format!(
+                "after {event}, terminal fg={fg} still not shell pgrp={shell_pgrp} \
+                 (prior distinct handoff was proven)"
+            ),
+        ),
+        None => InvariantResult::unavailable(
+            inv,
+            format!("terminal fg missing after {event} despite proven handoff"),
+        ),
     }
 }
 
-/// Judge: a stopped foreground child is observed as STOPPED (not only exit).
+/// Independent process-stopped fact (procfs / kernel state).
+///
+/// Grade is Strong for "job IS stopped". This is never substituted for
+/// [`judge_wait_observes_stopped`].
+pub fn judge_job_stopped_observed(
+    obs: &JobStoppedObserved,
+) -> (InvariantId, EvidenceGrade, String) {
+    // Reported as a raw fact alongside scenario results; not an invariant ID.
+    (
+        InvariantId::WaitObservesStoppedState,
+        EvidenceGrade::Strong,
+        format!(
+            "process stopped fact STRONG: pid={} source={} (not Omen wait-path evidence)",
+            obs.pid, obs.source
+        ),
+    )
+}
+
+/// Judge: Omen's wait/job-control path observed STOPPED (not merely `/proc`).
+///
+/// `source` must name a wait-path mechanism (e.g. `waitpid_wuntraced`).
+/// Procfs process-state sources cannot PASS this invariant.
 pub fn judge_wait_observes_stopped(wait: &PosixWaitState) -> InvariantResult {
     let inv = InvariantId::WaitObservesStoppedState;
-    if wait.stopped {
+    let wait_path = wait_source_is_wait_path(&wait.source);
+    if wait.stopped && wait_path {
         InvariantResult::pass(
             inv,
             EvidenceGrade::Strong,
-            format!("wait status reports stopped for pid={}", wait.pid),
+            format!(
+                "wait path {} reports stopped for pid={}",
+                wait.source, wait.pid
+            ),
+        )
+        .with_observations(vec![wait.observation()])
+    } else if wait.stopped && !wait_path {
+        InvariantResult::inconclusive(
+            inv,
+            EvidenceGrade::Partial,
+            format!(
+                "process stopped via {} for pid={}; not Omen wait-path observation",
+                wait.source, wait.pid
+            ),
         )
         .with_observations(vec![wait.observation()])
     } else if wait.exited || wait.signaled {
@@ -158,45 +272,101 @@ pub fn judge_wait_observes_stopped(wait: &PosixWaitState) -> InvariantResult {
     }
 }
 
-/// Judge: terminal-generated SIGINT targets the foreground job, not the shell.
+fn wait_source_is_wait_path(source: &str) -> bool {
+    let s = source.to_ascii_lowercase();
+    s.contains("waitpid") || s.contains("wait_path") || s.contains("wuntraced")
+}
+
+/// Judge: terminal-generated SIGINT targeted the foreground job.
+///
+/// PASS requires **all** of:
+/// - job pid/pgrp observed (caller passes `job_pgrp`),
+/// - job pgrp distinct from shell,
+/// - terminal fg == actual job pgrp before injection,
+/// - SIGINT delivery independently observed (not merely VINTR injected),
+/// - shell survives.
+///
+/// Never hard-code delivery. Injection alone is not delivery.
 pub fn judge_sigint_targets_foreground_job(
-    job_signaled: bool,
     shell_alive: bool,
     shell_pgrp: Option<u32>,
     job_pgrp: Option<u32>,
     fg_before: Option<u32>,
+    receipt: &SigintReceiptObservation,
 ) -> InvariantResult {
     let inv = InvariantId::TerminalSigintTargetsForegroundJob;
-    let routing_ok = job_signaled
-        && shell_alive
-        && shell_pgrp.is_some_and(|s| job_pgrp.is_some_and(|j| s != j))
-        && fg_before == job_pgrp;
-    if routing_ok {
-        InvariantResult::pass(
-            inv,
-            EvidenceGrade::Strong,
-            format!(
-                "Ctrl-C delivered to job pgrp {job_pgrp:?} (shell pgrp {shell_pgrp:?} survived)"
-            ),
-        )
-    } else if !shell_alive {
-        InvariantResult::fail(
+
+    if !shell_alive {
+        return InvariantResult::fail(
             inv,
             EvidenceGrade::Strong,
             "shell did not survive foreground SIGINT",
-        )
-    } else {
-        InvariantResult::fail(
+        );
+    }
+
+    let (Some(sp), Some(jp), Some(fg)) = (shell_pgrp, job_pgrp, fg_before) else {
+        return InvariantResult::unavailable(
+            inv,
+            format!(
+                "routing inputs incomplete: shell_pgrp={shell_pgrp:?} job_pgrp={job_pgrp:?} \
+                 fg_before={fg_before:?}"
+            ),
+        );
+    };
+
+    if sp == jp {
+        // Distinct ownership never established; cannot claim targeting PASS.
+        return match receipt {
+            SigintReceiptObservation::Observed { source } => InvariantResult::inconclusive(
+                inv,
+                EvidenceGrade::Partial,
+                format!(
+                    "SIGINT receipt observed via {source}, but shell pgrp={sp} equals \
+                         job pgrp={jp}: no distinct foreground job to target (raw equality only)"
+                ),
+            ),
+            _ => InvariantResult::inconclusive(
+                inv,
+                EvidenceGrade::Partial,
+                format!(
+                    "shell pgrp={sp} equals job pgrp={jp}: no distinct foreground job; \
+                     delivery state={receipt:?}"
+                ),
+            ),
+        };
+    }
+
+    match receipt {
+        SigintReceiptObservation::Observed { source } if fg == jp => InvariantResult::pass(
+            inv,
+            EvidenceGrade::Strong,
+            format!(
+                "SIGINT delivered to job pgrp {jp} (shell pgrp {sp} survived); receipt via {source}"
+            ),
+        ),
+        SigintReceiptObservation::Observed { source } => InvariantResult::fail(
+            inv,
+            EvidenceGrade::Strong,
+            format!("SIGINT receipt via {source} but terminal fg={fg} != job pgrp={jp}"),
+        ),
+        SigintReceiptObservation::InjectedNotObserved => InvariantResult::inconclusive(
             inv,
             EvidenceGrade::Partial,
             format!(
-                "job_signaled={job_signaled} shell_alive={shell_alive} fg_before={fg_before:?} job_pgrp={job_pgrp:?}"
+                "VINTR injected; SIGINT delivery not observed (fg_before={fg} job_pgrp={jp} \
+                 shell_pgrp={sp})"
             ),
-        )
+        ),
+        SigintReceiptObservation::Unavailable { reason } => InvariantResult::unavailable(
+            inv,
+            format!("SIGINT delivery cannot be observed: {reason}"),
+        ),
     }
 }
 
 /// Judge: foreground SIGINT termination does not kill the shell.
+///
+/// Independent of child SIGINT receipt: shell survival alone can PASS.
 pub fn judge_shell_survives_foreground_sigint(
     shell_alive: bool,
     shell_pid: u32,
@@ -342,4 +512,36 @@ pub fn judge_no_zombie_children(
             format!("zombie direct children of shell {shell_pid}: {zombie_direct_children:?}"),
         )
     }
+}
+
+/// Topology judgments when fixture identity is missing/malformed.
+///
+/// Never fabricates a `PosixProcessIdentity`. Never returns STRONG PASS/FAIL
+/// topology results — only missing-evidence outcomes.
+pub fn topology_results_missing_identity(
+    parse_error: &crate::posix::observe::ParseEvidenceError,
+) -> Vec<InvariantResult> {
+    let detail = parse_error.to_string();
+    vec![
+        InvariantResult::inconclusive(
+            InvariantId::ShellJobSharesShellSession,
+            EvidenceGrade::Partial,
+            format!("missing fixture identity; no STRONG topology: {detail}"),
+        ),
+        InvariantResult::inconclusive(
+            InvariantId::ShellJobHasDistinctProcessGroup,
+            EvidenceGrade::Partial,
+            format!("missing fixture identity; no STRONG topology: {detail}"),
+        ),
+        InvariantResult::inconclusive(
+            InvariantId::TerminalForegroundPgrpIsJob,
+            EvidenceGrade::Partial,
+            format!("missing fixture identity; no STRONG topology: {detail}"),
+        ),
+        InvariantResult::inconclusive(
+            InvariantId::ShellRegainsTtyAfterJobExit,
+            EvidenceGrade::Partial,
+            format!("missing fixture identity; reacquisition dependency blocked: {detail}"),
+        ),
+    ]
 }

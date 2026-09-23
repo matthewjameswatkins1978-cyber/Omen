@@ -122,3 +122,33 @@ bounded. Sleeps are not sequencing primitives; readiness uses fixture
 barriers (`OMEN_COMPAT_READY`, `OMEN_COMPAT_STOPPING`, …) and OS wait
 state. A PTY remaining open after process transitions is treated as hostile
 I/O, never an unbounded read.
+
+## D2-017 — Dependent claims never exceed observed evidence
+
+Measurement-integrity repair for M0-D/G (IDO No. 2):
+
+1. **No fabricated identity.** Fixture identity is either parsed
+   (`pid`/`pgrp`/`sid` present) or missing evidence
+   (`ParseEvidenceError`). Shell values are never copied into a job
+   identity. Missing/malformed identity yields INCONCLUSIVE / harness
+   failure — never STRONG topology PASS/FAIL.
+2. **Reacquisition requires proven prior handoff.**
+   `SHELL_REGAINS_TTY_AFTER_JOB_{STOP,EXIT}` PASS only with
+   `HandoffEvidence`: shell pgrp known, job pgrp known, distinct, and
+   terminal fg during the job == job pgrp. When `job_pgrp == shell_pgrp`,
+   reacquisition is dependency-blocked / INCONCLUSIVE. Raw
+   `fg_after == shell_pgrp` alone is current ownership, not reacquisition.
+3. **Distinct fg ownership for `TERMINAL_FOREGROUND_PGRP_IS_JOB`.**
+   Raw equality `fg == job == shell` is recorded but does not prove a
+   distinct job-control handoff (INCONCLUSIVE).
+4. **VINTR ≠ delivery.** SIGINT targeting PASS requires independently
+   observed receipt (`OMEN_COMPAT_SIGINT` marker or equivalent), distinct
+   job pgrp, fg == job, and shell survival. Injection-only is never
+   hard-coded as delivery. Shell survival remains a separate invariant.
+5. **`/proc` stopped ≠ Omen wait observation.**
+   `JobStoppedObserved { pid, source: procfs }` is a STRONG process fact.
+   `WAIT_OBSERVES_STOPPED_STATE` PASS requires a wait-path source
+   (`waitpid`/`WUNTRACED`). Control-tier waitpid evidence for Compat's own
+   child is never transferred to product Omen judgments.
+
+Do not reward a plausible story; reward an observed fact.

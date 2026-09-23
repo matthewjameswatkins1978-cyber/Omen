@@ -86,8 +86,13 @@ Fixture JSON reports remain limited to controlled Compat fixtures.
   observation slave opened `O_NOCTTY`. Bounded non-blocking master reads
   (`poll` + transcript cap). Cleanup is non-waiting kill + bounded reap.
 - **Observations:** `PosixProcessIdentity`, `PosixTerminalState`,
-  `PosixWaitState`, signal-mask fixture reports — facts only.
-- **Judges:** thirteen invariants in `compat/invariants/posix.md`.
+  `PosixWaitState`, `JobStoppedObserved`, `HandoffEvidence`,
+  `SigintReceiptObservation`, `ParseEvidenceError`, signal-mask fixture
+  reports — facts only. Fixture identity parse failure never becomes a
+  synthetic identity.
+- **Judges:** thirteen invariants in `compat/invariants/posix.md`, with
+  D2-017 evidence-model constraints (handoff-gated reacquisition, distinct
+  fg ownership, observed SIGINT receipt, wait-path-only stopped PASS).
 - **Linux `/proc`:** explicit Linux evidence (`linux_proc`); never claimed
   on non-Linux platforms (UNAVAILABLE instead).
 - **Tiers:** POSIX CONTROL calibrates the instrument without Omen; POSIX

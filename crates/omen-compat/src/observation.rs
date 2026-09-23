@@ -130,6 +130,17 @@ pub enum Observation {
         ignored: Vec<String>,
         source: String,
     },
+    /// Process is STOPPED according to an independent source (e.g. procfs).
+    /// Not proof that Omen's wait path observed STOPPED.
+    JobStoppedObserved {
+        pid: u32,
+        source: String,
+    },
+    /// Independent observation that SIGINT was actually delivered/receipted.
+    SigintReceiptObserved {
+        recipient_pid: Option<u32>,
+        source: String,
+    },
     HarnessFailed {
         phase: String,
         detail: String,
@@ -160,6 +171,8 @@ impl Observation {
             Observation::PosixTerminalState { .. } => "posix_terminal_state",
             Observation::PosixWaitState { .. } => "posix_wait_state",
             Observation::PosixSignalMaskReport { .. } => "posix_signal_mask_report",
+            Observation::JobStoppedObserved { .. } => "job_stopped_observed",
+            Observation::SigintReceiptObserved { .. } => "sigint_receipt_observed",
             Observation::HarnessFailed { .. } => "harness_failed",
         }
     }

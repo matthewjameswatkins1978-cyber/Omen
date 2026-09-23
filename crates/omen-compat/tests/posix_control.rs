@@ -6,7 +6,8 @@
 #![cfg(unix)]
 
 use omen_compat::{
-    InvariantOutcome, PosixWaitState, PtySession, PtyWinsize, judge_wait_observes_stopped,
+    InvariantOutcome, PosixWaitState, PtySession, PtyWinsize, SigintReceiptObservation,
+    judge_wait_observes_stopped,
 };
 use std::os::fd::BorrowedFd;
 use std::path::PathBuf;
@@ -147,8 +148,21 @@ fn control_stopped_state_is_observed() {
         signal: None,
         source: "waitpid_wuntraced".into(),
     };
+    // Regression J.7 — Compat's own wait path observes stop (control tier).
     let result = judge_wait_observes_stopped(&wait);
     assert_eq!(result.outcome, InvariantOutcome::Pass);
+
+    // Regression J.6 contrast — procfs-only stopped fact must not PASS wait.
+    let procfs_only = PosixWaitState {
+        source: "linux_proc".into(),
+        ..wait.clone()
+    };
+    let procfs_result = judge_wait_observes_stopped(&procfs_only);
+    assert_ne!(
+        procfs_result.outcome,
+        InvariantOutcome::Pass,
+        "/proc stopped must not prove WAIT_OBSERVES_STOPPED_STATE"
+    );
 
     continue_process(session.child_pid());
     let transcript = session
@@ -160,6 +174,7 @@ fn control_stopped_state_is_observed() {
 
 #[test]
 fn control_sigint_control_fixture_receives_terminal_signal() {
+    // Signal-faithful default disposition: fixture dies with signal 2.
     let mut session = spawn(&["--posix-sigint-report"], Duration::from_secs(15));
     session
         .wait_for_text("OMEN_COMPAT_READY", Duration::from_secs(5))
@@ -206,6 +221,74 @@ fn control_sigint_control_fixture_receives_terminal_signal() {
         }
         Err(e) => panic!("sigint fixture must exit: {e}"),
     }
+}
+
+/// Regression J.5 — CTRL-C with independently observed SIGINT receipt.
+///
+/// Distinct fixture owns the terminal; VINTR; fixture emits
+/// `OMEN_COMPAT_SIGINT`. Delivery must be observed, never assumed.
+#[test]
+fn control_sigint_receipt_observed_after_vintr() {
+    let mut session = spawn(&["--posix-sigint-observe"], Duration::from_secs(15));
+    session
+        .wait_for_text("OMEN_COMPAT_SIGINT_ARMED", Duration::from_secs(5))
+        .expect("ARMED");
+
+    let child = session.child_pid();
+    // Wait until the child is terminal foreground so VINTR targets it.
+    let fg_deadline = Instant::now() + Duration::from_secs(3);
+    let mut fg = session.observe_foreground_pgrp().ok();
+    let mut last_err = None;
+    while fg != Some(child) && Instant::now() < fg_deadline {
+        std::thread::park_timeout(Duration::from_millis(25));
+        match session.observe_foreground_pgrp() {
+            Ok(v) => {
+                fg = Some(v);
+                last_err = None;
+            }
+            Err(e) => {
+                fg = None;
+                last_err = Some(e.to_string());
+            }
+        }
+    }
+    if fg != Some(child) {
+        eprintln!(
+            "fg observation failed: fg={fg:?} child={child} last_err={last_err:?} transcript={:?}",
+            session.transcript().as_lossy()
+        );
+    }
+    assert_eq!(fg, Some(child), "fixture must own terminal foreground");
+
+    session.write_ctrl(0x03).expect("write VINTR");
+
+    // Exact line only: ARMED/TIMEOUT share the OMEN_COMPAT_SIGINT prefix.
+    let observed = matches!(
+        session.pump_until(
+            |t| t
+                .as_lossy()
+                .lines()
+                .any(|l| l.trim() == "OMEN_COMPAT_SIGINT"
+                    || l.trim() == "OMEN_COMPAT_SIGINT_TIMEOUT"),
+            Duration::from_secs(8),
+        ),
+        Ok(t) if t.as_lossy().lines().any(|l| l.trim() == "OMEN_COMPAT_SIGINT")
+    );
+
+    if observed {
+        let receipt = SigintReceiptObservation::Observed {
+            source: "control_fixture_marker".into(),
+        };
+        assert!(matches!(receipt, SigintReceiptObservation::Observed { .. }));
+    } else if cfg!(target_os = "macos") {
+        eprintln!("UNAVAILABLE: SIGINT receipt marker not observed on macOS (harness gap)");
+        let _ = session.terminate_bounded(Duration::from_secs(2));
+        return;
+    } else {
+        panic!("fixture must emit OMEN_COMPAT_SIGINT receipt after VINTR");
+    }
+
+    let _ = session.wait_child_exit(Duration::from_secs(3));
 }
 
 #[test]
