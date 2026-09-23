@@ -1,4 +1,5 @@
-//! Bounded candidate interrogation (Lucy repair B2, hardened Preview 19).
+//! Bounded candidate interrogation (Lucy repair B2, hardened Preview 19,
+//! atomic Windows containment Preview 20).
 //!
 //! The staged candidate is asked exactly one question (`--version`) under
 //! a hard deadline with file-backed output capture. A corrupt, hostile, or
@@ -13,9 +14,13 @@
 //!   dependency on inherited handles: a descendant holding the write end
 //!   open can NEVER block Omen's snapshot read. Snapshots are capped at
 //!   [`CAPTURE_CAP`] each;
-//! - containment: Windows Job Object (`KILL_ON_JOB_CLOSE`; supervised
-//!   taskkill fallback when no job can be assigned) / Unix own process
-//!   group (`SIGKILL` to the group). Strays are swept on both the timeout
+//! - containment: Windows Job Object (`KILL_ON_JOB_CLOSE`) entered
+//!   ATOMICALLY at process creation (`STARTUPINFOEX` +
+//!   `PROC_THREAD_ATTRIBUTE_JOB_LIST` — the kernel places the candidate in
+//!   the job before any candidate code executes, so no pre-assignment
+//!   descendant can escape; supervised taskkill fallback when no job can
+//!   be used) / Unix own process group (`SIGKILL` to the group, set
+//!   pre-exec — likewise no window). Strays are swept on both the timeout
 //!   AND the clean-exit path;
 //! - cleanup: [`CLEANUP_BUDGET`] (3 s) covering termination, tree
 //!   containment, and CONFIRMED reap (job empty / group empty / helper
@@ -69,6 +74,12 @@ pub struct ProbeOutcome {
     pub stderr: Vec<u8>,
     pub elapsed: Duration,
     pub cleanup: CleanupState,
+    /// True when the candidate ran inside atomically-established
+    /// containment: Windows job-list spawn (no pre-containment execution
+    /// window), Unix pre-exec process group. False on the degraded
+    /// Windows fallback (nested-job host) and on platforms with no
+    /// containment set — never inferred, always reported.
+    pub atomically_contained: bool,
 }
 
 /// Interrogate `binary --version` with an explicit deadline. Closed stdin,
@@ -96,34 +107,64 @@ pub fn probe_candidate_with_budget(
     let out_path = out_file.path().to_path_buf();
     let err_path = err_file.path().to_path_buf();
 
-    let mut cmd = std::process::Command::new(binary);
-    cmd.arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(out_file.as_file().try_clone().map_err(
-            |e| LifecycleError::Health(format!("health capture handle would not clone: {e}")),
-        )?))
-        .stderr(Stdio::from(err_file.as_file().try_clone().map_err(
-            |e| LifecycleError::Health(format!("health capture handle would not clone: {e}")),
-        )?));
-    #[cfg(unix)]
-    {
-        // Own process group: containment set for group termination. Uses
-        // only std (stable CommandExt); the kill itself uses rustix.
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| LifecycleError::Health(format!("candidate would not spawn: {e}")))?;
+    let out_clone = out_file.as_file().try_clone().map_err(|e| {
+        LifecycleError::Health(format!("health capture handle would not clone: {e}"))
+    })?;
+    let err_clone = err_file.as_file().try_clone().map_err(|e| {
+        LifecycleError::Health(format!("health capture handle would not clone: {e}"))
+    })?;
 
-    // Windows containment: fresh Job Object, KILL_ON_JOB_CLOSE. All
-    // descendants join automatically; closing the handle kills strays on
-    // BOTH the timeout and the clean-exit path. None on assignment failure
-    // (nested-job hosts) — the supervised taskkill fallback covers that.
+    // Windows containment is established BEFORE any candidate code can
+    // execute: a fresh Job Object (KILL_ON_JOB_CLOSE) is created first,
+    // then the candidate is created atomically inside it via STARTUPINFOEX
+    // + PROC_THREAD_ATTRIBUTE_JOB_LIST. The kernel assigns job membership
+    // as part of process creation — there is no spawn-then-assign window
+    // in which a pre-containment descendant could escape.
     #[cfg(windows)]
-    let job = assign_contained_job(&child);
+    let job = create_contained_job();
+    #[cfg(windows)]
+    let (mut child, atomic): (ProbeChild, bool) =
+        match spawn_contained(binary, &out_clone, &err_clone, job.as_ref()) {
+            Some(atom) => (ProbeChild::Atomic(atom), true),
+            None => {
+                // Degraded path (nested-job hosts where the OS refuses the
+                // job list): Preview 19 behavior — plain spawn, best-effort
+                // post-hoc assign into the existing job, supervised
+                // taskkill fallback when no job covers the tree.
+                let mut cmd = std::process::Command::new(binary);
+                cmd.arg("--version")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::from(out_clone))
+                    .stderr(Stdio::from(err_clone));
+                let plain = cmd.spawn().map_err(|e| {
+                    LifecycleError::Health(format!("candidate would not spawn: {e}"))
+                })?;
+                if let Some(j) = job.as_ref() {
+                    assign_to_job(j, &plain);
+                }
+                (ProbeChild::Plain(plain), false)
+            }
+        };
     #[cfg(not(windows))]
     let job: Option<JobGuard> = None;
+    #[cfg(not(windows))]
+    let mut child = {
+        let mut cmd = std::process::Command::new(binary);
+        cmd.arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(out_clone))
+            .stderr(Stdio::from(err_clone));
+        #[cfg(unix)]
+        {
+            // Own process group: containment set for group termination. Set
+            // pre-exec in the child (stable CommandExt) — atomically, with
+            // no window, like the Windows job list.
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        cmd.spawn()
+            .map_err(|e| LifecycleError::Health(format!("candidate would not spawn: {e}")))?
+    };
 
     let start = Instant::now();
     let timed_out = loop {
@@ -169,6 +210,16 @@ pub fn probe_candidate_with_budget(
     drop(out_file);
     drop(err_file);
 
+    // Containment provenance: Windows reports whether the atomic job-list
+    // spawn was used; Unix containment is pre-exec by construction; other
+    // platforms have no containment set (false, not unknown-by-silence).
+    #[cfg(windows)]
+    let atomically_contained = atomic;
+    #[cfg(unix)]
+    let atomically_contained = true;
+    #[cfg(not(any(windows, unix)))]
+    let atomically_contained = false;
+
     Ok(ProbeOutcome {
         timed_out,
         exit_ok,
@@ -176,6 +227,7 @@ pub fn probe_candidate_with_budget(
         stderr,
         elapsed: start.elapsed(),
         cleanup,
+        atomically_contained,
     })
 }
 
@@ -208,7 +260,7 @@ fn read_snapshot(path: &Path) -> Vec<u8> {
 /// [`CleanupState::CleanupIncomplete`] — never a blocking wait.
 #[cfg(windows)]
 fn contain_terminate(
-    child: &mut std::process::Child,
+    child: &mut ProbeChild,
     job: &Option<JobGuard>,
     budget: Duration,
 ) -> CleanupState {
@@ -289,7 +341,7 @@ fn contain_terminate(
 /// the root exited cleanly so cleanup is [`CleanupState::NotNeeded`];
 /// strays cannot affect the already-read snapshots).
 #[cfg(windows)]
-fn sweep_strays(_child: &std::process::Child, job: &Option<JobGuard>) {
+fn sweep_strays(_child: &ProbeChild, job: &Option<JobGuard>) {
     // Dropping the caller's guard is what kills; here the guard is still
     // alive (it drops at probe end). Explicitly terminate the job now so
     // strays die before the snapshot read rather than after.
@@ -345,6 +397,26 @@ pub fn terminate_bounded(child: &mut std::process::Child, budget: Duration) -> C
 /// Poll `try_wait` until `deadline`. Returns Ok once the child has
 /// exited (reaped by the successful `try_wait`); Err if still alive at
 /// the deadline. No blocking wait — the bound is absolute.
+#[cfg(windows)]
+pub(crate) fn reap_bounded(child: &mut impl WaitTarget, deadline: Instant) -> Result<(), String> {
+    loop {
+        match WaitTarget::try_wait(child) {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    return Err("candidate would not confirm termination within budget".to_string());
+                }
+                std::thread::sleep(POLL);
+            }
+            Err(e) => return Err(format!("candidate wait failed during cleanup: {e}")),
+        }
+    }
+}
+
+/// Poll `try_wait` until `deadline`. Returns Ok once the child has
+/// exited (reaped by the successful `try_wait`); Err if still alive at
+/// the deadline. No blocking wait — the bound is absolute.
+#[cfg(not(windows))]
 pub(crate) fn reap_bounded(
     child: &mut std::process::Child,
     deadline: Instant,
@@ -440,26 +512,26 @@ fn supervised_tree_kill(pid: u32, deadline: Instant) -> Option<String> {
     }
 }
 
-/// Windows Job Object containment (Preview 19): a fresh job with
-/// KILL_ON_JOB_CLOSE; the candidate is assigned immediately after spawn so
-/// every descendant joins automatically. Closing the last handle kills the
-/// whole tree — atomic containment with no PID-race enumeration. All
-/// failures return None (nested-job hosts) and the caller falls back to
-/// supervised taskkill. Contained in this one function: no architectural
-/// spread.
+/// Windows Job Object containment (Preview 20): a fresh job with
+/// KILL_ON_JOB_CLOSE, created BEFORE the candidate exists. The candidate
+/// is then created atomically inside it ([`spawn_contained`]), so the job
+/// covers the candidate from its first instruction — every descendant
+/// joins automatically, and closing the last handle kills the whole tree
+/// on BOTH the timeout and the clean-exit path. Creation failure returns
+/// None (nested-job hosts) and the caller falls back to the degraded
+/// plain-spawn + supervised taskkill path. Contained in this section: no
+/// architectural spread.
 #[cfg(windows)]
 struct JobGuard {
     handle: windows_sys::Win32::Foundation::HANDLE,
 }
 
 #[cfg(windows)]
-fn assign_contained_job(child: &std::process::Child) -> Option<JobGuard> {
-    use std::os::windows::io::AsRawHandle;
+fn create_contained_job() -> Option<JobGuard> {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-        SetInformationJobObject,
+        CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
     };
     unsafe {
         let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
@@ -478,17 +550,344 @@ fn assign_contained_job(child: &std::process::Child) -> Option<JobGuard> {
             CloseHandle(job);
             return None;
         }
-        let child_handle = child.as_raw_handle();
-        if AssignProcessToJobObject(job, child_handle) == 0 {
-            CloseHandle(job);
-            return None;
-        }
         Some(JobGuard { handle: job })
     }
 }
 
+/// Best-effort post-hoc assignment, used ONLY on the degraded path where
+/// the atomic job-list spawn was refused (nested-job hosts). Returns
+/// whether the child joined the job.
+#[cfg(windows)]
+fn assign_to_job(job: &JobGuard, child: &std::process::Child) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+    unsafe { AssignProcessToJobObject(job.handle(), child.as_raw_handle()) != 0 }
+}
+
+/// A Windows candidate created atomically inside its Job Object. Owns the
+/// raw process handle (closed on drop); the JOB handle (owned by
+/// [`JobGuard`]) is what kills strays, so drop order in the probe — child
+/// first, job last — preserves the KILL_ON_JOB_CLOSE backstop.
+#[cfg(windows)]
+struct AtomicProcess {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    pid: u32,
+}
+
+#[cfg(windows)]
+impl AtomicProcess {
+    fn id(&self) -> u32 {
+        self.pid
+    }
+
+    /// Direct kill (TerminateProcess). Used as a backstop; the job kill is
+    /// the primary tree terminator.
+    fn kill(&mut self) -> std::io::Result<()> {
+        use windows_sys::Win32::System::Threading::TerminateProcess;
+        unsafe {
+            if TerminateProcess(self.handle, 1) == 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Zero-timeout poll only: signalled -> read the exit code (valid once
+    /// signalled); unsignalled -> None. Never a wait.
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        use std::os::windows::process::ExitStatusExt;
+        use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+        unsafe {
+            match WaitForSingleObject(self.handle, 0) {
+                WAIT_OBJECT_0 => {
+                    let mut code: u32 = 0;
+                    if GetExitCodeProcess(self.handle, &mut code) == 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(Some(std::process::ExitStatus::from_raw(code)))
+                }
+                WAIT_TIMEOUT => Ok(None),
+                _ => Err(std::io::Error::last_os_error()),
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for AtomicProcess {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.handle);
+        }
+    }
+}
+
+/// The probe's child on Windows: either atomically contained (created in
+/// the job before executing a single instruction) or the degraded plain
+/// spawn. One narrow interface so the shared supervision body cannot tell
+/// the difference — except via `ProbeOutcome::atomically_contained`.
+#[cfg(windows)]
+enum ProbeChild {
+    Atomic(AtomicProcess),
+    Plain(std::process::Child),
+}
+
+#[cfg(windows)]
+impl ProbeChild {
+    fn id(&self) -> u32 {
+        match self {
+            ProbeChild::Atomic(p) => p.id(),
+            ProbeChild::Plain(c) => c.id(),
+        }
+    }
+
+    fn kill(&mut self) -> std::io::Result<()> {
+        match self {
+            ProbeChild::Atomic(p) => p.kill(),
+            ProbeChild::Plain(c) => c.kill(),
+        }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        match self {
+            ProbeChild::Atomic(p) => p.try_wait(),
+            ProbeChild::Plain(c) => c.try_wait(),
+        }
+    }
+}
+
+/// Narrow capability the bounded reaper needs. Implemented by
+/// [`ProbeChild`] and by `std::process::Child` (so `reap_bounded` stays
+/// generic and integration tests keep driving the same primitive).
+#[cfg(windows)]
+pub(crate) trait WaitTarget {
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>>;
+}
+
+#[cfg(windows)]
+impl WaitTarget for std::process::Child {
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        std::process::Child::try_wait(self)
+    }
+}
+
+#[cfg(windows)]
+impl WaitTarget for ProbeChild {
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        ProbeChild::try_wait(self)
+    }
+}
+
+#[cfg(windows)]
+impl WaitTarget for AtomicProcess {
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        AtomicProcess::try_wait(self)
+    }
+}
+
+/// Create the candidate atomically inside `job` (Windows): STARTUPINFOEX
+/// carries PROC_THREAD_ATTRIBUTE_JOB_LIST, so the kernel places the new
+/// process in the job AS PART OF CREATION. Candidate code cannot execute
+/// before containment — the spawn→assign race is closed by construction,
+/// not by speed, sleeps, or retries.
+///
+/// Stdio mirrors the plain path exactly: NUL stdin, the two capture files
+/// as stdout/stderr (the handle list whitelists EXACTLY these three
+/// handles — nothing else leaks in). Batch files run via COMSPEC, as std
+/// does. No CREATE_SUSPENDED, no resume dance, no supervisor subsystem.
+///
+/// Returns None when the OS refuses (nested-job hosts): the caller takes
+/// the degraded Preview-19 path. All syscalls here are synchronous and
+/// local — nothing waits, nothing blocks.
+#[cfg(windows)]
+fn spawn_contained(
+    binary: &Path,
+    stdout: &std::fs::File,
+    stderr: &std::fs::File,
+    job: Option<&JobGuard>,
+) -> Option<AtomicProcess> {
+    use std::os::windows::io::AsRawHandle;
+    let job = job?;
+    // Command line (safe code): `<binary> --version`; batch files via
+    // COMSPEC (`cmd /c <script> --version`), mirroring std's .bat handling.
+    let is_batch = matches!(
+        binary
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("bat") | Some("cmd")
+    );
+    let mut argv: Vec<String> = Vec::with_capacity(4);
+    if is_batch {
+        argv.push(
+            std::env::var_os("COMSPEC")
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "cmd.exe".to_string()),
+        );
+        argv.push("/c".to_string());
+    }
+    argv.push(binary.to_string_lossy().into_owned());
+    argv.push("--version".to_string());
+    let mut cmdline: Vec<u16> = Vec::with_capacity(260);
+    for (i, a) in argv.iter().enumerate() {
+        if i > 0 {
+            cmdline.push(0x20);
+        }
+        quote_windows_arg(a, &mut cmdline);
+    }
+    cmdline.push(0);
+
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation,
+    };
+    use windows_sys::Win32::System::Threading::{
+        CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
+        EXTENDED_STARTUPINFO_PRESENT, InitializeProcThreadAttributeList,
+        LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+        PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+        UpdateProcThreadAttribute,
+    };
+    unsafe {
+        // Private stdio handles, marked inheritable and whitelisted: the
+        // ONLY handles the candidate inherits.
+        let nul = std::fs::File::open("NUL").ok()?;
+        for f in [&nul, stdout, stderr] {
+            if SetHandleInformation(
+                f.as_raw_handle() as HANDLE,
+                HANDLE_FLAG_INHERIT,
+                HANDLE_FLAG_INHERIT,
+            ) == 0
+            {
+                return None;
+            }
+        }
+        let mut inherit = [
+            nul.as_raw_handle() as HANDLE,
+            stdout.as_raw_handle() as HANDLE,
+            stderr.as_raw_handle() as HANDLE,
+        ];
+        // Attribute list: two slots (job list + handle whitelist). Sized
+        // first via the documented NULL call, then initialized.
+        let mut size: usize = 0;
+        InitializeProcThreadAttributeList(std::ptr::null_mut(), 2, 0, &mut size);
+        if size == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; size];
+        let list = buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
+        if InitializeProcThreadAttributeList(list, 2, 0, &mut size) == 0 {
+            return None;
+        }
+        // Every failure path from here deletes the list before returning.
+        let mut job_handle: HANDLE = job.handle();
+        let ok_job = UpdateProcThreadAttribute(
+            list,
+            0,
+            PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+            &mut job_handle as *mut HANDLE as *const std::ffi::c_void,
+            std::mem::size_of::<HANDLE>(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        ) != 0;
+        let ok_handles = UpdateProcThreadAttribute(
+            list,
+            0,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+            inherit.as_mut_ptr() as *const std::ffi::c_void,
+            inherit.len() * std::mem::size_of::<HANDLE>(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        ) != 0;
+        if !ok_job || !ok_handles {
+            DeleteProcThreadAttributeList(list);
+            return None;
+        }
+        let mut si: STARTUPINFOEXW = std::mem::zeroed();
+        si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        si.StartupInfo.hStdInput = inherit[0];
+        si.StartupInfo.hStdOutput = inherit[1];
+        si.StartupInfo.hStdError = inherit[2];
+        si.lpAttributeList = list;
+        let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
+        let created = CreateProcessW(
+            std::ptr::null(),
+            cmdline.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+            std::ptr::null(),
+            std::ptr::null(),
+            &si.StartupInfo as *const _,
+            &mut pi,
+        );
+        DeleteProcThreadAttributeList(list);
+        if created == 0 {
+            return None;
+        }
+        CloseHandle(pi.hThread);
+        if pi.hProcess.is_null() {
+            return None;
+        }
+        Some(AtomicProcess {
+            handle: pi.hProcess,
+            pid: pi.dwProcessId,
+        })
+    }
+}
+
+/// Quote one command-line argument per MSVCRT rules (what
+/// CommandLineToArgvW inverts): quote when empty or containing
+/// whitespace/quotes; double backslashes preceding a quote or the end.
+#[cfg(windows)]
+fn quote_windows_arg(arg: &str, out: &mut Vec<u16>) {
+    const QUOTE: u16 = b'"' as u16;
+    const SLASH: u16 = b'\\' as u16;
+    let needs = arg.is_empty()
+        || arg
+            .bytes()
+            .any(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\x0B' | b'"'));
+    if !needs {
+        out.extend(arg.encode_utf16());
+        return;
+    }
+    out.push(QUOTE);
+    let mut slashes = 0usize;
+    for c in arg.encode_utf16() {
+        if c == SLASH {
+            slashes += 1;
+        } else {
+            if c == QUOTE {
+                for _ in 0..slashes {
+                    out.push(SLASH);
+                }
+                slashes = 0;
+                out.push(SLASH);
+            } else {
+                for _ in 0..slashes {
+                    out.push(SLASH);
+                }
+                slashes = 0;
+            }
+            out.push(c);
+        }
+    }
+    for _ in 0..slashes * 2 {
+        out.push(SLASH);
+    }
+    out.push(QUOTE);
+}
+
 #[cfg(windows)]
 impl JobGuard {
+    fn handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        self.handle
+    }
+
     /// Kill the whole tree now (atomic; no enumeration race).
     fn terminate(&self) {
         unsafe {
@@ -648,7 +1047,7 @@ mod tests {
         let bat = dir.path().join("quick.bat");
         std::fs::write(
             &bat,
-            "@echo off\r\necho omen 0.9.0-preview.19 contract:0.8 commit:abc123\r\n",
+            "@echo off\r\necho omen 0.9.0-preview.20 contract:0.8 commit:abc123\r\n",
         )
         .unwrap();
         (dir, bat)
@@ -661,7 +1060,7 @@ mod tests {
         let sh = dir.path().join("quick.sh");
         std::fs::write(
             &sh,
-            "#!/bin/sh\necho 'omen 0.9.0-preview.19 contract:0.8 commit:abc123'\n",
+            "#!/bin/sh\necho 'omen 0.9.0-preview.20 contract:0.8 commit:abc123'\n",
         )
         .unwrap();
         std::fs::set_permissions(&sh, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -685,7 +1084,7 @@ mod tests {
         std::fs::write(
             &bat,
             format!(
-                "@echo off\r\nstart \"\" /b powershell -NoProfile -Command \"$PID | Out-File -FilePath '{}' -Encoding ascii; Start-Sleep 60\"\r\nset /a n=0\r\n:wait\r\nif exist \"{}\" goto done\r\nset /a n+=1\r\nif %n% GEQ 6 goto done\r\ntimeout /t 1 /nobreak >nul\r\ngoto wait\r\n:done\r\necho omen 0.9.0-preview.19 contract:0.8 commit:abc123\r\n",
+                "@echo off\r\nstart \"\" /b powershell -NoProfile -Command \"$PID | Out-File -FilePath '{}' -Encoding ascii; Start-Sleep 60\"\r\nset /a n=0\r\n:wait\r\nif exist \"{}\" goto done\r\nset /a n+=1\r\nif %n% GEQ 6 goto done\r\ntimeout /t 1 /nobreak >nul\r\ngoto wait\r\n:done\r\necho omen 0.9.0-preview.20 contract:0.8 commit:abc123\r\n",
                 marker.display(),
                 marker.display()
             ),
@@ -703,13 +1102,141 @@ mod tests {
         std::fs::write(
             &sh,
             format!(
-                "#!/bin/sh\n( sleep 60 & echo $! > '{}' )\necho 'omen 0.9.0-preview.19 contract:0.8 commit:abc123'\n",
+                "#!/bin/sh\n( sleep 60 & echo $! > '{}' )\necho 'omen 0.9.0-preview.20 contract:0.8 commit:abc123'\n",
                 marker.display()
             ),
         )
         .unwrap();
         std::fs::set_permissions(&sh, std::fs::Permissions::from_mode(0o755)).unwrap();
         (dir, sh, marker)
+    }
+
+    /// Atomic-containment fixture (Windows only): a NATIVE zero-dependency
+    /// helper (compiled once per test with rustc — no PowerShell, no C#
+    /// compile, millisecond startup, no console needed). Omen fixes
+    /// candidate argv to `--version`, so fixture configuration travels in
+    /// a `helper.cfg` sibling file (KEY=VALUE lines) — NEVER via
+    /// process-wide env vars, which leak across parallel tests. Grandchild
+    /// sleepers take `--sleep <pidfile>` via argv (record PID, hold
+    /// inherited stdio open, sleep past deadlines). `tree=1` selects the
+    /// TEST 9 tree parent (spawn the sleeper, sleep past the deadline,
+    /// print nothing). The default prints a valid identity line and exits
+    /// immediately, spawning the sleeper first when `gc_path` is set.
+    /// Job membership is NEVER self-reported by the fixture: a NULL
+    /// `IsProcessInJob` query is confounded by ambient (e.g. Cargo-owned)
+    /// job membership inherited from the test runner. The deterministic
+    /// proof (TEST 10b) queries membership against an EXPLICIT job handle
+    /// from the test side instead — TRUE iff the job-list creation
+    /// mechanism placed the child, FALSE for a plain spawn, with zero
+    /// scheduler dependence (placement is atomic at creation, so query
+    /// timing is irrelevant).
+    #[cfg(windows)]
+    const NATIVE_HELPER_RS: &str = r#"#![windows_subsystem = "windows"]
+fn cfg_value(key: &str) -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let text = std::fs::read_to_string(exe.with_extension("cfg")).ok()?;
+    text.lines().find_map(|l| {
+        let (k, v) = l.split_once('=')?;
+        (k.trim() == key).then(|| v.trim().to_string())
+    })
+}
+fn spawn_sleeper() {
+    if let Some(gc) = cfg_value("gc_path") {
+        let exe = std::env::current_exe().unwrap();
+        std::process::Command::new(&exe)
+            .arg("--sleep")
+            .arg(&gc)
+            .spawn()
+            .unwrap();
+    }
+}
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    // Sleeper grandchild: record PID, hold inherited stdio open, sleep.
+    if args.iter().any(|a| a == "--sleep") {
+        if let Some(m) = args.iter().skip_while(|a| *a != "--sleep").nth(1) {
+            let _ = std::fs::write(m, std::process::id().to_string());
+        }
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        return;
+    }
+    // Tree-parent mode (TEST 9): spawn the sleeper, sleep past deadline.
+    if cfg_value("tree").as_deref() == Some("1") {
+        spawn_sleeper();
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        return;
+    }
+    // Probe mode: spawn the sleeper (if configured), print identity, exit
+    // immediately — no waiting, so any descendant is necessarily already
+    // born when the root exits.
+    spawn_sleeper();
+    println!("omen 0.9.0-preview.20 contract:0.8 commit:abc123");
+}
+"#;
+
+    /// Build the native helper exe in a fresh tempdir (returns dir +
+    /// helper path). rustc is on PATH wherever cargo test runs.
+    #[cfg(windows)]
+    fn native_helper() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("helper.rs"), NATIVE_HELPER_RS).unwrap();
+        let out = std::process::Command::new("rustc")
+            .arg("--edition=2021")
+            .arg("--crate-name")
+            .arg("omen_h_helper")
+            .arg("helper.rs")
+            .arg("-o")
+            .arg("helper.exe")
+            .current_dir(dir.path())
+            .stdin(Stdio::null())
+            .output()
+            .expect("rustc must be on PATH to build the containment fixture");
+        assert!(
+            out.status.success(),
+            "helper build failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let helper_path = dir.path().join("helper.exe");
+        (dir, helper_path)
+    }
+
+    /// Atomic-containment fixture: helper exe + grandchild marker. The
+    /// helper is configured via a `helper.cfg` sibling (per-tempdir, so
+    /// parallel tests never share state): probe mode with the gc marker
+    /// when `tree` is false.
+    #[cfg(windows)]
+    fn atomic_fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let (dir, helper) = native_helper();
+        let gcpid = dir.path().join("atomic_gc.pid");
+        write_helper_cfg(&dir, false, &gcpid);
+        (dir, helper, gcpid)
+    }
+
+    /// Write the helper's `helper.cfg` sibling: `tree=1` selects
+    /// tree-parent mode, `gc_path` selects the sleeper marker. Per-fixture
+    /// tempdir — fully parallel-safe, no env involved.
+    #[cfg(windows)]
+    fn write_helper_cfg(dir: &tempfile::TempDir, tree: bool, gc: &Path) {
+        let mut cfg = String::new();
+        if tree {
+            cfg.push_str("tree=1\n");
+        }
+        cfg.push_str(&format!("gc_path={}\n", gc.display()));
+        std::fs::write(dir.path().join("helper.cfg"), cfg).unwrap();
+    }
+
+    /// Explicit job-membership query (Windows tests): is `process` a
+    /// member of the EXPLICIT job `job`? Unlike a NULL-handle query (which
+    /// is confounded by ambient job membership inherited from the test
+    /// runner), this answers about OUR containment set only.
+    #[cfg(windows)]
+    fn in_explicit_job(
+        process: windows_sys::Win32::Foundation::HANDLE,
+        job: windows_sys::Win32::Foundation::HANDLE,
+    ) -> bool {
+        use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+        let mut r: i32 = 0;
+        unsafe { IsProcessInJob(process, job, &mut r) != 0 && r != 0 }
     }
 
     /// Flood fixture: writes 3 MiB (> CAPTURE_CAP) to stdout, exits 0.
@@ -818,7 +1345,7 @@ mod tests {
         assert!(out.exit_ok);
         assert_eq!(out.cleanup, CleanupState::NotNeeded);
         let (v, c, _) = parse_identity(&out.stdout);
-        assert_eq!(v.as_deref(), Some("0.9.0-preview.19"));
+        assert_eq!(v.as_deref(), Some("0.9.0-preview.20"));
         assert_eq!(c.as_deref(), Some("0.8"));
         // No deadline dependence: root exits in ~1 s; the probe must be
         // nowhere near the 10 s deadline.
@@ -887,7 +1414,7 @@ mod tests {
             assert_eq!(out.cleanup, CleanupState::NotNeeded);
             assert!(out.exit_ok);
             let (v, c, _) = parse_identity(&out.stdout);
-            assert_eq!(v.as_deref(), Some("0.9.0-preview.19"));
+            assert_eq!(v.as_deref(), Some("0.9.0-preview.20"));
             assert_eq!(c.as_deref(), Some("0.8"));
         }
     }
@@ -981,48 +1508,145 @@ mod tests {
         );
     }
 
-    /// TEST 9 (Windows) — tree cleanup through the timeout path: a parent
-    /// that holds a live grandchild in its process tree. The probe spawns
-    /// the parent, times out, and must take parent AND grandchild. The
-    /// grandchild PID is tracked through a marker file and asserted absent.
+    /// TEST 9 (Windows) — tree cleanup through the timeout path: a NATIVE
+    /// parent that spawns a live sleeper grandchild in its process tree
+    /// within milliseconds, then sleeps past the deadline. The probe times
+    /// out and must take parent AND grandchild. The grandchild PID is
+    /// tracked through a marker file and asserted absent. Native fixture
+    /// (no shell cold-start on the critical path): millisecond startup
+    /// against a 5 s deadline, so slow shared CI runners cannot flake it.
     #[cfg(windows)]
     #[test]
     fn tree_child_is_reaped_on_windows() {
-        let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join("grandchild.pid");
-        let parent_ps1 = dir.path().join("tree_parent.ps1");
-        std::fs::write(
-            &parent_ps1,
-            format!(
-                "$g = Start-Process powershell -ArgumentList '-NoProfile','-Command','Start-Sleep 60' -PassThru\r\n\
-                 $g.Id | Out-File -FilePath '{}' -Encoding ascii\r\n\
-                 Start-Sleep 60\r\n",
-                marker.display()
-            ),
-        )
-        .unwrap();
-        let bat = dir.path().join("tree.bat");
-        std::fs::write(
-            &bat,
-            format!(
-                "@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -File \"{}\"\r\n",
-                parent_ps1.display()
-            ),
-        )
-        .unwrap();
-        // The 8 s deadline gives the parent (~2 s startup) ample time to
-        // record the grandchild before the timeout fires.
-        let out = probe_candidate_with_budget(&bat, Duration::from_secs(8), Duration::from_secs(5))
-            .unwrap();
+        // Tree mode via the helper.cfg sibling (per-tempdir: no shared
+        // state with parallel tests).
+        let (_dir, helper) = native_helper();
+        let gcpid = _dir.path().join("tree_gc.pid");
+        write_helper_cfg(&_dir, true, &gcpid);
+        let out =
+            probe_candidate_with_budget(&helper, Duration::from_secs(5), Duration::from_secs(5))
+                .unwrap();
         assert!(out.timed_out);
         assert_eq!(out.cleanup, CleanupState::TerminatedAndReaped);
         let text =
-            std::fs::read_to_string(&marker).expect("parent must have recorded the grandchild PID");
+            std::fs::read_to_string(&gcpid).expect("parent must have recorded the grandchild PID");
         let grand_pid: u32 = text.trim().parse().expect("marker holds a PID");
         // Hygiene first (never leave a 60 s sleeper), then the real
         // assertion: the grandchild must ALREADY be gone.
         let already_gone = !pid_runs(grand_pid);
         kill_pid_hygiene(grand_pid);
         assert!(already_gone, "grandchild {grand_pid} survived tree-kill");
+    }
+
+    /// TEST 10 (Windows) — end-to-end under atomic containment: the
+    /// native candidate spawns a 60 s descendant and exits immediately
+    /// (millisecond startup, no shell). The probe must return bounded
+    /// with the identity captured, the atomic flag set, and the immediate
+    /// descendant already gone via the clean-exit sweep.
+    #[cfg(windows)]
+    #[test]
+    fn immediate_descendant_is_contained_atomically() {
+        let (_dir, bin, gcpid) = atomic_fixture();
+        let t0 = Instant::now();
+        let out =
+            probe_candidate_with_budget(&bin, Duration::from_secs(15), Duration::from_secs(3))
+                .unwrap();
+        let total = t0.elapsed();
+        assert!(
+            !out.timed_out,
+            "atomic probe must not hang on descendant-held handles"
+        );
+        assert!(out.exit_ok);
+        assert_eq!(out.cleanup, CleanupState::NotNeeded);
+        let (v, c, _) = parse_identity(&out.stdout);
+        assert_eq!(v.as_deref(), Some("0.9.0-preview.20"));
+        assert_eq!(c.as_deref(), Some("0.8"));
+        if !out.atomically_contained {
+            // Nested-job host: the OS refused the job list, so atomicity
+            // is unprovable in THIS environment. Reported, not disguised —
+            // the outcome flag (not inference) is the authority.
+            eprintln!("SKIP-ATOMIC: job-list spawn unavailable (nested-job host?)");
+            return;
+        }
+        assert!(
+            total < Duration::from_secs(13),
+            "atomic probe took {total:?} — deadline-dependent"
+        );
+        // The immediate descendant (born inside the job by inheritance)
+        // must already be gone via the clean-exit sweep. Poll briefly for
+        // the PID file (scheduling is never assumed), then assert absence
+        // with hygiene afterwards.
+        let gc = (0..60).find_map(|_| {
+            let pid = read_marker_pid(&gcpid);
+            if pid.is_none() {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            pid
+        });
+        if let Some(pid) = gc {
+            std::thread::sleep(Duration::from_millis(500));
+            let already_gone = !pid_runs(pid);
+            kill_pid_hygiene(pid);
+            assert!(
+                already_gone,
+                "immediate descendant {pid} survived atomic containment"
+            );
+        }
+    }
+
+    /// TEST 10b (Windows) — THE atomicity proof, deterministic: drive the
+    /// exact production primitive ([`spawn_contained`]) and query the
+    /// child's membership against the EXPLICIT job handle. Placement via
+    /// PROC_THREAD_ATTRIBUTE_JOB_LIST happens at creation, before any
+    /// candidate instruction — so the verdict cannot depend on scheduling,
+    /// polling speed, or spawn-vs-assign races: there is no window to
+    /// race in. The negative control (plain spawn, same binary) must
+    /// report NOT-a-member of the same job, proving the query
+    /// discriminates. Together: TRUE iff the atomic mechanism placed the
+    /// child. No hangs possible (no waits, one bounded reap each).
+    #[cfg(windows)]
+    #[test]
+    fn atomic_spawn_places_child_in_job_at_creation() {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::HANDLE;
+        let (_dir, helper) = native_helper();
+        let job = create_contained_job().expect("test env must allow job creation");
+        let tmp = tempfile::tempdir().unwrap();
+        let cap_out = std::fs::File::create(tmp.path().join("o")).unwrap();
+        let cap_err = std::fs::File::create(tmp.path().join("e")).unwrap();
+        let atom = spawn_contained(&helper, &cap_out, &cap_err, Some(&job));
+        let Some(mut atom) = atom else {
+            eprintln!("SKIP-ATOMIC: job-list spawn refused (nested-job host?)");
+            return;
+        };
+        assert!(
+            in_explicit_job(atom.handle, job.handle()),
+            "atomically spawned child must be IN the job from creation"
+        );
+        // Negative control: the same binary, plain-spawned, is NOT a
+        // member of our job (whatever ambient jobs exist).
+        let plain = std::process::Command::new(&helper)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("control spawn works");
+        assert!(
+            !in_explicit_job(plain.as_raw_handle() as HANDLE, job.handle()),
+            "plain-spawned child must NOT join our job — the query is vacuous"
+        );
+        // Bounded hygiene: both helpers exit on their own in milliseconds
+        // (identity + exit); reap under a fixed bound, never .wait().
+        let end = Instant::now() + Duration::from_secs(10);
+        assert!(
+            reap_bounded(&mut atom, end).is_ok(),
+            "atomic child must exit promptly"
+        );
+        let mut plain = plain;
+        assert!(
+            reap_bounded(&mut plain, end).is_ok(),
+            "control child must exit promptly"
+        );
     }
 }

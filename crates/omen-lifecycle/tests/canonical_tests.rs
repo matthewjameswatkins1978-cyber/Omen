@@ -339,6 +339,9 @@ fn probe_argv(
         stderr,
         elapsed: start.elapsed(),
         cleanup,
+        // Test seam spawns plain (no job list): honestly reported as NOT
+        // atomically contained — the flag is never inferred.
+        atomically_contained: false,
     }
 }
 
