@@ -454,10 +454,11 @@ pub struct ProcessLauncher;
 
 impl Launcher for ProcessLauncher {
     fn launches(&self, binary: &Path) -> bool {
-        std::process::Command::new(binary)
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
+        // Same bounded supervision as the update health gate: file-backed
+        // capture, contained tree, no unbounded wait/output/drain. A
+        // hostile previous-slot binary cannot hang rollback.
+        crate::health::probe_candidate_default(binary)
+            .map(|p| p.exit_ok && !p.timed_out)
             .unwrap_or(false)
     }
 }

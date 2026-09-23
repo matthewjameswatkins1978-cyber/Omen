@@ -271,19 +271,30 @@ fn staller() -> (PathBuf, Vec<String>) {
 /// Run the probe against an arbitrary argv (test-only seam): replicate the
 /// production spawn flags with a custom program, but drive cleanup through
 /// the SAME bounded primitive production uses (no unbounded replicas).
+/// File-backed capture in an isolated tempdir (argv programs may live in
+/// read-only system dirs, so NOT beside the binary): no pipe-EOF hang,
+/// no blocking wait, snapshot reads only.
 fn probe_argv(
     program: &Path,
     args: &[String],
     deadline: std::time::Duration,
 ) -> omen_lifecycle::health::ProbeOutcome {
+    use std::io::Read as _;
     use std::process::Stdio;
+    let dir = tempfile::tempdir().unwrap();
+    let out_file = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+    let err_file = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+    let out_path = out_file.path().to_path_buf();
+    let err_path = err_file.path().to_path_buf();
     let mut child = std::process::Command::new(program)
         .args(args)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::from(out_file.as_file().try_clone().unwrap()))
+        .stderr(Stdio::from(err_file.as_file().try_clone().unwrap()))
         .spawn()
         .unwrap();
+    // NOTE: out_file/err_file stay alive (not dropped) until after the
+    // snapshot reads below — dropping a NamedTempFile deletes it.
     let start = std::time::Instant::now();
     let timed_out = loop {
         match child.try_wait().unwrap() {
@@ -304,21 +315,23 @@ fn probe_argv(
     } else {
         omen_lifecycle::health::CleanupState::NotNeeded
     };
+    // NO wait(): classification from try_wait only — an unconfirmed child
+    // is simply not exit_ok, never a blocking wait.
     let exit_ok = child
         .try_wait()
         .unwrap()
         .map(|s| s.success())
         .unwrap_or(false);
-    use std::io::Read as _;
+    // Regular-file snapshot reads: bounded, never EOF-blocked by live
+    // foreign processes. Tempdir deletes on drop: no residue.
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
-    if let Some(out) = child.stdout.take() {
-        out.take(1024 * 1024).read_to_end(&mut stdout).ok();
+    if let Ok(f) = std::fs::File::open(&out_path) {
+        f.take(1024 * 1024).read_to_end(&mut stdout).ok();
     }
-    if let Some(err) = child.stderr.take() {
-        err.take(1024 * 1024).read_to_end(&mut stderr).ok();
+    if let Ok(f) = std::fs::File::open(&err_path) {
+        f.take(1024 * 1024).read_to_end(&mut stderr).ok();
     }
-    let _ = child.wait();
     omen_lifecycle::health::ProbeOutcome {
         timed_out,
         exit_ok,
