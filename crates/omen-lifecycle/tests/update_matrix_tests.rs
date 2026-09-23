@@ -126,6 +126,16 @@ fn setup() -> Fx {
     let slot = base.join("versions").join("0.9.0-preview.15-aaaaaaa");
     std::fs::create_dir_all(&slot).unwrap();
     std::fs::write(slot.join(exe_name()), b"fake-binary-A").unwrap();
+    std::fs::write(
+        slot.join("slot.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "version": "0.9.0-preview.15",
+            "git_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     omen_lifecycle::install::save_install_record(&base, &record).unwrap();
     update::write_active_pointer(&base, "0.9.0-preview.15-aaaaaaa").unwrap();
     Fx {
@@ -604,6 +614,10 @@ fn rollback_proof_binary_then_state() {
         std::fs::read(fx.base.join("bin").join(exe_name())).unwrap(),
         b"fake-binary-A"
     );
+    // Record identity restored from the slot's own truth: check/update
+    // can offer the way back instead of dead-ending on "up to date".
+    assert_eq!(record.version, "0.9.0-preview.15");
+    assert_eq!(record.git_sha, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
 
     // State rollback is separate: snapshot then restore.
     let snap = "snap_test1";
@@ -613,10 +627,34 @@ fn rollback_proof_binary_then_state() {
     let restored = update::rollback_state(&fx.base, snap).unwrap();
     assert!(restored.iter().any(|r| r == "install/record.json"));
     let record2 = load_record(&fx);
-    assert_eq!(record2.version, "0.9.0-preview.16");
+    // Snapshot was taken after binary rollback: identity truthfully 15.
+    assert_eq!(record2.version, "0.9.0-preview.15");
+    assert_eq!(
+        record2.active_slot.as_deref(),
+        Some("0.9.0-preview.15-aaaaaaa")
+    );
 
     // Snapshot without manifest: refuse, never guess.
     assert!(update::rollback_state(&fx.base, "nope-missing").is_err());
+}
+
+#[test]
+fn rollback_refuses_identity_less_slot() {
+    let fx = setup();
+    // Slot binary present but no slot.json/manifest: rollback refuses
+    // rather than activating an unnamed target.
+    let naked = fx.base.join("versions").join("naked-slot");
+    std::fs::create_dir_all(&naked).unwrap();
+    std::fs::write(naked.join(exe_name()), b"naked").unwrap();
+    let mut record = load_record(&fx);
+    record.previous_slot = Some("naked-slot".to_string());
+    omen_lifecycle::install::save_install_record(&fx.base, &record).unwrap();
+    let err = update::rollback_binary(&fx.base, &mut record, &StubLauncher(true)).unwrap_err();
+    assert_eq!(err.phase(), "rollback");
+    assert_eq!(
+        load_record(&fx).active_slot.as_deref(),
+        Some("0.9.0-preview.15-aaaaaaa")
+    );
 }
 
 #[test]

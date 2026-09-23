@@ -866,6 +866,20 @@ fn run_stages(
         std::fs::copy(dq, slot.join(daemon_file))
             .map_err(|e| LifecycleError::Stage(e.to_string()))?;
     }
+    // Slot identity file: the slot names its own version truth, so a later
+    // binary rollback can restore record identity without parsing slot
+    // names or guessing. (Conveyor slots predate this file and carry the
+    // inner manifest.json instead — read_slot_identity honors both.)
+    std::fs::write(
+        slot.join("slot.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "version": candidate.version,
+            "git_sha": candidate.git_sha,
+        }))
+        .unwrap(),
+    )
+    .map_err(|e| LifecycleError::Stage(e.to_string()))?;
 
     // Migrate (checkpointed; non-destructive v1 ensure).
     if hooks.fail_migrate {
@@ -1149,9 +1163,47 @@ pub fn classify_update_restart(base: &Path) -> Vec<UpdateRestart> {
     out
 }
 
-/// Binary rollback: re-activate the previous slot after existence + launch
-/// gating. Returns the re-activated slot. State is untouched (separate
-/// truth).
+/// Read a slot's own version identity: `slot.json` (update-created slots)
+/// or the conveyor inner `manifest.json` (pre-H slots). Refuses when
+/// neither names the target — rollback never guesses what it activates.
+pub fn read_slot_identity(base: &Path, slot: &str) -> Result<(String, String), LifecycleError> {
+    if slot.contains('/') || slot.contains('\\') || slot.contains("..") {
+        return Err(LifecycleError::Rollback(
+            "slot identity escapes".to_string(),
+        ));
+    }
+    let dir = base.join("versions").join(slot);
+    let slot_file = dir.join("slot.json");
+    if slot_file.is_file() {
+        let v: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&slot_file).map_err(|e| LifecycleError::Io(e.to_string()))?,
+        )
+        .map_err(|e| LifecycleError::Rollback(format!("slot identity unreadable: {e}")))?;
+        let version = v.get("version").and_then(|x| x.as_str()).unwrap_or("");
+        let sha = v.get("git_sha").and_then(|x| x.as_str()).unwrap_or("");
+        if !version.is_empty() && !sha.is_empty() {
+            return Ok((version.to_string(), sha.to_string()));
+        }
+    }
+    let manifest = dir.join("manifest.json");
+    if manifest.is_file() {
+        let v: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&manifest).map_err(|e| LifecycleError::Io(e.to_string()))?,
+        )
+        .map_err(|e| LifecycleError::Rollback(format!("slot manifest unreadable: {e}")))?;
+        let version = v
+            .get("preview_version")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        let sha = v.get("git_sha").and_then(|x| x.as_str()).unwrap_or("");
+        if !version.is_empty() && !sha.is_empty() {
+            return Ok((version.to_string(), sha.to_string()));
+        }
+    }
+    Err(LifecycleError::Rollback(format!(
+        "slot {slot} carries no version identity; refusing to guess"
+    )))
+}
 pub fn rollback_binary(
     base: &Path,
     record: &mut InstallRecord,
@@ -1169,6 +1221,10 @@ pub fn rollback_binary(
             "previous slot {prev} binary missing; refusing to guess"
         )));
     }
+    // Identity BEFORE any mutation: a slot that cannot name its target
+    // refuses with the current install completely untouched (stable copies
+    // refresh only after this gate passes).
+    let (slot_version, slot_sha) = read_slot_identity(base, &prev)?;
     // Stale-slot substitution guard: refuse when the slot has no binary at
     // all. Digest lineage for the previous slot is verified by comparing
     // against the transaction that installed it when available; without
@@ -1187,9 +1243,17 @@ pub fn rollback_binary(
             "stable copies would not refresh; active install untouched: {e}"
         )));
     }
+    // Restore record identity from the slot's own truth (never parsed from
+    // the slot name, never left stale): after rollback the record names
+    // what actually runs, so update --check can offer the way back.
+    let slot_binary_sha = sha256_file(&binary)?;
     let current = record.active_slot.clone();
     record.active_slot = Some(prev.clone());
     record.previous_slot = current;
+    record.version = slot_version;
+    record.git_sha = slot_sha;
+    record.binary_sha256 = Some(slot_binary_sha);
+    record.package_sha256 = None;
     crate::install::save_install_record(base, record)?;
     write_active_pointer(base, &prev)?;
     Ok(prev)
