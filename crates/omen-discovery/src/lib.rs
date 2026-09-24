@@ -35,6 +35,7 @@ pub mod authority;
 pub mod budget;
 pub mod cache;
 pub mod candidate;
+pub mod config;
 pub mod context;
 pub mod error;
 pub mod identity;
@@ -57,6 +58,7 @@ pub use candidate::{
     OrderPolicy, PresentationSlot, RankScore, RankedCandidate, SafetyAnnotation, SignalBreakdown,
     TextSpan,
 };
+pub use config::LensConfig;
 pub use context::{
     ActiveToken, CommandPosition, EnvFacts, ExecutableIdentity, ProjectContext, ProviderContext,
 };
