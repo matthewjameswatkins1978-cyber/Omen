@@ -5,6 +5,7 @@ pub mod ai_lane;
 pub mod child;
 pub mod commands;
 pub mod completion;
+pub mod discovery;
 pub mod grammar;
 pub mod interaction;
 pub mod preflight;
