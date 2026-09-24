@@ -34,6 +34,8 @@ pub mod observation;
 #[cfg(unix)]
 pub mod posix;
 pub mod runner;
+#[cfg(windows)]
+pub mod windows;
 
 pub use core::*;
 pub use failure::*;
@@ -42,3 +44,5 @@ pub use observation::*;
 #[cfg(unix)]
 pub use posix::*;
 pub use runner::*;
+#[cfg(windows)]
+pub use windows::*;

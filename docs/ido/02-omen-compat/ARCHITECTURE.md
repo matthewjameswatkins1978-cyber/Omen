@@ -111,6 +111,31 @@ explicitly UNSUPPORTED — never fake POSIX semantics.
 
 Production Omen is not repaired in this layer (D2-014).
 
+### Windows ConPTY / console-control layer (M0-W)
+
+`crates/omen-compat/src/windows/` is `cfg(windows)`-gated measurement code:
+
+- **Harness:** Compat-owned independent ConPTY (`CreatePseudoConsole`,
+  `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`, `CreateProcessW`) — never
+  omen-engine (D2-020). Bounded `PeekNamedPipe` reads, bounded writes,
+  bounded `WaitForSingleObject`, single-close handle ownership.
+- **Observations:** Windows std-handle/console-mode/dimensions/ctrl-receipt/
+  process-liveness/exit/conpty-lifecycle facts with explicit availability.
+- **Judges:** twelve canonical IDs in `compat/invariants/windows.md` with
+  D2-019/020/021 honesty (console events ≠ POSIX signals; control ≠ product
+  ConPTY; exit bits ≠ cause).
+- **Product access:** Windows-only `omen-engine` **dev-dependency** solely
+  to invoke public `NativePtyHandle` / `PtyExecutionHandle`. Production
+  never depends on omen-compat; production files are never modified.
+- **Tiers:** WINDOWS CONTROL calibrates the instrument without Omen;
+  WINDOWS OMEN INTERACTIVE runs the real shell under Compat ConPTY;
+  WINDOWS ENGINE CONPTY measures product `NativePtyHandle`.
+
+Non-Windows: Windows modules are `cfg(windows)` and do not run; workspace
+stays green without fake POSIX-on-Windows semantics.
+
+Production Omen is not repaired in this layer (D2-014).
+
 ## Evidence layers
 
 - Invariants state what must be true.

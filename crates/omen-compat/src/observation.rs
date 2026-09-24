@@ -145,6 +145,58 @@ pub enum Observation {
         recipient_pid: Option<u32>,
         source: String,
     },
+    /// Windows standard-handle capability facts (non-null vs console mode).
+    WindowsStdHandleObservation {
+        stdin_non_null: bool,
+        stdout_non_null: bool,
+        stderr_non_null: bool,
+        stdin_file_type: Option<u32>,
+        stdout_file_type: Option<u32>,
+        stderr_file_type: Option<u32>,
+        stdin_console_mode: Option<u32>,
+        stdout_console_mode: Option<u32>,
+        source: String,
+    },
+    /// Canonical Windows console-mode snapshot (availability separate).
+    WindowsConsoleModeSnapshot {
+        input_mode: Option<u32>,
+        output_mode: Option<u32>,
+        available: bool,
+        source: String,
+    },
+    /// Observed console screen-buffer dimensions.
+    WindowsConsoleDimensions {
+        rows: Option<u16>,
+        cols: Option<u16>,
+        available: bool,
+        source: String,
+    },
+    /// Independent receipt of a Windows console control event.
+    WindowsCtrlReceiptObserved {
+        event_kind: String,
+        source: String,
+    },
+    /// Toolhelp / process liveness fact.
+    WindowsProcessLiveness {
+        pid: u32,
+        alive: bool,
+        parent_pid: Option<u32>,
+        source: String,
+    },
+    /// Observed product/compat Windows exit code with cause context.
+    WindowsExitObservation {
+        raw_status: Option<u32>,
+        product_code: Option<i32>,
+        cause_context: String,
+        source: String,
+    },
+    /// ConPTY lifecycle fact (create/resize/close return codes).
+    WindowsConPtyLifecycleObservation {
+        phase: String,
+        ok: bool,
+        detail: String,
+        source: String,
+    },
     HarnessFailed {
         phase: String,
         detail: String,
@@ -177,6 +229,15 @@ impl Observation {
             Observation::PosixSignalMaskReport { .. } => "posix_signal_mask_report",
             Observation::JobStoppedObserved { .. } => "job_stopped_observed",
             Observation::SigintReceiptObserved { .. } => "sigint_receipt_observed",
+            Observation::WindowsStdHandleObservation { .. } => "windows_std_handle_observation",
+            Observation::WindowsConsoleModeSnapshot { .. } => "windows_console_mode_snapshot",
+            Observation::WindowsConsoleDimensions { .. } => "windows_console_dimensions",
+            Observation::WindowsCtrlReceiptObserved { .. } => "windows_ctrl_receipt_observed",
+            Observation::WindowsProcessLiveness { .. } => "windows_process_liveness",
+            Observation::WindowsExitObservation { .. } => "windows_exit_observation",
+            Observation::WindowsConPtyLifecycleObservation { .. } => {
+                "windows_conpty_lifecycle_observation"
+            }
             Observation::HarnessFailed { .. } => "harness_failed",
         }
     }

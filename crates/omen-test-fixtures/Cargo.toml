@@ -26,3 +26,13 @@ rustix = { version = "1.0", features = [
     "termios",
 ] }
 
+# Existing workspace dependency; Windows gremlin modes only.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+    "Win32_System_Pipes",
+    "Win32_Storage_FileSystem",
+] }
+

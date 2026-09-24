@@ -25,6 +25,18 @@ pub enum InvariantId {
     SigwinchAsyncDeliveredToForegroundPgrpOnResize,
     ShellTermiosSnapshotRestoredAfterAbnormalChildExit,
     NoZombieChildrenOfShell,
+    WindowsInteractiveChildConsoleHandlesValid,
+    WindowsInteractiveChildHasTargetableControlGroup,
+    WindowsTerminalCtrlCReachesInteractiveChild,
+    WindowsShellSurvivesInteractiveChildCtrlC,
+    WindowsConsoleModeRestoredAfterAbnormalChildExit,
+    WindowsOuterConPtyResizeVisibleToInteractiveChild,
+    WindowsEngineConPtyClientConsoleValid,
+    WindowsEngineConPtyResizeVisible,
+    WindowsEngineJobContainsDescendants,
+    WindowsEngineTerminateKillsDescendants,
+    WindowsEngineExitStatusPreservesRawBits,
+    WindowsEngineShutdownBounded,
 }
 
 impl InvariantId {
@@ -57,6 +69,38 @@ impl InvariantId {
                 "SHELL_TERMIOS_SNAPSHOT_RESTORED_AFTER_ABNORMAL_CHILD_EXIT"
             }
             InvariantId::NoZombieChildrenOfShell => "NO_ZOMBIE_CHILDREN_OF_SHELL",
+            InvariantId::WindowsInteractiveChildConsoleHandlesValid => {
+                "WINDOWS_INTERACTIVE_CHILD_CONSOLE_HANDLES_VALID"
+            }
+            InvariantId::WindowsInteractiveChildHasTargetableControlGroup => {
+                "WINDOWS_INTERACTIVE_CHILD_HAS_TARGETABLE_CONTROL_GROUP"
+            }
+            InvariantId::WindowsTerminalCtrlCReachesInteractiveChild => {
+                "WINDOWS_TERMINAL_CTRL_C_REACHES_INTERACTIVE_CHILD"
+            }
+            InvariantId::WindowsShellSurvivesInteractiveChildCtrlC => {
+                "WINDOWS_SHELL_SURVIVES_INTERACTIVE_CHILD_CTRL_C"
+            }
+            InvariantId::WindowsConsoleModeRestoredAfterAbnormalChildExit => {
+                "WINDOWS_CONSOLE_MODE_RESTORED_AFTER_ABNORMAL_CHILD_EXIT"
+            }
+            InvariantId::WindowsOuterConPtyResizeVisibleToInteractiveChild => {
+                "WINDOWS_OUTER_CONPTY_RESIZE_VISIBLE_TO_INTERACTIVE_CHILD"
+            }
+            InvariantId::WindowsEngineConPtyClientConsoleValid => {
+                "WINDOWS_ENGINE_CONPTY_CLIENT_CONSOLE_VALID"
+            }
+            InvariantId::WindowsEngineConPtyResizeVisible => "WINDOWS_ENGINE_CONPTY_RESIZE_VISIBLE",
+            InvariantId::WindowsEngineJobContainsDescendants => {
+                "WINDOWS_ENGINE_JOB_CONTAINS_DESCENDANTS"
+            }
+            InvariantId::WindowsEngineTerminateKillsDescendants => {
+                "WINDOWS_ENGINE_TERMINATE_KILLS_DESCENDANTS"
+            }
+            InvariantId::WindowsEngineExitStatusPreservesRawBits => {
+                "WINDOWS_ENGINE_EXIT_STATUS_PRESERVES_RAW_BITS"
+            }
+            InvariantId::WindowsEngineShutdownBounded => "WINDOWS_ENGINE_SHUTDOWN_BOUNDED",
         }
     }
 
@@ -95,11 +139,45 @@ impl InvariantId {
                 Some(InvariantId::ShellTermiosSnapshotRestoredAfterAbnormalChildExit)
             }
             "NO_ZOMBIE_CHILDREN_OF_SHELL" => Some(InvariantId::NoZombieChildrenOfShell),
+            "WINDOWS_INTERACTIVE_CHILD_CONSOLE_HANDLES_VALID" => {
+                Some(InvariantId::WindowsInteractiveChildConsoleHandlesValid)
+            }
+            "WINDOWS_INTERACTIVE_CHILD_HAS_TARGETABLE_CONTROL_GROUP" => {
+                Some(InvariantId::WindowsInteractiveChildHasTargetableControlGroup)
+            }
+            "WINDOWS_TERMINAL_CTRL_C_REACHES_INTERACTIVE_CHILD" => {
+                Some(InvariantId::WindowsTerminalCtrlCReachesInteractiveChild)
+            }
+            "WINDOWS_SHELL_SURVIVES_INTERACTIVE_CHILD_CTRL_C" => {
+                Some(InvariantId::WindowsShellSurvivesInteractiveChildCtrlC)
+            }
+            "WINDOWS_CONSOLE_MODE_RESTORED_AFTER_ABNORMAL_CHILD_EXIT" => {
+                Some(InvariantId::WindowsConsoleModeRestoredAfterAbnormalChildExit)
+            }
+            "WINDOWS_OUTER_CONPTY_RESIZE_VISIBLE_TO_INTERACTIVE_CHILD" => {
+                Some(InvariantId::WindowsOuterConPtyResizeVisibleToInteractiveChild)
+            }
+            "WINDOWS_ENGINE_CONPTY_CLIENT_CONSOLE_VALID" => {
+                Some(InvariantId::WindowsEngineConPtyClientConsoleValid)
+            }
+            "WINDOWS_ENGINE_CONPTY_RESIZE_VISIBLE" => {
+                Some(InvariantId::WindowsEngineConPtyResizeVisible)
+            }
+            "WINDOWS_ENGINE_JOB_CONTAINS_DESCENDANTS" => {
+                Some(InvariantId::WindowsEngineJobContainsDescendants)
+            }
+            "WINDOWS_ENGINE_TERMINATE_KILLS_DESCENDANTS" => {
+                Some(InvariantId::WindowsEngineTerminateKillsDescendants)
+            }
+            "WINDOWS_ENGINE_EXIT_STATUS_PRESERVES_RAW_BITS" => {
+                Some(InvariantId::WindowsEngineExitStatusPreservesRawBits)
+            }
+            "WINDOWS_ENGINE_SHUTDOWN_BOUNDED" => Some(InvariantId::WindowsEngineShutdownBounded),
             _ => None,
         }
     }
 
-    pub const ALL: [InvariantId; 19] = [
+    pub const ALL: [InvariantId; 31] = [
         InvariantId::BoundedWaitNoHang,
         InvariantId::ExitCausePreserved,
         InvariantId::DrainBothStreamsNoDeadlock,
@@ -119,6 +197,18 @@ impl InvariantId {
         InvariantId::SigwinchAsyncDeliveredToForegroundPgrpOnResize,
         InvariantId::ShellTermiosSnapshotRestoredAfterAbnormalChildExit,
         InvariantId::NoZombieChildrenOfShell,
+        InvariantId::WindowsInteractiveChildConsoleHandlesValid,
+        InvariantId::WindowsInteractiveChildHasTargetableControlGroup,
+        InvariantId::WindowsTerminalCtrlCReachesInteractiveChild,
+        InvariantId::WindowsShellSurvivesInteractiveChildCtrlC,
+        InvariantId::WindowsConsoleModeRestoredAfterAbnormalChildExit,
+        InvariantId::WindowsOuterConPtyResizeVisibleToInteractiveChild,
+        InvariantId::WindowsEngineConPtyClientConsoleValid,
+        InvariantId::WindowsEngineConPtyResizeVisible,
+        InvariantId::WindowsEngineJobContainsDescendants,
+        InvariantId::WindowsEngineTerminateKillsDescendants,
+        InvariantId::WindowsEngineExitStatusPreservesRawBits,
+        InvariantId::WindowsEngineShutdownBounded,
     ];
 }
 

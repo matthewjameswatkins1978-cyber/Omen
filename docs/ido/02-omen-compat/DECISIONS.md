@@ -175,3 +175,28 @@ Absence of evidence is not an empty measurement.
    `is_controlling_terminal` is `Some(true)` only when terminal-session
    and process-session observations succeed and match; otherwise `None`.
    Never hard-code `Some(true)` because the harness launched under a PTY.
+
+## D2-019 — WINDOWS CONSOLE EVENTS ARE NOT POSIX SIGNALS
+
+Distinguish terminal/user-like Ctrl-C (ConPTY input `0x03` → `CTRL_C_EVENT`),
+programmatic `GenerateConsoleCtrlEvent`, `CTRL_BREAK_EVENT`,
+`TerminateProcess`, and `TerminateJobObject`. Do not map Unix `killpg` /
+foreground pgrp reasoning onto Windows. Controlled targeting requires
+behavioral receipt evidence; configuration flags alone are not targeting
+proof.
+
+## D2-020 — CONTROL HARNESS AND PRODUCT CONPTY ARE SEPARATE AUTHORITIES
+
+Compat owns an independent ConPTY control harness (`CreatePseudoConsole` via
+windows-sys) that calibrates the mechanism. Omen engine `NativePtyHandle` is
+the product under test via a Windows-only **dev-dependency**. A Windows-only
+dev-dependency from Compat → engine is acceptable; production must never
+depend on omen-compat. Control-harness PASS never becomes product PASS.
+
+## D2-021 — WINDOWS EXIT CODE DOES NOT PROVE CAUSE
+
+Raw DWORD / bit-preservation and semantic cause context remain separate
+facts. `WindowsExitObservation` records `raw_status`, `product_code`, and an
+explicit `cause_context` (`NormalExit`, `CtrlCObserved`, `ProductTerminateRequested`,
+`TimeoutTerminationRequested`, `Unknown`, …). Never infer cause from the
+integer alone. Ctrl-C receipt PASS and exit-cause INCONCLUSIVE can coexist.

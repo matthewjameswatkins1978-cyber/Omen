@@ -1092,6 +1092,8 @@ dependencies = [
 name = "omen-compat"
 version = "0.9.0-preview.15"
 dependencies = [
+ "omen-core",
+ "omen-engine",
  "omen-test-fixtures",
  "rustix",
  "serde",
@@ -1099,6 +1101,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1287,6 +1290,7 @@ dependencies = [
  "rustix",
  "serde_json",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

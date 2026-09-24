@@ -106,6 +106,39 @@ struct GremlinArgs {
     #[arg(long)]
     posix_termios_dirty_exit: bool,
 
+    /// Windows: emit one structured console/process JSON report and exit.
+    #[arg(long)]
+    windows_report: bool,
+
+    /// Windows: install console ctrl handler, announce ARMED, wait boundedly
+    /// for CTRL_C_EVENT / CTRL_BREAK_EVENT, emit receipt marker, exit.
+    #[arg(long)]
+    windows_ctrl_observe: bool,
+
+    /// Windows: announce READY with initial dimensions, wait boundedly for a
+    /// console dimension change, emit RESIZED, exit.
+    #[arg(long)]
+    windows_resize_report: bool,
+
+    /// Windows: dirty a small controlled console-mode subset, verify, emit
+    /// DIRTY evidence, exit without restoring.
+    #[arg(long)]
+    windows_console_mode_dirty_exit: bool,
+
+    /// Windows: spawn a self child-hold, emit parent+child pids, both wait boundedly.
+    #[arg(long)]
+    windows_tree_report: bool,
+
+    /// Windows: hold alive with a liveness marker for job-containment calibration.
+    #[arg(long)]
+    windows_child_hold: bool,
+
+    /// Windows: exit with this exact DWORD status (raw bit pattern).
+    /// Use with `--windows-exit-status` always when set; 0 is the default
+    /// process exit path so `0` alone does not force a special exit mode.
+    #[arg(long, default_value_t = 0)]
+    windows_exit_status: u32,
+
     #[arg(long)]
     write: Option<PathBuf>,
 
@@ -330,6 +363,55 @@ fn main() {
         if requested_posix {
             println!(
                 "{{\"fixture\":\"posix-unsupported\",\"pid\":{},\"platform\":\"windows\"}}",
+                std::process::id()
+            );
+            let _ = io::stdout().flush();
+            std::process::exit(64);
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        if args.windows_report {
+            run_windows_report();
+            std::process::exit(args.exit);
+        }
+        if args.windows_ctrl_observe {
+            run_windows_ctrl_observe(args.exit);
+            std::process::exit(args.exit);
+        }
+        if args.windows_resize_report {
+            run_windows_resize_report(args.exit);
+            std::process::exit(args.exit);
+        }
+        if args.windows_console_mode_dirty_exit {
+            run_windows_console_mode_dirty_exit(args.exit);
+            std::process::exit(args.exit);
+        }
+        if args.windows_tree_report {
+            run_windows_tree_report(args.exit);
+            std::process::exit(args.exit);
+        }
+        if args.windows_child_hold {
+            run_windows_child_hold(args.exit);
+            std::process::exit(args.exit);
+        }
+        if args.windows_exit_status != 0 {
+            std::process::exit(args.windows_exit_status as i32);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let requested_windows = args.windows_report
+            || args.windows_ctrl_observe
+            || args.windows_resize_report
+            || args.windows_console_mode_dirty_exit
+            || args.windows_tree_report
+            || args.windows_child_hold
+            || args.windows_exit_status != 0;
+        if requested_windows {
+            println!(
+                "{{\"fixture\":\"windows-unsupported\",\"pid\":{},\"platform\":\"non-windows\"}}",
                 std::process::id()
             );
             let _ = io::stdout().flush();
@@ -909,6 +991,292 @@ fn stdin_kind() -> &'static str {
 fn stdin_kind() -> &'static str {
     "unknown"
 }
+
+#[cfg(windows)]
+mod win_fixture {
+    use std::io::{self, Write};
+    use std::os::windows::io::AsRawHandle;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::GetFileType;
+    use windows_sys::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_C_EVENT, GetConsoleMode, GetConsoleScreenBufferInfo,
+        SetConsoleCtrlHandler, SetConsoleMode,
+    };
+
+    pub fn stdin_handle() -> HANDLE {
+        io::stdin().as_raw_handle() as HANDLE
+    }
+    pub fn stdout_handle() -> HANDLE {
+        io::stdout().as_raw_handle() as HANDLE
+    }
+    pub fn stderr_handle() -> HANDLE {
+        io::stderr().as_raw_handle() as HANDLE
+    }
+
+    fn file_type(h: HANDLE) -> Option<u32> {
+        if h.is_null() || h == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let t = unsafe { GetFileType(h) };
+        if t == 0 { None } else { Some(t) }
+    }
+
+    fn console_mode(h: HANDLE) -> Option<u32> {
+        let mut mode: u32 = 0;
+        if h.is_null() || h == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        if unsafe { GetConsoleMode(h, &mut mode) } == 0 {
+            None
+        } else {
+            Some(mode)
+        }
+    }
+
+    fn dims(h: HANDLE) -> (Option<u16>, Option<u16>) {
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Coord {
+            x: i16,
+            y: i16,
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct SmallRect {
+            left: i16,
+            top: i16,
+            right: i16,
+            bottom: i16,
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct ScreenBufferInfo {
+            dw_size: Coord,
+            dw_cursor_position: Coord,
+            w_attributes: u16,
+            sr_window: SmallRect,
+            dw_maximum_window_size: Coord,
+        }
+        let mut info: ScreenBufferInfo = unsafe { std::mem::zeroed() };
+        if h.is_null() || h == INVALID_HANDLE_VALUE {
+            return (None, None);
+        }
+        if unsafe { GetConsoleScreenBufferInfo(h, &mut info as *mut _ as *mut _) } == 0 {
+            return (None, None);
+        }
+        let rows = (info.sr_window.bottom - info.sr_window.top + 1) as u16;
+        let cols = (info.sr_window.right - info.sr_window.left + 1) as u16;
+        (Some(rows), Some(cols))
+    }
+
+    pub fn windows_report_json() -> String {
+        let (rows, cols) = dims(stdout_handle());
+        serde_json::json!({
+            "fixture": "windows-report",
+            "pid": std::process::id(),
+            "stdin_non_null": !stdin_handle().is_null() && stdin_handle() != INVALID_HANDLE_VALUE,
+            "stdout_non_null": !stdout_handle().is_null() && stdout_handle() != INVALID_HANDLE_VALUE,
+            "stderr_non_null": !stderr_handle().is_null() && stderr_handle() != INVALID_HANDLE_VALUE,
+            "stdin_file_type": file_type(stdin_handle()),
+            "stdout_file_type": file_type(stdout_handle()),
+            "stderr_file_type": file_type(stderr_handle()),
+            "stdin_console_mode": console_mode(stdin_handle()),
+            "stdout_console_mode": console_mode(stdout_handle()),
+            "input_mode": console_mode(stdin_handle()),
+            "output_mode": console_mode(stdout_handle()),
+            "winsize_rows": rows,
+            "winsize_cols": cols,
+        })
+        .to_string()
+    }
+
+    pub fn run_windows_report() {
+        println!("OMEN_COMPAT_READY");
+        println!("{}", windows_report_json());
+        let _ = io::stdout().flush();
+    }
+
+    /// Shared ctrl-handler state (minimal safe mechanism: atomic + marker).
+    pub static CTRL_KIND: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    // 0 = none, 1 = CTRL_C, 2 = CTRL_BREAK
+
+    unsafe extern "system" fn ctrl_handler(event: u32) -> i32 {
+        match event {
+            CTRL_C_EVENT => {
+                CTRL_KIND.store(1, std::sync::atomic::Ordering::SeqCst);
+                1 // handled: do not terminate default path
+            }
+            CTRL_BREAK_EVENT => {
+                CTRL_KIND.store(2, std::sync::atomic::Ordering::SeqCst);
+                1
+            }
+            _ => 0,
+        }
+    }
+
+    pub fn run_windows_ctrl_observe(exit_code: i32) {
+        let ok = unsafe { SetConsoleCtrlHandler(Some(ctrl_handler), 1) };
+        if ok == 0 {
+            eprintln!("OMEN_COMPAT_CTRL_HANDLER_FAILED");
+            std::process::exit(exit_code);
+        }
+        println!("OMEN_COMPAT_READY");
+        println!("{}", windows_report_json());
+        println!("OMEN_COMPAT_CTRL_ARMED");
+        let _ = io::stdout().flush();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            let k = CTRL_KIND.load(std::sync::atomic::Ordering::SeqCst);
+            if k == 1 {
+                println!("\nOMEN_COMPAT_CTRL_C");
+                let _ = io::stdout().flush();
+                std::process::exit(exit_code);
+            }
+            if k == 2 {
+                println!("\nOMEN_COMPAT_CTRL_BREAK");
+                let _ = io::stdout().flush();
+                std::process::exit(exit_code);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        println!("\nOMEN_COMPAT_CTRL_TIMEOUT");
+        let _ = io::stdout().flush();
+        std::process::exit(exit_code);
+    }
+
+    pub fn run_windows_resize_report(exit_code: i32) {
+        let (r0, c0) = dims(stdout_handle());
+        println!("OMEN_COMPAT_READY");
+        println!(
+            "{{\"fixture\":\"windows-resize-report\",\"pid\":{},\"winsize_rows\":{},\"winsize_cols\":{}}}",
+            std::process::id(),
+            r0.unwrap_or(0),
+            c0.unwrap_or(0)
+        );
+        println!("OMEN_COMPAT_RESIZE_WAIT");
+        let _ = io::stdout().flush();
+
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline {
+            let (r, c) = dims(stdout_handle());
+            if r.is_some() && c.is_some() && (r, c) != (r0, c0) {
+                println!("OMEN_COMPAT_RESIZED");
+                println!(
+                    "{{\"fixture\":\"windows-resize-report\",\"signal\":\"RESIZED\",\"winsize_rows\":{},\"winsize_cols\":{}}}",
+                    r.unwrap_or(0),
+                    c.unwrap_or(0)
+                );
+                let _ = io::stdout().flush();
+                std::process::exit(exit_code);
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        println!("OMEN_COMPAT_RESIZE_TIMEOUT");
+        let _ = io::stdout().flush();
+        std::process::exit(exit_code);
+    }
+
+    pub fn run_windows_console_mode_dirty_exit(exit_code: i32) {
+        let before_in = console_mode(stdin_handle());
+        let before_out = console_mode(stdout_handle());
+        println!("OMEN_COMPAT_READY");
+        println!("{}", windows_report_json());
+        println!("OMEN_COMPAT_DIRTYING");
+        let _ = io::stdout().flush();
+
+        // Controlled dirty subset: clear ENABLE_ECHO_INPUT | ENABLE_LIN_INPUT on stdin
+        // if present; clear ENABLE_WRAP_AT_EOL_OUTPUT on stdout if present.
+        let mut applied = false;
+        if let Some(m) = before_in {
+            let dirty = m & !(0x0004 | 0x0002); // clear ECHO | LINE
+            if unsafe { SetConsoleMode(stdin_handle(), dirty) } != 0 {
+                applied = true;
+            }
+        }
+        if let Some(m) = before_out {
+            let dirty = m & !0x0002; // clear WRAP_AT_EOL
+            if unsafe { SetConsoleMode(stdout_handle(), dirty) } != 0 {
+                applied = true;
+            }
+        }
+        let after_in = console_mode(stdin_handle());
+        let after_out = console_mode(stdout_handle());
+        let verified = after_in != before_in || after_out != before_out;
+        println!(
+            "OMEN_COMPAT_DIRTY applied={applied} verify={verified} before_in={before_in:?} after_in={after_in:?} before_out={before_out:?} after_out={after_out:?}"
+        );
+        println!("{}", windows_report_json());
+        let _ = io::stdout().flush();
+        std::process::exit(exit_code);
+    }
+
+    pub fn run_windows_tree_report(exit_code: i32) {
+        let exe = match std::env::current_exe() {
+            Ok(e) => e,
+            Err(err) => {
+                println!(
+                    "{{\"fixture\":\"windows-tree-report\",\"pid\":{},\"error\":\"{err}\"}}",
+                    std::process::id()
+                );
+                let _ = io::stdout().flush();
+                std::process::exit(exit_code);
+            }
+        };
+        match Command::new(exe)
+            .arg("--windows-child-hold")
+            .arg("--sleep-ms")
+            .arg("4000")
+            .spawn()
+        {
+            Ok(mut child) => {
+                let child_pid = child.id();
+                println!("OMEN_COMPAT_READY");
+                println!(
+                    "{{\"fixture\":\"windows-tree-report\",\"pid\":{},\"child_pid\":{child_pid}}}",
+                    std::process::id()
+                );
+                println!("OMEN_COMPAT_TREE_LIVE");
+                let _ = io::stdout().flush();
+                // Bounded wait so the report is readable before exit path.
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while Instant::now() < deadline {
+                    if let Ok(Some(_)) = child.try_wait() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                std::process::exit(exit_code);
+            }
+            Err(err) => {
+                println!(
+                    "{{\"fixture\":\"windows-tree-report\",\"pid\":{},\"error\":\"{err}\"}}",
+                    std::process::id()
+                );
+                let _ = io::stdout().flush();
+                std::process::exit(exit_code);
+            }
+        }
+    }
+
+    pub fn run_windows_child_hold(exit_code: i32) {
+        println!(
+            "{{\"fixture\":\"windows-child-hold\",\"pid\":{},\"liveness\":\"alive\"}}",
+            std::process::id()
+        );
+        let _ = io::stdout().flush();
+        // Hold boundedly for containment calibration.
+        std::thread::sleep(Duration::from_millis(3500));
+        std::process::exit(exit_code);
+    }
+}
+
+#[cfg(windows)]
+use win_fixture::*;
 
 fn run_hostile_lsp(mode: &str) {
     use std::io::{BufRead, Read, Write};

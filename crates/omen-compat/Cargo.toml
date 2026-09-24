@@ -35,6 +35,11 @@ tokio = { workspace = true, features = [
     "macros",
     "sync",
 ] }
+# Product under test for engine ConPTY scenarios only (Windows M0-W).
+# No production crate may depend on omen-compat.
+[target.'cfg(windows)'.dev-dependencies]
+omen-engine = { workspace = true }
+omen-core = { workspace = true }
 
 # Existing workspace dependency (already used by omen-engine/omen-ipc).
 # Newly used by omen-compat for POSIX PTY/termios/process observation only.
@@ -45,4 +50,16 @@ rustix = { version = "1.0", features = [
     "pty",
     "termios",
     "event",
+] }
+
+# Existing workspace dependency; Windows ConPTY control harness only.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_System_JobObjects",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_Storage_FileSystem",
 ] }

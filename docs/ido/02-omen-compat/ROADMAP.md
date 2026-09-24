@@ -63,9 +63,32 @@ deserialization rejects Exact (D2-013).
   sets → UNAVAILABLE judge); `is_controlling_terminal` derived from
   session observation only.
 
-Still open for M0: Windows ConPTY/console control, deeper process-tree
-containment, and any repair of production defects discovered by the
-instrument (separate tranche).
+### M0 Windows tranche (M0-W) — final major M0 packet
+
+- **Compat-owned independent ConPTY control harness**
+  (`crates/omen-compat/src/windows/`): `CreatePseudoConsole`,
+  `STARTUPINFOEX`/`PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`, `CreateProcessW`,
+  bounded `PeekNamedPipe`+`ReadFile`/`WriteFile`, `ResizePseudoConsole`,
+  bounded exit/cleanup, Toolhelp/`OpenProcess` liveness — **never**
+  omen-engine ConPTY (D2-020).
+- **Observations:** `WindowsStdHandleObservation`,
+  `WindowsConsoleModeSnapshot`, `WindowsConsoleDimensions`,
+  `WindowsCtrlReceipt`, `WindowsProcessLiveness`,
+  `WindowsExitObservation`, `WindowsConPtyLifecycle` — facts only.
+- **Judges:** twelve canonical Windows invariants in
+  `compat/invariants/windows.md` plus optional targeted Ctrl-Break only if
+  evidence supports it cleanly.
+- **Fixtures:** `--windows-report`, `--windows-ctrl-observe`,
+  `--windows-resize-report`, `--windows-console-mode-dirty-exit`,
+  `--windows-tree-report`, `--windows-child-hold`, `--windows-exit-status`.
+- **Tiers:** `windows_control.rs`, `windows_omen.rs`,
+  `windows_engine_conpty.rs` (product `NativePtyHandle` via Windows-only
+  dev-dependency).
+- Decisions D2-019 (console events ≠ POSIX signals), D2-020 (control vs
+  product ConPTY authorities), D2-021 (exit code ≠ cause).
+- Defect ledger: `WINDOWS_M0_DEFECTS.md`.
+
+After M0-W acceptance: **M0 COMPLETE** → **M1 real-application compatibility**.
 
 ## M1 — Deterministic Compat foundation
 

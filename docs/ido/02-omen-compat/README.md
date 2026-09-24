@@ -1,7 +1,8 @@
 # IDO No. 2 — Omen Compat
 
 Status: **M0 portable foundation accepted (M0-A/B/C); POSIX truth tranche
-(M0-D/G) in progress; not M0-complete; V1 foundation incomplete**.
+(M0-D/G) accepted; Windows truth tranche (M0-W) in progress; M0 complete
+after M0-W acceptance; V1 foundation incomplete**.
 
 Omen Compat is Omen's bounded compatibility laboratory. It is kept in the
 Omen repository so each Omen revision carries the compatible corpus and
