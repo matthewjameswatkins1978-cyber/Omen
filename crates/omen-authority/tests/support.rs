@@ -53,7 +53,10 @@ pub enum CommitScript {
     /// Mutate one dispatch field before returning.
     AdmitMutated(DispatchMutation),
     /// Refuse the commit with a machine code (replay/refusal paths).
-    Refuse { code: String, message: String },
+    Refuse {
+        code: String,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
