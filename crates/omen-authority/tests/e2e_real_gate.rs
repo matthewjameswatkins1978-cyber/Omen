@@ -272,8 +272,8 @@ impl Workspace {
         cap(&d)
     }
 
-    fn spawn_gate(&self, env: &GateEnv) -> GateProcess {
-        let cfg = GateSpawnConfig {
+    fn spawn_config(&self, env: &GateEnv) -> GateSpawnConfig {
+        GateSpawnConfig {
             exe: env.gate_exe.clone(),
             args: vec![
                 "gate".to_string(),
@@ -292,7 +292,11 @@ impl Workspace {
             startup_timeout: Duration::from_secs(30),
             request_timeout: Duration::from_secs(90),
             stderr_cap: 32768,
-        };
+        }
+    }
+
+    fn spawn_gate(&self, env: &GateEnv) -> GateProcess {
+        let cfg = self.spawn_config(env);
         // Fixture paths resolve relative to the config dir (Gate-side).
         let mut gate = GateProcess::spawn(&cfg).expect("gate spawns");
         let hello = gate.hello(Duration::from_secs(30)).unwrap_or_else(|e| {
@@ -306,6 +310,98 @@ impl Workspace {
             .verify_hello(&hello)
             .expect("canonical gate identity verifies");
         gate
+    }
+
+    /// Preview-23 temporary seam probe (Windows only): true when this
+    /// workspace's replay-root owner differs from the invoking user, i.e.
+    /// the canonical Gate WILL deterministically refuse hello with exactly
+    /// GATE_REPLAY_UNAVAILABLE. Harness-only; changes no authority
+    /// semantics. A failed probe returns false (fail-safe toward the
+    /// strict positive path, which then governs loudly).
+    #[cfg(windows)]
+    fn windows_owner_seam_active(&self) -> bool {
+        let hd = self.host_data.to_string_lossy().into_owned();
+        let owner = std::process::Command::new("pwsh.exe")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!("(Get-Acl -LiteralPath '{hd}').Owner"),
+            ])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        let user = std::process::Command::new("whoami")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        !owner.is_empty() && !user.is_empty() && !owner.eq_ignore_ascii_case(&user)
+    }
+
+    /// TEMPORARY EXACT-SEAM CHARACTERISATION (Windows hosted runners).
+    /// Proves, against the real canonical Gate: exact companion reached
+    /// the replay-root admission boundary; refusal is specifically the
+    /// known owner seam (GATE_REPLAY_UNAVAILABLE); Omen reports
+    /// unavailability truthfully; ZERO spawn, ZERO ALLOW, ZERO outcome,
+    /// no fallback path. Panics on ANY deviation — including an
+    /// unexpected hello success (upstream seam fixed without review).
+    #[cfg(windows)]
+    async fn characterise_owner_seam(&self, env: &GateEnv, dir: &Path, marker: &Path, name: &str) {
+        let cfg = self.spawn_config(env);
+        // Fixture paths resolve relative to the config dir (Gate-side).
+        let mut gate = GateProcess::spawn(&cfg).expect("gate spawns");
+        match gate.hello(Duration::from_secs(30)) {
+            Ok(hello) => panic!(
+                "UPSTREAM-SEAM-REVIEW-REQUIRED ({name}): canonical Gate hello unexpectedly succeeded ({hello:?}); the Tethers owner seam may be fixed upstream — review before accepting"
+            ),
+            Err(e) => {
+                let s = format!("{e:?}");
+                assert!(
+                    s.contains("GATE_REPLAY_UNAVAILABLE"),
+                    "seam drift ({name}): expected exactly GATE_REPLAY_UNAVAILABLE, got {s}"
+                );
+                assert!(!s.contains("Admitted"), "seam admitted ({name}): {s}");
+            }
+        }
+        // Attempted admission through the refused session must fail closed.
+        let fixture = marker_fixture(dir);
+        let digest = manifest_digest(&env.manifest_text);
+        let intent = intent_for(&fixture, marker, &format!("eval_e2e_seam_{name}"), &digest);
+        let journal_path = dir.join(format!("seam-{name}.jsonl"));
+        let journal = OutcomeJournal::open(journal_path.clone());
+        let mut driver = AdmitExecute::new(gate);
+        let mut exec = SupervisorExecutor::new();
+        match run_once(
+            &mut driver,
+            Some("gate_e2e".to_string()),
+            &intent,
+            AskPolicy::Defer,
+            &mut exec,
+            &journal,
+        )
+        .await
+        {
+            Err(_) => {}
+            Ok(report) => {
+                assert_eq!(report.spawn_count, 0, "seam executed ({name})");
+                assert!(
+                    !matches!(report.human, HumanOutcome::Admitted),
+                    "seam admitted ({name}): {:?}",
+                    report.human
+                );
+            }
+        }
+        assert!(!marker.exists(), "seam executed ({name}): marker exists");
+        assert_eq!(
+            std::fs::metadata(&journal_path)
+                .map(|m| m.len())
+                .unwrap_or(0),
+            0,
+            "seam fabricated an outcome ({name})"
+        );
+        eprintln!(
+            "H2-WINDOWS-SEAM-CHARACTERISED ({name}): exact GATE_REPLAY_UNAVAILABLE, zero spawn, zero ALLOW, zero outcome — fail-closed, NOT live-authority proof (Tethers owner seam)"
+        );
+        driver.transport_mut().shutdown();
     }
 }
 
@@ -386,6 +482,12 @@ async fn e2e_allow_executes_once_and_reports() {
     let ws = Workspace::create("allow", &env.manifest_text);
     let fixture = marker_fixture(tmp.path());
     let marker = tmp.path().join("allow.marker");
+    #[cfg(windows)]
+    if ws.windows_owner_seam_active() {
+        ws.characterise_owner_seam(&env, tmp.path(), &marker, "allow")
+            .await;
+        return;
+    }
     let digest = manifest_digest(&env.manifest_text);
     let intent = intent_for(&fixture, &marker, "eval_e2e_allow", &digest);
     let journal = OutcomeJournal::open(tmp.path().join("j.jsonl"));
@@ -443,6 +545,12 @@ async fn e2e_deny_zero_spawn() {
     let ws = Workspace::create("deny", &env.manifest_text);
     let fixture = marker_fixture(tmp.path());
     let marker = tmp.path().join("deny.marker");
+    #[cfg(windows)]
+    if ws.windows_owner_seam_active() {
+        ws.characterise_owner_seam(&env, tmp.path(), &marker, "deny")
+            .await;
+        return;
+    }
     let digest = manifest_digest(&env.manifest_text);
     let intent = intent_for(&fixture, &marker, "eval_e2e_deny", &digest);
     let journal = OutcomeJournal::open(tmp.path().join("j.jsonl"));
@@ -476,6 +584,12 @@ async fn e2e_ask_approve_executes_once() {
     let ws = Workspace::create("ask", &env.manifest_text);
     let fixture = marker_fixture(tmp.path());
     let marker = tmp.path().join("ask.marker");
+    #[cfg(windows)]
+    if ws.windows_owner_seam_active() {
+        ws.characterise_owner_seam(&env, tmp.path(), &marker, "ask")
+            .await;
+        return;
+    }
     let digest = manifest_digest(&env.manifest_text);
     let journal = OutcomeJournal::open(tmp.path().join("j.jsonl"));
 
@@ -524,6 +638,12 @@ async fn e2e_revoke_before_commit_zero_spawn() {
     let ws = Workspace::create("allow", &env.manifest_text);
     let fixture = marker_fixture(tmp.path());
     let marker = tmp.path().join("revoke.marker");
+    #[cfg(windows)]
+    if ws.windows_owner_seam_active() {
+        ws.characterise_owner_seam(&env, tmp.path(), &marker, "revoke")
+            .await;
+        return;
+    }
     let digest = manifest_digest(&env.manifest_text);
     let intent = intent_for(&fixture, &marker, "eval_e2e_revoke", &digest);
 
@@ -576,6 +696,12 @@ async fn e2e_gate_down_zero_spawn() {
     let ws = Workspace::create("allow", &env.manifest_text);
     let fixture = marker_fixture(tmp.path());
     let marker = tmp.path().join("down.marker");
+    #[cfg(windows)]
+    if ws.windows_owner_seam_active() {
+        ws.characterise_owner_seam(&env, tmp.path(), &marker, "down")
+            .await;
+        return;
+    }
     let digest = manifest_digest(&env.manifest_text);
     let intent = intent_for(&fixture, &marker, "eval_e2e_down", &digest);
     let journal = OutcomeJournal::open(tmp.path().join("j.jsonl"));
@@ -608,6 +734,13 @@ async fn e2e_multistep_readmission() {
     };
     let tmp = tempfile::tempdir().unwrap();
     let ws = Workspace::create("allow", &env.manifest_text);
+    #[cfg(windows)]
+    if ws.windows_owner_seam_active() {
+        let seam_marker = tmp.path().join("seam-multistep.marker");
+        ws.characterise_owner_seam(&env, tmp.path(), &seam_marker, "multistep")
+            .await;
+        return;
+    }
     let fixture = marker_fixture(tmp.path());
     let digest = manifest_digest(&env.manifest_text);
     let journal = OutcomeJournal::open(tmp.path().join("j.jsonl"));
@@ -650,4 +783,36 @@ async fn e2e_multistep_readmission() {
     assert!(matches!(s2.human, HumanOutcome::Denied(_)));
     assert!(!marker2.exists(), "step 2 inherited step 1 permission");
     driver.transport_mut().shutdown();
+}
+
+// WINDOWS OWNER SEAM (Preview-23 temporary exact-seam characterisation).
+// On hosts whose token default owner is NOT the invoking user (hosted
+// runners), the canonical Gate deterministically refuses hello with
+// exactly GATE_REPLAY_UNAVAILABLE; this test proves the seam and Omen's
+// fail-closed behaviour. On ownership-compliant hosts there is no seam
+// to characterise — the six positive tests above own the live proof,
+// and this test merely verifies a live hello still works.
+#[cfg(windows)]
+#[tokio::test]
+async fn e2e_windows_owner_seam_characterised() {
+    let Some(env) = gate_env() else {
+        skip("windows-seam");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = Workspace::create("allow", &env.manifest_text);
+    if !ws.windows_owner_seam_active() {
+        eprintln!(
+            "SEAM-ABSENT (windows-seam): ownership compliant on this host; live E2E owns the proof"
+        );
+        let gate = ws.spawn_gate(&env);
+        let mut driver = AdmitExecute::new(gate);
+        let view = driver.status().expect("status works");
+        let _ = view;
+        driver.transport_mut().shutdown();
+        return;
+    }
+    let marker = tmp.path().join("seam.marker");
+    ws.characterise_owner_seam(&env, tmp.path(), &marker, "seam")
+        .await;
 }
