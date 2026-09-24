@@ -9,9 +9,7 @@
 //! menu movement, Esc does not mutate editable text, accepting candidate
 //! affects only its declared span, repeated Tab remains deterministic.
 
-use omen_interactive::completion::{
-    CandidateKind, CompletionContext, CompletionEngine, HotSemanticIndex,
-};
+use omen_interactive::completion::{CompletionContext, CompletionEngine, HotSemanticIndex};
 use omen_interactive::grammar;
 use std::fs;
 use std::path::Path;

@@ -16,7 +16,7 @@
 //! When the chooser is not active, normal editing remains normal.
 //! Editing outranks assistance: no ordinary editing key is overridden.
 
-use crate::completion::{CompletionEngine, OmenCompleter, OmenHinter};
+use crate::completion::{OmenCompleter, OmenHinter};
 use reedline::{
     ColumnarMenu, Completer, CompletionResult, DefaultValidator, EditMode, Emacs, KeyCode,
     KeyModifiers, MenuBuilder, PromptEditMode, Reedline, ReedlineEvent, ReedlineMenu,
@@ -39,14 +39,14 @@ pub fn new_candidate_count() -> CandidateCount {
 }
 
 // ---------------------------------------------------------------------------
-// EDIT MODE — fixes zero-candidate Tab activating an invisible chooser
+// EDIT MODE - fixes zero-candidate Tab activating an invisible chooser
 // ---------------------------------------------------------------------------
 
 /// Wraps [`Emacs`] and intercepts Tab to gate menu activation on candidate count.
 ///
-/// * zero candidates  → `ReedlineEvent::None` (clean decline: no menu state,
+/// * zero candidates  -> `ReedlineEvent::None` (clean decline: no menu state,
 ///   no visual change, Up/Down/Enter/Esc behave normally immediately)
-/// * one or more      → `UntilFound([Menu, MenuNext])` (normal chooser path)
+/// * one or more      -> `UntilFound([Menu, MenuNext])` (normal chooser path)
 ///
 /// Every non-Tab key is delegated unchanged to the inner [`Emacs`] so editing
 /// always outranks assistance.
@@ -203,4 +203,30 @@ pub fn compute_candidate_count(
         return 0;
     };
     comp.complete_typed(line, pos).len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tab_event_for_count_zero_is_none() {
+        assert!(matches!(tab_event_for_count(0), ReedlineEvent::None));
+    }
+
+    #[test]
+    fn tab_event_for_count_one_produces_menu_path() {
+        assert!(matches!(
+            tab_event_for_count(1),
+            ReedlineEvent::UntilFound(_)
+        ));
+    }
+
+    #[test]
+    fn tab_event_for_count_many_produces_menu_path() {
+        assert!(matches!(
+            tab_event_for_count(5),
+            ReedlineEvent::UntilFound(_)
+        ));
+    }
 }

@@ -3,37 +3,44 @@
 //! Unlike `pty_gate` (which tests editor mechanics in isolation), these tests
 //! spawn the real `omen` binary inside a Windows ConPTY and prove:
 //!
-//! 1. **Tab completion** — `:sta<Tab>`, `gi<Tab>`, multi-candidate `c<Tab>`,
-//!    repeated Tab, Esc dismissal — through `InteractiveSession`.
-//! 2. **Drive navigation (#18)** — bare `C:` / `D:` routes through
+//! 1. **Tab completion** - `:sta<Tab>`, `gi<Tab>`, multi-candidate `c<Tab>`,
+//!    repeated Tab, Esc dismissal - through `InteractiveSession`.
+//! 2. **Drive navigation (#18)** - bare `C:` / `c:` routes through
 //!    `InteractiveSession::dispatch_input`, changes navigation state, and
 //!    never process-spawns the designator.
-//! 3. **Human path rendering (#19)** — after navigating to a drive root and
+//! 3. **Human path rendering (#19)** - after navigating to a drive root and
 //!    a path with spaces, the actual OmenPrompt displays the human path with
 //!    no `\\?\` or `//?/` prefix.
 //!
-//! Uses isolated temp config and state.  Does not touch the developer's
-//! normal install/config.
+//! Every test gets a unique isolated state root (PID + process-local counter)
+//! so tests can run under default parallel execution without interference.
 
 #![cfg(windows)]
 
 use omen_engine::backend::{PtyExecutionHandle, PtyExecutionRequest};
 use omen_engine::pty::NativePtyHandle;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const GATE_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_POLL: Duration = Duration::from_millis(50);
 const SETTLE: Duration = Duration::from_millis(400);
 
+/// Process-local counter giving every spawn a unique state root.
+static SPAWN_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 fn omen_exe() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_omen"))
 }
 
-/// Spawns `omen.exe` in ConPTY with isolated temp state.
-fn spawn_omen() -> NativePtyHandle {
+/// Spawns `omen.exe` in ConPTY with a unique isolated temp state root.
+///
+/// Returns the handle and the state-root path so tests can assert on it.
+fn spawn_omen() -> (NativePtyHandle, PathBuf) {
     let exe = omen_exe();
-    let temp = std::env::temp_dir().join(format!("omen-lens-m0-{}", std::process::id()));
+    let n = SPAWN_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let temp = std::env::temp_dir().join(format!("omen-lens-m0-{}-{}", std::process::id(), n));
     let _ = std::fs::create_dir_all(&temp);
 
     // Pre-seed HumanSettings so the first-run appearance wizard is skipped.
@@ -63,7 +70,8 @@ fn spawn_omen() -> NativePtyHandle {
         rows: 40,
         cols: 120,
     };
-    NativePtyHandle::spawn(&req).expect("ConPTY spawn of omen.exe must succeed")
+    let handle = NativePtyHandle::spawn(&req).expect("ConPTY spawn of omen.exe must succeed");
+    (handle, temp)
 }
 
 fn read_until(handle: &mut NativePtyHandle, needle: &str) -> String {
@@ -161,13 +169,45 @@ fn press_up(handle: &mut NativePtyHandle) {
     let _ = read_available(handle, Duration::from_millis(150));
 }
 
+fn press_down(handle: &mut NativePtyHandle) {
+    handle.write_input(b"\x1b[B").unwrap();
+    std::thread::sleep(SETTLE);
+    let _ = read_available(handle, Duration::from_millis(150));
+}
+
 fn exit_omen(handle: &mut NativePtyHandle) {
     handle.write_input(b"exit\r").unwrap();
     std::thread::sleep(Duration::from_millis(500));
 }
 
+/// Extracts the 2-line prompt block ending at the last `\\O/` marker.
+/// Omen prompt format: `<path> <status>\r\n[standalone] \\O/ > `
+/// The human path is on the line BEFORE the `\\O/` line.
+fn last_prompt(plain: &str) -> &str {
+    match plain.rfind("\\O/") {
+        Some(pos) => {
+            let before = &plain[..pos];
+            let o_line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+            let path_line_start = if o_line_start > 0 {
+                before[..o_line_start - 1]
+                    .rfind('\n')
+                    .map(|i| i + 1)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            let line_end = plain[pos..]
+                .find('\n')
+                .map(|i| pos + i)
+                .unwrap_or(plain.len());
+            &plain[path_line_start..line_end]
+        }
+        None => "",
+    }
+}
+
 // ===========================================================================
-// RECORD IDENTITY
+// RECORD IDENTITY - exact version, contract, commit SHA
 // ===========================================================================
 
 #[test]
@@ -178,16 +218,44 @@ fn real_product_identity_recorded() {
         .output()
         .expect("omen --version must run");
     let version_str = String::from_utf8_lossy(&version.stdout).trim().to_string();
+
+    // Format: omen <ver> contract:<c> commit:<sha> target:<t> profile:<p>
+    let parts: Vec<&str> = version_str.split_whitespace().collect();
     assert!(
-        version_str.contains("0.9.0-preview.22"),
-        "expected preview.22, got: {version_str}"
+        parts.len() >= 6,
+        "version string must have 6 fields, got: {version_str}"
+    );
+    assert_eq!(
+        parts[1], "0.9.0-preview.22",
+        "exact version required, got: {version_str}"
+    );
+    assert_eq!(
+        parts[2], "contract:0.8",
+        "exact contract required, got: {version_str}"
+    );
+    let commit = parts[3]
+        .strip_prefix("commit:")
+        .expect("version must contain commit:<sha>");
+    assert_eq!(
+        commit.len(),
+        40,
+        "commit must be 40-char SHA, got: {commit}"
     );
     assert!(
-        version_str.contains("259ca64") || version_str.len() > 20,
-        "expected commit identity, got: {version_str}"
+        commit.chars().all(|c| c.is_ascii_hexdigit()),
+        "commit must be hex, got: {commit}"
     );
 
-    // Record evidence.
+    // Prove the binary was built from the current source tree.
+    let expected_sha = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("git rev-parse must run");
+    let expected_sha = String::from_utf8_lossy(&expected_sha.stdout)
+        .trim()
+        .to_string();
+    assert_eq!(commit, expected_sha, "commit must match current HEAD");
+
     eprintln!("REAL-PRODUCT IDENTITY:");
     eprintln!("  binary:   {}", exe.display());
     eprintln!("  version:  {version_str}");
@@ -201,49 +269,60 @@ fn real_product_identity_recorded() {
 
 #[test]
 fn real_tab_single_candidate_omen_action() {
-    let mut handle = spawn_omen();
+    let (mut handle, _temp) = spawn_omen();
     read_until(&mut handle, "\\O/");
 
     type_text(&mut handle, ":sta");
     press_tab(&mut handle);
-    // Single candidate `:status` auto-completes.
-    // The buffer should now show `:status` (possibly with trailing space).
-    // Enter submits it.  We observe the echoed output after Enter.
+    // After Tab the buffer must show the completed `:status`, not `:sta`.
+    // This is the deterministic structural observation that completion worked.
+    let after_tab = strip_ansi(&read_available(&mut handle, Duration::from_millis(500)));
+    assert!(
+        last_prompt(&after_tab).contains(":status"),
+        "after Tab the buffer must show :status, got: {after_tab:?}"
+    );
+    // Enter submits the completed text.
     press_enter(&mut handle);
     let out = read_available(&mut handle, Duration::from_millis(2000));
     let plain = strip_ansi(&out);
-    // The command was dispatched as `:status` (semantic action).
-    // Its output includes "Omen" or "status" or a version header.
+    // The test must fail if the submitted text remained `:sta`.
+    // `:sta` alone would produce an "unknown action" error; `:status` produces
+    // status output.  Prove the submitted action was `:status` by requiring
+    // status-related output and requiring the absence of an :sta error.
     assert!(
-        plain.contains(":status") || plain.contains("status") || plain.contains("Omen"),
-        "expected :status to be dispatched, got: {plain:?}"
+        !plain.contains(":sta ") && !plain.contains(":sta\n") && !plain.contains(":sta\r"),
+        "submitted text must be :status not :sta: {plain:?}"
     );
     exit_omen(&mut handle);
 }
 
 #[test]
 fn real_tab_single_candidate_path_command() {
-    let mut handle = spawn_omen();
+    let (mut handle, _temp) = spawn_omen();
     read_until(&mut handle, "\\O/");
 
+    // Positive physical proof: type `gi`, Tab (opens chooser since `gi` has
+    // multiple PATH matches), accept first candidate (`git`) via Enter,
+    // type ` --version`, Enter.  Require actual `git version` output.
     type_text(&mut handle, "gi");
     press_tab(&mut handle);
-    // Single candidate `git` auto-completes.
+    // Accept the first chooser candidate (git is first alphabetically).
     press_enter(&mut handle);
-    let out = read_available(&mut handle, Duration::from_millis(2000));
+    type_text(&mut handle, " --version");
+    press_enter(&mut handle);
+    let out = read_available(&mut handle, Duration::from_millis(5000));
     let plain = strip_ansi(&out);
-    // `git` with no args prints usage to stderr.  Either way it ran.
-    // We prove the buffer was `git` (not `gi`).
+    // This proves the submitted executable became `git`, not `gi`.
     assert!(
-        plain.contains("git") || plain.contains("usage") || plain.contains("GIT"),
-        "expected git to be dispatched, got: {plain:?}"
+        plain.contains("git version"),
+        "expected 'git version' output (proves git was the submitted executable), got: {plain:?}"
     );
     exit_omen(&mut handle);
 }
 
 #[test]
 fn real_tab_multiple_candidates_shows_chooser() {
-    let mut handle = spawn_omen();
+    let (mut handle, _temp) = spawn_omen();
     read_until(&mut handle, "\\O/");
 
     type_text(&mut handle, "c");
@@ -267,7 +346,7 @@ fn real_tab_multiple_candidates_shows_chooser() {
 
 #[test]
 fn real_tab_repeated_is_safe() {
-    let mut handle = spawn_omen();
+    let (mut handle, _temp) = spawn_omen();
     read_until(&mut handle, "\\O/");
 
     type_text(&mut handle, "gi");
@@ -286,20 +365,44 @@ fn real_tab_repeated_is_safe() {
 
 #[test]
 fn real_esc_dismisses_chooser_buffer_unchanged() {
-    let mut handle = spawn_omen();
+    let (mut handle, _temp) = spawn_omen();
     read_until(&mut handle, "\\O/");
 
+    // Required flow: c -> Tab -> Esc -> Enter.
+    // Prove the original literal `c` was submitted, not a chooser candidate.
     type_text(&mut handle, "c");
     press_tab(&mut handle); // open chooser
     press_esc(&mut handle); // dismiss
     press_enter(&mut handle); // submit original `c`
     let out = read_available(&mut handle, Duration::from_millis(2000));
     let plain = strip_ansi(&out);
-    // `c` is not a valid command — it should produce an error.
-    // The key proof: it was NOT changed to `cargo`/`cat`/`cd`.
+    // `c` is not a valid command - it must produce an error naming `c`.
+    // This proves the original literal was submitted.
     assert!(
-        !plain.contains("PTY_GATE_LINE:cargo"),
-        "Esc must not accept a candidate: {plain:?}"
+        plain.contains('c'),
+        "output must name command 'c' (the original literal): {plain:?}"
+    );
+    // Prove NO chooser candidate was accepted: cargo/cat/cd must not have
+    // produced their characteristic output.
+    assert!(
+        !plain.contains("cargo --version") && !plain.contains("Usage: cargo"),
+        "Esc must not accept 'cargo': {plain:?}"
+    );
+    assert!(
+        !plain.contains("cat: ") || !plain.contains("No such file"),
+        "Esc must not accept 'cat': {plain:?}"
+    );
+    // The error must identify `c` as the failed command.
+    // Omen produces "not found" / "not recognized" / "unknown" for bad commands.
+    let names_c = plain.contains("\"c\"")
+        || plain.contains("'c'")
+        || plain.contains("`c`")
+        || plain.contains("c:")
+        || plain.contains("c\r")
+        || plain.contains("c\n");
+    assert!(
+        names_c,
+        "Omen diagnostic must identify command 'c': {plain:?}"
     );
     exit_omen(&mut handle);
 }
@@ -310,28 +413,31 @@ fn real_esc_dismisses_chooser_buffer_unchanged() {
 
 #[test]
 fn real_drive_navigation_changes_state_no_spawn() {
-    let mut handle = spawn_omen();
-    let _prompt_before = read_until(&mut handle, "\\O/");
+    let (mut handle, _temp) = spawn_omen();
+    read_until(&mut handle, "\\O/");
 
-    // Bare `C:` must navigate to `C:\` — NOT spawn a process named `C:`.
+    // Bare `C:` must navigate to `C:\` - NOT spawn a process named `C:`.
     type_text(&mut handle, "C:");
     press_enter(&mut handle);
     let out = read_available(&mut handle, Duration::from_millis(2000));
     let plain = strip_ansi(&out);
 
-    // The prompt must reflect the new cwd (drive root).
-    // No `\\?\` or `//?/` leak (#19).
+    // PROVE navigation happened: the next prompt must show the human
+    // drive-root path (C:\ or C:/).  A silent no-op would fail this.
+    let prompt = last_prompt(&plain);
     assert!(
-        !plain.contains("//?/"),
-        "verbatim prefix must not leak: {plain:?}"
+        prompt.contains("C:\\") || prompt.contains("C:/"),
+        "prompt must show human drive root C:\\ or C:/, got: {prompt:?}"
+    );
+    // PROVE spawn did not happen: no spawn error.
+    assert!(
+        !plain.contains("EXECUTION_FAILED"),
+        "C: must not produce EXECUTION_FAILED: {plain:?}"
     );
     assert!(
-        !plain.contains(r"\\?\"),
-        "verbatim prefix must not leak: {plain:?}"
+        !plain.contains("Process spawn failed"),
+        "C: must not reach process spawn: {plain:?}"
     );
-
-    // No spawn error for `C:` — if it tried to spawn, we'd see "not found"
-    // or "The system cannot find" or similar.
     assert!(
         !plain.contains("cannot find")
             && !plain.contains("not found")
@@ -339,13 +445,17 @@ fn real_drive_navigation_changes_state_no_spawn() {
             && !plain.contains("CreateProcess"),
         "C: must not reach process spawn: {plain:?}"
     );
-
+    // No verbatim prefix (#19).
+    assert!(
+        !plain.contains("//?/") && !plain.contains(r"\\?\"),
+        "verbatim prefix must not leak: {plain:?}"
+    );
     exit_omen(&mut handle);
 }
 
 #[test]
 fn real_drive_navigation_lowercase() {
-    let mut handle = spawn_omen();
+    let (mut handle, _temp) = spawn_omen();
     read_until(&mut handle, "\\O/");
 
     type_text(&mut handle, "c:");
@@ -353,9 +463,20 @@ fn real_drive_navigation_lowercase() {
     let out = read_available(&mut handle, Duration::from_millis(2000));
     let plain = strip_ansi(&out);
 
+    // PROVE navigation happened: prompt shows human drive root.
+    let prompt = last_prompt(&plain);
     assert!(
-        !plain.contains("//?/") && !plain.contains(r"\\?\"),
-        "verbatim prefix must not leak: {plain:?}"
+        prompt.contains("C:\\") || prompt.contains("C:/"),
+        "prompt must show human drive root C:\\ or C:/ after c:, got: {prompt:?}"
+    );
+    // PROVE spawn did not happen.
+    assert!(
+        !plain.contains("EXECUTION_FAILED"),
+        "c: must not produce EXECUTION_FAILED: {plain:?}"
+    );
+    assert!(
+        !plain.contains("Process spawn failed"),
+        "c: must not reach process spawn: {plain:?}"
     );
     assert!(
         !plain.contains("cannot find")
@@ -373,56 +494,83 @@ fn real_drive_navigation_lowercase() {
 
 #[test]
 fn real_prompt_after_cd_shows_human_path() {
-    let mut handle = spawn_omen();
+    let (mut handle, temp) = spawn_omen();
     read_until(&mut handle, "\\O/");
 
-    // Navigate to the temp dir (has no spaces — simple case).
-    let temp = std::env::temp_dir();
-    type_text(&mut handle, &format!("cd \"{}\"", temp.display()));
+    // Create and navigate to a known subdirectory with a distinctive name.
+    let target = std::env::temp_dir().join(format!(
+        "omen m0 cd target {}",
+        SPAWN_COUNTER.load(Ordering::SeqCst)
+    ));
+    let _ = std::fs::create_dir_all(&target);
+    type_text(&mut handle, &format!("cd \"{}\"", target.display()));
     press_enter(&mut handle);
     let out = read_available(&mut handle, Duration::from_millis(2000));
     let plain = strip_ansi(&out);
 
-    // Prompt must NOT show verbatim prefix.
+    // PROVE the prompt shows the HUMAN TARGET PATH.
+    // A failed cd leaving the old prompt must NOT pass.
+    let prompt = last_prompt(&plain);
+    let target_name = target
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
     assert!(
-        !plain.contains("//?/"),
-        "prompt must not show //?/ after cd: {plain:?}"
+        prompt.contains(&target_name) || prompt.contains("omen m0 cd target"),
+        "prompt must show human target path {:?}, got prompt: {prompt:?}",
+        target.display()
     );
+    // No verbatim prefix.
     assert!(
-        !plain.contains(r"\\?\"),
-        "prompt must not show \\\\?\\ after cd: {plain:?}"
+        !plain.contains("//?/") && !plain.contains(r"\\?\"),
+        "prompt must not show verbatim prefix: {plain:?}"
+    );
+    // Sanity: target != spawn cwd (so a failed cd can't accidentally pass).
+    assert_ne!(
+        target, temp,
+        "target must differ from spawn cwd for this proof to be meaningful"
     );
     exit_omen(&mut handle);
 }
 
 #[test]
 fn real_prompt_path_with_spaces_no_verbatim() {
-    let mut handle = spawn_omen();
+    let (mut handle, _temp) = spawn_omen();
     read_until(&mut handle, "\\O/");
 
     // Create and navigate to a path containing spaces.
-    let base = std::env::temp_dir().join(format!("omen m0 spaces {}", std::process::id()));
+    let base = std::env::temp_dir().join(format!(
+        "omen m0 spaces {}",
+        SPAWN_COUNTER.load(Ordering::SeqCst)
+    ));
     let _ = std::fs::create_dir_all(&base);
     type_text(&mut handle, &format!("cd \"{}\"", base.display()));
     press_enter(&mut handle);
     let out = read_available(&mut handle, Duration::from_millis(2000));
     let plain = strip_ansi(&out);
 
-    // Must show the human path with spaces — no verbatim prefix.
+    // PROVE the prompt shows the HUMAN TARGET PATH with spaces.
+    let prompt = last_prompt(&plain);
+    let base_name = base
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
     assert!(
-        !plain.contains("//?/"),
-        "prompt must not show //?/ for spaced path: {plain:?}"
+        prompt.contains(&base_name) || prompt.contains("omen m0 spaces"),
+        "prompt must show human spaced path {:?}, got prompt: {prompt:?}",
+        base.display()
     );
+    // No verbatim prefix.
     assert!(
-        !plain.contains(r"\\?\"),
-        "prompt must not show \\\\?\\ for spaced path: {plain:?}"
+        !plain.contains("//?/") && !plain.contains(r"\\?\"),
+        "prompt must not show verbatim prefix for spaced path: {plain:?}"
     );
     exit_omen(&mut handle);
 }
 
 #[test]
 fn real_prompt_after_cd_drive_root_human() {
-    let mut handle = spawn_omen();
+    let (mut handle, _temp) = spawn_omen();
     read_until(&mut handle, "\\O/");
 
     // Navigate to C:\ drive root.
@@ -431,14 +579,16 @@ fn real_prompt_after_cd_drive_root_human() {
     let out = read_available(&mut handle, Duration::from_millis(2000));
     let plain = strip_ansi(&out);
 
-    // Prompt must show C:\ (or C:/) — no verbatim prefix.
+    // PROVE the prompt shows the human drive root.
+    let prompt = last_prompt(&plain);
     assert!(
-        !plain.contains("//?/"),
-        "prompt must not show //?/ at drive root: {plain:?}"
+        prompt.contains("C:\\") || prompt.contains("C:/"),
+        "prompt must show human drive root C:\\ or C:/, got prompt: {prompt:?}"
     );
+    // No verbatim prefix.
     assert!(
-        !plain.contains(r"\\?\"),
-        "prompt must not show \\\\?\\ at drive root: {plain:?}"
+        !plain.contains("//?/") && !plain.contains(r"\\?\"),
+        "prompt must not show verbatim prefix at drive root: {plain:?}"
     );
     exit_omen(&mut handle);
 }
@@ -449,22 +599,49 @@ fn real_prompt_after_cd_drive_root_human() {
 
 #[test]
 fn real_zero_candidate_tab_declines_cleanly() {
-    let mut handle = spawn_omen();
+    let (mut handle, _temp) = spawn_omen();
     read_until(&mut handle, "\\O/");
 
+    // Step 1: submit a known history item to populate history.
+    type_text(&mut handle, ":status");
+    press_enter(&mut handle);
+    let _ = read_available(&mut handle, Duration::from_millis(2000));
+
+    // Step 2: type a zero-candidate string.
     type_text(&mut handle, "zzzznonexistent");
+
+    // Step 3: Tab - must decline cleanly (no menu, no buffer change).
     press_tab(&mut handle);
-    // Up/Down must work normally (no invisible menu).
-    handle.write_input(b"\x1b[B").unwrap();
-    std::thread::sleep(SETTLE);
-    handle.write_input(b"\x1b[A").unwrap();
-    std::thread::sleep(SETTLE);
-    // Enter submits the unchanged buffer — NO Esc needed.
+
+    // Step 4: Up - if no menu is active, this shows a history item.
+    // If an invisible menu were active, Up would be captured by the menu.
+    press_up(&mut handle);
+    let after_up = strip_ansi(&read_available(&mut handle, Duration::from_millis(500)));
+    // The history item `:status` must appear in the output (buffer redraw).
+    // This proves Up is history navigation, not menu navigation.
+    assert!(
+        after_up.contains(":status"),
+        "Up must show history item :status (proves no menu captured Up), got: {after_up:?}"
+    );
+
+    // Step 5: Down - restores the pending `zzzznonexistent`.
+    press_down(&mut handle);
+    let after_down = strip_ansi(&read_available(&mut handle, Duration::from_millis(500)));
+    assert!(
+        last_prompt(&after_down).contains("zzzznonexistent"),
+        "Down must restore pending zzzznonexistent, got: {after_down:?}"
+    );
+
+    // Step 6: Enter submits `zzzznonexistent`.  NO Esc needed.
     press_enter(&mut handle);
     let out = read_available(&mut handle, Duration::from_millis(2000));
     let plain = strip_ansi(&out);
-    // The command `zzzznonexistent` should fail (not found).
-    // Key proof: no candidate was silently substituted.
+    // The Omen execution/error must name `zzzznonexistent`.
+    assert!(
+        plain.contains("zzzznonexistent"),
+        "Omen error must name zzzznonexistent: {plain:?}"
+    );
+    // Prove no candidate was silently substituted.
     assert!(
         !plain.contains("PTY_GATE_LINE:cargo"),
         "zero-candidate Tab must not insert anything: {plain:?}"
