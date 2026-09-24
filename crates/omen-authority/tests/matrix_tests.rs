@@ -764,3 +764,36 @@ fn matrix_compiles_and_intent_sane() {
     assert!(d.starts_with("sha256:"));
     let _ = json!({"ok": true});
 }
+
+// 22. Journal unavailable: execution truth stands (marker written) but the
+// outcome can never be recorded — surfaces incomplete, never success.
+#[tokio::test]
+async fn m22_journal_unavailable_outcome_incomplete_no_success_claim() {
+    let (dir, intent, gate, marker, _journal) =
+        harness(PrepareScript::Allow, CommitScript::Admit, "eval_22");
+    // Trap the journal path under a regular file: every journal write fails.
+    let blocker = dir.path().join("blocker");
+    std::fs::write(&blocker, b"not-a-dir").unwrap();
+    let journal = OutcomeJournal::open(blocker.join("j.jsonl"));
+    let mut driver = AdmitExecute::new(gate);
+    let mut exec = succeeding(&marker);
+    let err = run_once(
+        &mut driver,
+        Some("gate_fake".to_string()),
+        &intent,
+        AskPolicy::Defer,
+        &mut exec,
+        &journal,
+    )
+    .await
+    .expect_err("unwritable journal must surface incomplete");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("OutcomeIncomplete") || msg.contains("journal"),
+        "got: {msg}"
+    );
+    // Execution DID happen (truthful dispatch record), but no terminal
+    // outcome may be claimed from an unrecorded journal.
+    assert!(marker.exists(), "execution truth lost");
+    assert!(!journal.is_terminal("exec_prep_1_action_1"));
+}

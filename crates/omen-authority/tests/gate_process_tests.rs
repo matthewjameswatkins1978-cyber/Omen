@@ -173,6 +173,21 @@ fn g08_missing_gate_zero_spawn() {
     assert!(!marker.exists());
 }
 
+// 8c. Wrong executable digest: pinned identity refuses BEFORE spawn.
+#[test]
+fn g08c_exe_digest_mismatch_zero_spawn() {
+    let (_dir, marker, _journal) = harness_bits();
+    let mut cfg = spawn_config("ok", vec![]);
+    cfg.expected_exe_sha256 =
+        Some("sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string());
+    let err = GateProcess::spawn(&cfg).expect_err("wrong digest must fail");
+    assert!(
+        format!("{err:?}").contains("identity_mismatch"),
+        "got: {err:?}"
+    );
+    assert!(!marker.exists());
+}
+
 // 9. Gate startup failure: child exits at once; hello fails; zero spawn.
 #[tokio::test]
 async fn g09_startup_failure_zero_spawn() {
