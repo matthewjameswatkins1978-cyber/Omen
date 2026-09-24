@@ -107,6 +107,19 @@ pub fn omen_action_subcommands(action: &str) -> &'static [&'static str] {
     }
 }
 
+/// Typed references offered inside a specific action's argument grammar.
+///
+/// Authority: `grammar::TypedReference::STATIC_HANDLES`. Empty slice means the
+/// action's arguments are not typed-reference scoped.
+pub fn action_reference_handles(action: &str) -> &'static [&'static str] {
+    match action {
+        "rerun" | "show" | "inspect" | "why" | "history" => {
+            crate::grammar::TypedReference::STATIC_HANDLES
+        }
+        _ => &[],
+    }
+}
+
 /// Static subcommand syntax for well-known external tools.
 ///
 /// This is syntax knowledge only (the shape of canonical argv after the tool

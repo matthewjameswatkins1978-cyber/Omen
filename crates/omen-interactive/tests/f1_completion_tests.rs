@@ -610,10 +610,7 @@ fn f1_ghost_hint_is_append_only_and_subordinate() {
     let dir = tempdir().unwrap();
     let ctx = Arc::new(Mutex::new(ctx_in(dir.path(), &["cargo"])));
     let completer = Arc::new(Mutex::new(OmenCompleter::new(ctx)));
-    let mut hinter = OmenHinter::new(
-        completer,
-        omen_interactive::interaction::new_candidate_count(),
-    );
+    let mut hinter = OmenHinter::new(completer, omen_interactive::interaction::new_readiness());
 
     let hist = reedline::FileBackedHistory::with_file(10, dir.path().join("h.txt")).unwrap();
     let hint = hinter.handle("car", 3, &hist, false, ".");
@@ -931,10 +928,7 @@ mod ghost_acceptance {
         }));
         let completer = Arc::new(Mutex::new(OmenCompleter::new(ctx)));
         (
-            OmenHinter::new(
-                completer,
-                omen_interactive::interaction::new_candidate_count(),
-            ),
+            OmenHinter::new(completer, omen_interactive::interaction::new_readiness()),
             dir,
         )
     }

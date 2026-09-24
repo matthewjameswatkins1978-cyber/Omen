@@ -1,24 +1,44 @@
 //! Deterministic completion and ghost-suggestion engine for the human shell.
 //!
-//! Architecture: ONE typed candidate model -> many deterministic bounded
-//! sources -> ONE ranking authority -> ghost presentation OR candidate menu.
+//! **The live completion authority is the M1 discovery substrate.** Every
+//! candidate this module presents originates from
+//! [`crate::discovery::DiscoveryRuntime`] (providers -> semantic merge ->
+//! matcher -> LensRanker); this module owns only:
+//!
+//! - the **projection boundary**: `RankedCandidate` -> grammar-validated edit
+//!   -> [`CompletionCandidate`] -> [`reedline::Suggestion`];
+//! - the **interaction seam**: Reedline `Completer` (`Fresh` / `Stale` /
+//!   `Pending` + `poll_completion`) and the ghost hinter;
+//! - session contexts ([`CompletionContext`], [`HotSemanticIndex`]) from
+//!   which the runtime's [`LiveSnapshot`](crate::discovery::LiveSnapshot) is
+//!   built.
 //!
 //! Completion assists editing; it is not a second grammar. Every insertion is
 //! validated to round-trip through the accepted argv grammar
 //! ([`crate::grammar`]) before it is offered. Anything the grammar cannot
 //! faithfully represent is declined rather than corrupted.
 //!
-//! Hot-path contract (keystroke): pure computation over the parsed buffer,
-//! cwd, immutable command authority, and bounded local completion state. No
-//! subprocess, no network, no model, no PATH scan, no recursive traversal, no
-//! sleep/retry. Bounded single-directory reads are permitted for path
-//! completion and are capped by [`bounds`].
+//! Hot-path contract (keystroke): the repaint paths ([`OmenCompleter::complete_typed`],
+//! [`OmenCompleter::readiness`], [`OmenCompleter::ghost_view`]) **observe**
+//! inline truth only — they never dispatch background work and never block.
+//! The completion request ([`Completer::complete`](reedline::Completer::complete))
+//! dispatches TIER 1B/2 work out-of-band and reports `Pending`/`Stale` until
+//! [`OmenCompleter::poll_completion`](reedline::Completer::poll_completion)
+//! settles it. The static [`CompletionEngine`] API pumps to a settled result
+//! for tests and sync tooling.
 
 use crate::commands;
-use crate::grammar::{self, CursorToken, GrammarScanner, TypedReference};
+use crate::discovery::{CompletionPhase, DiscoveryRuntime, LiveSnapshot};
+use crate::grammar::{self, CursorToken};
 use omen_core::ValidityState;
+use omen_discovery::candidate::RankedCandidate;
+use omen_discovery::kind::Kind;
+use omen_discovery::providers::{HotFact, HotIndexSnapshot};
+use omen_discovery::scheduler::WorkStatus;
 use omen_knowledge::{Database, FactRegistry};
-use reedline::{Completer, CompletionResult, Hinter, Span, Suggestion};
+use reedline::{
+    Completer, CompletionOrigin, CompletionResult, CompletionStatus, Hinter, Span, Suggestion,
+};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -107,7 +127,7 @@ pub struct CompletionEdit {
     pub insertion_text: String,
 }
 
-/// ONE candidate model shared by every source.
+/// ONE candidate model shared by every presentation path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletionCandidate {
     /// Human-facing label. May differ from insertion text (unquoted view).
@@ -120,8 +140,32 @@ pub struct CompletionCandidate {
     pub score: i32,
     /// The explicit buffer edit.
     pub edit: CompletionEdit,
-    /// Optional short detail for the candidate menu.
+    /// Optional detail for the candidate menu (description detail/short text).
     pub detail: Option<String>,
+}
+
+/// Tab-gating readiness: distinguishes a *proven* zero from discovery that is
+/// still in flight.
+///
+/// M0 gated Tab on a candidate count alone; M1 adds PENDING ASYNC DISCOVERY,
+/// which must not be swallowed as though discovery proved zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionReadiness {
+    /// Discovery finished; zero candidates. Tab declines cleanly.
+    FinalZero,
+    /// Discovery finished; `n` candidates are available now.
+    Ready(usize),
+    /// Async discovery is in flight; `inline` candidates are known so far
+    /// (possibly none). Tab must not be treated as a proven zero.
+    Pending { inline: usize },
+}
+
+/// Shared readiness cell consulted by the edit mode on every Tab.
+pub type ReadinessCell = Arc<Mutex<CompletionReadiness>>;
+
+/// Creates the shared readiness cell.
+pub fn new_readiness() -> ReadinessCell {
+    Arc::new(Mutex::new(CompletionReadiness::FinalZero))
 }
 
 /// Cached active fact entry in the hot semantic index.
@@ -296,16 +340,40 @@ impl Default for CompletionContext {
     }
 }
 
-/// Where in the line the cursor sits, for source selection.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum CommandPosition {
-    /// Cursor is in the first word (command / action name).
-    CommandName,
-    /// Cursor is in an argument of `:action`.
-    ActionArg { action: String },
-    /// Cursor is in an argument of an executable.
-    ExecArg { command: String },
+// ---------------------------------------------------------------------------
+// SNAPSHOT — interactive context -> discovery runtime inputs
+// ---------------------------------------------------------------------------
+
+/// Builds the discovery snapshot from the session completion context.
+fn snapshot_from(ctx: &CompletionContext) -> LiveSnapshot {
+    LiveSnapshot {
+        cwd: ctx.cwd.to_string_lossy().into_owned(),
+        path_commands: ctx.hot_index.path_commands.clone(),
+        path_commands_truncated: ctx.hot_index.path_commands_truncated,
+        hot: hot_snapshot(&ctx.hot_index),
+    }
 }
+
+fn hot_snapshot(hot: &HotSemanticIndex) -> HotIndexSnapshot {
+    HotIndexSnapshot {
+        facts: hot
+            .active_facts
+            .iter()
+            .map(|f| HotFact {
+                resource_uri: f.resource_uri.clone(),
+                validity: format!("{:?}", f.validity),
+            })
+            .collect(),
+        symbols: hot.cached_symbols.clone(),
+        packages: hot.known_packages.clone(),
+        tasks: hot.known_tasks.clone(),
+        services: hot.known_services.clone(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GRAMMAR-SAFE EDIT APPLICATION (unchanged M0 contract)
+// ---------------------------------------------------------------------------
 
 /// Builds the explicit edit for `literal` against the cursor token.
 ///
@@ -392,239 +460,15 @@ pub fn build_edit(token: &CursorToken, literal: &str, cursor: usize) -> Option<C
     None
 }
 
-/// Deterministic ranking authority.
-///
-/// Signals (documented, stable, non-learned):
-/// 1. candidate kind base priority (context-valid kinds only are scored)
-/// 2. prefix quality (exact > case-sensitive prefix > case-insensitive prefix)
-/// 3. length penalty (prefer less remaining typing), capped
-/// 4. locality bias (directories once a path parent is typed)
-///
-/// Late tie-breaker: lexicographic on (kind, literal). Alphabetical order is
-/// never a ranking preference, only a stability tie-break.
-fn score_candidate(literal: &str, kind: CandidateKind, prefix: &str, prefix_cs: bool) -> i32 {
-    let mut s = match kind {
-        CandidateKind::OmenAction => 900,
-        CandidateKind::Intrinsic => 880,
-        CandidateKind::Command => 860,
-        CandidateKind::TypedReference => 840,
-        CandidateKind::Resource => 760,
-        CandidateKind::Service => 740,
-        CandidateKind::WorkspaceTarget => 720,
-        CandidateKind::Directory => 700,
-        CandidateKind::Path => 680,
-        CandidateKind::Option => 600,
-    };
-    if literal == prefix {
-        s += 200;
-    } else if prefix_cs {
-        s += 100;
-    } else {
-        s += 60;
+/// Whether `buffer`/`cursor` may be completed at all (safe token boundary,
+/// no split-unsafe token). Mirrors M0's pre-discovery guards so unsafe input
+/// never dispatches background work.
+fn token_allows(buffer: &str, cursor: usize) -> bool {
+    let cursor = cursor.min(buffer.len());
+    if !buffer.is_char_boundary(cursor) {
+        return false;
     }
-    s -= (literal.chars().count().min(40) as i32) / 4;
-    if kind == CandidateKind::Directory && (prefix.contains('/') || prefix.contains('\\')) {
-        s += 15;
-    }
-    s
-}
-
-fn prefix_quality(literal: &str, prefix: &str) -> Option<bool> {
-    if prefix.is_empty() {
-        return Some(true);
-    }
-    if literal.starts_with(prefix) {
-        return Some(true);
-    }
-    if literal.to_lowercase().starts_with(&prefix.to_lowercase()) {
-        return Some(false);
-    }
-    None
-}
-
-fn truncate_display(s: &str) -> String {
-    if s.chars().count() <= bounds::MAX_DISPLAY_CHARS {
-        return s.to_string();
-    }
-    s.chars().take(bounds::MAX_DISPLAY_CHARS).collect()
-}
-
-/// The typed deterministic completion core.
-///
-/// Callable as plain Rust with no terminal, no pixels, and no I/O beyond one
-/// bounded directory read for path completion.
-pub struct CompletionEngine;
-
-impl CompletionEngine {
-    /// Produces the bounded, ranked candidate set for `buffer`/`cursor`.
-    pub fn complete(
-        ctx: &CompletionContext,
-        buffer: &str,
-        cursor: usize,
-    ) -> Vec<CompletionCandidate> {
-        let cursor = cursor.min(buffer.len());
-        if !buffer.is_char_boundary(cursor) {
-            return Vec::new();
-        }
-        let token = match grammar::token_at_cursor(buffer, cursor) {
-            Some(t) => t,
-            None => synthetic_token(cursor),
-        };
-        if token.split_unsafe {
-            return Vec::new();
-        }
-
-        let position = command_position(buffer, &token);
-        let prefix = token.decoded_prefix.clone();
-
-        let mut raw: Vec<RawCandidate> = Vec::new();
-        gather_sources(ctx, &token, &position, &prefix, &mut raw);
-
-        let mut out: Vec<CompletionCandidate> = Vec::new();
-        for r in raw {
-            if out.len() >= bounds::MAX_CANDIDATES_PER_SOURCE * 4 {
-                break;
-            }
-            let Some(pq) = prefix_quality(&r.literal, &prefix) else {
-                continue;
-            };
-            if !token.decoded_suffix.is_empty()
-                && (!r.literal.starts_with(token.decoded_prefix.as_str())
-                    || !r.literal.ends_with(token.decoded_suffix.as_str()))
-            {
-                continue;
-            }
-            let Some(edit) = build_edit(&token, &r.literal, cursor) else {
-                continue;
-            };
-            let score = score_candidate(&r.literal, r.kind, &prefix, pq) + r.score_bias;
-            out.push(CompletionCandidate {
-                display_text: truncate_display(&r.display.unwrap_or_else(|| r.literal.clone())),
-                literal: r.literal,
-                kind: r.kind,
-                source: r.source,
-                score,
-                edit,
-                detail: r.detail,
-            });
-        }
-
-        out.sort_by(|a, b| {
-            b.score
-                .cmp(&a.score)
-                .then_with(|| b.kind.cmp(&a.kind))
-                .then_with(|| a.literal.cmp(&b.literal))
-                .then_with(|| a.source.cmp(&b.source))
-        });
-        out.dedup_by(|a, b| a.edit == b.edit && a.literal == b.literal);
-        out.truncate(bounds::MAX_FINAL_CANDIDATES);
-        out
-    }
-
-    /// Returns the single calm ghost candidate, if confidence is high enough.
-    ///
-    /// A ghost is NOT simply candidate[0]. It requires: context validity,
-    /// prefix compatibility, suffix compatibility when mid-token, a safe edit,
-    /// and a unique or decisively better best candidate. When in doubt: quiet.
-    pub fn ghost(
-        ctx: &CompletionContext,
-        buffer: &str,
-        cursor: usize,
-    ) -> Option<CompletionCandidate> {
-        if cursor < buffer.len() {
-            // Ghosts only appear at the live end of input; mid-line the explicit
-            // menu is the calm interaction.
-            return None;
-        }
-        let candidates = Self::complete(ctx, buffer, cursor);
-        if candidates.is_empty() {
-            return None;
-        }
-        let best = candidates[0].clone();
-        if best.edit.replacement_range.start != cursor
-            && best.edit.replacement_range.end != cursor
-            && !(best.edit.replacement_range.start <= cursor
-                && cursor <= best.edit.replacement_range.end)
-        {
-            return None;
-        }
-        // Ghost is append-only in the line editor: only safe when the edit is a
-        // pure insertion at the cursor, or a full-span replace that is itself a
-        // pure extension of the raw prefix.
-        let token =
-            grammar::token_at_cursor(buffer, cursor).unwrap_or_else(|| synthetic_token(cursor));
-        let append_safe = if best.edit.replacement_range.start == best.edit.replacement_range.end {
-            best.edit.replacement_range.start == cursor
-        } else {
-            best.edit.insertion_text.starts_with(&token.raw_prefix)
-                && best.edit.replacement_range == token.span
-        };
-        if !append_safe {
-            return None;
-        }
-
-        let decisive = if candidates.len() == 1 {
-            true
-        } else {
-            best.score - candidates[1].score >= bounds::GHOST_MIN_SCORE_MARGIN
-        };
-        if !decisive {
-            return None;
-        }
-        Some(best)
-    }
-
-    /// The append-only hint string for the ghost (what the editor shows).
-    pub fn ghost_hint(
-        ctx: &CompletionContext,
-        buffer: &str,
-        cursor: usize,
-    ) -> Option<(String, CompletionCandidate)> {
-        let best = Self::ghost(ctx, buffer, cursor)?;
-        let token =
-            grammar::token_at_cursor(buffer, cursor).unwrap_or_else(|| synthetic_token(cursor));
-        let hint = if best.edit.replacement_range.start == best.edit.replacement_range.end {
-            best.edit.insertion_text.clone()
-        } else {
-            best.edit.insertion_text[token.raw_prefix.len()..].to_string()
-        };
-        if hint.is_empty() {
-            return None;
-        }
-        Some((hint, best))
-    }
-}
-
-struct RawCandidate {
-    literal: String,
-    display: Option<String>,
-    kind: CandidateKind,
-    source: CandidateSource,
-    detail: Option<String>,
-    score_bias: i32,
-}
-
-impl RawCandidate {
-    fn new(literal: impl Into<String>, kind: CandidateKind, source: CandidateSource) -> Self {
-        Self {
-            literal: literal.into(),
-            display: None,
-            kind,
-            source,
-            detail: None,
-            score_bias: 0,
-        }
-    }
-
-    fn with_detail(mut self, d: impl Into<String>) -> Self {
-        self.detail = Some(d.into());
-        self
-    }
-
-    fn with_bias(mut self, b: i32) -> Self {
-        self.score_bias = b;
-        self
-    }
+    !matches!(grammar::token_at_cursor(buffer, cursor), Some(t) if t.split_unsafe)
 }
 
 fn synthetic_token(cursor: usize) -> CursorToken {
@@ -641,427 +485,489 @@ fn synthetic_token(cursor: usize) -> CursorToken {
     }
 }
 
-fn command_position(buffer: &str, token: &CursorToken) -> CommandPosition {
-    // Words fully before the current token determine the position.
-    let words_before = GrammarScanner::split_words(&buffer[..token.span.start.min(buffer.len())]);
-    if words_before.is_empty() {
-        return CommandPosition::CommandName;
+fn truncate_display(s: &str) -> String {
+    if s.chars().count() <= bounds::MAX_DISPLAY_CHARS {
+        return s.to_string();
     }
-    let first = words_before[0].clone();
-    if first.starts_with(':') {
-        let action = first.trim_start_matches(':').to_string();
-        return CommandPosition::ActionArg { action };
-    }
-    CommandPosition::ExecArg { command: first }
+    s.chars().take(bounds::MAX_DISPLAY_CHARS).collect()
 }
 
-fn gather_sources(
-    ctx: &CompletionContext,
-    token: &CursorToken,
-    position: &CommandPosition,
-    prefix: &str,
-    out: &mut Vec<RawCandidate>,
-) {
-    let starts_colon = prefix.starts_with(':');
-    let starts_at = prefix.starts_with('@');
+// ---------------------------------------------------------------------------
+// PROJECTION — RankedCandidate -> CompletionCandidate (the one human projection)
+// ---------------------------------------------------------------------------
 
-    // Omen semantic actions: canonical `:name` in command-name position.
-    if matches!(position, CommandPosition::CommandName) && (starts_colon || prefix.is_empty()) {
-        for action in commands::OMEN_ACTIONS {
-            out.push(RawCandidate::new(
-                format!(":{action}"),
-                CandidateKind::OmenAction,
-                CandidateSource::OmenActionAuthority,
-            ));
+/// Maps a discovery [`Kind`] onto the presentation vocabulary.
+fn map_kind(kind: Kind) -> CandidateKind {
+    match kind {
+        Kind::Command => CandidateKind::Command,
+        Kind::Intrinsic => CandidateKind::Intrinsic,
+        Kind::OmenAction => CandidateKind::OmenAction,
+        Kind::Option | Kind::Subcommand => CandidateKind::Option,
+        Kind::File => CandidateKind::Path,
+        Kind::Directory => CandidateKind::Directory,
+        Kind::Reference => CandidateKind::TypedReference,
+        Kind::Resource | Kind::ArgumentValue | Kind::Capability | Kind::HistoryItem => {
+            CandidateKind::Resource
         }
-        if starts_colon {
-            return;
-        }
-    }
-
-    if starts_at {
-        gather_typed_refs(ctx, prefix, out);
-        return;
-    }
-
-    if matches!(position, CommandPosition::CommandName) && !starts_colon {
-        for name in commands::SHELL_INTRINSICS {
-            out.push(RawCandidate::new(
-                *name,
-                CandidateKind::Intrinsic,
-                CandidateSource::IntrinsicAuthority,
-            ));
-        }
-        for name in &ctx.hot_index.path_commands {
-            out.push(RawCandidate::new(
-                name.clone(),
-                CandidateKind::Command,
-                CandidateSource::PathCommandCache,
-            ));
-        }
-    }
-
-    match position {
-        CommandPosition::ActionArg { action } => {
-            gather_action_args(ctx, action, prefix, out);
-            let subs = commands::omen_action_subcommands(action);
-            for s in subs {
-                out.push(RawCandidate::new(
-                    *s,
-                    CandidateKind::Option,
-                    CandidateSource::SyntaxMetadata,
-                ));
-            }
-        }
-        CommandPosition::ExecArg { command } => {
-            let cmd = command.trim_start_matches(':');
-            for s in commands::tool_subcommands(cmd) {
-                out.push(RawCandidate::new(
-                    *s,
-                    CandidateKind::Option,
-                    CandidateSource::SyntaxMetadata,
-                ));
-            }
-        }
-        CommandPosition::CommandName => {}
-    }
-
-    // Path completion: argument position, or command position when the token
-    // looks like an explicit path or bare Windows drive designator.
-    // Drive-relative tokens (`D:foo`) are outside M0 and get no path candidates.
-    let path_ok = match position {
-        CommandPosition::CommandName => {
-            prefix.contains('/')
-                || prefix.contains('\\')
-                || prefix.starts_with('.')
-                || crate::commands::is_drive_designator(prefix).is_some()
-        }
-        _ => true,
-    };
-    if path_ok && !starts_colon && !starts_at {
-        let dirs_only = matches!(position, CommandPosition::ExecArg { command } if command == "cd");
-        gather_paths(ctx, token, prefix, dirs_only, out);
+        Kind::Service => CandidateKind::Service,
+        Kind::Workspace => CandidateKind::WorkspaceTarget,
     }
 }
 
-fn gather_typed_refs(ctx: &CompletionContext, prefix: &str, out: &mut Vec<RawCandidate>) {
-    for h in TypedReference::STATIC_HANDLES {
-        out.push(RawCandidate::new(
-            *h,
-            CandidateKind::TypedReference,
-            CandidateSource::TypedReferenceAuthority,
-        ));
-    }
-    if prefix.starts_with("@fact.") || "@fact.".starts_with(prefix) || prefix == "@" {
-        for f in &ctx.hot_index.active_facts {
-            let name = f
-                .resource_uri
-                .strip_prefix("fact://")
-                .unwrap_or(&f.resource_uri)
-                .to_string();
-            let lit = format!("@fact.{name}");
-            let validity = format!("{:?}", f.validity);
-            let bias = if f.validity == ValidityState::Dirty {
-                50
-            } else {
-                0
-            };
-            out.push(
-                RawCandidate::new(
-                    lit,
-                    CandidateKind::Resource,
-                    CandidateSource::HotSemanticIndex,
-                )
-                .with_detail(format!("fact ({validity})"))
-                .with_bias(bias),
-            );
-        }
-    }
-    if prefix.starts_with("@service.") || "@service.".starts_with(prefix) || prefix == "@" {
-        for s in &ctx.hot_index.known_services {
-            out.push(RawCandidate::new(
-                format!("@service.{s}"),
-                CandidateKind::Service,
-                CandidateSource::HotSemanticIndex,
-            ));
-        }
+/// Maps provider provenance onto the presentation source vocabulary.
+fn map_source(provenance: &omen_discovery::identity::ProvenanceKey) -> CandidateSource {
+    match provenance.provider.as_str() {
+        "omen-actions" => CandidateSource::OmenActionAuthority,
+        "intrinsics" => CandidateSource::IntrinsicAuthority,
+        "path-commands" => CandidateSource::PathCommandCache,
+        "filesystem-paths" => CandidateSource::Filesystem,
+        "references" => CandidateSource::TypedReferenceAuthority,
+        "hot-semantic-index" => CandidateSource::HotSemanticIndex,
+        _ => CandidateSource::SyntaxMetadata,
     }
 }
 
-fn gather_action_args(
-    ctx: &CompletionContext,
-    action: &str,
-    _prefix: &str,
-    out: &mut Vec<RawCandidate>,
-) {
-    match action {
-        "symbol" | "def" | "refs" => {
-            for s in &ctx.hot_index.cached_symbols {
-                out.push(RawCandidate::new(
-                    s.clone(),
-                    CandidateKind::Resource,
-                    CandidateSource::HotSemanticIndex,
-                ));
-            }
-        }
-        "packages" => {
-            for p in &ctx.hot_index.known_packages {
-                out.push(RawCandidate::new(
-                    p.clone(),
-                    CandidateKind::Resource,
-                    CandidateSource::HotSemanticIndex,
-                ));
-            }
-        }
-        "tasks" => {
-            for t in &ctx.hot_index.known_tasks {
-                out.push(RawCandidate::new(
-                    t.clone(),
-                    CandidateKind::Resource,
-                    CandidateSource::HotSemanticIndex,
-                ));
-            }
-        }
-        "stop" | "status" | "services" => {
-            for s in &ctx.hot_index.known_services {
-                out.push(RawCandidate::new(
-                    format!("@service.{s}"),
-                    CandidateKind::Service,
-                    CandidateSource::HotSemanticIndex,
-                ));
-            }
-        }
-        "rerun" | "show" | "inspect" | "why" | "history" => {
-            for h in TypedReference::STATIC_HANDLES {
-                out.push(RawCandidate::new(
-                    *h,
-                    CandidateKind::TypedReference,
-                    CandidateSource::TypedReferenceAuthority,
-                ));
-            }
-        }
-        _ => {}
-    }
-}
-
-struct PathEntry {
-    name: String,
-    is_dir: bool,
-}
-
-fn gather_paths(
-    ctx: &CompletionContext,
-    token: &CursorToken,
-    prefix: &str,
-    dirs_only: bool,
-    out: &mut Vec<RawCandidate>,
-) {
-    let entries = list_dir_bounded(ctx, prefix);
-    let sep = preferred_sep(prefix);
-    let (parent_raw, _leaf) = split_path_prefix(prefix);
-
-    for e in entries {
-        if dirs_only && !e.is_dir {
-            continue;
-        }
-        let mut literal = String::new();
-        literal.push_str(&parent_raw);
-        if !parent_raw.is_empty() && !parent_raw.ends_with('/') && !parent_raw.ends_with('\\') {
-            literal.push(sep);
-        }
-        literal.push_str(&e.name);
-        if e.is_dir {
-            literal.push(sep);
-        }
-        let kind = if e.is_dir {
-            CandidateKind::Directory
-        } else {
-            CandidateKind::Path
-        };
-        out.push(
-            RawCandidate::new(literal, kind, CandidateSource::Filesystem).with_display(e.name),
-        );
-    }
-
-    if !dirs_only || prefix.is_empty() || prefix == "." || prefix == ".." {
-        // no-op placeholder for future workspace targets
-    }
-    let _ = token;
-}
-
-impl RawCandidate {
-    fn with_display(mut self, d: impl Into<String>) -> Self {
-        self.display = Some(d.into());
-        self
-    }
-}
-
-fn preferred_sep(prefix: &str) -> char {
-    if prefix.contains('\\') && !prefix.contains('/') {
-        '\\'
-    } else if prefix.contains('/') {
-        '/'
-    } else if cfg!(windows) {
-        '\\'
-    } else {
-        '/'
-    }
-}
-
-/// Splits a typed path into (parent_with_separators, leaf_prefix).
+/// Projects ranked discovery truth into grammar-validated presentation
+/// candidates. The ONE human projection; the machine projection serialises
+/// the same [`RankedCandidate`]s.
 ///
-/// Handles Windows drive designators: `D:` → (`D:\`, ``).
-fn split_path_prefix(prefix: &str) -> (String, String) {
-    // Bare drive designator: `D:` is a path prefix for the drive root.
-    if crate::commands::is_drive_designator(prefix).is_some() {
-        return (format!("{prefix}\\"), String::new());
-    }
-    let bytes = prefix.as_bytes();
-    let mut split_at = None;
-    for (i, b) in bytes.iter().enumerate().rev() {
-        if *b == b'/' || *b == b'\\' {
-            split_at = Some(i);
-            break;
-        }
-    }
-    match split_at {
-        Some(i) => (prefix[..=i].to_string(), prefix[i + 1..].to_string()),
-        None => (String::new(), prefix.to_string()),
-    }
-}
-
-fn list_dir_bounded(ctx: &CompletionContext, prefix: &str) -> Vec<PathEntry> {
-    let (parent_raw, leaf) = split_path_prefix(prefix);
-    let parent_path = if parent_raw.is_empty() {
-        ctx.cwd.clone()
-    } else {
-        let p = PathBuf::from(&parent_raw);
-        if p.is_absolute() { p } else { ctx.cwd.join(&p) }
-    };
-
-    let Ok(read_dir) = std::fs::read_dir(&parent_path) else {
+/// Candidates whose edits cannot round-trip through the accepted grammar are
+/// declined here (never corrupted). Result order is the ranker's order.
+pub(crate) fn project_ranked(
+    ranked: &[RankedCandidate],
+    buffer: &str,
+    cursor: usize,
+    include_descriptions: bool,
+) -> Vec<CompletionCandidate> {
+    let cursor = cursor.min(buffer.len());
+    if !buffer.is_char_boundary(cursor) {
         return Vec::new();
-    };
-
-    let mut scanned: Vec<PathEntry> = Vec::new();
-    for (i, entry) in read_dir.flatten().enumerate() {
-        if i >= bounds::MAX_FS_SCAN {
-            break;
-        }
-        let name = entry.file_name().to_string_lossy().to_string();
-        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        if leaf.is_empty() || name.to_lowercase().starts_with(&leaf.to_lowercase()) {
-            scanned.push(PathEntry { name, is_dir });
-        }
+    }
+    let token = grammar::token_at_cursor(buffer, cursor).unwrap_or_else(|| synthetic_token(cursor));
+    if token.split_unsafe {
+        return Vec::new();
     }
 
-    scanned.sort_by(|a, b| a.name.cmp(&b.name).then(a.is_dir.cmp(&b.is_dir)));
-    scanned.truncate(bounds::MAX_FS_ENTRIES);
-    scanned
+    let mut out: Vec<CompletionCandidate> = Vec::new();
+    for r in ranked {
+        if out.len() >= bounds::MAX_FINAL_CANDIDATES {
+            break;
+        }
+        let literal = r.value().insert.clone();
+        let Some(edit) = build_edit(&token, &literal, cursor) else {
+            continue;
+        };
+        let discovered = &r.matched.discovered;
+        let detail = if include_descriptions {
+            discovered
+                .description
+                .as_ref()
+                .and_then(|d| d.detail.clone().or_else(|| Some(d.short.clone())))
+        } else {
+            None
+        };
+        out.push(CompletionCandidate {
+            display_text: truncate_display(
+                &discovered
+                    .display
+                    .as_ref()
+                    .map(|d| d.label.clone())
+                    .unwrap_or_else(|| literal.clone()),
+            ),
+            literal,
+            kind: map_kind(r.semantic().kind),
+            source: map_source(&discovered.provenance),
+            score: (r.rank_score.0 * 10.0).round() as i32,
+            edit,
+            detail,
+        });
+    }
+    out
 }
 
-/// Reedline adapter: exposes the typed engine as a `Completer`.
+/// Descriptions included (default presentation).
+pub(crate) fn project_ranked_default(
+    ranked: &[RankedCandidate],
+    buffer: &str,
+    cursor: usize,
+) -> Vec<CompletionCandidate> {
+    project_ranked(ranked, buffer, cursor, true)
+}
+
+// ---------------------------------------------------------------------------
+// GHOST POLICY (M0 calm-ghost rules over M1 truth)
+// ---------------------------------------------------------------------------
+
+/// Returns the single calm ghost candidate, if confidence is high enough.
+///
+/// A ghost is NOT simply candidate[0]. It requires: end-of-line cursor,
+/// context validity, an append-only-safe edit, and a unique or decisively
+/// better best candidate. The candidate itself is always M1 truth — ghosts
+/// never invent a candidate absent from discovery.
+fn ghost_from(
+    candidates: &[CompletionCandidate],
+    buffer: &str,
+    cursor: usize,
+) -> Option<CompletionCandidate> {
+    if cursor < buffer.len() {
+        // Ghosts only appear at the live end of input; mid-line the explicit
+        // menu is the calm interaction.
+        return None;
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+    let best = candidates[0].clone();
+    if best.edit.replacement_range.start != cursor
+        && best.edit.replacement_range.end != cursor
+        && !(best.edit.replacement_range.start <= cursor
+            && cursor <= best.edit.replacement_range.end)
+    {
+        return None;
+    }
+    // Ghost is append-only in the line editor: only safe when the edit is a
+    // pure insertion at the cursor, or a full-span replace that is itself a
+    // pure extension of the raw prefix.
+    let token = grammar::token_at_cursor(buffer, cursor).unwrap_or_else(|| synthetic_token(cursor));
+    let append_safe = if best.edit.replacement_range.start == best.edit.replacement_range.end {
+        best.edit.replacement_range.start == cursor
+    } else {
+        best.edit.insertion_text.starts_with(&token.raw_prefix)
+            && best.edit.replacement_range == token.span
+    };
+    if !append_safe {
+        return None;
+    }
+
+    let decisive = if candidates.len() == 1 {
+        true
+    } else {
+        best.score - candidates[1].score >= bounds::GHOST_MIN_SCORE_MARGIN
+    };
+    if !decisive {
+        return None;
+    }
+    Some(best)
+}
+
+/// The append-only hint string for the ghost (what the editor shows).
+fn ghost_hint_from(
+    best: &CompletionCandidate,
+    buffer: &str,
+    cursor: usize,
+) -> Option<(String, CompletionCandidate)> {
+    let token = grammar::token_at_cursor(buffer, cursor).unwrap_or_else(|| synthetic_token(cursor));
+    let hint = if best.edit.replacement_range.start == best.edit.replacement_range.end {
+        best.edit.insertion_text.clone()
+    } else {
+        best.edit.insertion_text[token.raw_prefix.len()..].to_string()
+    };
+    if hint.is_empty() {
+        return None;
+    }
+    Some((hint, best.clone()))
+}
+
+// ---------------------------------------------------------------------------
+// COMPLETION ENGINE — static, synchronous convenience (tests / sync tooling)
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// Per-thread default discovery runtime for the static API. Persistent
+    /// per thread (no thread-farm-per-call) and backed by the same shared
+    /// scheduler worker as the live session.
+    static STATIC_RUNTIME: std::cell::RefCell<DiscoveryRuntime> =
+        std::cell::RefCell::new(DiscoveryRuntime::new());
+}
+
+/// The typed deterministic completion core, backed by M1 discovery.
+///
+/// Callable as plain Rust with no terminal and no pixels. Pumps background
+/// work to a settled result (bounded deadline) so callers observe complete
+/// truth synchronously. **The live editor path does not use this**: the
+/// completer's `Fresh`/`Stale`/`Pending` seam is non-blocking.
+pub struct CompletionEngine;
+
+impl CompletionEngine {
+    /// Produces the bounded, ranked candidate set for `buffer`/`cursor`.
+    pub fn complete(
+        ctx: &CompletionContext,
+        buffer: &str,
+        cursor: usize,
+    ) -> Vec<CompletionCandidate> {
+        if !token_allows(buffer, cursor) {
+            return Vec::new();
+        }
+        let snap = snapshot_from(ctx);
+        STATIC_RUNTIME.with(|rt| {
+            let view =
+                rt.borrow_mut()
+                    .pump(buffer, cursor, &snap, DiscoveryRuntime::settle_deadline());
+            project_ranked_default(&view.ranked, buffer, cursor)
+        })
+    }
+
+    /// Returns the single calm ghost candidate, if confidence is high enough.
+    pub fn ghost(
+        ctx: &CompletionContext,
+        buffer: &str,
+        cursor: usize,
+    ) -> Option<CompletionCandidate> {
+        if cursor < buffer.len() {
+            return None;
+        }
+        if !token_allows(buffer, cursor) {
+            return None;
+        }
+        let candidates = Self::complete(ctx, buffer, cursor);
+        ghost_from(&candidates, buffer, cursor)
+    }
+
+    /// The append-only hint string for the ghost.
+    pub fn ghost_hint(
+        ctx: &CompletionContext,
+        buffer: &str,
+        cursor: usize,
+    ) -> Option<(String, CompletionCandidate)> {
+        let best = Self::ghost(ctx, buffer, cursor)?;
+        ghost_hint_from(&best, buffer, cursor)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// REEDLINE ADAPTER — the live session's one completer
+// ---------------------------------------------------------------------------
+
+/// Reedline adapter: the live session's completion source, backed by the
+/// persistent M1 [`DiscoveryRuntime`].
+///
+/// - [`Completer::complete`] issues a completion **request**: dispatches
+///   TIER 1B/2 work out-of-band, never waits, and answers `Fresh` or
+///   `Stale`/`Pending` bound to the originating buffer/cursor.
+/// - [`Completer::poll_completion`] reports background progress to the
+///   Reedline event loop (`Idle` / `Pending` / `Ready`).
+/// - The typed/ghost/readiness paths observe inline truth only (no dispatch,
+///   no blocking) so repaints stay cheap.
 pub struct OmenCompleter {
     context: Arc<Mutex<CompletionContext>>,
+    runtime: Arc<Mutex<DiscoveryRuntime>>,
 }
 
 impl OmenCompleter {
     pub fn new(context: Arc<Mutex<CompletionContext>>) -> Self {
-        Self { context }
+        Self {
+            context,
+            runtime: Arc::new(Mutex::new(DiscoveryRuntime::new())),
+        }
     }
 
     pub fn context(&self) -> Arc<Mutex<CompletionContext>> {
         self.context.clone()
     }
 
-    /// Typed core result (machine-readable; no terminal scraping required).
-    pub fn complete_typed(&mut self, line: &str, pos: usize) -> Vec<CompletionCandidate> {
-        let Ok(ctx) = self.context.lock() else {
-            return Vec::new();
-        };
-        CompletionEngine::complete(&ctx, line, pos)
+    /// The session's persistent discovery runtime (registry, scheduler,
+    /// caches, pending identity, telemetry).
+    pub fn runtime(&self) -> Arc<Mutex<DiscoveryRuntime>> {
+        self.runtime.clone()
     }
 
-    /// Reedline-shaped result. `value` is the canonical insertion text and
-    /// `span` is the explicit replacement range.
+    fn snapshot(&self) -> LiveSnapshot {
+        match self.context.lock() {
+            Ok(ctx) => snapshot_from(&ctx),
+            Err(e) => snapshot_from(&e.into_inner()),
+        }
+    }
+
+    fn with_runtime<R>(&self, f: impl FnOnce(&mut DiscoveryRuntime) -> R) -> R {
+        match self.runtime.lock() {
+            Ok(mut rt) => f(&mut rt),
+            Err(e) => f(&mut e.into_inner()),
+        }
+    }
+
+    /// Read-only discovery view for the current origin (no dispatch).
+    pub fn observe(&self, line: &str, pos: usize) -> crate::discovery::DiscoveryView {
+        if !token_allows(line, pos) {
+            return crate::discovery::DiscoveryView::empty_at(line, pos);
+        }
+        let snap = self.snapshot();
+        self.with_runtime(|rt| rt.observe(line, pos.min(line.len()), &snap))
+    }
+
+    /// Completion request for the current origin (dispatches async work).
+    pub fn request(&self, line: &str, pos: usize) -> crate::discovery::DiscoveryView {
+        if !token_allows(line, pos) {
+            return crate::discovery::DiscoveryView::empty_at(line, pos);
+        }
+        let snap = self.snapshot();
+        self.with_runtime(|rt| rt.request(line, pos.min(line.len()), &snap))
+    }
+
+    /// Typed core result (machine-readable; no terminal scraping required).
+    ///
+    /// Non-blocking: observes inline + already-settled truth.
+    pub fn complete_typed(&mut self, line: &str, pos: usize) -> Vec<CompletionCandidate> {
+        let view = self.observe(line, pos);
+        let descriptions = self
+            .runtime
+            .lock()
+            .map(|rt| rt.config().descriptions)
+            .unwrap_or(true);
+        project_ranked(&view.ranked, line, pos, descriptions)
+    }
+
+    /// Tab readiness for the current origin: `FinalZero` vs `Ready(n)` vs
+    /// `Pending` (async discovery in flight or triggered but not final).
+    pub fn readiness(&mut self, line: &str, pos: usize) -> CompletionReadiness {
+        let view = self.observe(line, pos);
+        match view.phase {
+            CompletionPhase::Fresh => {
+                if view.ranked.is_empty() {
+                    CompletionReadiness::FinalZero
+                } else {
+                    CompletionReadiness::Ready(view.ranked.len())
+                }
+            }
+            CompletionPhase::Computing => CompletionReadiness::Pending {
+                inline: view.ranked.len(),
+            },
+        }
+    }
+
+    /// The calm ghost over M1 truth (non-blocking observe path).
+    pub fn ghost_view(&mut self, line: &str, pos: usize) -> Option<CompletionCandidate> {
+        if pos < line.len() || !token_allows(line, pos) {
+            return None;
+        }
+        let ghosts_enabled = self
+            .runtime
+            .lock()
+            .map(|rt| rt.config().ghosts)
+            .unwrap_or(true);
+        if !ghosts_enabled {
+            return None;
+        }
+        let candidates = self.complete_typed(line, pos);
+        ghost_from(&candidates, line, pos)
+    }
+
+    /// The ghost's append-safe hint payload.
+    pub fn ghost_view_hint(
+        &mut self,
+        line: &str,
+        pos: usize,
+    ) -> Option<(String, CompletionCandidate)> {
+        let best = self.ghost_view(line, pos)?;
+        ghost_hint_from(&best, line, pos)
+    }
+
+    /// Reedline-shaped suggestion projection for a presentation candidate.
+    fn to_suggestion(c: CompletionCandidate, line_len: usize, pos: usize) -> Suggestion {
+        let append_whitespace = c.edit.replacement_range.start == c.edit.replacement_range.end
+            && c.kind != CandidateKind::Directory
+            && c.kind != CandidateKind::Path
+            && pos == line_len;
+        let kind_label = kind_label(c.kind);
+        let description = match &c.detail {
+            Some(d) if d.as_str() == kind_label => Some(kind_label.to_string()),
+            Some(d) => Some(format!("{kind_label}: {d}")),
+            None => Some(kind_label.to_string()),
+        };
+        Suggestion {
+            value: c.edit.insertion_text,
+            description,
+            extra: None,
+            span: Span {
+                start: c.edit.replacement_range.start,
+                end: c.edit.replacement_range.end,
+            },
+            append_whitespace,
+            display_override: Some(c.display_text),
+            match_indices: None,
+            style: None,
+        }
+    }
+
+    /// Reedline-shaped result for the typed candidate list.
     pub fn complete_items(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
+        let line_len = line.len();
         self.complete_typed(line, pos)
             .into_iter()
-            .map(|c| {
-                let append_whitespace = c.edit.replacement_range.start
-                    == c.edit.replacement_range.end
-                    && c.kind != CandidateKind::Directory
-                    && c.kind != CandidateKind::Path
-                    && pos == line.len();
-                Suggestion {
-                    value: c.edit.insertion_text,
-                    description: {
-                        let kind = match c.kind {
-                            CandidateKind::Command => "command",
-                            CandidateKind::Intrinsic => "intrinsic",
-                            CandidateKind::OmenAction => "semantic action",
-                            CandidateKind::Option => "option",
-                            CandidateKind::Path => "path",
-                            CandidateKind::Directory => "directory",
-                            CandidateKind::TypedReference => "typed reference",
-                            CandidateKind::WorkspaceTarget => "workspace target",
-                            CandidateKind::Service => "service",
-                            CandidateKind::Resource => "resource",
-                        };
-                        match c.detail {
-                            Some(d) => Some(format!("{kind}: {d}")),
-                            None => Some(kind.to_string()),
-                        }
-                    },
-                    extra: None,
-                    span: Span {
-                        start: c.edit.replacement_range.start,
-                        end: c.edit.replacement_range.end,
-                    },
-                    append_whitespace,
-                    display_override: Some(c.display_text),
-                    match_indices: None,
-                    style: None,
-                }
-            })
+            .map(|c| Self::to_suggestion(c, line_len, pos))
             .collect()
+    }
+}
+
+fn kind_label(kind: CandidateKind) -> &'static str {
+    match kind {
+        CandidateKind::Command => "command",
+        CandidateKind::Intrinsic => "intrinsic",
+        CandidateKind::OmenAction => "semantic action",
+        CandidateKind::Option => "option",
+        CandidateKind::Path => "path",
+        CandidateKind::Directory => "directory",
+        CandidateKind::TypedReference => "typed reference",
+        CandidateKind::WorkspaceTarget => "workspace target",
+        CandidateKind::Service => "service",
+        CandidateKind::Resource => "resource",
     }
 }
 
 impl Completer for OmenCompleter {
     fn complete(&mut self, line: &str, pos: usize) -> CompletionResult {
-        let items = self.complete_items(line, pos);
-        CompletionResult::fresh(items)
+        let view = self.request(line, pos);
+        let descriptions = self
+            .runtime
+            .lock()
+            .map(|rt| rt.config().descriptions)
+            .unwrap_or(true);
+        let line_len = line.len();
+        let items: Vec<Suggestion> = project_ranked(&view.ranked, line, pos, descriptions)
+            .into_iter()
+            .map(|c| Self::to_suggestion(c, line_len, pos.min(line.len())))
+            .collect();
+        match view.phase {
+            CompletionPhase::Fresh => CompletionResult::fresh(items),
+            CompletionPhase::Computing => CompletionResult::stale_or_pending(
+                items.into(),
+                CompletionOrigin::new(line, pos.min(line.len())),
+            ),
+        }
+    }
+
+    fn poll_completion(&mut self) -> CompletionStatus {
+        self.with_runtime(|rt| match rt.poll() {
+            WorkStatus::Idle => CompletionStatus::Idle,
+            WorkStatus::Pending => CompletionStatus::Pending,
+            WorkStatus::Ready => CompletionStatus::Ready,
+        })
     }
 }
 
 /// Ghost-suggestion hinter. Append-only; calm by construction.
 ///
 /// Retains the current safe ghost suffix so Reedline's `HistoryHintComplete`
-/// (Right / End) can insert it into the editable buffer via [`complete_hint`].
+/// (Right / End) can insert it into the editable buffer via [`Hinter::complete_hint`].
 /// The cached accept payload is cleared on every `handle()` call and is only
-/// populated when [`CompletionEngine::ghost_hint`] approves a ghost. The
-/// visible ghost and the accepted payload are always the same safe edit.
+/// populated when the M1 ghost view approves a ghost. The visible ghost and
+/// the accepted payload are always the same safe edit.
 ///
-/// Also maintains the shared [`crate::interaction::CandidateCount`] cell that
+/// Also maintains the shared [`ReadinessCell`] that
 /// [`crate::interaction::OmenEditMode`] consults to gate zero-candidate Tab.
 pub struct OmenHinter {
     completer: Arc<Mutex<OmenCompleter>>,
-    /// Raw unformatted safe ghost suffix approved by `CompletionEngine::ghost_hint`.
+    /// Raw unformatted safe ghost suffix approved by the M1 ghost view.
     current_hint: String,
-    /// Shared candidate count for Tab gating (updated on every repaint).
-    candidate_count: crate::interaction::CandidateCount,
+    /// Shared readiness for Tab gating (updated on every repaint).
+    candidate_readiness: ReadinessCell,
 }
 
 impl OmenHinter {
-    pub fn new(
-        completer: Arc<Mutex<OmenCompleter>>,
-        candidate_count: crate::interaction::CandidateCount,
-    ) -> Self {
+    pub fn new(completer: Arc<Mutex<OmenCompleter>>, candidate_readiness: ReadinessCell) -> Self {
         Self {
             completer,
             current_hint: String::new(),
-            candidate_count,
+            candidate_readiness,
         }
     }
 }
@@ -1079,22 +985,24 @@ impl Hinter for OmenHinter {
         // a buffer change, cursor move, ambiguity, lock failure, or empty input.
         self.current_hint.clear();
 
-        // Refresh the shared candidate count so OmenEditMode can gate Tab.
-        let count = crate::interaction::compute_candidate_count(&self.completer, line, pos);
-        if let Ok(mut c) = self.candidate_count.lock() {
-            *c = count;
+        // Refresh the shared readiness so OmenEditMode can gate Tab (including
+        // the pending state: zero inline + in-flight work is not a final zero).
+        let readiness = match self.completer.lock() {
+            Ok(mut c) => c.readiness(line, pos),
+            Err(e) => e.into_inner().readiness(line, pos),
+        };
+        if let Ok(mut c) = self.candidate_readiness.lock() {
+            *c = readiness;
         }
 
         if line.is_empty() {
             return String::new();
         }
-        let Ok(comp) = self.completer.lock() else {
-            return String::new();
+        let mut comp = match self.completer.lock() {
+            Ok(c) => c,
+            Err(e) => e.into_inner(),
         };
-        let Ok(ctx) = comp.context.lock() else {
-            return String::new();
-        };
-        match CompletionEngine::ghost_hint(&ctx, line, pos) {
+        match comp.ghost_view_hint(line, pos) {
             Some((hint, _)) => {
                 self.current_hint = hint.clone();
                 hint

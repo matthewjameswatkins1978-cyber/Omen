@@ -21,10 +21,18 @@ use crate::candidate::{Description, DiscoveredCandidate};
 use crate::identity::{ProvenanceKey, SemanticKey, StabilityKey};
 
 /// Corroborating provenance retained alongside the primary authority.
+///
+/// Supporting evidence travels all the way to the ranked state so the human
+/// projection, the machine projection and telemetry can inspect the complete
+/// evidence set (merge preserves all useful provenance).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SupportingEvidence {
     pub provenance: ProvenanceKey,
     pub authority: Authority,
+    /// The description this observation carried, if any. Preserved so the
+    /// deterministic description-merge rules can run *before* evidence is
+    /// dropped; it is never concatenated with any other description.
+    pub description: Option<Description>,
 }
 
 /// A merged semantic candidate: one semantic thing, many observations.
@@ -74,22 +82,16 @@ pub fn merge_by_semantic(batch: Vec<DiscoveredCandidate>) -> Vec<MergedCandidate
             .map(|c| SupportingEvidence {
                 provenance: c.provenance,
                 authority: c.authority,
+                description: c.description,
             })
             .collect();
 
-        // Deterministic description merge: prefer the primary's description;
-        // fill in missing detail from supporting evidence in stable order.
-        if primary.description.is_none() {
-            for s in &supporting {
-                // Supporting evidence does not carry descriptions in this model;
-                // the primary already holds the strongest-authority description.
-                let _ = s;
-            }
-        } else if let Some(p) = primary.description.as_mut()
-            && p.detail.is_none()
-        {
-            p.detail = None;
-        }
+        // Deterministic description resolution, run BEFORE any evidence is
+        // dropped. The primary (strongest validity evidence) wins wherever it
+        // has a description; supporting evidence may only *fill missing*
+        // short/detail slots in stable strength order. Never concatenate,
+        // never pick shortest-regardless-of-evidence.
+        resolve_description(&mut primary, &supporting);
 
         let stability = StabilityKey::derive(&semantic);
         merged.push(MergedCandidate {
@@ -110,24 +112,54 @@ pub fn merge_by_semantic(batch: Vec<DiscoveredCandidate>) -> Vec<MergedCandidate
     merged
 }
 
-/// Deterministic description merge rule for two descriptions of one semantic
-/// candidate. Never concatenates arbitrary prose.
+/// Deterministic description merge for two descriptions of one semantic
+/// candidate.
+///
+/// `a` is the primary (strongest validity evidence) description: it wins
+/// wholesale. `b` may only fill a *missing* `detail` slot. Never concatenates
+/// arbitrary prose; never selects text independently of evidence.
 pub fn merge_description(a: Option<&Description>, b: Option<&Description>) -> Option<Description> {
     match (a, b) {
         (None, None) => None,
         (Some(a), None) => Some(a.clone()),
         (None, Some(b)) => Some(b.clone()),
         (Some(a), Some(b)) => {
-            // Prefer the shorter authoritative short text (deterministic);
-            // fill detail from the other only when one side lacks it.
-            let short = if a.short.len() <= b.short.len() {
-                a.short.clone()
-            } else {
-                b.short.clone()
-            };
-            let detail = a.detail.clone().or_else(|| b.detail.clone());
-            Some(Description { short, detail })
+            let mut merged = a.clone();
+            if merged.detail.is_none() {
+                merged.detail = b.detail.clone();
+            }
+            Some(merged)
         }
+    }
+}
+
+/// Resolves the primary candidate's description from the preserved supporting
+/// evidence, under the accepted deterministic rules:
+///
+/// - the primary description (strongest validity evidence) is kept whenever
+///   present;
+/// - a missing primary description is filled from the first supporting
+///   observation that has one (stable strength order);
+/// - a missing primary `detail` is filled likewise;
+/// - descriptions are never concatenated and prose is never selected by
+///   length.
+fn resolve_description(primary: &mut DiscoveredCandidate, supporting: &[SupportingEvidence]) {
+    // `supporting` is ordered strongest-first, so a plain `find_map` is the
+    // deterministic choice: first supporting observation with a description.
+    if primary.description.is_none() {
+        primary.description = supporting.iter().find_map(|s| s.description.clone());
+        return;
+    }
+    if primary
+        .description
+        .as_ref()
+        .is_some_and(|d| d.detail.is_none())
+        && let Some(detail) = supporting
+            .iter()
+            .find_map(|s| s.description.as_ref().and_then(|d| d.detail.clone()))
+        && let Some(d) = primary.description.as_mut()
+    {
+        d.detail = Some(detail);
     }
 }
 
@@ -295,5 +327,136 @@ mod tests {
         let m = merge_description(Some(&a), Some(&b)).unwrap();
         assert_eq!(m.short, "Short A");
         assert_eq!(m.detail.as_deref(), Some("detail a"));
+    }
+
+    #[test]
+    fn supporting_description_is_preserved_on_merge() {
+        let native = obs(
+            "commit",
+            "tool-options",
+            AuthorityClass::ToolNative,
+            Authority::ToolNative {
+                tool: "git".into(),
+                spec_version: None,
+            },
+        );
+        let harvest = obs(
+            "commit",
+            "tool-options-harvest",
+            AuthorityClass::HelpHarvest,
+            Authority::HelpHarvest {
+                tool: "git".into(),
+                tool_version: None,
+                harvested_at_unix: 0,
+            },
+        )
+        .with_description(Description::short("harvested description"));
+        let merged = merge_by_semantic(vec![native, harvest]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].supporting.len(), 1);
+        assert_eq!(
+            merged[0].supporting[0].description.as_ref().unwrap().short,
+            "harvested description",
+            "supporting descriptions must survive the merge for later rules"
+        );
+    }
+
+    #[test]
+    fn primary_without_description_adopts_supporting_description() {
+        let native = obs(
+            "commit",
+            "tool-options",
+            AuthorityClass::ToolNative,
+            Authority::ToolNative {
+                tool: "git".into(),
+                spec_version: None,
+            },
+        );
+        let harvest = obs(
+            "commit",
+            "tool-options-harvest",
+            AuthorityClass::HelpHarvest,
+            Authority::HelpHarvest {
+                tool: "git".into(),
+                tool_version: None,
+                harvested_at_unix: 0,
+            },
+        )
+        .with_description(Description::short("harvested description"));
+        let merged = merge_by_semantic(vec![native, harvest]);
+        assert_eq!(
+            merged[0].primary.description.as_ref().unwrap().short,
+            "harvested description",
+            "missing primary description fills from the strongest supporting evidence"
+        );
+    }
+
+    #[test]
+    fn primary_description_wins_and_detail_fills_from_supporting() {
+        let native = obs(
+            "commit",
+            "tool-options",
+            AuthorityClass::ToolNative,
+            Authority::ToolNative {
+                tool: "git".into(),
+                spec_version: None,
+            },
+        )
+        .with_description(Description::short("primary short"));
+        let harvest = obs(
+            "commit",
+            "tool-options-harvest",
+            AuthorityClass::HelpHarvest,
+            Authority::HelpHarvest {
+                tool: "git".into(),
+                tool_version: None,
+                harvested_at_unix: 0,
+            },
+        )
+        .with_description(Description::short("secondary short").with_detail("secondary detail"));
+        let merged = merge_by_semantic(vec![native, harvest]);
+        let d = merged[0].primary.description.as_ref().unwrap();
+        assert_eq!(d.short, "primary short", "primary description wins");
+        assert_eq!(
+            d.detail.as_deref(),
+            Some("secondary detail"),
+            "supporting fills only the missing detail slot"
+        );
+    }
+
+    #[test]
+    fn description_merge_is_deterministic_across_runs() {
+        let batch = || {
+            vec![
+                obs(
+                    "commit",
+                    "b",
+                    AuthorityClass::HelpHarvest,
+                    Authority::HelpHarvest {
+                        tool: "git".into(),
+                        tool_version: None,
+                        harvested_at_unix: 0,
+                    },
+                )
+                .with_description(Description::short("B").with_detail("b-detail")),
+                obs(
+                    "commit",
+                    "a",
+                    AuthorityClass::ToolNative,
+                    Authority::ToolNative {
+                        tool: "git".into(),
+                        spec_version: None,
+                    },
+                ),
+            ]
+        };
+        let a = merge_by_semantic(batch());
+        let b = merge_by_semantic(batch());
+        assert_eq!(a, b);
+        assert_eq!(
+            a[0].primary.description.as_ref().unwrap().short,
+            "B",
+            "description filled from strongest supporting evidence"
+        );
     }
 }

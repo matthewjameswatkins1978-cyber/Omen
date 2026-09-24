@@ -123,6 +123,8 @@ mod tests {
                 _ => &[],
             },
             is_drive_designator: |_| None,
+            typed_handles: &[],
+            action_reference_handles: |_| &[],
         })
     }
 

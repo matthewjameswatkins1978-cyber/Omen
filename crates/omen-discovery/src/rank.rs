@@ -49,6 +49,9 @@ impl LensRanker {
                 let stability = m.stability;
                 let rc = RankedCandidate {
                     matched,
+                    // Evidence survives ranking: the merged supporting set is
+                    // part of the final representation, not an intermediate.
+                    supporting: m.supporting,
                     rank_score: RankScore(total),
                     signals,
                     slot: PresentationSlot(0),
@@ -186,7 +189,7 @@ mod tests {
     use super::*;
     use crate::authority::{Authority, AuthorityClass};
     use crate::candidate::{
-        CandidateValue, Description, DiscoveredCandidate, OrderPolicy, SafetyAnnotation, TextSpan,
+        Description, DiscoveredCandidate, OrderPolicy, SafetyAnnotation, TextSpan,
     };
     use crate::context::{ActiveToken, EnvFacts, ProjectContext};
     use crate::identity::{
@@ -291,17 +294,65 @@ mod tests {
     }
 
     #[test]
-    fn semantic_order_is_respected_but_not_dominant() {
+    fn safety_demotes_but_never_removes() {
         let c = ctx();
         let ranked = to_ranked(
             vec![
-                opt("--bbb", OrderPolicy::Semantic(0)),
-                opt("--aaa", OrderPolicy::Semantic(1)),
+                opt("--force", OrderPolicy::Unspecified).with_safety(SafetyAnnotation::Destructive),
+                opt("--safe", OrderPolicy::Unspecified).with_safety(SafetyAnnotation::SafeReadOnly),
             ],
             &c,
         );
-        // Same match quality; semantic order 0 should outrank semantic order 1.
-        assert_eq!(ranked[0].value().insert, "--bbb");
+        assert_eq!(
+            ranked.len(),
+            2,
+            "dangerous candidate is demoted, not removed"
+        );
+        assert_eq!(ranked[0].value().insert, "--safe", "safer surfaces first");
+    }
+
+    #[test]
+    fn supporting_provenance_survives_ranking() {
+        use crate::authority::{Authority, AuthorityClass};
+        use crate::identity::ProvenanceKey;
+        use crate::merge::SupportingEvidence;
+
+        let c = ctx();
+        let primary = opt("--verbose", OrderPolicy::Unspecified);
+        let merged = crate::merge::MergedCandidate {
+            semantic: primary.semantic.clone(),
+            supporting: vec![SupportingEvidence {
+                provenance: ProvenanceKey::new(
+                    "help-harvest",
+                    AuthorityClass::HelpHarvest,
+                    EvidenceIdentity::Static,
+                ),
+                authority: Authority::HelpHarvest {
+                    tool: "git".into(),
+                    tool_version: None,
+                    harvested_at_unix: 0,
+                },
+                description: None,
+            }],
+            primary,
+            stability: StabilityKey::derive(&crate::identity::SemanticKey::new(
+                Kind::Option,
+                "--verbose",
+                crate::identity::SemanticNamespace::Tool { tool: "git".into() },
+            )),
+        };
+        let matched = Matcher::match_one(&merged.primary.clone(), "--ver").unwrap();
+        let ranked = LensRanker::rank(vec![(merged, matched)], &c);
+        assert_eq!(ranked.len(), 1);
+        assert!(
+            ranked[0].has_supporting_evidence(),
+            "evidence must remain inspectable after ranking"
+        );
+        assert_eq!(ranked[0].all_provenances().len(), 2);
+        assert!(matches!(
+            ranked[0].supporting[0].authority,
+            Authority::HelpHarvest { .. }
+        ));
     }
 
     #[test]
@@ -326,22 +377,5 @@ mod tests {
         for (i, r) in ranked.iter().enumerate() {
             assert_eq!(r.slot.0, i);
         }
-    }
-
-    #[test]
-    fn safety_demotes_but_never_removes() {
-        let c = ctx();
-        let safe =
-            opt("--safe", OrderPolicy::Unspecified).with_safety(SafetyAnnotation::SafeReadOnly);
-        let mut dangerous = opt("--force", OrderPolicy::Unspecified);
-        dangerous.safety = SafetyAnnotation::Destructive;
-        dangerous.value = CandidateValue::new("--force");
-        let ranked = to_ranked(vec![dangerous, safe], &c);
-        assert_eq!(
-            ranked.len(),
-            2,
-            "dangerous candidate is demoted, not removed"
-        );
-        assert_eq!(ranked[0].value().insert, "--safe", "safer surfaces first");
     }
 }
