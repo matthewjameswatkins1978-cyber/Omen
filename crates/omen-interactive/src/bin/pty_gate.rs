@@ -1,12 +1,11 @@
 //! Minimal Reedline loop for genuine ConPTY terminal-gate testing.
 //!
-//! Spawns a Reedline line editor wired to the F1 completion engine so an
+//! Spawns a Reedline line editor wired to the ONE interaction model so an
 //! external ConPTY test can send keystrokes and observe real terminal output.
 
-use omen_interactive::completion::{
-    CompletionContext, HotSemanticIndex, OmenCompleter, OmenHinter,
-};
-use reedline::{DefaultValidator, MenuBuilder, Prompt, Reedline, Signal};
+use omen_interactive::completion::{CompletionContext, HotSemanticIndex, OmenCompleter};
+use omen_interactive::interaction;
+use reedline::{Prompt, Reedline, Signal};
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
@@ -48,26 +47,7 @@ fn main() {
     }));
 
     let completer = Arc::new(Mutex::new(OmenCompleter::new(ctx)));
-    let hinter = Box::new(OmenHinter::new(completer.clone()));
-
-    struct CompleterAdapter(Arc<Mutex<OmenCompleter>>);
-    impl reedline::Completer for CompleterAdapter {
-        fn complete(&mut self, line: &str, pos: usize) -> reedline::CompletionResult {
-            if let Ok(mut c) = self.0.lock() {
-                c.complete(line, pos)
-            } else {
-                reedline::CompletionResult::fresh(Vec::new())
-            }
-        }
-    }
-
-    let completion_menu = Box::new(reedline::ColumnarMenu::default().with_name("completion_menu"));
-
-    let mut line_editor = Reedline::create()
-        .with_validator(Box::new(DefaultValidator))
-        .with_completer(Box::new(CompleterAdapter(completer)))
-        .with_hinter(hinter)
-        .with_menu(reedline::ReedlineMenu::EngineCompleter(completion_menu));
+    let mut line_editor: Reedline = interaction::create_line_editor(completer);
 
     loop {
         match line_editor.read_line(&GatePrompt) {

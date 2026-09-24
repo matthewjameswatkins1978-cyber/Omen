@@ -61,6 +61,29 @@ pub fn is_shell_intrinsic(name: &str) -> bool {
     SHELL_INTRINSICS.contains(&name)
 }
 
+/// Returns `Some(drive_letter)` when `s` is a bare Windows drive designator
+/// (`D:`, `d:`) — exactly one ASCII letter followed by `:`.
+///
+/// Bare drive designators are **navigation grammar**, not executable names.
+/// They must never reach process spawn.
+///
+/// Does NOT match `D:\`, `D:foo`, `CD:`, or any longer token.
+pub fn is_drive_designator(s: &str) -> Option<char> {
+    let b = s.as_bytes();
+    if b.len() == 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
+        Some(b[0].to_ascii_uppercase() as char)
+    } else {
+        None
+    }
+}
+
+/// Returns `true` when `s` starts with a Windows drive prefix (`D:`, `D:\`,
+/// `D:foo`, `D:\path`).
+pub fn is_drive_path(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic()
+}
+
 /// Renders the unknown-action diagnostic from the shared authority.
 pub fn unknown_action_message(action: &str) -> String {
     let mut listed: Vec<String> = OMEN_ACTIONS.iter().map(|a| format!(":{a}")).collect();

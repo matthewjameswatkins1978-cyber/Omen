@@ -727,10 +727,13 @@ fn gather_sources(
     }
 
     // Path completion: argument position, or command position when the token
-    // looks like an explicit path.
+    // looks like an explicit path or Windows drive designator.
     let path_ok = match position {
         CommandPosition::CommandName => {
-            prefix.contains('/') || prefix.contains('\\') || prefix.starts_with('.')
+            prefix.contains('/')
+                || prefix.contains('\\')
+                || prefix.starts_with('.')
+                || crate::commands::is_drive_path(prefix)
         }
         _ => true,
     };
@@ -905,7 +908,13 @@ fn preferred_sep(prefix: &str) -> char {
 }
 
 /// Splits a typed path into (parent_with_separators, leaf_prefix).
+///
+/// Handles Windows drive designators: `D:` → (`D:\`, ``).
 fn split_path_prefix(prefix: &str) -> (String, String) {
+    // Bare drive designator: `D:` is a path prefix for the drive root.
+    if crate::commands::is_drive_designator(prefix).is_some() {
+        return (format!("{prefix}\\"), String::new());
+    }
     let bytes = prefix.as_bytes();
     let mut split_at = None;
     for (i, b) in bytes.iter().enumerate().rev() {
