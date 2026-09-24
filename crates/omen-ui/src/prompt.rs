@@ -40,14 +40,18 @@ impl PromptState {
     }
 
     fn compact_path(path: &Path) -> String {
-        let path_str = path.to_string_lossy().replace('\\', "/");
+        let human = crate::humanize::humanize_path(path);
         if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
-            let home_norm = home.replace('\\', "/");
-            if let Some(rest) = path_str.strip_prefix(&home_norm) {
+            let home_h = crate::humanize::humanize_path_str(&home);
+            if let Some(rest) = human.strip_prefix(&home_h) {
                 return format!("~{rest}");
             }
+            #[cfg(windows)]
+            if human.len() >= home_h.len() && human[..home_h.len()].eq_ignore_ascii_case(&home_h) {
+                return format!("~{}", &human[home_h.len()..]);
+            }
         }
-        path_str
+        human
     }
 
     pub fn with_theme(mut self, theme: Theme) -> Self {
