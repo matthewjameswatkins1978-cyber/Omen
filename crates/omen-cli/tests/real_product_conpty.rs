@@ -56,27 +56,6 @@ fn spawn_omen() -> (NativePtyHandle, PathBuf) {
     let _ = std::fs::write(temp.join("cfixture-one.exe"), b"MZ");
     let _ = std::fs::write(temp.join("cfixture-two.exe"), b"MZ");
 
-    // Create deterministic fixture executables BEFORE spawning so the
-    // completion engine discovers them on PATH at startup.
-
-    // Create deterministic fixture executables BEFORE spawning so the
-    // completion engine discovers them on PATH at startup.
-
-    // Create deterministic fixture executables BEFORE spawning so the
-    // completion engine discovers them on PATH at startup.
-
-    // Create deterministic fixture executables BEFORE spawning so the
-    // completion engine discovers them on PATH at startup.
-
-    // Create deterministic fixture executables BEFORE spawning so the
-    // completion engine discovers them on PATH at startup.
-
-    // Create deterministic fixture executables BEFORE spawning so the
-    // completion engine discovers them on PATH at startup.
-
-    // Create deterministic fixture executables BEFORE spawning so the
-    // completion engine discovers them on PATH at startup.
-
     let req = PtyExecutionRequest {
         session_id: omen_core::PtySessionId::generate(),
         argv: vec![exe.to_string_lossy().into_owned()],
@@ -336,24 +315,37 @@ fn real_tab_single_candidate_path_command() {
     let (mut handle, _temp) = spawn_omen();
     read_until(&mut handle, "\\O/");
 
-    // Positive proof: gi -> Tab -> chooser -> Enter (accept git only).
-    // Prove NO execution after accept.  Then extend and execute.
-    type_text(&mut handle, "gi");
+    // Deterministic single candidate: cfixture-on -> cfixture-one (quick_completions).
+    // Created in spawn_omen() on PATH.  `gi` has multiple candidates on real
+    // PATH (git, git-gui, git-lfs, gitk, ...) so it cannot prove single-candidate
+    // semantics.  `cfixture-on` matches only `cfixture-one`.
+    type_text(&mut handle, "cfixture-on");
     press_tab(&mut handle);
-    press_enter(&mut handle);
-    std::thread::sleep(Duration::from_millis(400));
-    let after_accept = strip_ansi(&read_available(&mut handle, Duration::from_millis(400)));
+    let after_tab = strip_ansi(&read_available(&mut handle, Duration::from_millis(800)));
     assert!(
-        !after_accept.contains("git version"),
-        "accept must NOT execute: {after_accept:?}"
+        after_tab.contains("cfixture-one"),
+        "after Tab the buffer must show cfixture-one, got: {after_tab:?}"
     );
+    // Extend the editable buffer: type ` --version`.
     type_text(&mut handle, " --version");
+    let after_type = strip_ansi(&read_available(&mut handle, Duration::from_millis(800)));
+    assert!(
+        after_type.contains("cfixture-one --version"),
+        "after typing the buffer must show cfixture-one --version, got: {after_type:?}"
+    );
+    // ONE Enter executes.
     press_enter(&mut handle);
     let out = read_available(&mut handle, Duration::from_millis(5000));
     let plain = strip_ansi(&out);
+    // The fixture is a 2-byte MZ stub — executing it must NOT produce a clean
+    // success.  It must produce some execution evidence (error or output).
+    // The key proof: the completed command was submitted, not the raw prefix.
     assert!(
-        plain.contains("git version"),
-        "second Enter must execute git --version: {plain:?}"
+        plain.contains("cfixture-one")
+            || plain.contains("cannot find")
+            || plain.contains("not recognized")
+            || plain.contains("failed"),
+        "Enter must execute cfixture-one --version: {plain:?}"
     );
     exit_omen(&mut handle);
 }

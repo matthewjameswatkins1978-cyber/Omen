@@ -78,16 +78,6 @@ impl EditMode for OmenEditMode {
                 .unwrap_or_else(|e| e.into_inner());
             return tab_event_for_count(count);
         }
-        // Intercept bare Enter to route through Reedline's menu-aware handler.
-        // When a menu is active, `Submit` is caught by `handle_event` which
-        // accepts the selected candidate into the buffer and closes the menu
-        // (ZERO execution).  When no menu is active, `Submit` submits the line.
-        if let crossterm::event::Event::Key(ke) = &crossterm_event
-            && ke.code == KeyCode::Enter
-            && ke.modifiers == KeyModifiers::NONE
-        {
-            return ReedlineEvent::Submit;
-        }
         // Everything else: standard Emacs behaviour.
         let event = ReedlineRawEvent::try_from(crossterm_event)
             .expect("Event -> ReedlineRawEvent round-trip is total");
@@ -238,25 +228,5 @@ mod tests {
             tab_event_for_count(5),
             ReedlineEvent::UntilFound(_)
         ));
-    }
-
-    #[test]
-    fn enter_routes_to_submit_for_menu_aware_handling() {
-        use reedline::{Emacs, ReedlineRawEvent};
-        use std::sync::{Arc, Mutex};
-        let count: CandidateCount = Arc::new(Mutex::new(3));
-        let mut mode = OmenEditMode::new(Emacs::new(default_emacs_keybindings()), count);
-        let raw = ReedlineRawEvent::try_from(crossterm::event::Event::Key(
-            crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Enter,
-                crossterm::event::KeyModifiers::NONE,
-            ),
-        ))
-        .expect("key event conversion");
-        let result = mode.parse_event(raw);
-        assert!(
-            matches!(result, ReedlineEvent::Submit),
-            "Enter must route to Submit for menu-aware handling, got {result:?}"
-        );
     }
 }
