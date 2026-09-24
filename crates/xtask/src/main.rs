@@ -4,6 +4,7 @@ use schemars::schema_for;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 mod perf;
 mod preview;
@@ -57,17 +58,6 @@ fn generate_schemas_content() -> [(String, String); 2] {
     ]
 }
 
-fn run_cmd(cmd: &str, args: &[&str]) {
-    println!("Running: {} {}", cmd, args.join(" "));
-    let status = Command::new(cmd)
-        .args(args)
-        .status()
-        .unwrap_or_else(|e| panic!("Failed to run {cmd}: {e}"));
-    if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
-    }
-}
-
 fn main() {
     let cli = Cli::parse();
     let target_dir = schemas_dir();
@@ -82,36 +72,131 @@ fn main() {
             }
         }
         Commands::VerifySchemas => {
-            if !target_dir.exists() {
-                eprintln!("Schemas directory does not exist: {}", target_dir.display());
-                std::process::exit(1);
-            }
-            let mut diff_found = false;
-            for (filename, expected) in generate_schemas_content() {
-                let file_path = target_dir.join(&filename);
-                if !file_path.exists() {
-                    eprintln!("Missing schema file: {}", file_path.display());
-                    diff_found = true;
-                    continue;
-                }
-                let actual = fs::read_to_string(&file_path).expect("Failed to read schema");
-                let actual_norm = actual.replace("\r\n", "\n");
-                let expected_norm = expected.replace("\r\n", "\n");
-                if actual_norm.trim() != expected_norm.trim() {
-                    eprintln!("Schema drift detected in {}", file_path.display());
-                    diff_found = true;
-                }
-            }
-            if diff_found {
-                eprintln!("Run 'cargo xtask generate-schemas' to update schemas.");
+            if let Err(error) = verify_schemas(&target_dir) {
+                eprintln!("{error}");
                 std::process::exit(1);
             }
             println!("All JSON schemas are up to date.");
         }
         Commands::Verify => {
-            println!("=== Omen Verification Suite ===");
-            run_cmd("cargo", &["fmt", "--check"]);
-            run_cmd(
+            run_verification(&target_dir);
+        }
+        Commands::Bench => {
+            run_benchmarks();
+        }
+        Commands::Perf(args) => perf::run(args, &project_root()),
+        Commands::Preview(args) => preview::run(args, &project_root()),
+    }
+}
+
+fn verify_schemas(target_dir: &Path) -> Result<(), String> {
+    if !target_dir.exists() {
+        return Err(format!(
+            "Schemas directory does not exist: {}",
+            target_dir.display()
+        ));
+    }
+    let mut diff_found = false;
+    for (filename, expected) in generate_schemas_content() {
+        let file_path = target_dir.join(&filename);
+        if !file_path.exists() {
+            eprintln!("Missing schema file: {}", file_path.display());
+            diff_found = true;
+            continue;
+        }
+        let actual = fs::read_to_string(&file_path)
+            .map_err(|error| format!("Failed to read {}: {error}", file_path.display()))?;
+        let actual_norm = actual.replace("\r\n", "\n");
+        let expected_norm = expected.replace("\r\n", "\n");
+        if actual_norm.trim() != expected_norm.trim() {
+            eprintln!("Schema drift detected in {}", file_path.display());
+            diff_found = true;
+        }
+    }
+    if diff_found {
+        return Err("Run 'cargo xtask generate-schemas' to update schemas.".into());
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct VerificationStage {
+    name: &'static str,
+    elapsed: Duration,
+    passed: bool,
+}
+
+fn run_command(cmd: &str, args: &[&str]) -> Result<(), i32> {
+    println!("Running: {} {}", cmd, args.join(" "));
+    let status = Command::new(cmd).args(args).status().map_err(|error| {
+        eprintln!("Failed to run {cmd}: {error}");
+        1
+    })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(status.code().unwrap_or(1))
+    }
+}
+
+fn record_stage(
+    name: &'static str,
+    action: impl FnOnce() -> Result<(), i32>,
+    stages: &mut Vec<VerificationStage>,
+) -> Result<(), i32> {
+    let start = Instant::now();
+    let result = action();
+    stages.push(VerificationStage {
+        name,
+        elapsed: start.elapsed(),
+        passed: result.is_ok(),
+    });
+    result
+}
+
+fn print_verification_summary(stages: &[VerificationStage]) {
+    for stage in stages {
+        println!(
+            "{:<16} {:<7} {:>7.1}s",
+            stage.name,
+            if stage.passed { "PASS" } else { "FAIL" },
+            stage.elapsed.as_secs_f64()
+        );
+    }
+    println!("{}", "-".repeat(34));
+    let total: Duration = stages.iter().map(|stage| stage.elapsed).sum();
+    let passed = stages.iter().all(|stage| stage.passed);
+    println!(
+        "{:<16} {:<7} {:>7.1}s",
+        "total",
+        if passed { "PASS" } else { "FAIL" },
+        total.as_secs_f64()
+    );
+}
+
+fn run_stage_or_exit(
+    name: &'static str,
+    action: impl FnOnce() -> Result<(), i32>,
+    stages: &mut Vec<VerificationStage>,
+) {
+    if let Err(code) = record_stage(name, action, stages) {
+        print_verification_summary(stages);
+        std::process::exit(code);
+    }
+}
+
+fn run_verification(schema_dir: &Path) {
+    println!("=== Omen Verification Suite ===");
+    let mut stages = Vec::new();
+    run_stage_or_exit(
+        "fmt",
+        || run_command("cargo", &["fmt", "--check"]),
+        &mut stages,
+    );
+    run_stage_or_exit(
+        "clippy",
+        || {
+            run_command(
                 "cargo",
                 &[
                     "clippy",
@@ -122,22 +207,37 @@ fn main() {
                     "-D",
                     "warnings",
                 ],
-            );
-            run_cmd("cargo", &["test", "--workspace"]);
-            run_cmd(
-                "cargo",
-                &["run", "--package", "xtask", "--", "verify-schemas"],
-            );
-            run_benchmarks();
-            run_cmd("cargo-deny", &["check"]);
-            println!("=== Verification Passed Successfully ===");
-        }
-        Commands::Bench => {
-            run_benchmarks();
-        }
-        Commands::Perf(args) => perf::run(args, &project_root()),
-        Commands::Preview(args) => preview::run(args, &project_root()),
-    }
+            )
+        },
+        &mut stages,
+    );
+    run_stage_or_exit(
+        "tests",
+        || run_command("cargo", &["test", "--workspace"]),
+        &mut stages,
+    );
+    run_stage_or_exit(
+        "schemas",
+        || match verify_schemas(schema_dir) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                eprintln!("{error}");
+                Err(1)
+            }
+        },
+        &mut stages,
+    );
+    run_stage_or_exit(
+        "benchmarks",
+        || std::panic::catch_unwind(std::panic::AssertUnwindSafe(run_benchmarks)).map_err(|_| 101),
+        &mut stages,
+    );
+    run_stage_or_exit(
+        "cargo-deny",
+        || run_command("cargo-deny", &["check"]),
+        &mut stages,
+    );
+    print_verification_summary(&stages);
 }
 
 fn run_benchmarks() {
