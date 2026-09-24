@@ -310,11 +310,22 @@ jobs:
           restore-keys: rust-h2-${{ runner.os }}-
 
       - name: Build canonical Tethers Gate
-        # CWD inside the Tethers checkout: cargo walks UP from CWD for
-        # workspace membership, and --manifest-path alone would attach
-        # the build to the Omen workspace instead.
-        working-directory: tethers-canonical/tethers-0.1/host-rust
-        run: cargo build --release -p tethers-reference-host
+        # Cargo discovers workspaces by walking UP from CWD: a checkout
+        # nested inside the Omen tree would attach to Omen's workspace.
+        # Copy the SHA-verified sources outside the Omen tree first
+        # (byte-identical; SHA already proven above) and build there.
+        shell: pwsh
+        run: |
+          $dst = Join-Path $env:RUNNER_TEMP 'tethers-build'
+          if (Test-Path $dst) { Remove-Item -Recurse -Force $dst }
+          Copy-Item -Recurse -Force tethers-canonical $dst
+          Push-Location (Join-Path $dst 'tethers-0.1/host-rust')
+          try {
+            cargo build --release -p tethers-reference-host
+          } finally {
+            Pop-Location
+          }
+          "TETHERS_BUILD_DIR=$dst" >> $env:GITHUB_ENV
 
       - name: Setup OCaml
         uses: ocaml/setup-ocaml@v3
@@ -325,7 +336,7 @@ jobs:
       - name: Build canonical Tethers engine
         shell: bash
         run: |
-          cd tethers-canonical/tethers-0.1/engine-ocaml
+          cd "$TETHERS_BUILD_DIR/tethers-0.1/engine-ocaml"
           opam install . --deps-only --with-test=false -y
           opam exec -- dune build @all
 
@@ -333,8 +344,8 @@ jobs:
         shell: pwsh
         run: |
           $ext = if ($IsWindows) { '.exe' } else { '' }
-          $gate = Join-Path (Get-Location) "tethers-canonical/tethers-0.1/host-rust/target/release/tethers$ext"
-          $engine = Join-Path (Get-Location) "tethers-canonical/tethers-0.1/engine-ocaml/_build/default/bin/tethers_mcp_main$ext"
+          $gate = Join-Path $env:TETHERS_BUILD_DIR "tethers-0.1/host-rust/target/release/tethers$ext"
+          $engine = Join-Path $env:TETHERS_BUILD_DIR "tethers-0.1/engine-ocaml/_build/default/bin/tethers_mcp_main$ext"
           if (-not (Test-Path $gate)) { throw "gate binary missing: $gate" }
           if (-not (Test-Path $engine)) { throw "engine binary missing: $engine" }
           "OMEN_H2_GATE_EXE=$gate" >> $env:GITHUB_ENV
