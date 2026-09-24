@@ -14,7 +14,7 @@ serialized identity must match these IDs or clearly preserve their meaning.
 | `TERMINAL_SIGINT_TARGETS_FOREGROUND_JOB` | Ctrl-C / terminal-generated SIGINT reaches the **distinct** foreground job rather than being mistaken for shell termination. | Strong: job pid/pgrp observed; `job_pgrp != shell_pgrp`; `tcgetpgrp` == job pgrp; **SIGINT delivery independently observed** (receipt marker); shell alive. VINTR injection alone is not delivery. Without delivery: INCONCLUSIVE/UNAVAILABLE. Distinguish from programmatic `kill(pid)`. |
 | `SHELL_SURVIVES_FOREGROUND_JOB_SIGINT` | Foreground SIGINT termination does not incorrectly kill Omen itself. | Strong: shell process still alive after VINTR. |
 | `EXIT_STATUS_PRESERVES_SIGNAL_NUMBER` | A process terminated by signal retains signal identity (SIGINT ≠ SIGTERM ≠ SIGKILL). | Strong: wait status `WIFSIGNALED` + exact signo. Never collapse to anonymous failure. |
-| `CHILD_SIGNAL_MASK_UNBLOCKED_BEFORE_EXEC` | Relevant inherited blocked signal state does not leak into the exec'd foreground job. | Partial: fixture-reported `/proc/self/status` `SigBlk` names on Linux; empty set on platforms without that source. Only assert measured signals. |
+| `CHILD_SIGNAL_MASK_UNBLOCKED_BEFORE_EXEC` | Relevant inherited blocked signal state does not leak into the exec'd foreground job. | Partial: fixture must report explicit `signal_masks_available`. Available + measured Linux `/proc/self/status` `SigBlk` names: empty relevant set → PASS/PARTIAL; blocked relevant signal → FAIL/PARTIAL. Unavailable (`signal_masks_available=false` or missing) → UNAVAILABLE — never an empty measured set that could PASS. Only assert measured signals. |
 | `SIGWINCH_ASYNC_DELIVERED_TO_FOREGROUND_PGRP_ON_RESIZE` | Resize while a foreground job owns the terminal produces both new size and async SIGWINCH delivery. | Strong: `tcgetwinsize` change + fixture `OMEN_COMPAT_SIGWINCH` barrier. |
 | `SHELL_TERMIOS_SNAPSHOT_RESTORED_AFTER_ABNORMAL_CHILD_EXIT` | After a foreground child dirties selected terminal modes and exits abnormally, Omen restores the shell's pre-job selected canonical snapshot (ICANON/ECHO/ISIG). | Strong: pre vs post `TermiosSnapshot` equality. Never compare against a hard-coded fantasy. |
 | `NO_ZOMBIE_CHILDREN_OF_SHELL` | After the tested lifecycle reaches its documented terminal state, Omen does not leave a reapable zombie direct child. | Strong on Linux (`/proc` children state `Z`); UNAVAILABLE elsewhere when not independently observable. |
@@ -29,6 +29,9 @@ serialized identity must match these IDs or clearly preserve their meaning.
 - fixture SIGINT receipt marker after VINTR: STRONG for delivery (routing still needs distinct pgrp + fg)
 - VINTR write alone (no receipt): not delivery evidence
 - missing/malformed fixture identity: missing evidence — never invent pid/pgrp/sid
+- failed shell `getpgid`/`getsid` observation: missing `pgrp`/`sid` — never derive from pid; never `harness_session_leader_fallback`
+- signal-mask unavailable: UNAVAILABLE evidence — never empty measured `[]`
+- controlling-terminal status: observed session match → `Some(true)`; failed observation → `None`; never hard-coded `Some(true)`
 - terminal text implying foreground: WEAK / PARTIAL
 - reference Bash behaviour: WITNESS ONLY (not authority)
 

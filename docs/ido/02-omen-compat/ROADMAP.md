@@ -51,9 +51,17 @@ deserialization rejects Exact (D2-013).
   observe controlling terminal), D2-016 (bounded hostile PTY I/O),
   D2-017 (dependent claims never exceed observed evidence — no fabricated
   identity; reacquisition requires proven prior handoff; VINTR ≠ SIGINT
-  delivery; `/proc` stopped ≠ Omen wait-path observation).
+  delivery; `/proc` stopped ≠ Omen wait-path observation),
+  D2-018 (UNAVAILABLE is not a value — no synthetic shell topology;
+  explicit signal-mask availability; controlling-terminal observed or
+  unknown).
 - Defect ledger: `POSIX_M0_DEFECTS.md` (M0-002 regraded INCONCLUSIVE;
   M0-003 kept UNAVAILABLE as observability gap).
+- Final POSIX platform-honesty micro-repair: shell identity observed
+  (`getpgid`/`getsid`, no `harness_session_leader_fallback`); signal-mask
+  fixture JSON carries `signal_masks_available` (unavailable → `null`
+  sets → UNAVAILABLE judge); `is_controlling_terminal` derived from
+  session observation only.
 
 Still open for M0: Windows ConPTY/console control, deeper process-tree
 containment, and any repair of production defects discovered by the

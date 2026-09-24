@@ -152,3 +152,26 @@ Measurement-integrity repair for M0-D/G (IDO No. 2):
    child is never transferred to product Omen judgments.
 
 Do not reward a plausible story; reward an observed fact.
+
+## D2-018 — UNAVAILABLE IS NOT A VALUE
+
+Absence of evidence is not an empty measurement.
+
+1. **Harness construction ≠ observed topology.** Creating a PTY session
+   (setsid / TIOCSCTTY / tcsetpgrp) does not grant product judgment
+   permission to assume resulting `pgrp`/`sid`. Shell topology is observed
+   via `getpgid`/`getsid` (with Linux `/proc` corroboration where present)
+   or remains missing (`None`). Failed observation never invents
+   `pgrp = pid` / `sid = pid`. There is no
+   `harness_session_leader_fallback` (or equivalent) source in product
+   evidence. Missing shell topology cannot produce STRONG topology results.
+2. **Signal-mask availability is explicit.** Fixture JSON carries
+   `signal_masks_available` and `signal_masks_source`. Unavailable masks
+   serialize as `blocked/ignored/caught = null`, never `[]`. The judge
+   returns UNAVAILABLE when evidence is unavailable; measured-empty is a
+   distinct PASS/PARTIAL state. macOS does not fake symmetry with Linux —
+   without an allowed primitive the result is UNAVAILABLE.
+3. **Controlling-terminal status is observed or unknown.**
+   `is_controlling_terminal` is `Some(true)` only when terminal-session
+   and process-session observations succeed and match; otherwise `None`.
+   Never hard-code `Some(true)` because the harness launched under a PTY.

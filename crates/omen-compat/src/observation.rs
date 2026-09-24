@@ -124,10 +124,14 @@ pub enum Observation {
         source: String,
     },
     /// Signal mask/disposition facts reported by a controlled fixture.
+    ///
+    /// `available == false` means not measured; `blocked`/`ignored` are then
+    /// `None` (never empty measured sets).
     PosixSignalMaskReport {
         fixture: String,
-        blocked: Vec<String>,
-        ignored: Vec<String>,
+        available: bool,
+        blocked: Option<Vec<String>>,
+        ignored: Option<Vec<String>>,
         source: String,
     },
     /// Process is STOPPED according to an independent source (e.g. procfs).

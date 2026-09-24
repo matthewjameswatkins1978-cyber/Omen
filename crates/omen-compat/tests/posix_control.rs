@@ -112,6 +112,26 @@ fn control_pty_is_tty_and_session_coherent() {
 }
 
 #[test]
+fn control_controlling_terminal_relationship_observed() {
+    let mut session = spawn(&["--posix-stop-report"], Duration::from_secs(8));
+    session
+        .wait_for_text("OMEN_COMPAT_STOPPING", Duration::from_secs(5))
+        .expect("STOPPING barrier");
+    let terminal_session = session.observe_terminal_session().ok();
+    let process_session = omen_compat::observe_shell_identity(session.child_pid()).session_id;
+    let is_ctty = omen_compat::derive_controlling_terminal(terminal_session, process_session);
+    assert_eq!(
+        is_ctty,
+        Some(true),
+        "calibrated PTY must prove controlling relationship by observation \
+         (terminal_session={terminal_session:?} process_session={process_session:?})"
+    );
+    continue_process(session.child_pid());
+    let _ = session.wait_for_text("OMEN_COMPAT_CONTINUED", Duration::from_secs(5));
+    let _ = session.wait_child_exit(Duration::from_secs(3));
+}
+
+#[test]
 fn control_foreground_pgrp_observation_works() {
     // Keep the child alive (stopped) so fg observation is not racing exit.
     let mut session = spawn(&["--posix-stop-report"], Duration::from_secs(8));

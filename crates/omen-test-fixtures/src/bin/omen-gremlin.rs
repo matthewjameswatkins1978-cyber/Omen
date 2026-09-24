@@ -523,10 +523,10 @@ fn posix_identity_json() -> String {
         isig = Some(t.local_modes.contains(rustix::termios::LocalModes::ISIG));
     }
 
-    let (blocked, ignored, caught) = posix_signal_masks();
+    let masks = posix_signal_masks();
 
     format!(
-        "{{\"fixture\":\"posix-report\",\"pid\":{},\"ppid\":{},\"pgrp\":{},\"sid\":{},\"stdin_isatty\":{stdin_tty},\"stdout_isatty\":{stdout_tty},\"stderr_isatty\":{stderr_tty},\"terminal_foreground_pgrp\":{},\"winsize_rows\":{rows},\"winsize_cols\":{cols},\"icanon\":{},\"echo\":{},\"isig\":{},\"blocked\":{},\"ignored\":{},\"caught\":{}}}",
+        "{{\"fixture\":\"posix-report\",\"pid\":{},\"ppid\":{},\"pgrp\":{},\"sid\":{},\"stdin_isatty\":{stdin_tty},\"stdout_isatty\":{stdout_tty},\"stderr_isatty\":{stderr_tty},\"terminal_foreground_pgrp\":{},\"winsize_rows\":{rows},\"winsize_cols\":{cols},\"icanon\":{},\"echo\":{},\"isig\":{},\"signal_masks_available\":{},\"signal_masks_source\":\"{}\",\"blocked\":{},\"ignored\":{},\"caught\":{}}}",
         pid,
         ppid.map(|p| p.as_raw_nonzero().get()).unwrap_or(-1),
         pgrp.map(|p| p.as_raw_nonzero().get()).unwrap_or(-1),
@@ -535,9 +535,11 @@ fn posix_identity_json() -> String {
         opt_bool(icanon),
         opt_bool(echo),
         opt_bool(isig),
-        json_str_array(&blocked),
-        json_str_array(&ignored),
-        json_str_array(&caught),
+        masks.available,
+        masks.source,
+        json_opt_str_array(masks.blocked.as_deref()),
+        json_opt_str_array(masks.ignored.as_deref()),
+        json_opt_str_array(masks.caught.as_deref()),
     )
 }
 
@@ -546,8 +548,12 @@ fn opt_bool(v: Option<bool>) -> String {
     v.map(|b| b.to_string()).unwrap_or_else(|| "null".into())
 }
 
+/// `null` when unavailable (not `[]`); arrays when measured.
 #[cfg(unix)]
-fn json_str_array(items: &[String]) -> String {
+fn json_opt_str_array(items: Option<&[String]>) -> String {
+    let Some(items) = items else {
+        return "null".into();
+    };
     let parts: Vec<String> = items
         .iter()
         .map(|s| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
@@ -555,25 +561,57 @@ fn json_str_array(items: &[String]) -> String {
     format!("[{}]", parts.join(","))
 }
 
-/// Report blocked/ignored/caught signal names via `/proc/self/status` on Linux.
-/// Empty vectors on platforms without that file (UNAVAILABLE, not guessed).
 #[cfg(unix)]
-fn posix_signal_masks() -> (Vec<String>, Vec<String>, Vec<String>) {
-    let mut blocked = Vec::new();
-    let mut ignored = Vec::new();
-    let mut caught = Vec::new();
-    if let Ok(text) = std::fs::read_to_string("/proc/self/status") {
-        for line in text.lines() {
-            if let Some(rest) = line.strip_prefix("SigBlk:") {
-                blocked = decode_sigmask_hex(rest.trim());
-            } else if let Some(rest) = line.strip_prefix("SigIgn:") {
-                ignored = decode_sigmask_hex(rest.trim());
-            } else if let Some(rest) = line.strip_prefix("SigCgt:") {
-                caught = decode_sigmask_hex(rest.trim());
-            }
+struct FixtureSignalMasks {
+    available: bool,
+    source: &'static str,
+    blocked: Option<Vec<String>>,
+    ignored: Option<Vec<String>>,
+    caught: Option<Vec<String>>,
+}
+
+/// Report blocked/ignored/caught signal names via `/proc/self/status` on
+/// Linux. When that source is missing, availability is `false` and the sets
+/// are `None` — never empty measured vectors (D2-018: unavailable ≠ empty).
+#[cfg(unix)]
+fn posix_signal_masks() -> FixtureSignalMasks {
+    let Ok(text) = std::fs::read_to_string("/proc/self/status") else {
+        return FixtureSignalMasks {
+            available: false,
+            source: "unavailable",
+            blocked: None,
+            ignored: None,
+            caught: None,
+        };
+    };
+    let mut blocked = None;
+    let mut ignored = None;
+    let mut caught = None;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("SigBlk:") {
+            blocked = Some(decode_sigmask_hex(rest.trim()));
+        } else if let Some(rest) = line.strip_prefix("SigIgn:") {
+            ignored = Some(decode_sigmask_hex(rest.trim()));
+        } else if let Some(rest) = line.strip_prefix("SigCgt:") {
+            caught = Some(decode_sigmask_hex(rest.trim()));
         }
     }
-    (blocked, ignored, caught)
+    match (blocked, ignored, caught) {
+        (Some(blocked), Some(ignored), Some(caught)) => FixtureSignalMasks {
+            available: true,
+            source: "proc_self_status",
+            blocked: Some(blocked),
+            ignored: Some(ignored),
+            caught: Some(caught),
+        },
+        _ => FixtureSignalMasks {
+            available: false,
+            source: "proc_self_status_parse_failed",
+            blocked: None,
+            ignored: None,
+            caught: None,
+        },
+    }
 }
 
 #[cfg(unix)]

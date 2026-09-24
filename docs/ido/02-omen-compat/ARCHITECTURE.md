@@ -85,14 +85,19 @@ Fixture JSON reports remain limited to controlled Compat fixtures.
   child establishes `setsid` + `TIOCSCTTY` + `tcsetpgrp` before exec;
   observation slave opened `O_NOCTTY`. Bounded non-blocking master reads
   (`poll` + transcript cap). Cleanup is non-waiting kill + bounded reap.
-- **Observations:** `PosixProcessIdentity`, `PosixTerminalState`,
+- **Observations:** `PosixProcessIdentity` (via `observe_shell_identity`
+  using `getpgid`/`getsid` + optional Linux `/proc` corroboration — never
+  synthesized from pid), `PosixTerminalState` (`is_controlling_terminal`
+  derived from observed session match, never hard-coded),
   `PosixWaitState`, `JobStoppedObserved`, `HandoffEvidence`,
-  `SigintReceiptObservation`, `ParseEvidenceError`, signal-mask fixture
-  reports — facts only. Fixture identity parse failure never becomes a
-  synthetic identity.
+  `SigintReceiptObservation`, `SignalMaskEvidence` (explicit availability;
+  unavailable ≠ empty), `ParseEvidenceError` — facts only. Fixture identity
+  parse failure never becomes a synthetic identity.
 - **Judges:** thirteen invariants in `compat/invariants/posix.md`, with
   D2-017 evidence-model constraints (handoff-gated reacquisition, distinct
-  fg ownership, observed SIGINT receipt, wait-path-only stopped PASS).
+  fg ownership, observed SIGINT receipt, wait-path-only stopped PASS) and
+  D2-018 availability honesty (missing topology / unavailable masks cannot
+  become STRONG or PASS).
 - **Linux `/proc`:** explicit Linux evidence (`linux_proc`); never claimed
   on non-Linux platforms (UNAVAILABLE instead).
 - **Tiers:** POSIX CONTROL calibrates the instrument without Omen; POSIX

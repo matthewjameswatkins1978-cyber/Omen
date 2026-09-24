@@ -25,6 +25,189 @@ impl PosixProcessIdentity {
     }
 }
 
+/// Observe process identity for `pid` without synthesizing topology.
+///
+/// Consequential topology (`pgrp`, `session_id`) comes from direct POSIX
+/// process APIs (`getpgid` / `getsid`). Linux `/proc/<pid>/stat` may
+/// corroborate when present. Failed observation leaves `None`; callers must
+/// never derive `pgrp`/`session_id` from `pid`. Establishing a topology
+/// (setsid / TIOCSCTTY in the harness) is not observation.
+pub fn observe_shell_identity(pid: u32) -> PosixProcessIdentity {
+    let mut sources: Vec<&str> = Vec::new();
+    // rustix::Pid::from_raw asserts non-negative; only convert in-range pids.
+    let raw = i32::try_from(pid)
+        .ok()
+        .filter(|&p| p > 0)
+        .and_then(rustix::process::Pid::from_raw);
+
+    // Reassigned only by Linux /proc corroboration; never on other Unixes.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    let mut pgrp = raw
+        .and_then(|p| rustix::process::getpgid(Some(p)).ok())
+        .map(|p| p.as_raw_nonzero().get() as u32);
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    let mut session_id = raw
+        .and_then(|p| rustix::process::getsid(Some(p)).ok())
+        .map(|p| p.as_raw_nonzero().get() as u32);
+    if pgrp.is_some() && session_id.is_some() {
+        sources.push("rustix_getpgid_getsid");
+    } else if pgrp.is_some() {
+        sources.push("rustix_getpgid");
+    } else if session_id.is_some() {
+        sources.push("rustix_getsid");
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    let mut ppid = None;
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(proc_id) = crate::posix::linux_proc::read_process_identity(pid) {
+            if pgrp.is_none() {
+                pgrp = proc_id.pgrp;
+            }
+            if session_id.is_none() {
+                session_id = proc_id.session_id;
+            }
+            ppid = proc_id.ppid;
+            sources.push("linux_proc_stat");
+        }
+    }
+
+    let source = if sources.is_empty() {
+        "identity_observation_failed".into()
+    } else {
+        sources.join("+")
+    };
+    PosixProcessIdentity {
+        pid,
+        ppid,
+        pgrp,
+        session_id,
+        source,
+    }
+}
+
+/// Derive controlling-terminal status from observed terminal session vs
+/// observed process session.
+///
+/// `Some(true)` only when both observations succeeded and match. Failed or
+/// non-distinguishing observations yield `None` — never a hard-coded true.
+/// Unequal sessions are not over-interpreted as proven non-controlling
+/// without a dedicated negative observation.
+pub fn derive_controlling_terminal(
+    terminal_session: Option<u32>,
+    process_session: Option<u32>,
+) -> Option<bool> {
+    match (terminal_session, process_session) {
+        (Some(t), Some(p)) if t == p => Some(true),
+        _ => None,
+    }
+}
+
+/// Signal-mask evidence from a controlled fixture.
+///
+/// `available == false` means the platform/source could not measure masks.
+/// That is never encoded as empty measured sets (D2-018).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignalMaskEvidence {
+    pub available: bool,
+    pub source: String,
+    pub blocked: Option<Vec<String>>,
+    pub ignored: Option<Vec<String>>,
+    pub caught: Option<Vec<String>>,
+}
+
+impl SignalMaskEvidence {
+    /// Explicitly unavailable — not an empty measurement.
+    pub fn unavailable(source: impl Into<String>) -> Self {
+        Self {
+            available: false,
+            source: source.into(),
+            blocked: None,
+            ignored: None,
+            caught: None,
+        }
+    }
+
+    /// Measured sets from a named source (empty vectors are semantic values).
+    pub fn measured(
+        source: impl Into<String>,
+        blocked: Vec<String>,
+        ignored: Vec<String>,
+        caught: Vec<String>,
+    ) -> Self {
+        Self {
+            available: true,
+            source: source.into(),
+            blocked: Some(blocked),
+            ignored: Some(ignored),
+            caught: Some(caught),
+        }
+    }
+
+    pub fn observation(&self) -> Observation {
+        Observation::PosixSignalMaskReport {
+            fixture: "omen-gremlin".into(),
+            available: self.available,
+            blocked: self.blocked.clone(),
+            ignored: self.ignored.clone(),
+            source: self.source.clone(),
+        }
+    }
+}
+
+/// Parse fixture signal-mask availability from a transcript.
+///
+/// Requires an explicit `signal_masks_available` boolean. Missing field or
+/// unavailable payload yields unavailable evidence — never empty measured
+/// sets.
+pub fn parse_signal_mask_evidence(text: &str) -> SignalMaskEvidence {
+    for line in text.lines().rev() {
+        let line = line.trim();
+        let json_start = match line.find('{') {
+            Some(i) => i,
+            None => continue,
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line[json_start..]) else {
+            continue;
+        };
+        let Some(available) = v.get("signal_masks_available").and_then(|b| b.as_bool()) else {
+            continue;
+        };
+        if !available {
+            let source = v
+                .get("signal_masks_source")
+                .and_then(|s| s.as_str())
+                .unwrap_or("unavailable");
+            return SignalMaskEvidence::unavailable(source);
+        }
+        // Available but blocked is not an array (null/missing): not a
+        // measurement — refuse to invent empty measured sets (D2-018).
+        if !v.get("blocked").is_some_and(|b| b.is_array()) {
+            return SignalMaskEvidence::unavailable(
+                "signal_masks_available true but blocked is not an array",
+            );
+        }
+        let source = v
+            .get("signal_masks_source")
+            .and_then(|s| s.as_str())
+            .unwrap_or("unknown");
+        let arr = |key: &str| -> Vec<String> {
+            v.get(key)
+                .and_then(|a| a.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        return SignalMaskEvidence::measured(source, arr("blocked"), arr("ignored"), arr("caught"));
+    }
+    SignalMaskEvidence::unavailable("signal_masks_available missing from fixture report")
+}
+
 /// Terminal ownership facts (fg pgrp, session, winsize, selected termios).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PosixTerminalState {

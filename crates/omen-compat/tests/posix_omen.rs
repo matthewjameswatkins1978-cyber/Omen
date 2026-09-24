@@ -13,12 +13,13 @@
 use omen_compat::{
     EvidenceGrade, HandoffEvidence, InvariantId, InvariantOutcome, InvariantResult,
     JobStoppedObserved, ParseEvidenceError, PosixProcessIdentity, PosixTerminalState, PtySession,
-    PtyWinsize, SigintReceiptObservation, TermiosSnapshot, judge_child_signal_mask_unblocked,
-    judge_job_has_distinct_pgrp, judge_job_shares_session, judge_no_zombie_children,
-    judge_shell_regains_tty_after_exit, judge_shell_regains_tty_after_stop,
-    judge_shell_survives_foreground_sigint, judge_sigint_targets_foreground_job,
-    judge_sigwinch_async_delivered, judge_terminal_fg_is_job, judge_termios_restored,
-    parse_posix_report, topology_results_missing_identity,
+    PtyWinsize, SigintReceiptObservation, TermiosSnapshot, derive_controlling_terminal,
+    judge_child_signal_mask_unblocked, judge_job_has_distinct_pgrp, judge_job_shares_session,
+    judge_no_zombie_children, judge_shell_regains_tty_after_exit,
+    judge_shell_regains_tty_after_stop, judge_shell_survives_foreground_sigint,
+    judge_sigint_targets_foreground_job, judge_sigwinch_async_delivered, judge_terminal_fg_is_job,
+    judge_termios_restored, observe_shell_identity, parse_posix_report, parse_signal_mask_evidence,
+    topology_results_missing_identity,
 };
 use std::path::PathBuf;
 use std::time::Duration;
@@ -71,6 +72,8 @@ fn gremlin_exe() -> PathBuf {
             }
         }
         let found = found.expect("omen-gremlin");
+        // Always refresh the space-free copy so fixture schema changes stick.
+        let _ = std::fs::remove_file(&stable);
         let _ = std::fs::copy(&found, &stable);
         if stable.exists() { stable } else { found }
     })
@@ -143,22 +146,9 @@ fn wait_prompt(session: &mut PtySession) -> bool {
 }
 
 fn shell_identity(session: &PtySession) -> PosixProcessIdentity {
-    let pid = session.child_pid();
-    #[cfg(target_os = "linux")]
-    {
-        if let Some(id) = omen_compat::read_process_identity(pid) {
-            return id;
-        }
-    }
-    // Harness established setsid + tcsetpgrp(self) before exec: session
-    // leader identity is a harness fact, not a fabricated job identity.
-    PosixProcessIdentity {
-        pid,
-        ppid: None,
-        pgrp: Some(pid),
-        session_id: Some(pid),
-        source: "harness_session_leader_fallback".into(),
-    }
+    // Direct getpgid/getsid (+ Linux /proc corroboration). Never synthesize
+    // pgrp/sid from pid when observation fails (D2-018).
+    omen_compat::observe_shell_identity(session.child_pid())
 }
 
 fn terminal_state(session: &PtySession) -> PosixTerminalState {
@@ -166,15 +156,22 @@ fn terminal_state(session: &PtySession) -> PosixTerminalState {
     let sid = session.observe_terminal_session().ok();
     let ws = session.observe_winsize().ok();
     let termios = session.observe_termios_snapshot().ok();
+    let process_session = observe_process_session(session.child_pid());
     PosixTerminalState {
         foreground_pgrp: fg,
         session_id: sid,
-        is_controlling_terminal: Some(true),
+        is_controlling_terminal: derive_controlling_terminal(sid, process_session),
         rows: ws.map(|w| w.rows),
         cols: ws.map(|w| w.cols),
         termios,
-        source: "rustix_tcgetpgrp_tcgetsid".into(),
+        // Mechanism family only — does not claim every optional field was
+        // successfully observed (D2-018 / §17).
+        source: "pty_observation_mechanisms".into(),
     }
+}
+
+fn observe_process_session(pid: u32) -> Option<u32> {
+    observe_shell_identity(pid).session_id
 }
 
 /// Wait for needle; returns false if bound-out without the needle.
@@ -608,7 +605,7 @@ fn transcript_has_line(text: &str, needle: &str) -> bool {
     text.lines().any(|l| l.trim() == needle)
 }
 
-/// Scenario G — signal-mask/disposition child report.
+/// Scenario G — signal-mask/disposition child report (availability-aware).
 #[test]
 fn omen_g_signal_mask_child_report() {
     let Some(mut omen) = spawn_omen(&workspace_root()) else {
@@ -616,19 +613,36 @@ fn omen_g_signal_mask_child_report() {
         return;
     };
     assert!(wait_prompt(&mut omen));
+    // Rebuild + refresh space-free fixture copy so schema changes are live.
+    let _ = std::process::Command::new("cargo")
+        .args(["build", "-p", "omen-test-fixtures", "--bin", "omen-gremlin"])
+        .current_dir(workspace_root())
+        .status();
     write_line(
         &mut omen,
         &format!("{} --posix-report", gremlin_exe().display()),
     );
     let text = omen
-        .wait_for_text("\"blocked\"", Duration::from_secs(15))
+        .wait_for_text("\"signal_masks_available\"", Duration::from_secs(15))
         .map(|t| t.as_lossy())
         .unwrap_or_default();
-    let blocked = parse_json_str_array(&text, "blocked");
+    let evidence = parse_signal_mask_evidence(&text);
     let results = vec![judge_child_signal_mask_unblocked(
-        &blocked,
+        &evidence,
         &["SIGINT", "SIGTSTP", "SIGQUIT", "SIGTTIN", "SIGTTOU"],
     )];
+    println!(
+        "FACT\tSIGNAL_MASKS\tavailable={}\tsource={}\tblocked={:?}",
+        evidence.available, evidence.source, evidence.blocked
+    );
+    if !evidence.available {
+        assert_eq!(
+            results[0].outcome,
+            InvariantOutcome::Unavailable,
+            "unavailable masks must not PASS: {:?}",
+            results[0]
+        );
+    }
     print_report("signal-mask", &results);
     assert!(omen.child_pid() > 0);
 }
@@ -771,28 +785,6 @@ fn omen_f_signal_faithful_exit_identity() {
     ];
     let _ = omen.wait_for_text("\\O/", Duration::from_secs(10));
     print_report("signal-faithful", &results);
-}
-
-fn parse_json_str_array(text: &str, key: &str) -> Vec<String> {
-    let needle = format!("\"{key}\":[");
-    if let Some(idx) = text.rfind(&needle) {
-        let rest = &text[idx + needle.len()..];
-        if let Some(end) = rest.find(']') {
-            let inner = &rest[..end];
-            return inner
-                .split(',')
-                .filter_map(|s| {
-                    let t = s.trim().trim_matches('"');
-                    if t.is_empty() {
-                        None
-                    } else {
-                        Some(t.to_string())
-                    }
-                })
-                .collect();
-        }
-    }
-    Vec::new()
 }
 
 #[allow(dead_code)]

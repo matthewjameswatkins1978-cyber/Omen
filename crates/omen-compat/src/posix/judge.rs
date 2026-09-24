@@ -14,7 +14,7 @@ use crate::invariant::{InvariantId, InvariantResult};
 use crate::posix::harness::TermiosSnapshot;
 use crate::posix::observe::{
     HandoffEvidence, JobStoppedObserved, PosixProcessIdentity, PosixTerminalState, PosixWaitState,
-    SigintReceiptObservation,
+    SigintReceiptObservation, SignalMaskEvidence,
 };
 
 /// Judge: foreground job remains in the shell's session.
@@ -413,9 +413,32 @@ pub fn judge_signal_faithful_exit(
 
 /// Judge: relevant inherited blocked signals do not poison the exec'd child.
 ///
-/// Only asserts signals the fixture actually measured.
-pub fn judge_child_signal_mask_unblocked(blocked: &[String], relevant: &[&str]) -> InvariantResult {
+/// Availability is explicit (D2-018): unavailable evidence is UNAVAILABLE,
+/// never an empty measured set that could PASS. Only asserts signals the
+/// fixture actually measured.
+pub fn judge_child_signal_mask_unblocked(
+    evidence: &SignalMaskEvidence,
+    relevant: &[&str],
+) -> InvariantResult {
     let inv = InvariantId::ChildSignalMaskUnblockedBeforeExec;
+    if !evidence.available {
+        return InvariantResult::unavailable(
+            inv,
+            format!(
+                "signal-mask evidence unavailable (source={}): not an empty measurement",
+                evidence.source
+            ),
+        );
+    }
+    let Some(blocked) = evidence.blocked.as_deref() else {
+        return InvariantResult::unavailable(
+            inv,
+            format!(
+                "signal-mask marked available but blocked set missing (source={})",
+                evidence.source
+            ),
+        );
+    };
     let relevant_lower: Vec<String> = relevant.iter().map(|s| s.to_string()).collect();
     let leaked: Vec<&String> = blocked
         .iter()
@@ -425,7 +448,10 @@ pub fn judge_child_signal_mask_unblocked(blocked: &[String], relevant: &[&str]) 
         InvariantResult::pass(
             inv,
             EvidenceGrade::Partial,
-            format!("fixture-reported blocked set {blocked:?} does not include {relevant_lower:?}"),
+            format!(
+                "fixture-reported blocked set {blocked:?} (source={}) does not include {relevant_lower:?}",
+                evidence.source
+            ),
         )
     } else {
         InvariantResult::fail(

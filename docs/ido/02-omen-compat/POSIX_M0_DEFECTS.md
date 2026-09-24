@@ -13,6 +13,12 @@ Measurement-integrity regrade applied at worktree head
 longer exceed observed evidence (no fabricated identity; reacquisition needs
 prior handoff; VINTR ≠ delivery; `/proc` ≠ Omen wait path).
 
+Platform-honesty micro-repair applied at worktree head after `633452f`
+(D2-018): shell `pgrp`/`sid` observed via `getpgid`/`getsid` or missing
+(never a synthetic session-leader fallback source); signal-mask
+availability explicit (unavailable ≠ empty); controlling-terminal status
+observed or `None` (never hard-coded true).
+
 | ID | Invariant | Platform | Omen SHA | Scenario | Evidence grade | Status | Likely subsystem | Repair |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | POSIX-M0-001 | `SHELL_JOB_HAS_DISTINCT_PROCESS_GROUP` | linux-x86_64 | ce7593d (worktree) | A: `--interactive … --posix-report` under calibrated PTY; fixture identity parsed (not fabricated) | STRONG | FAIL | `omen-interactive` `ChildHandoff::spawn_interactive` (inherit stdio; no observed `setpgid`/job pgrp split) | NOT ATTEMPTED |

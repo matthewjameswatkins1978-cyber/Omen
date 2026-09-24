@@ -9,9 +9,11 @@
 use omen_compat::{
     EvidenceGrade, HandoffEvidence, InvariantId, InvariantOutcome, InvariantResult,
     ParseEvidenceError, PosixProcessIdentity, PosixTerminalState, PosixWaitState,
-    SigintReceiptObservation, judge_job_has_distinct_pgrp, judge_shell_regains_tty_after_exit,
-    judge_sigint_targets_foreground_job, judge_terminal_fg_is_job, judge_wait_observes_stopped,
-    parse_posix_report, topology_results_missing_identity,
+    SigintReceiptObservation, SignalMaskEvidence, derive_controlling_terminal,
+    judge_child_signal_mask_unblocked, judge_job_has_distinct_pgrp, judge_job_shares_session,
+    judge_shell_regains_tty_after_exit, judge_sigint_targets_foreground_job,
+    judge_terminal_fg_is_job, judge_wait_observes_stopped, observe_shell_identity,
+    parse_posix_report, parse_signal_mask_evidence, topology_results_missing_identity,
 };
 
 fn identity(pid: u32, pgrp: u32, sid: u32) -> PosixProcessIdentity {
@@ -28,7 +30,9 @@ fn term(fg: u32) -> PosixTerminalState {
     PosixTerminalState {
         foreground_pgrp: Some(fg),
         session_id: Some(1),
-        is_controlling_terminal: Some(true),
+        // Test inputs never hard-code product truth; ctty is observed only
+        // in live helpers. Judge tests below do not read this field.
+        is_controlling_terminal: None,
         rows: Some(24),
         cols: Some(80),
         termios: None,
@@ -280,4 +284,163 @@ fn missing_identity_results_are_inconclusive() {
             }
         ));
     }
+}
+
+/// Shell identity sources are observation mechanisms only — never a
+/// synthetic session-leader fallback (D2-018). Built at runtime so a
+/// literal search for the forbidden source name finds no product code.
+#[test]
+fn shell_identity_source_is_observation_only() {
+    let forbidden = ["harness", "session", "leader", "fallback"].join("_");
+    let id = observe_shell_identity(std::process::id());
+    assert!(
+        !id.source.contains(&forbidden),
+        "synthetic fallback forbidden: {}",
+        id.source
+    );
+    assert!(
+        id.source.starts_with("rustix_get")
+            || id.source.contains("linux_proc_stat")
+            || id.source == "identity_observation_failed",
+        "source must name an observation mechanism: {}",
+        id.source
+    );
+}
+
+/// Shell identity: failed observation leaves pgrp/sid missing (not synthesized).
+#[test]
+fn shell_identity_failed_observation_leaves_pgrp_sid_missing() {
+    // Unlikely-to-exist high pid: getpgid/getsid fail; Linux /proc absent.
+    let id = observe_shell_identity(u32::MAX - 16);
+    assert!(
+        id.pgrp.is_none(),
+        "failed observation must not invent pgrp: {id:?}"
+    );
+    assert!(
+        id.session_id.is_none(),
+        "failed observation must not invent sid: {id:?}"
+    );
+    assert_eq!(id.source, "identity_observation_failed");
+}
+
+/// Shell identity: successful observation records live process topology.
+#[test]
+fn shell_identity_observed_pgrp_and_sid() {
+    let id = observe_shell_identity(std::process::id());
+    assert!(id.pgrp.is_some(), "getpgid must observe pgrp: {id:?}");
+    assert!(id.session_id.is_some(), "getsid must observe sid: {id:?}");
+}
+
+/// Missing shell topology cannot produce STRONG topology results.
+#[test]
+fn missing_shell_topology_cannot_produce_strong_topology() {
+    let shell = PosixProcessIdentity {
+        pid: 100,
+        ppid: None,
+        pgrp: None,
+        session_id: None,
+        source: "identity_observation_failed".into(),
+    };
+    let job = identity(50, 200, 100);
+    for r in [
+        judge_job_shares_session(&shell, &job),
+        judge_job_has_distinct_pgrp(&shell, &job),
+    ] {
+        assert_ne!(
+            r.evidence_grade,
+            EvidenceGrade::Strong,
+            "STRONG forbidden without shell topology: {r:?}"
+        );
+        assert_ne!(
+            r.outcome,
+            InvariantOutcome::Pass,
+            "PASS forbidden without shell topology: {r:?}"
+        );
+        assert_ne!(
+            r.outcome,
+            InvariantOutcome::Fail,
+            "FAIL forbidden without shell topology: {r:?}"
+        );
+    }
+}
+
+/// A — measured empty blocked set is a semantic PASS (not unavailable).
+#[test]
+fn signal_mask_measured_empty_passes() {
+    let ev = SignalMaskEvidence::measured("proc_self_status", vec![], vec![], vec![]);
+    let r = judge_child_signal_mask_unblocked(&ev, &["SIGINT"]);
+    assert_eq!(r.outcome, InvariantOutcome::Pass, "{r:?}");
+    assert_eq!(r.evidence_grade, EvidenceGrade::Partial);
+}
+
+/// B — measured relevant blocked signal FAILs.
+#[test]
+fn signal_mask_measured_blocked_fails() {
+    let ev =
+        SignalMaskEvidence::measured("proc_self_status", vec!["SIGINT".into()], vec![], vec![]);
+    let r = judge_child_signal_mask_unblocked(&ev, &["SIGINT"]);
+    assert_eq!(r.outcome, InvariantOutcome::Fail, "{r:?}");
+}
+
+/// C — unavailable evidence is UNAVAILABLE, never empty-measured PASS.
+#[test]
+fn signal_mask_unavailable_is_unavailable_not_pass() {
+    let ev = SignalMaskEvidence::unavailable("unavailable");
+    let r = judge_child_signal_mask_unblocked(&ev, &["SIGINT"]);
+    assert_eq!(r.outcome, InvariantOutcome::Unavailable, "{r:?}");
+    assert_ne!(r.outcome, InvariantOutcome::Pass);
+}
+
+/// D — fixture JSON parser preserves availability through parse.
+#[test]
+fn signal_mask_parser_preserves_availability() {
+    let available = r#"{"signal_masks_available":true,"signal_masks_source":"proc_self_status","blocked":[],"ignored":[],"caught":[]}"#;
+    let ev = parse_signal_mask_evidence(available);
+    assert!(ev.available);
+    assert_eq!(ev.blocked, Some(vec![]));
+    let r = judge_child_signal_mask_unblocked(&ev, &["SIGINT"]);
+    assert_eq!(r.outcome, InvariantOutcome::Pass);
+
+    let unavailable = r#"{"signal_masks_available":false,"signal_masks_source":"unavailable","blocked":null,"ignored":null,"caught":null}"#;
+    let ev = parse_signal_mask_evidence(unavailable);
+    assert!(!ev.available);
+    assert!(ev.blocked.is_none());
+    let r = judge_child_signal_mask_unblocked(&ev, &["SIGINT"]);
+    assert_eq!(r.outcome, InvariantOutcome::Unavailable);
+
+    // Missing availability field is unavailable, not empty measured.
+    let missing = r#"{"blocked":[]}"#;
+    let ev = parse_signal_mask_evidence(missing);
+    assert!(!ev.available);
+    let r = judge_child_signal_mask_unblocked(&ev, &["SIGINT"]);
+    assert_eq!(r.outcome, InvariantOutcome::Unavailable);
+
+    // available=true with blocked=null is not a measurement (D2-018).
+    let available_null_blocked = r#"{"signal_masks_available":true,"signal_masks_source":"proc_self_status","blocked":null}"#;
+    let ev = parse_signal_mask_evidence(available_null_blocked);
+    assert!(
+        !ev.available,
+        "null blocked must not become measured: {ev:?}"
+    );
+    let r = judge_child_signal_mask_unblocked(&ev, &["SIGINT"]);
+    assert_eq!(r.outcome, InvariantOutcome::Unavailable);
+}
+
+/// Controlling terminal: matching observed sessions → Some(true).
+#[test]
+fn controlling_terminal_observed_match_is_true() {
+    assert_eq!(
+        derive_controlling_terminal(Some(100), Some(100)),
+        Some(true)
+    );
+}
+
+/// Controlling terminal: failed observation → None (never hard-coded true).
+#[test]
+fn controlling_terminal_unavailable_observation_is_none() {
+    assert_eq!(derive_controlling_terminal(None, Some(100)), None);
+    assert_eq!(derive_controlling_terminal(Some(100), None), None);
+    assert_eq!(derive_controlling_terminal(None, None), None);
+    // Unequal sessions are not over-interpreted without negative evidence.
+    assert_eq!(derive_controlling_terminal(Some(100), Some(200)), None);
 }
