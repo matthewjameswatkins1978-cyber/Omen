@@ -36,6 +36,19 @@ pub struct ReleaseManifest {
     pub daemon_binary_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub package_size: Option<u64>,
+    /// H2 managed Gate companion (all optional; unknown-field-tolerant
+    /// readers ignore them). When present, the exact companion asset on
+    /// the same release is bound by name + hash, with pinned provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_companion_asset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_companion_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_tethers_sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_exe_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_engine_sha256: Option<String>,
 }
 
 impl ReleaseManifest {
@@ -97,6 +110,45 @@ impl ReleaseManifest {
             && (size == 0 || size > super::transport::MAX_PACKAGE_BYTES)
         {
             return Err(bad("package_size"));
+        }
+        // Gate companion binding: all-or-nothing shape. Names are plain
+        // basenames (same rules as package_asset); hashes are SHA-256;
+        // the Tethers source pin is a full commit SHA.
+        let gate_fields = [
+            &self.gate_companion_asset,
+            &self.gate_companion_sha256,
+            &self.gate_tethers_sha,
+            &self.gate_exe_sha256,
+            &self.gate_engine_sha256,
+        ];
+        if gate_fields.iter().any(|f| f.is_some()) {
+            let asset = self
+                .gate_companion_asset
+                .as_ref()
+                .ok_or_else(|| bad("gate_companion_asset"))?;
+            if asset.is_empty()
+                || asset.len() > 128
+                || asset.contains('/')
+                || asset.contains('\\')
+                || asset.contains("..")
+                || asset.contains(':')
+            {
+                return Err(bad("gate_companion_asset (want plain file name)"));
+            }
+            for (name, value) in [
+                ("gate_companion_sha256", &self.gate_companion_sha256),
+                ("gate_exe_sha256", &self.gate_exe_sha256),
+                ("gate_engine_sha256", &self.gate_engine_sha256),
+            ] {
+                match value {
+                    Some(v) if is_sha256(v) => {}
+                    _ => return Err(bad(name)),
+                }
+            }
+            match &self.gate_tethers_sha {
+                Some(v) if is_full_sha(v) => {}
+                _ => return Err(bad("gate_tethers_sha")),
+            }
         }
         Ok(())
     }

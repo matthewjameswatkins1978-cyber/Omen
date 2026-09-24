@@ -973,7 +973,7 @@ dependencies = [
 
 [[package]]
 name = "omen-adapters"
-version = "0.9.0-preview.21"
+version = "0.9.0-preview.22"
 dependencies = [
  "hex",
  "omen-atlas",
@@ -995,7 +995,7 @@ dependencies = [
 
 [[package]]
 name = "omen-agent"
-version = "0.9.0-preview.21"
+version = "0.9.0-preview.22"
 dependencies = [
  "chrono",
  "hex",
@@ -1019,7 +1019,7 @@ dependencies = [
 
 [[package]]
 name = "omen-agent-adapter"
-version = "0.9.0-preview.21"
+version = "0.9.0-preview.22"
 dependencies = [
  "hex",
  "omen-agent",
@@ -1033,7 +1033,7 @@ dependencies = [
 
 [[package]]
 name = "omen-atlas"
-version = "0.9.0-preview.21"
+version = "0.9.0-preview.22"
 dependencies = [
  "chrono",
  "hex",
@@ -1051,8 +1051,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "omen-authority"
+version = "0.9.0-preview.22"
+dependencies = [
+ "hex",
+ "omen-core",
+ "omen-engine",
+ "omen-lifecycle",
+ "omen-test-fixtures",
+ "serde",
+ "serde_json",
+ "serde_json_canonicalizer",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "uuid",
+ "zip",
+]
+
+[[package]]
 name = "omen-cli"
-version = "0.9.0-preview.21"
+version = "0.9.0-preview.22"
 dependencies = [
  "chrono",
  "clap",
@@ -1061,6 +1081,7 @@ dependencies = [
  "omen-adapters",
  "omen-agent",
  "omen-atlas",
+ "omen-authority",
  "omen-client",
  "omen-core",
  "omen-daemon",
@@ -1086,7 +1107,7 @@ dependencies = [
 
 [[package]]
 name = "omen-client"
-version = "0.9.0-preview.21"
+version = "0.9.0-preview.22"
 dependencies = [
  "chrono",
  "omen-core",
@@ -1104,7 +1125,7 @@ dependencies = [
 
 [[package]]
 name = "omen-core"
-version = "0.9.0-preview.21"
+version = "0.9.0-preview.22"
 dependencies = [
  "chrono",
  "hex",
@@ -1118,7 +1139,7 @@ dependencies = [
 
 [[package]]
 name = "omen-daemon"
-version = "0.9.0-preview.21"
+version = "0.9.0-preview.22"
 dependencies = [
  "chrono",
  "clap",
@@ -1147,7 +1168,7 @@ dependencies = [
 
 [[package]]
 name = "omen-engine"
-version = "0.9.0-preview.21"
+version = "0.9.0-preview.22"
 dependencies = [
  "omen-core",
  "omen-schema",
@@ -1164,7 +1185,7 @@ dependencies = [
 
 [[package]]
 name = "omen-interactive"
-version = "0.9.0-preview.21"
+version = "0.9.0-preview.22"
 dependencies = [
  "chrono",
  "hex",
@@ -1196,7 +1217,7 @@ dependencies = [
 
 [[package]]
 name = "omen-ipc"
-version = "0.9.0-preview.21"
+version = "0.9.0-preview.22"
 dependencies = [
  "omen-core",
  "omen-schema",
@@ -1211,7 +1232,7 @@ dependencies = [
 
 [[package]]
 name = "omen-knowledge"
-version = "0.9.0-preview.21"
+version = "0.9.0-preview.22"
 dependencies = [
  "chrono",
  "hex",
@@ -1227,7 +1248,7 @@ dependencies = [
 
 [[package]]
 name = "omen-lifecycle"
-version = "0.9.0-preview.21"
+version = "0.9.0-preview.22"
 dependencies = [
  "chrono",
  "fs2",
@@ -1249,7 +1270,7 @@ dependencies = [
 
 [[package]]
 name = "omen-mcp"
-version = "0.9.0-preview.21"
+version = "0.9.0-preview.22"
 dependencies = [
  "chrono",
  "clap",
@@ -1276,7 +1297,7 @@ dependencies = [
 
 [[package]]
 name = "omen-schema"
-version = "0.9.0-preview.21"
+version = "0.9.0-preview.22"
 dependencies = [
  "omen-core",
  "schemars",
@@ -1287,7 +1308,7 @@ dependencies = [
 
 [[package]]
 name = "omen-semantic"
-version = "0.9.0-preview.21"
+version = "0.9.0-preview.22"
 dependencies = [
  "hex",
  "omen-core",
@@ -1303,7 +1324,7 @@ dependencies = [
 
 [[package]]
 name = "omen-test-fixtures"
-version = "0.9.0-preview.21"
+version = "0.9.0-preview.22"
 dependencies = [
  "clap",
  "crossterm",
@@ -1313,7 +1334,7 @@ dependencies = [
 
 [[package]]
 name = "omen-ui"
-version = "0.9.0-preview.21"
+version = "0.9.0-preview.22"
 dependencies = [
  "crossterm",
  "nu-ansi-term",
@@ -1580,6 +1601,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
+name = "ryu-js"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04d056b875a9d2e6cb9a61d127afee9ac5999b9f87bcb32079d1318e505be714"
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1676,6 +1703,17 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "serde_json_canonicalizer"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe52319a927259afbfa5180c5157cd8167edfd3e8c254f9558c7fef44c5649f2"
+dependencies = [
+ "ryu-js",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2542,7 +2580,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "xtask"
-version = "0.9.0-preview.21"
+version = "0.9.0-preview.22"
 dependencies = [
  "chrono",
  "clap",

@@ -16,6 +16,7 @@ members = [
     "crates/omen-agent",
     "crates/omen-agent-adapter",    "crates/omen-mcp",
     "crates/omen-lifecycle",
+    "crates/omen-authority",
     "crates/omen-test-fixtures",
     "crates/omen-semantic",
     "crates/xtask",
@@ -25,7 +26,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.9.0-preview.21"
+version = "0.9.0-preview.22"
 edition = "2024"
 rust-version = "1.98.1"
 publish = false
@@ -48,6 +49,7 @@ omen-agent = { path = "crates/omen-agent", version = "0.9.0-preview.7" }
 omen-agent-adapter = { path = "crates/omen-agent-adapter", version = "0.9.0-preview.7" }
 omen-mcp = { path = "crates/omen-mcp", version = "0.9.0-preview.7" }
 omen-lifecycle = { path = "crates/omen-lifecycle", version = "0.9.0-preview.7" }
+omen-authority = { path = "crates/omen-authority", version = "0.9.0-preview.7" }
 omen-test-fixtures = { path = "crates/omen-test-fixtures", version = "0.9.0-preview.7" }
 omen-semantic = { path = "crates/omen-semantic", version = "0.9.0-preview.7" }
 
@@ -57,6 +59,7 @@ schemars = { version = "0.8", features = ["derive"] }
 thiserror = "2.0"
 sha2 = "0.10"
 hex = "0.4"
+serde_json_canonicalizer = "0.3"
 tokio = { version = "1.43", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

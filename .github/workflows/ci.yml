@@ -179,8 +179,7 @@ jobs:
           OMEN_REQUIRE_SEMANTIC_EXTERNAL_PROOFS: "1"
         run: cargo test -p omen-cli --test semantic_environment_proofs test_proof_c_real_lsp_symbol_definition_and_references -- --exact --nocapture
 
-  windows-preview-candidate:
-    needs: check-and-lint
+  windows-preview-candidate:    needs: check-and-lint
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -247,3 +246,95 @@ jobs:
             work/omen-*-windows-x86_64.zip
             work/omen-release.json
             work/provenance.json
+
+  h2-gate-e2e:
+    needs: check-and-lint
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout Omen repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || inputs.target_sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Verify exact Omen product source
+        shell: pwsh
+        env:
+          REQUESTED_PRODUCT_SHA: ${{ github.event.pull_request.head.sha || inputs.target_sha || github.sha }}
+        run: |
+          $requested = $env:REQUESTED_PRODUCT_SHA.Trim().ToLowerInvariant()
+          if ($requested -notmatch '^[0-9a-f]{40}$') { throw "target_sha must be a full 40-character commit SHA" }
+          $resolved = (git rev-parse "$requested^{commit}").Trim().ToLowerInvariant()
+          $checkedOut = (git rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($resolved -ne $requested -or $checkedOut -ne $requested) {
+            throw "EXACT_SHA_GUARD_FAILED: requested=$requested resolved=$resolved checked_out=$checkedOut"
+          }
+          "EXACT_SHA_GUARD: PASS ($checkedOut)"
+
+      - name: Checkout canonical Tethers source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: matthewjameswatkins1978-cyber/tethers-lang
+          ref: 7e29110319c554a6586865ec6c47a45498696d16
+          path: tethers-canonical
+
+      - name: Verify canonical Tethers SHA
+        shell: pwsh
+        run: |
+          $sha = (git -C tethers-canonical rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($sha -ne '7e29110319c554a6586865ec6c47a45498696d16') {
+            throw "TETHERS_SHA_GUARD_FAILED: $sha"
+          }
+          "OMEN_H2_TETHERS_SHA=$sha" >> $env:GITHUB_ENV
+          "TETHERS_SHA_GUARD: PASS ($sha)"
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup default 1.98.1
+
+      - name: Restore Rust cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            tethers-canonical/tethers-0.1/host-rust/target
+          key: rust-h2-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-h2-${{ runner.os }}-
+
+      - name: Build canonical Tethers Gate
+        run: cargo build --release --manifest-path tethers-canonical/tethers-0.1/host-rust/Cargo.toml -p tethers-reference-host
+
+      - name: Setup OCaml
+        uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: 5.5.0
+          dune-cache: true
+
+      - name: Build canonical Tethers engine
+        shell: bash
+        run: |
+          cd tethers-canonical/tethers-0.1/engine-ocaml
+          opam install . --deps-only --with-test=false -y
+          opam exec -- dune build @all
+
+      - name: Wire canonical Gate environment
+        shell: pwsh
+        run: |
+          $ext = if ($IsWindows) { '.exe' } else { '' }
+          $gate = Join-Path (Get-Location) "tethers-canonical/tethers-0.1/host-rust/target/release/tethers$ext"
+          $engine = Join-Path (Get-Location) "tethers-canonical/tethers-0.1/engine-ocaml/_build/default/bin/tethers_mcp_main$ext"
+          if (-not (Test-Path $gate)) { throw "gate binary missing: $gate" }
+          if (-not (Test-Path $engine)) { throw "engine binary missing: $engine" }
+          "OMEN_H2_GATE_EXE=$gate" >> $env:GITHUB_ENV
+          "OMEN_H2_ENGINE_EXE=$engine" >> $env:GITHUB_ENV
+          "OMEN_H2_TETHERS_SRC=$((Get-Location).Path)/tethers-canonical" >> $env:GITHUB_ENV
+
+      - name: Run Omen authority proofs (matrix + supervision + fetch + live E2E)
+        run: cargo test -p omen-authority --all-targets
