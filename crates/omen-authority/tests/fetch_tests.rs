@@ -319,3 +319,27 @@ fn fetch_refuses_wrong_tag() {
         .expect_err("wrong tag must refuse");
     assert!(format!("{err:?}").contains("tag_missing"), "got: {err:?}");
 }
+
+#[test]
+fn fetch_commit_failure_installs_nothing_verifiable() {
+    let fx = Fixture::new();
+    let zip = fx.zip_bytes(&[], &[]);
+    let t = FakeTransport {
+        tag: "v0.9.0-preview.22".to_string(),
+        manifest_json: fx.manifest(&sha(&zip)),
+        zip_bytes: zip,
+        zip_digest_override: None,
+        fail_download: false,
+    };
+    // Trap the live dir under a regular file: download + verify succeed,
+    // but the commit cannot proceed. Nothing verifiable may remain.
+    let blocker = fx.dir.path().join("blocker");
+    std::fs::write(&blocker, b"not-a-dir").unwrap();
+    let trapped = blocker.join("live");
+    let err = fetch_companion(&t, "v0.9.0-preview.22", &trapped, &work_dir(&fx))
+        .expect_err("trapped commit must fail");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("companion.install"), "got: {msg}");
+    assert!(!trapped.join("tethers-gate.exe").is_file());
+    assert!(omen_authority::resolve_companion(&trapped).is_err());
+}
