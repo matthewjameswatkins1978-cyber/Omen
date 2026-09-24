@@ -72,7 +72,7 @@ pub use merge::{MergedCandidate, SupportingEvidence, merge_by_semantic};
 pub use outcome::{DeclineReason, PartialReason, ProviderError, ProviderOutcome};
 pub use provider::{Determinism, DiscoveryProvider, FreshnessPolicy, ProviderId, TriggerDecision};
 pub use rank::LensRanker;
-pub use registry::{DiscoveryResult, ProviderRegistry};
+pub use registry::{DeferredWork, DiscoveryResult, ProviderRegistry};
 pub use scheduler::{Scheduler, WorkResult, WorkStatus};
 pub use telemetry::{Phase, Telemetry, TelemetryEvent};
 

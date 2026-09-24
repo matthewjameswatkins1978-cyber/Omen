@@ -89,6 +89,13 @@ impl Authority {
 /// not be demoted below an unrelated tool-native option simply because their
 /// authority classes differ; they are different semantic objects and are
 /// ordered by match quality and context, not by this function.
+///
+/// Ordering: ToolNative > InstalledSpec > HelpHarvest > OmenFact >
+/// Filesystem = Static > Environment. `Static` (bare compile-time syntax
+/// lists) sits **below** Omen's owned fact/spec authority so that, for the
+/// same semantic candidate, an owned spec's real description becomes the
+/// primary description instead of losing a strength tie to a generic
+/// `"tool subcommand"` placeholder.
 pub fn validity_evidence_strength(authority: &Authority) -> u8 {
     match authority {
         Authority::ToolNative { .. } => 6,
@@ -96,8 +103,8 @@ pub fn validity_evidence_strength(authority: &Authority) -> u8 {
         Authority::HelpHarvest { .. } => 4,
         Authority::OmenFact { .. } => 3,
         Authority::Filesystem { .. } => 2,
+        Authority::Static => 2,
         Authority::Environment { .. } => 1,
-        Authority::Static => 3,
     }
 }
 
@@ -117,6 +124,20 @@ mod tests {
             harvested_at_unix: 0,
         };
         assert!(validity_evidence_strength(&native) > validity_evidence_strength(&harvest));
+    }
+
+    #[test]
+    fn owned_fact_evidence_outranks_bare_syntax_lists() {
+        // Flow B rationale: `cargo test` is observed by the owned tool spec
+        // (OmenFact, real description) and by the static syntax list (Static,
+        // generic description). The owned spec must win the primary slot so
+        // its description is the merged description.
+        assert!(
+            validity_evidence_strength(&Authority::OmenFact {
+                fact_id: "omen-spec:cargo".into()
+            }) > validity_evidence_strength(&Authority::Static),
+            "a strength tie would let generic syntax prose beat an owned spec"
+        );
     }
 
     #[test]

@@ -298,9 +298,15 @@ pub fn run_help_harvest(tool: &str) -> Result<String, ProviderError> {
 }
 
 /// Cached harvest store, keyed by executable identity.
+///
+/// Two maps with one job each: [`DiscoveryCache`] tracks identity binding and
+/// freshness (a changed digest misses the key entirely), while the options map
+/// stores the actual harvested payload so the cache path really serves results
+/// instead of an empty stand-in.
 #[derive(Debug, Clone, Default)]
 pub struct HelpHarvestCache {
-    cache: DiscoveryCache,
+    freshness: DiscoveryCache,
+    options: Arc<Mutex<std::collections::HashMap<CacheKey, Vec<HarvestedOption>>>>,
     /// External identity resolver (path/digest/version), injected.
     identity: Arc<Mutex<Option<ToolIdentity>>>,
 }
@@ -345,28 +351,28 @@ impl HelpHarvestCache {
 
     pub fn get(&self, tool: &str) -> Option<Vec<HarvestedOption>> {
         let key = self.cache_key(tool)?;
-        let entry = self.cache.get(&key)?;
-        serde_json::from_slice::<Vec<HarvestedOption>>(
-            // Candidates are stored as their harvested option records.
-            &serde_json::to_vec(&entry.provenances).unwrap_or_default(),
-        )
-        .ok()
-        .or_else(|| Some(vec![]))
+        // Identity/freshness gate: expired or absent entries miss, so a
+        // changed executable never reuses old truth.
+        self.freshness.get(&key)?;
+        self.options.lock().ok()?.get(&key).cloned()
     }
 
     pub fn put(&self, tool: &str, options: Vec<HarvestedOption>) {
         if let Some(key) = self.cache_key(tool) {
-            let payload = serde_json::to_vec(&options).unwrap_or_default();
-            let _ = payload;
-            // Store as empty provenance list with freshness; the harvested
-            // options are re-derived deterministically from the cached text.
-            self.cache.put(key, Vec::new(), Vec::new(), now_unix());
+            self.freshness
+                .put(key.clone(), Vec::new(), Vec::new(), now_unix());
+            if let Ok(mut m) = self.options.lock() {
+                m.insert(key, options);
+            }
         }
     }
 
     pub fn invalidate(&self, tool: &str) {
         if let Some(key) = self.cache_key(tool) {
-            self.cache.invalidate(&key);
+            self.freshness.invalidate(&key);
+            if let Ok(mut m) = self.options.lock() {
+                m.remove(&key);
+            }
         }
     }
 }
@@ -473,7 +479,13 @@ impl DiscoveryProvider for HelpHarvestProvider {
                     Ok(text) => {
                         let opts = parse_help_options(&text, MAX_HARVEST_CANDIDATES);
                         if opts.is_empty() {
-                            // Malformed / unparseable help: decline, never guess.
+                            // Malformed / unparseable help: decline, never
+                            // guess — and remember the decline so the cache
+                            // path does not respawn the tool on every request.
+                            if let Ok(mut m) = self.memo.lock() {
+                                m.insert(tool.clone(), Vec::new());
+                            }
+                            self.cache.put(&tool, Vec::new());
                             return ProviderOutcome::Declined {
                                 reason: DeclineReason::NoMatch,
                             };
@@ -659,6 +671,43 @@ These are common Git commands used in various situations:
             cache.get("git").is_none(),
             "changed digest invalidates harvest cache"
         );
+    }
+
+    #[test]
+    fn harvest_cache_path_actually_serves_stored_options() {
+        // The cache path must return the stored harvest, not an empty
+        // stand-in; otherwise a "cache hit" would silently decline forever.
+        let cache = HelpHarvestCache::new();
+        cache.set_identity(ToolIdentity {
+            path: "/usr/bin/git".into(),
+            digest: Some("aaa".into()),
+            version: Some("2.0".into()),
+            platform: "linux".into(),
+            locale: "C".into(),
+        });
+        assert!(cache.get("git").is_none(), "cold cache misses");
+        cache.put(
+            "git",
+            vec![HarvestedOption {
+                long: Some("verbose".into()),
+                short: Some("v".into()),
+                description: Some("be more verbose".into()),
+            }],
+        );
+        let got = cache.get("git").expect("warm cache must serve");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].long.as_deref(), Some("verbose"));
+        // Restoring the original identity serves again; identity still binds.
+        cache.set_identity(ToolIdentity {
+            path: "/usr/bin/git".into(),
+            digest: Some("aaa".into()),
+            version: Some("2.0".into()),
+            platform: "linux".into(),
+            locale: "C".into(),
+        });
+        assert!(cache.get("git").is_some());
+        cache.invalidate("git");
+        assert!(cache.get("git").is_none(), "explicit invalidation misses");
     }
 
     #[test]

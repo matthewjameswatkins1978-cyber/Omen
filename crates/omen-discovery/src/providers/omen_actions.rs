@@ -173,6 +173,8 @@ mod tests {
             shell_intrinsics: &["cd", "exit", "quit"],
             tool_subcommands: |_| &[],
             is_drive_designator: |_| None,
+            typed_handles: &[],
+            action_reference_handles: |_| &[],
         })
     }
 

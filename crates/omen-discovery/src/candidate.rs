@@ -294,9 +294,18 @@ pub struct RankScore(pub f32);
 pub struct PresentationSlot(pub usize);
 
 /// Ranker-owned presentation state.
+///
+/// The complete evidence set survives to this final stage: `matched` carries
+/// the primary (strongest validity evidence) observation and `supporting`
+/// carries every corroborating provenance observed for the same
+/// [`SemanticKey`](crate::identity::SemanticKey) — so the human projection,
+/// the machine projection and telemetry can all inspect why this candidate is
+/// believed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RankedCandidate {
     pub matched: MatchedCandidate,
+    /// Corroborating provenance preserved through merge, match and rank.
+    pub supporting: Vec<crate::merge::SupportingEvidence>,
     pub rank_score: RankScore,
     pub signals: SignalBreakdown,
     pub slot: PresentationSlot,
@@ -321,6 +330,20 @@ impl RankedCandidate {
 
     pub fn stability(&self) -> StabilityKey {
         StabilityKey(self.signals.stability)
+    }
+
+    /// Every provenance that believes this semantic candidate: the primary
+    /// first, then the supporting evidence in strength order.
+    pub fn all_provenances(&self) -> Vec<&ProvenanceKey> {
+        let mut out = Vec::with_capacity(1 + self.supporting.len());
+        out.push(&self.matched.discovered.provenance);
+        out.extend(self.supporting.iter().map(|s| &s.provenance));
+        out
+    }
+
+    /// Whether more than one provider observed this semantic candidate.
+    pub fn has_supporting_evidence(&self) -> bool {
+        !self.supporting.is_empty()
     }
 }
 
@@ -372,6 +395,7 @@ mod tests {
         let m = MatchedCandidate::new(d, MatchQuality::Prefix, vec![0, 1]);
         let r = RankedCandidate {
             matched: m,
+            supporting: vec![],
             rank_score: RankScore(1.0),
             signals: SignalBreakdown {
                 match_quality: MatchQuality::Prefix,
@@ -384,6 +408,51 @@ mod tests {
         };
         assert_eq!(r.span(), span);
         assert_eq!(r.matched.match_quality, MatchQuality::Prefix);
+        assert!(!r.has_supporting_evidence());
+        assert_eq!(r.all_provenances().len(), 1);
+    }
+
+    #[test]
+    fn supporting_evidence_survives_to_ranked_state() {
+        use crate::authority::{Authority, AuthorityClass};
+        use crate::identity::{EvidenceIdentity, ProvenanceKey};
+        use crate::merge::SupportingEvidence;
+
+        let primary = discovered();
+        let provenance = ProvenanceKey::new(
+            "tool-options",
+            AuthorityClass::ToolNative,
+            EvidenceIdentity::Static,
+        );
+        let authority = Authority::ToolNative {
+            tool: "git".into(),
+            spec_version: None,
+        };
+        let r = RankedCandidate {
+            matched: MatchedCandidate::new(primary, MatchQuality::Exact, vec![]),
+            supporting: vec![SupportingEvidence {
+                provenance: provenance.clone(),
+                authority,
+                description: None,
+            }],
+            rank_score: RankScore(1.0),
+            signals: SignalBreakdown {
+                match_quality: MatchQuality::Exact,
+                context_relevance: 1.0,
+                semantic_order: None,
+                safety_adjustment: 0.0,
+                stability: 0,
+            },
+            slot: PresentationSlot(0),
+        };
+        assert!(r.has_supporting_evidence());
+        let provs = r.all_provenances();
+        assert_eq!(provs.len(), 2);
+        assert_eq!(provs[1], &provenance, "supporting provenance inspectable");
+        // Machine projection must carry it too.
+        let json = serde_json::to_string(&r).unwrap();
+        let back: RankedCandidate = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.supporting, r.supporting);
     }
 
     #[test]

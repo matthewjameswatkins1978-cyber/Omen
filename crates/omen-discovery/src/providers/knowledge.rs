@@ -18,6 +18,12 @@ pub struct OmenKnowledge {
     pub tool_subcommands: fn(&str) -> &'static [&'static str],
     /// Bare Windows drive designator detection (`D:`).
     pub is_drive_designator: fn(&str) -> Option<char>,
+    /// Authoritative typed-reference handles (`@last`, `@failed`, ...).
+    /// From `grammar::TypedReference::STATIC_HANDLES`.
+    pub typed_handles: &'static [&'static str],
+    /// Typed references offered inside a specific `:action`'s arguments
+    /// (`:rerun <Tab>` -> `@last`, ...). Empty for free-form actions.
+    pub action_reference_handles: fn(&str) -> &'static [&'static str],
 }
 
 impl OmenKnowledge {
@@ -29,6 +35,8 @@ impl OmenKnowledge {
             shell_intrinsics: &[],
             tool_subcommands: |_| &[],
             is_drive_designator: |_| None,
+            typed_handles: &[],
+            action_reference_handles: |_| &[],
         }
     }
 }
