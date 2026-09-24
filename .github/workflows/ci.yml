@@ -377,3 +377,15 @@ jobs:
 
       - name: Run Omen authority proofs (matrix + supervision + fetch + live E2E)
         run: cargo test -p omen-authority --all-targets
+
+      - name: Windows seam-characterisation note
+        # Preview-23 documented exclusion (Lucy ruling): on hosted Windows
+        # the canonical Gate deterministically refuses with the Tethers
+        # owner seam (GATE_REPLAY_UNAVAILABLE). GREEN on this job means the
+        # exact seam was characterised and Omen proved fail-closed
+        # (e2e_windows_owner_seam_characterised) — NOT live-authority proof.
+        # Ubuntu owns the positive live-Gate proof. This step changes no
+        # authority semantics; it states the job's acceptance meaning.
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: 'echo "H2 Windows Gate expectation: EXACT-SEAM characterisation (Tethers owner seam, fail-closed) — NOT live-authority proof (see e2e_windows_owner_seam_characterised)."'
