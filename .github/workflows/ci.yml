@@ -179,7 +179,8 @@ jobs:
           OMEN_REQUIRE_SEMANTIC_EXTERNAL_PROOFS: "1"
         run: cargo test -p omen-cli --test semantic_environment_proofs test_proof_c_real_lsp_symbol_definition_and_references -- --exact --nocapture
 
-  windows-preview-candidate:    needs: check-and-lint
+  windows-preview-candidate:
+    needs: check-and-lint
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
