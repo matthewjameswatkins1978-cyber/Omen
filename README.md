@@ -65,6 +65,7 @@ Omen gives humans and AI the same workspace through different interfaces, while 
 
 See [Using Omen](docs/USING_OMEN.md) for a walkthrough of daily shell workflows and what actually happens when you open it.
 See [Road to 1.0](docs/ROAD_TO_1_0.md) and [Roadmap](docs/ROADMAP.md) for full architectural specifications.
+See [Licensing and Open-Source Reuse Policy](docs/LICENSING_AND_REUSE.md) for the current licensing direction and dependency/reuse rules. The final Omen project licence has not yet been selected; MPL-2.0 is the current leading candidate.
 
 ## Getting Started
 
