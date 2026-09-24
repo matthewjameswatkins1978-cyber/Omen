@@ -188,6 +188,7 @@ impl Workspace {
                 out
             }
         }
+        #[cfg(windows)]
         fn run(prog: &str, args: &[&str]) -> String {
             match std::process::Command::new(prog).args(args).output() {
                 Ok(o) => {
