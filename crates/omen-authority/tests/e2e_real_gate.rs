@@ -204,18 +204,30 @@ impl Workspace {
 }
 
 fn marker_fixture(dir: &Path) -> PathBuf {
-    let src = dir.join("marker_fixture.rs");
-    std::fs::write(&src, MARKER_RS).unwrap();
-    let exe = dir.join("marker-fixture.exe");
-    let out = std::process::Command::new("rustc")
-        .arg("--edition=2021")
-        .arg(&src)
-        .arg("-o")
-        .arg(&exe)
-        .output()
-        .expect("rustc builds marker fixture");
-    assert!(out.status.success(), "marker build failed");
-    exe
+    // Compiled ONCE per test binary (leaked tempdir): six parallel
+    // rustc invocations would otherwise spike CI runner load and
+    // starve timing-sensitive suites running alongside. The exe is
+    // shared; only marker PATHS differ per test.
+    let _ = dir;
+    static COMPILED: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    COMPILED
+        .get_or_init(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let src = dir.path().join("marker_fixture.rs");
+            std::fs::write(&src, MARKER_RS).unwrap();
+            let exe = dir.path().join("marker-fixture.exe");
+            let out = std::process::Command::new("rustc")
+                .arg("--edition=2021")
+                .arg(&src)
+                .arg("-o")
+                .arg(&exe)
+                .output()
+                .expect("rustc builds marker fixture");
+            assert!(out.status.success(), "marker build failed");
+            let kept = dir.keep();
+            kept.join("marker-fixture.exe")
+        })
+        .clone()
 }
 
 fn intent_for(

@@ -310,7 +310,11 @@ jobs:
           restore-keys: rust-h2-${{ runner.os }}-
 
       - name: Build canonical Tethers Gate
-        run: cargo build --release --manifest-path tethers-canonical/tethers-0.1/host-rust/Cargo.toml -p tethers-reference-host
+        # CWD inside the Tethers checkout: cargo walks UP from CWD for
+        # workspace membership, and --manifest-path alone would attach
+        # the build to the Omen workspace instead.
+        working-directory: tethers-canonical/tethers-0.1/host-rust
+        run: cargo build --release -p tethers-reference-host
 
       - name: Setup OCaml
         uses: ocaml/setup-ocaml@v3
