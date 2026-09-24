@@ -17,6 +17,7 @@ omen-core = { workspace = true }
 omen-knowledge = { workspace = true }
 omen-ui = { workspace = true }
 omen-interactive = { workspace = true }
+omen-lifecycle = { workspace = true }
 clap = { workspace = true }
 schemars = { workspace = true }
 serde_json = { workspace = true }

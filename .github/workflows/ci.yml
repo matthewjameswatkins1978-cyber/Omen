@@ -250,4 +250,5 @@ jobs:
           name: omen-preview-candidate-windows-x86_64
           path: |
             work/omen-*-windows-x86_64.zip
+            work/omen-release.json
             work/provenance.json

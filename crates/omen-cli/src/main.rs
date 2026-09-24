@@ -76,6 +76,24 @@ enum Commands {
     Artifact(ArtifactArgs),
     /// Ephemeral storage garbage collection
     Gc(GcArgs),
+    /// Remove definitely disposable debris (conservative; --plan previews)
+    Clean(CleanArgs),
+    /// Inspect without repairing; propose explicit repair plan
+    Repair(RepairArgs),
+    /// Check for updates or apply an Omen-owned update transaction
+    Update(UpdateArgs),
+    /// Roll back to the previous healthy slot (binary) or a snapshot (state)
+    Rollback(RollbackArgs),
+    /// Show or set the user release channel (stable|preview)
+    Channel(ChannelArgs),
+    /// Optional first-run setup (idempotent; never required for install)
+    Setup,
+    /// Remove Omen application bytes with explicit retention classes
+    Uninstall(UninstallArgs),
+    /// Write a redacted diagnostic bundle for support
+    Diagnostics,
+    /// Pin evidence identities against retention collection
+    Pin(PinArgs),
     /// Manage Omen shared runtime daemon
     Daemon(DaemonArgs),
     /// Model Context Protocol (MCP) server over stdio
@@ -503,7 +521,75 @@ struct GcArgs {
     /// Dry run without deleting artifacts
     #[arg(long)]
     dry_run: bool,
+    /// Print the retention GC plan (workspace CAS evidence) instead of running legacy GC
+    #[arg(long)]
+    plan: bool,
+    /// Apply a saved retention GC plan with live revalidation
+    #[arg(long)]
+    apply: bool,
+    /// Plan file for --apply (from `omen gc --plan`)
+    #[arg(long)]
+    plan_file: Option<PathBuf>,
 }
+
+#[derive(Args, Debug)]
+struct CleanArgs {
+    /// Print the plan without removing anything
+    #[arg(long)]
+    plan: bool,
+}
+
+#[derive(Args, Debug)]
+struct RepairArgs {
+    /// Apply the proposed repairs (default previews only)
+    #[arg(long)]
+    apply: bool,
+}
+
+#[derive(Args, Debug)]
+struct UpdateArgs {
+    /// Read-only check: report current/channel/ownership/candidate
+    #[arg(long)]
+    check: bool,
+}
+
+#[derive(Args, Debug)]
+struct ChannelArgs {
+    /// Set channel: stable|preview (omit to show current)
+    set: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct RollbackArgs {
+    /// Roll back application bytes to the previous healthy slot
+    #[arg(long)]
+    binary: bool,
+    /// Roll back state from a snapshot id (see update transactions)
+    #[arg(long)]
+    state: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct UninstallArgs {
+    /// Retention scope: app|app-cache|everything (default app)
+    #[arg(long, default_value = "app")]
+    scope: String,
+    /// Apply removal (default previews only)
+    #[arg(long)]
+    apply: bool,
+}
+
+#[derive(Args, Debug)]
+struct PinArgs {
+    /// Pin a canonical identity (digest:|slot:|fact:|receipt:)
+    #[arg(long)]
+    add: Option<String>,
+    /// Release a pin
+    #[arg(long)]
+    remove: Option<String>,
+}
+
+mod lifecycle_cmds;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -626,7 +712,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let installed = installed_preview_identity();
             let duplicates = other_omen_executables_on_path(executable.as_deref());
             if json_mode {
-                let doc = serde_json::json!({
+                let mut doc = serde_json::json!({
                     "status": "ok",
                     "version": env!("CARGO_PKG_VERSION"),
                     "git_sha": env!("OMEN_GIT_SHA"),
@@ -643,6 +729,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "descendants": format!("{:?}", backend_caps.descendants),
                     }
                 });
+                // H lifecycle findings: observational, stable machine shape.
+                let lc = lifecycle_cmds::lifecycle_doctor_report();
+                doc["lifecycle"] = serde_json::to_value(&lc).unwrap_or(serde_json::Value::Null);
                 println!("{}", serde_json::to_string_pretty(&doc)?);
             } else {
                 println!("Omen {}: OK", env!("CARGO_PKG_VERSION"));
@@ -664,6 +753,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     for other in &duplicates {
                         println!("  - {other}");
                     }
+                }
+                // H lifecycle findings (observational; doctor never repairs).
+                let lc = lifecycle_cmds::lifecycle_doctor_report();
+                println!(
+                    "Lifecycle: ownership={:?} channel={:?} verdict={:?}",
+                    lc.ownership,
+                    lc.channel,
+                    lc.worst()
+                );
+                for finding in lc
+                    .findings
+                    .iter()
+                    .filter(|f| !matches!(f.status, omen_lifecycle::doctor::Status::Ok))
+                {
+                    println!(
+                        "  [{:?}] {}: {}",
+                        finding.status, finding.id, finding.summary
+                    );
                 }
             }
         }
@@ -1535,6 +1642,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         },
         Some(Commands::Gc(gc_args)) => {
+            // Retention GC plan/apply is the H product path; the legacy
+            // workspace CAS gc remains the default for compatibility.
+            if gc_args.plan {
+                lifecycle_cmds::cmd_gc_plan(json_mode)?;
+                return Ok(());
+            }
+            if gc_args.apply {
+                let Some(plan_file) = gc_args.plan_file.as_deref() else {
+                    eprintln!("omen gc --apply requires --plan-file <path> from `omen gc --plan`");
+                    std::process::exit(2);
+                };
+                lifecycle_cmds::cmd_gc_apply(plan_file, json_mode)?;
+                return Ok(());
+            }
             let mut db = Database::open(&db_path)?;
             let cas = ContentAddressedStore::new(cas_dir);
             let report = cas.gc(&mut db, gc_args.dry_run)?;
@@ -1545,6 +1666,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("  Reclaimed count: {}", report.reclaimed_count);
                 println!("  Reclaimed bytes: {}", report.reclaimed_bytes);
             }
+        }
+        Some(Commands::Clean(args)) => {
+            lifecycle_cmds::cmd_clean(args.plan, json_mode)?;
+        }
+        Some(Commands::Repair(args)) => {
+            lifecycle_cmds::cmd_repair(args.apply, json_mode)?;
+        }
+        Some(Commands::Update(args)) => {
+            if args.check {
+                lifecycle_cmds::cmd_update_check(json_mode)?;
+            } else {
+                lifecycle_cmds::cmd_update_apply(json_mode)?;
+            }
+        }
+        Some(Commands::Channel(args)) => {
+            lifecycle_cmds::cmd_channel(args.set, json_mode)?;
+        }
+        Some(Commands::Rollback(args)) => {
+            lifecycle_cmds::cmd_rollback(args.binary, args.state, json_mode)?;
+        }
+        Some(Commands::Setup) => {
+            lifecycle_cmds::cmd_setup(json_mode)?;
+        }
+        Some(Commands::Uninstall(args)) => {
+            lifecycle_cmds::cmd_uninstall(args.scope, args.apply, json_mode)?;
+        }
+        Some(Commands::Diagnostics) => {
+            lifecycle_cmds::cmd_diagnostics(json_mode)?;
+        }
+        Some(Commands::Pin(args)) => {
+            lifecycle_cmds::cmd_pin(args.add, args.remove, json_mode)?;
         }
         Some(Commands::Daemon(daemon_args)) => match daemon_args.subcommand {
             DaemonSubcommands::Start { foreground } => {

@@ -9,13 +9,10 @@ impl SemanticBlock {
         if !caps.has_osc7 {
             return String::new();
         }
-        let normalized = path.to_string_lossy().replace('\\', "/");
-        let path_part = if normalized.starts_with('/') {
-            normalized
-        } else {
-            format!("/{normalized}")
-        };
-        format!("\x1b]7;file://localhost{path_part}\x1b\\")
+        let uri = crate::humanize::path_to_file_uri(path);
+        // path_to_file_uri returns `file://localhost/...`; OSC 7 wants the
+        // full URI after the `]7;` introducer.
+        format!("\x1b]7;{uri}\x1b\\")
     }
 
     /// Generates OSC 8 hyperlink sequence if supported, else returns raw text.
@@ -60,8 +57,9 @@ impl SemanticBlock {
 
     /// Convenience helper to wrap a local file in an OSC 8 link.
     pub fn link_file(path: &Path, label: Option<&str>, caps: &TerminalCapabilities) -> String {
-        let display = label.unwrap_or_else(|| path.to_str().unwrap_or(""));
-        let url = format!("file://{}", path.display());
+        let human = crate::humanize::humanize_path(path);
+        let display = label.unwrap_or(&human);
+        let url = crate::humanize::path_to_file_uri(path);
         Self::osc8_link(&url, display, caps)
     }
 

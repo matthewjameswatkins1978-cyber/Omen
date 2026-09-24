@@ -4,8 +4,8 @@ use omen_core::{CoreError, InteractiveSessionId, ProcessExit, RequiredAssurance,
 use omen_engine::{ExecutionRequest, ProcessSupervisor};
 use omen_knowledge::Database;
 use omen_ui::{HumanSettings, TerminalCapabilities};
-use reedline::{DefaultValidator, MenuBuilder, Reedline, Signal};
-use std::path::PathBuf;
+use reedline::Signal;
+use std::path::{Path, PathBuf};
 
 pub struct InteractiveSession {
     pub session_id: InteractiveSessionId,
@@ -225,26 +225,7 @@ impl InteractiveSession {
         let completer = std::sync::Arc::new(std::sync::Mutex::new(
             crate::completion::OmenCompleter::new(self.comp_ctx.clone()),
         ));
-        let hinter = Box::new(crate::completion::OmenHinter::new(completer.clone()));
-        let completion_menu =
-            Box::new(reedline::ColumnarMenu::default().with_name("completion_menu"));
-
-        struct CompleterAdapter(std::sync::Arc<std::sync::Mutex<crate::completion::OmenCompleter>>);
-        impl reedline::Completer for CompleterAdapter {
-            fn complete(&mut self, line: &str, pos: usize) -> reedline::CompletionResult {
-                if let Ok(mut c) = self.0.lock() {
-                    c.complete(line, pos)
-                } else {
-                    reedline::CompletionResult::fresh(Vec::new())
-                }
-            }
-        }
-
-        let mut line_editor = Reedline::create()
-            .with_validator(Box::new(DefaultValidator))
-            .with_completer(Box::new(CompleterAdapter(completer)))
-            .with_hinter(hinter)
-            .with_menu(reedline::ReedlineMenu::EngineCompleter(completion_menu));
+        let mut line_editor = crate::interaction::create_line_editor(completer);
 
         loop {
             self.update_prompt_state();
@@ -460,39 +441,26 @@ impl InteractiveSession {
                     self.db.as_ref(),
                 );
 
+                // Windows drive navigation: bare `X:` designator is navigation
+                // grammar and must NEVER reach process spawn.
+                #[cfg(windows)]
+                if resolved_argv.len() == 1
+                    && let Some(drive) = crate::commands::is_drive_designator(&resolved_argv[0])
+                {
+                    let target = PathBuf::from(format!("{drive}:\\"));
+                    return self.navigate_to(target, &format!("{drive}:"));
+                }
+
                 // Built-in shell navigation: cd modifies session.cwd while preserving workspace_root
                 if resolved_argv.first().map(|s| s.as_str()) == Some("cd") {
                     debug_assert!(crate::commands::is_shell_intrinsic("cd"));
                     let target_path = if let Some(target) = resolved_argv.get(1) {
-                        let p = std::path::PathBuf::from(target);
-                        if p.is_absolute() { p } else { self.cwd.join(p) }
+                        resolve_cd_target(&self.cwd, target)
                     } else {
                         self.workspace_root.clone()
                     };
 
-                    if target_path.is_dir() {
-                        self.cwd = target_path.canonicalize().unwrap_or(target_path);
-                        if let Ok(mut ctx) = self.comp_ctx.lock() {
-                            ctx.cwd = self.cwd.clone();
-                            ctx.hot_index.refresh(&self.cwd, self.db.as_ref());
-                        }
-                        let exit = ProcessExit {
-                            code: Some(0),
-                            signal: None,
-                        };
-                        self.last_exit = Some(exit.clone());
-                        self.update_prompt_state();
-                        return Ok(exit);
-                    } else {
-                        eprintln!("cd: {}: No such file or directory", target_path.display());
-                        let exit = ProcessExit {
-                            code: Some(1),
-                            signal: None,
-                        };
-                        self.last_exit = Some(exit.clone());
-                        self.update_prompt_state();
-                        return Ok(exit);
-                    }
+                    return self.navigate_to(target_path, "cd");
                 }
 
                 // Blast-Radius Preflight assessment
@@ -697,6 +665,36 @@ impl InteractiveSession {
 
                 Ok(output.process_exit)
             }
+        }
+    }
+
+    /// Navigates the session cwd to `target`, updating all dependent state.
+    ///
+    /// Used by `cd`, bare drive designators (`D:`), and any future navigation
+    /// grammar.  Exactly one place owns the navigation side-effects.
+    fn navigate_to(&mut self, target: PathBuf, label: &str) -> Result<ProcessExit, CoreError> {
+        if target.is_dir() {
+            self.cwd = target.canonicalize().unwrap_or(target);
+            if let Ok(mut ctx) = self.comp_ctx.lock() {
+                ctx.cwd = self.cwd.clone();
+                ctx.hot_index.refresh(&self.cwd, self.db.as_ref());
+            }
+            let exit = ProcessExit {
+                code: Some(0),
+                signal: None,
+            };
+            self.last_exit = Some(exit.clone());
+            self.update_prompt_state();
+            Ok(exit)
+        } else {
+            eprintln!("{label}: {}: No such file or directory", target.display());
+            let exit = ProcessExit {
+                code: Some(1),
+                signal: None,
+            };
+            self.last_exit = Some(exit.clone());
+            self.update_prompt_state();
+            Ok(exit)
         }
     }
 
@@ -1043,4 +1041,22 @@ impl InteractiveSession {
         self.update_prompt_state();
         Ok(output.process_exit)
     }
+}
+
+/// Resolves a `cd` target argument to an absolute path.
+///
+/// Handles bare Windows drive designators (`D:`) as navigation grammar.
+/// Absolute paths (`D:\`, `D:\foo`) resolve normally via `Path::is_absolute`.
+///
+/// Drive-relative paths (`D:foo`) are **outside M0** — Omen has no per-drive
+/// cwd model and must not silently redefine their meaning.  They fall through
+/// to ordinary relative resolution against `cwd` and will typically produce
+/// "no such file or directory".
+fn resolve_cd_target(cwd: &Path, target: &str) -> PathBuf {
+    #[cfg(windows)]
+    if let Some(drive) = crate::commands::is_drive_designator(target) {
+        return PathBuf::from(format!("{drive}:\\"));
+    }
+    let p = PathBuf::from(target);
+    if p.is_absolute() { p } else { cwd.join(p) }
 }

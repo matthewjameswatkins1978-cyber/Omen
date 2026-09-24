@@ -4,6 +4,7 @@ pub mod appearance;
 pub mod blocks;
 pub mod color;
 pub mod diagnostics;
+pub mod humanize;
 pub mod prompt;
 pub mod terminal;
 

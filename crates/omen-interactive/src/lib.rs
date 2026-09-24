@@ -6,6 +6,7 @@ pub mod child;
 pub mod commands;
 pub mod completion;
 pub mod grammar;
+pub mod interaction;
 pub mod preflight;
 pub mod prompt_adapter;
 pub mod resolver;
