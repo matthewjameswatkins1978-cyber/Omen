@@ -146,7 +146,10 @@ fn test_fact_aware_ranking_elevates_dirty_facts() {
 fn test_hinter_provides_inline_suggestion() {
     let ctx = Arc::new(Mutex::new(CompletionContext::default()));
     let completer = Arc::new(Mutex::new(OmenCompleter::new(ctx)));
-    let mut hinter = OmenHinter::new(completer);
+    let mut hinter = OmenHinter::new(
+        completer,
+        omen_interactive::interaction::new_candidate_count(),
+    );
 
     let hist_dir = tempdir().unwrap();
     let hist_file = hist_dir.path().join("history.txt");

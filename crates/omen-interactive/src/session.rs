@@ -225,8 +225,7 @@ impl InteractiveSession {
         let completer = std::sync::Arc::new(std::sync::Mutex::new(
             crate::completion::OmenCompleter::new(self.comp_ctx.clone()),
         ));
-        let mut line_editor =
-            crate::interaction::create_line_editor(completer);
+        let mut line_editor = crate::interaction::create_line_editor(completer);
 
         loop {
             self.update_prompt_state();
@@ -446,8 +445,7 @@ impl InteractiveSession {
                 // grammar and must NEVER reach process spawn.
                 #[cfg(windows)]
                 if resolved_argv.len() == 1
-                    && let Some(drive) =
-                        crate::commands::is_drive_designator(&resolved_argv[0])
+                    && let Some(drive) = crate::commands::is_drive_designator(&resolved_argv[0])
                 {
                     let target = PathBuf::from(format!("{drive}:\\"));
                     return self.navigate_to(target, &format!("{drive}:"));
@@ -1047,29 +1045,18 @@ impl InteractiveSession {
 
 /// Resolves a `cd` target argument to an absolute path.
 ///
-/// Handles Windows drive designators (`D:`, `D:\`, `D:path`) as navigation
-/// grammar before falling through to ordinary absolute/relative resolution.
+/// Handles bare Windows drive designators (`D:`) as navigation grammar.
+/// Absolute paths (`D:\`, `D:\foo`) resolve normally via `Path::is_absolute`.
+///
+/// Drive-relative paths (`D:foo`) are **outside M0** — Omen has no per-drive
+/// cwd model and must not silently redefine their meaning.  They fall through
+/// to ordinary relative resolution against `cwd` and will typically produce
+/// "no such file or directory".
 fn resolve_cd_target(cwd: &Path, target: &str) -> PathBuf {
     #[cfg(windows)]
-    {
-        if let Some(drive) = crate::commands::is_drive_designator(target) {
-            return PathBuf::from(format!("{drive}:\\"));
-        }
-        if crate::commands::is_drive_path(target) {
-            let drive = target.chars().next().unwrap().to_ascii_uppercase();
-            let rest = &target[2..];
-            let rest = rest.trim_start_matches(['\\', '/']);
-            return if rest.is_empty() {
-                PathBuf::from(format!("{drive}:\\"))
-            } else {
-                PathBuf::from(format!("{drive}:\\{rest}"))
-            };
-        }
+    if let Some(drive) = crate::commands::is_drive_designator(target) {
+        return PathBuf::from(format!("{drive}:\\"));
     }
     let p = PathBuf::from(target);
-    if p.is_absolute() {
-        p
-    } else {
-        cwd.join(p)
-    }
+    if p.is_absolute() { p } else { cwd.join(p) }
 }

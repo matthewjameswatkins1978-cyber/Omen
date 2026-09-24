@@ -727,13 +727,14 @@ fn gather_sources(
     }
 
     // Path completion: argument position, or command position when the token
-    // looks like an explicit path or Windows drive designator.
+    // looks like an explicit path or bare Windows drive designator.
+    // Drive-relative tokens (`D:foo`) are outside M0 and get no path candidates.
     let path_ok = match position {
         CommandPosition::CommandName => {
             prefix.contains('/')
                 || prefix.contains('\\')
                 || prefix.starts_with('.')
-                || crate::commands::is_drive_path(prefix)
+                || crate::commands::is_drive_designator(prefix).is_some()
         }
         _ => true,
     };
@@ -1041,17 +1042,26 @@ impl Completer for OmenCompleter {
 /// The cached accept payload is cleared on every `handle()` call and is only
 /// populated when [`CompletionEngine::ghost_hint`] approves a ghost. The
 /// visible ghost and the accepted payload are always the same safe edit.
+///
+/// Also maintains the shared [`crate::interaction::CandidateCount`] cell that
+/// [`crate::interaction::OmenEditMode`] consults to gate zero-candidate Tab.
 pub struct OmenHinter {
     completer: Arc<Mutex<OmenCompleter>>,
     /// Raw unformatted safe ghost suffix approved by `CompletionEngine::ghost_hint`.
     current_hint: String,
+    /// Shared candidate count for Tab gating (updated on every repaint).
+    candidate_count: crate::interaction::CandidateCount,
 }
 
 impl OmenHinter {
-    pub fn new(completer: Arc<Mutex<OmenCompleter>>) -> Self {
+    pub fn new(
+        completer: Arc<Mutex<OmenCompleter>>,
+        candidate_count: crate::interaction::CandidateCount,
+    ) -> Self {
         Self {
             completer,
             current_hint: String::new(),
+            candidate_count,
         }
     }
 }
@@ -1068,6 +1078,13 @@ impl Hinter for OmenHinter {
         // Always clear the accept payload first: stale hints must never survive
         // a buffer change, cursor move, ambiguity, lock failure, or empty input.
         self.current_hint.clear();
+
+        // Refresh the shared candidate count so OmenEditMode can gate Tab.
+        let count = crate::interaction::compute_candidate_count(&self.completer, line, pos);
+        if let Ok(mut c) = self.candidate_count.lock() {
+            *c = count;
+        }
+
         if line.is_empty() {
             return String::new();
         }

@@ -90,8 +90,8 @@ fn bare_drive_designator_recognised_by_commands_authority() {
 
 #[cfg(windows)]
 mod windows_dispatch {
-    use omen_interactive::grammar::GrammarScanner;
     use omen_interactive::InputLane;
+    use omen_interactive::grammar::GrammarScanner;
 
     #[test]
     fn bare_drive_falls_to_executable_lane_before_nav_check() {

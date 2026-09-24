@@ -47,9 +47,7 @@ impl PromptState {
                 return format!("~{rest}");
             }
             #[cfg(windows)]
-            if human.len() >= home_h.len()
-                && human[..home_h.len()].eq_ignore_ascii_case(&home_h)
-            {
+            if human.len() >= home_h.len() && human[..home_h.len()].eq_ignore_ascii_case(&home_h) {
                 return format!("~{}", &human[home_h.len()..]);
             }
         }

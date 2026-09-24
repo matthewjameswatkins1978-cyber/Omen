@@ -56,7 +56,11 @@ fn span_contract_end_of_token_replaces_only_the_token() {
     assert_eq!(hit.edit.replacement_range, 4..7);
     assert_eq!(hit.edit.insertion_text, "alpha.txt");
 
-    let rebuilt = apply_edit(line, hit.edit.replacement_range.clone(), &hit.edit.insertion_text);
+    let rebuilt = apply_edit(
+        line,
+        hit.edit.replacement_range.clone(),
+        &hit.edit.insertion_text,
+    );
     assert_eq!(rebuilt, "cat alpha.txt trailing");
     // No duplicate prefix: `alp` was replaced, not extended.
     assert!(!rebuilt.contains("alpalpha"));
@@ -79,7 +83,11 @@ fn span_contract_mid_token_inserts_missing_middle_only() {
     assert_eq!(hit.edit.replacement_range, pos..pos);
     assert_eq!(hit.edit.insertion_text, "X");
 
-    let rebuilt = apply_edit(line, hit.edit.replacement_range.clone(), &hit.edit.insertion_text);
+    let rebuilt = apply_edit(
+        line,
+        hit.edit.replacement_range.clone(),
+        &hit.edit.insertion_text,
+    );
     assert_eq!(rebuilt, "cat fileX.txt");
     // No duplicate prefix: `file` was not re-inserted.
     assert!(!rebuilt.contains("filefile"));
@@ -101,7 +109,11 @@ fn span_contract_quoted_mid_token_preserves_surrounding_quotes() {
     assert_eq!(hit.edit.replacement_range, pos..pos);
     assert_eq!(hit.edit.insertion_text, " long");
 
-    let rebuilt = apply_edit(line, hit.edit.replacement_range.clone(), &hit.edit.insertion_text);
+    let rebuilt = apply_edit(
+        line,
+        hit.edit.replacement_range.clone(),
+        &hit.edit.insertion_text,
+    );
     assert_eq!(rebuilt, "cat \"file long.txt\"");
     // Quotes survive intact.
     assert!(rebuilt.starts_with("cat \""));
@@ -129,12 +141,22 @@ fn span_contract_no_duplicated_slash_path_segment() {
         .find(|x| x.literal.starts_with("src"))
         .expect("src candidate");
 
-    let rebuilt = apply_edit(line, hit.edit.replacement_range.clone(), &hit.edit.insertion_text);
+    let rebuilt = apply_edit(
+        line,
+        hit.edit.replacement_range.clone(),
+        &hit.edit.insertion_text,
+    );
     // The path is `src/main.rs` or `src\main.rs` — no `srsrc/` duplication.
-    assert!(!rebuilt.contains("srsr"), "duplicated prefix in {rebuilt:?}");
+    assert!(
+        !rebuilt.contains("srsr"),
+        "duplicated prefix in {rebuilt:?}"
+    );
     // Exactly one separator between src and main.rs.
     let path_part = rebuilt.strip_prefix("cat ").unwrap();
-    let sep_count = path_part.chars().filter(|c| *c == '/' || *c == '\\').count();
+    let sep_count = path_part
+        .chars()
+        .filter(|c| *c == '/' || *c == '\\')
+        .count();
     assert_eq!(sep_count, 1, "expected one separator in {rebuilt:?}");
 }
 
@@ -149,9 +171,16 @@ fn span_contract_directory_literal_does_not_duplicate_separator() {
     let c = CompletionEngine::complete(&ctx, line, pos);
     let hit = c.iter().find(|x| x.literal.contains("sub")).unwrap();
 
-    let rebuilt = apply_edit(line, hit.edit.replacement_range.clone(), &hit.edit.insertion_text);
+    let rebuilt = apply_edit(
+        line,
+        hit.edit.replacement_range.clone(),
+        &hit.edit.insertion_text,
+    );
     // Should be `cat sub/` or `cat sub\` — not `cat susub/`.
-    assert!(!rebuilt.contains("susub"), "duplicated separator in {rebuilt:?}");
+    assert!(
+        !rebuilt.contains("susub"),
+        "duplicated separator in {rebuilt:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -214,7 +243,11 @@ fn span_contract_accepting_leaves_prefix_and_suffix_intact() {
     let prefix_before = &line[..hit.edit.replacement_range.start];
     let suffix_after = &line[hit.edit.replacement_range.end..];
 
-    let rebuilt = apply_edit(line, hit.edit.replacement_range.clone(), &hit.edit.insertion_text);
+    let rebuilt = apply_edit(
+        line,
+        hit.edit.replacement_range.clone(),
+        &hit.edit.insertion_text,
+    );
 
     assert!(
         rebuilt.starts_with(prefix_before),
@@ -260,7 +293,11 @@ fn span_contract_repeated_edit_application_is_idempotent_for_exact_match() {
     let pos = 7;
     let c = CompletionEngine::complete(&ctx, line, pos);
     let hit = c.iter().find(|x| x.literal == "alpha.txt").unwrap();
-    let after = apply_edit(line, hit.edit.replacement_range.clone(), &hit.edit.insertion_text);
+    let after = apply_edit(
+        line,
+        hit.edit.replacement_range.clone(),
+        &hit.edit.insertion_text,
+    );
 
     // The buffer now has `cat alpha.txt`. Completion on `alpha.txt` at end
     // should not re-offer `alpha.txt` as a replacement (already exact).
@@ -316,7 +353,11 @@ fn span_contract_each_candidate_has_self_consistent_edit() {
     // buffer that decodes to that candidate's literal. No candidate's edit
     // depends on another candidate's edit having been applied first.
     for hit in &c {
-        let rebuilt = apply_edit(line, hit.edit.replacement_range.clone(), &hit.edit.insertion_text);
+        let rebuilt = apply_edit(
+            line,
+            hit.edit.replacement_range.clone(),
+            &hit.edit.insertion_text,
+        );
         let words = grammar::GrammarScanner::split_words(&rebuilt);
         assert_eq!(
             words.last().map(|s| s.as_str()),

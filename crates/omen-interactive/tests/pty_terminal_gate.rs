@@ -293,7 +293,9 @@ fn m0_tab_chooser_enter_accepts_selected_candidate() {
     let plain = strip_ansi(&out);
     // Must be one of the valid candidates, not `c` alone.
     let candidates = ["cargo", "cat", "cd"];
-    let accepted = candidates.iter().any(|c| plain.contains(&format!("PTY_GATE_LINE:{c}")));
+    let accepted = candidates
+        .iter()
+        .any(|c| plain.contains(&format!("PTY_GATE_LINE:{c}")));
     assert!(
         accepted,
         "Enter must accept a valid candidate from the chooser, got: {plain:?}"
@@ -317,7 +319,9 @@ fn m0_chooser_down_navigates_candidates() {
     let out = read_until(&mut handle, "PTY_GATE_LINE:");
     let plain = strip_ansi(&out);
     let candidates = ["cargo", "cat", "cd"];
-    let accepted = candidates.iter().any(|c| plain.contains(&format!("PTY_GATE_LINE:{c}")));
+    let accepted = candidates
+        .iter()
+        .any(|c| plain.contains(&format!("PTY_GATE_LINE:{c}")));
     assert!(
         accepted,
         "Down+Enter must accept a valid candidate, got: {plain:?}"
@@ -339,7 +343,9 @@ fn m0_chooser_up_down_navigates_candidates() {
     let out = read_until(&mut handle, "PTY_GATE_LINE:");
     let plain = strip_ansi(&out);
     let candidates = ["cargo", "cat", "cd"];
-    let accepted = candidates.iter().any(|c| plain.contains(&format!("PTY_GATE_LINE:{c}")));
+    let accepted = candidates
+        .iter()
+        .any(|c| plain.contains(&format!("PTY_GATE_LINE:{c}")));
     assert!(
         accepted,
         "Up/Down navigation + Enter must accept a valid candidate, got: {plain:?}"
@@ -474,17 +480,35 @@ fn m0_repeated_tab_on_single_candidate_is_deterministic() {
 
 #[test]
 fn m0_tab_no_candidate_declines_cleanly() {
+    // Required proof: Tab with zero candidates does NOTHING visible.
+    // No menu state remains active.  Up/Down immediately behave normally.
+    // Buffer unchanged.  Esc NOT required.
     let mut handle = spawn_gate();
     read_until(&mut handle, "pty-gate>");
 
     type_text(&mut handle, "zzzz");
+
+    // Tab: must decline cleanly (no menu, no buffer change).
     press_tab(&mut handle);
-    press_esc(&mut handle); // dismiss empty chooser if opened
-    press_enter(&mut handle); // submit original text
+
+    // Up/Down must immediately behave normally (history nav, not menu nav).
+    // We send Down then Up — if a menu were active these would be captured.
+    press_down(&mut handle);
+    press_up(&mut handle);
+
+    // Buffer must still be `zzzz` — no invisible chooser mutated it.
+    // Enter submits the unchanged buffer.  NO Esc needed.
+    press_enter(&mut handle);
     let out = read_until(&mut handle, "PTY_GATE_LINE:");
     let plain = strip_ansi(&out);
-    // Buffer must be unchanged: `zzzz`.
     assert_line_output(&plain, "zzzz");
+    // Also prove no candidate text leaked in.
+    assert!(
+        !plain.contains("PTY_GATE_LINE:cargo")
+            && !plain.contains("PTY_GATE_LINE:cat\r")
+            && !plain.contains("PTY_GATE_LINE:cd\r"),
+        "zero-candidate Tab must not insert anything: {plain:?}"
+    );
     exit_gate(&mut handle);
 }
 
@@ -501,7 +525,10 @@ fn m0_ghost_hint_visible_and_acceptable_via_right_arrow() {
     // Ghost shows `us`.
     let out = read_available(&mut handle, Duration::from_millis(200));
     let plain = strip_ansi(&out);
-    assert!(plain.contains(":status"), "ghost must show :status, got: {plain:?}");
+    assert!(
+        plain.contains(":status"),
+        "ghost must show :status, got: {plain:?}"
+    );
 
     // Right Arrow accepts ghost.
     handle.write_input(b"\x1b[C").unwrap();
@@ -557,6 +584,33 @@ fn m0_cd_drive_root() {
     let out = read_until(&mut handle, "PTY_GATE_LINE:");
     let plain = strip_ansi(&out);
     assert_line_output(&plain, r"cd D:\");
+    exit_gate(&mut handle);
+}
+
+// ===========================================================================
+// DRIVE-RELATIVE PATHS ARE OUTSIDE M0 (issue #3 correction)
+// ===========================================================================
+// `D:foo` is drive-relative Windows syntax.  Omen has no per-drive cwd model.
+// M0 does NOT redefine `D:foo` as `D:\foo`.  Only `D:` (bare designator),
+// `D:\`, and `D:\foo` (absolute) are supported.
+
+#[test]
+fn m0_drive_relative_not_remapped() {
+    // The pty_gate echoes lines verbatim — proving no remapping occurs in the
+    // interaction layer.  Session-level resolution is tested in unit tests.
+    let mut handle = spawn_gate();
+    read_until(&mut handle, "pty-gate>");
+
+    type_text(&mut handle, "cd D:foo");
+    press_enter(&mut handle);
+    let out = read_until(&mut handle, "PTY_GATE_LINE:");
+    let plain = strip_ansi(&out);
+    // Must echo `cd D:foo` — NOT `cd D:\foo`.
+    assert_line_output(&plain, "cd D:foo");
+    assert!(
+        !plain.contains(r"PTY_GATE_LINE:cd D:\foo"),
+        "D:foo must not be silently remapped to D:\\foo: {plain:?}"
+    );
     exit_gate(&mut handle);
 }
 

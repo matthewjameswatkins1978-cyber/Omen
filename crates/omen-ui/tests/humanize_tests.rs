@@ -72,15 +72,15 @@ fn humanize_strips_verbatim_spaces_in_nested() {
 
 #[test]
 fn humanize_preserves_ordinary_unix_path() {
-    assert_eq!(humanize_path_str("/home/user/project"), "/home/user/project");
+    assert_eq!(
+        humanize_path_str("/home/user/project"),
+        "/home/user/project"
+    );
 }
 
 #[test]
 fn humanize_preserves_ordinary_windows_path() {
-    assert_eq!(
-        humanize_path_str(r"C:\Users\Matmus"),
-        r"C:\Users\Matmus"
-    );
+    assert_eq!(humanize_path_str(r"C:\Users\Matmus"), r"C:\Users\Matmus");
 }
 
 #[test]

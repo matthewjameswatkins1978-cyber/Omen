@@ -1167,6 +1167,7 @@ name = "omen-interactive"
 version = "0.9.0-preview.22"
 dependencies = [
  "chrono",
+ "crossterm",
  "hex",
  "nu-ansi-term",
  "omen-adapters",
