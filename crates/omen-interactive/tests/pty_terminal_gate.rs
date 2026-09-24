@@ -281,6 +281,33 @@ fn m0_tab_multiple_candidates_opens_chooser() {
 }
 
 #[test]
+fn m0_chooser_enter_accepts_but_does_not_submit() {
+    let mut handle = spawn_gate();
+    read_until(&mut handle, "pty-gate>");
+    type_text(&mut handle, "c");
+    press_tab(&mut handle);
+    press_enter(&mut handle);
+    std::thread::sleep(Duration::from_millis(300));
+    let after_first = strip_ansi(&read_available(&mut handle, Duration::from_millis(400)));
+    assert!(
+        !after_first.contains("PTY_GATE_LINE:"),
+        "first Enter must NOT submit: {after_first:?}"
+    );
+    press_enter(&mut handle);
+    let out = read_until(&mut handle, "PTY_GATE_LINE:");
+    let plain = strip_ansi(&out);
+    let accepted = ["cargo", "cat", "cd"]
+        .iter()
+        .any(|c| plain.contains(&format!("PTY_GATE_LINE:{c}")));
+    assert!(
+        accepted,
+        "second Enter must submit accepted candidate: {plain:?}"
+    );
+    exit_gate(&mut handle);
+}
+
+#[test]
+
 fn m0_tab_chooser_enter_accepts_selected_candidate() {
     // `c` -> chooser -> Enter accepts the first candidate, Enter submits.
     let mut handle = spawn_gate();

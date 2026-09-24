@@ -51,6 +51,32 @@ fn spawn_omen() -> (NativePtyHandle, PathBuf) {
         "theme = 'omen'\ndensity = 'normal'\nepigraph = true\n",
     );
 
+    // Create deterministic fixture executables BEFORE spawning so the
+    // completion engine discovers them on PATH at startup.
+    let _ = std::fs::write(temp.join("cfixture-one.exe"), b"MZ");
+    let _ = std::fs::write(temp.join("cfixture-two.exe"), b"MZ");
+
+    // Create deterministic fixture executables BEFORE spawning so the
+    // completion engine discovers them on PATH at startup.
+
+    // Create deterministic fixture executables BEFORE spawning so the
+    // completion engine discovers them on PATH at startup.
+
+    // Create deterministic fixture executables BEFORE spawning so the
+    // completion engine discovers them on PATH at startup.
+
+    // Create deterministic fixture executables BEFORE spawning so the
+    // completion engine discovers them on PATH at startup.
+
+    // Create deterministic fixture executables BEFORE spawning so the
+    // completion engine discovers them on PATH at startup.
+
+    // Create deterministic fixture executables BEFORE spawning so the
+    // completion engine discovers them on PATH at startup.
+
+    // Create deterministic fixture executables BEFORE spawning so the
+    // completion engine discovers them on PATH at startup.
+
     let req = PtyExecutionRequest {
         session_id: omen_core::PtySessionId::generate(),
         argv: vec![exe.to_string_lossy().into_owned()],
@@ -65,6 +91,15 @@ fn spawn_omen() -> (NativePtyHandle, PathBuf) {
             (
                 "XDG_CONFIG_HOME".into(),
                 temp.join("config").to_string_lossy().into_owned(),
+            ),
+            // Prepend temp dir to PATH so fixture executables are discoverable.
+            (
+                "PATH".into(),
+                format!(
+                    "{};{}",
+                    temp.to_string_lossy(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
             ),
         ],
         rows: 40,
@@ -301,45 +336,48 @@ fn real_tab_single_candidate_path_command() {
     let (mut handle, _temp) = spawn_omen();
     read_until(&mut handle, "\\O/");
 
-    // Positive physical proof: type `gi`, Tab (opens chooser since `gi` has
-    // multiple PATH matches), accept first candidate (`git`) via Enter,
-    // type ` --version`, Enter.  Require actual `git version` output.
+    // Positive proof: gi -> Tab -> chooser -> Enter (accept git only).
+    // Prove NO execution after accept.  Then extend and execute.
     type_text(&mut handle, "gi");
     press_tab(&mut handle);
-    // Accept the first chooser candidate (git is first alphabetically).
     press_enter(&mut handle);
+    std::thread::sleep(Duration::from_millis(400));
+    let after_accept = strip_ansi(&read_available(&mut handle, Duration::from_millis(400)));
+    assert!(
+        !after_accept.contains("git version"),
+        "accept must NOT execute: {after_accept:?}"
+    );
     type_text(&mut handle, " --version");
     press_enter(&mut handle);
     let out = read_available(&mut handle, Duration::from_millis(5000));
     let plain = strip_ansi(&out);
-    // This proves the submitted executable became `git`, not `gi`.
     assert!(
         plain.contains("git version"),
-        "expected 'git version' output (proves git was the submitted executable), got: {plain:?}"
+        "second Enter must execute git --version: {plain:?}"
     );
     exit_omen(&mut handle);
 }
 
 #[test]
 fn real_tab_multiple_candidates_shows_chooser() {
+    // Deterministic fixture: cfixture-one.exe and cfixture-two.exe are created
+    // in spawn_omen() on PATH before the child starts.
     let (mut handle, _temp) = spawn_omen();
     read_until(&mut handle, "\\O/");
 
-    type_text(&mut handle, "c");
+    type_text(&mut handle, "cfi");
     let out = {
         handle.write_input(b"\t").unwrap();
         std::thread::sleep(SETTLE);
         read_available(&mut handle, Duration::from_millis(600))
     };
     let plain = strip_ansi(&out);
-    // Chooser must show multiple candidates (cd, cargo, cat, etc.).
-    let has_cd = plain.contains("cd");
-    let has_cargo = plain.contains("cargo");
-    let has_cat = plain.contains("cat");
-    let count = [has_cd, has_cargo, has_cat].iter().filter(|x| **x).count();
+    // Chooser must show BOTH fixture candidates.
+    let has_one = plain.contains("cfixture-one");
+    let has_two = plain.contains("cfixture-two");
     assert!(
-        count >= 2,
-        "chooser must show multiple candidates, got only {count}: {plain:?}"
+        has_one && has_two,
+        "chooser must show both fixture candidates (cfixture-one, cfixture-two), got: one={has_one} two={has_two}: {plain:?}"
     );
     exit_omen(&mut handle);
 }
