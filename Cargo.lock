@@ -1146,6 +1146,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "omen-discovery"
+version = "0.9.0-preview.22"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "omen-engine"
 version = "0.9.0-preview.22"
 dependencies = [
