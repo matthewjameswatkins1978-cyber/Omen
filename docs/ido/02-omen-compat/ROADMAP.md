@@ -85,8 +85,15 @@ deserialization rejects Exact (D2-013).
   `windows_engine_conpty.rs` (product `NativePtyHandle` via Windows-only
   dev-dependency).
 - Decisions D2-019 (console events ≠ POSIX signals), D2-020 (control vs
-  product ConPTY authorities), D2-021 (exit code ≠ cause).
+  product ConPTY authorities), D2-021 (exit code ≠ cause), D2-022
+  (synchronous does not mean unbounded — worker I/O, targeted cancellation,
+  close off the test thread, outer hostile-close watchdog).
 - Defect ledger: `WINDOWS_M0_DEFECTS.md`.
+- **Boundedness seal:** input `WriteFile` and `ClosePseudoConsole` never run
+  on the caller/test thread; output drain remains live during close;
+  deterministic blocked-write control; normal/live/final-output close
+  controls; blocked-write + shutdown interaction; ≥10 repeated lifecycle
+  cycles; helper-process hostile-close watchdog.
 
 After M0-W acceptance: **M0 COMPLETE** → **M1 real-application compatibility**.
 

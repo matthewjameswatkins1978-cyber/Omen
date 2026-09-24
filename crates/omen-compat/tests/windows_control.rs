@@ -2,14 +2,18 @@
 //!
 //! If these fail, the instrument is not ready. Do not judge Omen.
 //! Outer watchdog: every test is bounded; no sleep is used as proof.
+//!
+//! D2-022 boundedness seal: blocked-write cancellation, close modes,
+//! repeated lifecycle, and hostile helper watchdog are control facts.
 
 #![cfg(windows)]
 
 use omen_compat::{
-    InvariantOutcome, WindowsConPtySession, WindowsConsoleModeSnapshot, WindowsCtrlReceipt,
-    WindowsExitCauseContext, WindowsExitObservation, WindowsProcessLiveness,
-    judge_engine_shutdown_bounded, judge_terminal_ctrl_c_reaches_child, parse_windows_report,
-    poll_until,
+    InvariantOutcome, WIN_WRITE_CANCEL_BOUND, WindowsConPtySession, WindowsConsoleModeSnapshot,
+    WindowsCtrlReceipt, WindowsExitCauseContext, WindowsExitObservation, WindowsProcessLiveness,
+    WindowsWriteOutcome, control_blocked_write, judge_engine_shutdown_bounded,
+    judge_terminal_ctrl_c_reaches_child, parse_windows_report, poll_until,
+    release_pseudoconsole_available,
 };
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -369,4 +373,324 @@ fn control_process_liveness_self() {
     };
     assert!(obs.alive);
     let _ = poll_until(Duration::from_millis(10), || true);
+}
+
+/// D2-022 §41 — deterministic blocked write: CancelSynchronousIo path.
+#[test]
+fn control_blocked_write_cancellation() {
+    let t0 = Instant::now();
+    let write_budget = Duration::from_millis(400);
+    let obs = control_blocked_write(write_budget, WIN_WRITE_CANCEL_BOUND)
+        .expect("blocked write control must return an observation");
+    println!(
+        "FACT\tBLOCKED_WRITE\toutcome={} cancel_requested={} worker_completed={} \
+         written={} elapsed_ms={}",
+        obs.outcome.stable_id(),
+        obs.cancel_requested,
+        obs.worker_completed,
+        obs.written_bytes,
+        obs.elapsed.as_millis()
+    );
+    assert_ne!(
+        obs.outcome,
+        WindowsWriteOutcome::Completed,
+        "un-drained pipe write must not complete fully before timeout: {obs:?}"
+    );
+    assert!(
+        obs.cancel_requested,
+        "CancelSynchronousIo must be requested"
+    );
+    assert!(
+        obs.worker_completed,
+        "worker completion must be observed after cancel (no bare join)"
+    );
+    assert!(matches!(
+        obs.outcome,
+        WindowsWriteOutcome::Cancelled | WindowsWriteOutcome::TimedOut
+    ));
+    // Prefer Cancelled (actual cancellation observed); TimedOut only if
+    // completion still missing after cancel bound — that is a harness fail.
+    assert_eq!(
+        obs.outcome,
+        WindowsWriteOutcome::Cancelled,
+        "expected Cancelled after cancel+completion: {obs:?}"
+    );
+    assert!(
+        t0.elapsed() < WATCHDOG,
+        "blocked write control must stay bounded"
+    );
+}
+
+/// D2-022 §42 — small ConPTY write completes without cancellation.
+#[test]
+fn control_small_write_completed() {
+    let mut session = spawn(&["--windows-report"], Duration::from_secs(12));
+    let _ = session.wait_for_text("OMEN_COMPAT_READY", Duration::from_secs(6));
+    let obs = session
+        .write_input(b"\r\n")
+        .expect("small write must be accepted");
+    println!(
+        "FACT\tSMALL_WRITE\toutcome={} written={} cancel={}",
+        obs.outcome.stable_id(),
+        obs.written_bytes,
+        obs.cancel_requested
+    );
+    assert_eq!(obs.outcome, WindowsWriteOutcome::Completed, "{obs:?}");
+    assert_eq!(obs.written_bytes, 2);
+    assert!(!obs.cancel_requested);
+    assert!(obs.worker_completed);
+    let shutdown = session.shutdown_bounded(Duration::from_secs(6));
+    assert!(
+        shutdown.harness_shutdown_pass(Duration::from_secs(6)),
+        "{shutdown:?}"
+    );
+}
+
+/// D2-022 §43 — normal client exit → close worker returns, workers exit.
+#[test]
+fn control_close_normal_client_exit() {
+    let t0 = Instant::now();
+    let mut session = spawn(&["--windows-report"], Duration::from_secs(12));
+    let _ = session.wait_for_text("OMEN_COMPAT_READY", Duration::from_secs(6));
+    let _ = session.wait_exit(Duration::from_secs(5));
+    let obs = session.shutdown_bounded(Duration::from_secs(6));
+    println!(
+        "FACT\tCLOSE_NORMAL\tclose_started={} close_returned={} input_stopped={} \
+         output_stopped={} pipe_broken={} handles={} elapsed_ms={}",
+        obs.close_started,
+        obs.close_returned,
+        obs.input_worker_stopped,
+        obs.output_worker_stopped,
+        obs.output_pipe_broken,
+        obs.handles_closed_once,
+        obs.elapsed.as_millis()
+    );
+    assert!(obs.close_started, "close worker must start");
+    assert!(
+        obs.close_returned,
+        "ClosePseudoConsole must actually return"
+    );
+    assert!(obs.input_worker_stopped);
+    assert!(
+        obs.output_worker_stopped,
+        "output drain must stop after close"
+    );
+    assert!(obs.handles_closed_once);
+    assert!(obs.harness_shutdown_pass(Duration::from_secs(6)), "{obs:?}");
+    assert!(t0.elapsed() < WATCHDOG);
+    // Idempotent second call.
+    let again = session.shutdown_bounded(Duration::from_secs(1));
+    assert!(again.close_returned && !again.bounded_out, "{again:?}");
+}
+
+/// D2-022 §44 — live client: terminate + close bounded, output drain live.
+#[test]
+fn control_close_live_client() {
+    let t0 = Instant::now();
+    let mut session = spawn(&["--windows-child-hold"], Duration::from_secs(12));
+    let _ = session.wait_for_text("windows-child-hold", Duration::from_secs(6));
+    assert!(
+        session.is_alive(),
+        "child-hold must be live before teardown"
+    );
+    let obs = session.shutdown_bounded(Duration::from_secs(8));
+    println!(
+        "FACT\tCLOSE_LIVE\tclient_exit={} close_returned={} input_stopped={} \
+         output_stopped={} handles={} elapsed_ms={}",
+        obs.client_exit_observed,
+        obs.close_returned,
+        obs.input_worker_stopped,
+        obs.output_worker_stopped,
+        obs.handles_closed_once,
+        obs.elapsed.as_millis()
+    );
+    assert!(
+        obs.client_exit_observed,
+        "client termination must be observed"
+    );
+    assert!(obs.close_returned);
+    assert!(obs.input_worker_stopped && obs.output_worker_stopped);
+    assert!(obs.handles_closed_once);
+    assert!(obs.harness_shutdown_pass(Duration::from_secs(8)), "{obs:?}");
+    assert!(t0.elapsed() < WATCHDOG);
+    assert!(
+        session.write_input(b"x").is_err(),
+        "no writes after shutdown"
+    );
+}
+
+/// D2-022 §45 — pending/final output while close runs; drain stays live.
+#[test]
+fn control_close_with_final_output() {
+    let t0 = Instant::now();
+    let mut session = spawn(&["--windows-final-output-hold"], Duration::from_secs(15));
+    let _ = session.wait_for_text("OMEN_COMPAT_READY", Duration::from_secs(6));
+    // Do not wait for the full burst — start teardown while output may be pending.
+    let _ = session.wait_for_text("OMEN_COMPAT_FINAL_LINE", Duration::from_secs(3));
+    let bytes_before = session.transcript().total_bytes;
+    let obs = session.shutdown_bounded(Duration::from_secs(8));
+    let t = session.transcript().clone();
+    println!(
+        "FACT\tCLOSE_FINAL_OUTPUT\tbytes_before={} bytes_after={} final_done={} \
+         close_returned={} output_stopped={} pipe_broken={} elapsed_ms={}",
+        bytes_before,
+        t.total_bytes,
+        t.contains("OMEN_COMPAT_FINAL_OUTPUT_DONE") || t.contains("OMEN_COMPAT_FINAL_LINE"),
+        obs.close_returned,
+        obs.output_worker_stopped,
+        obs.output_pipe_broken,
+        obs.elapsed.as_millis()
+    );
+    assert!(
+        t.total_bytes >= bytes_before,
+        "transcript must not lose drained bytes"
+    );
+    assert!(
+        t.contains("OMEN_COMPAT_FINAL_LINE") || t.contains("OMEN_COMPAT_READY"),
+        "final/pending output must remain visible: {}",
+        t.as_lossy()
+    );
+    assert!(obs.close_returned, "{obs:?}");
+    assert!(obs.output_worker_stopped, "{obs:?}");
+    assert!(obs.harness_shutdown_pass(Duration::from_secs(8)), "{obs:?}");
+    assert!(t0.elapsed() < WATCHDOG);
+    // Transcript cap still holds.
+    assert!(t.retained.len() <= 64 * 1024);
+}
+
+/// D2-022 §46 — blocked write + shutdown interaction (worker cancel path).
+#[test]
+fn control_write_blocked_then_shutdown() {
+    let t0 = Instant::now();
+    // Phase 1: prove cancellation machinery on hostile pipe.
+    let w = control_blocked_write(Duration::from_millis(300), WIN_WRITE_CANCEL_BOUND)
+        .expect("hostile write");
+    assert_eq!(w.outcome, WindowsWriteOutcome::Cancelled, "{w:?}");
+    assert!(w.worker_completed);
+
+    // Phase 2: session accepts write, then shutdown stops further writes.
+    let mut session = spawn(&["--windows-child-hold"], Duration::from_secs(12));
+    let _ = session.wait_for_text("windows-child-hold", Duration::from_secs(6));
+    let wr = session.write_input(b"echo\r\n");
+    // Write may complete (ConPTY accepts) — either way shutdown must proceed.
+    println!("FACT\tWRITE_BEFORE_SHUTDOWN\t{wr:?}");
+    let obs = session.shutdown_bounded(Duration::from_secs(8));
+    assert!(
+        obs.harness_shutdown_pass(Duration::from_secs(8)),
+        "teardown must proceed without caller hang: {obs:?}"
+    );
+    assert!(
+        session.write_input(b"more").is_err(),
+        "no further writes accepted after shutdown"
+    );
+    assert!(
+        t0.elapsed() < WATCHDOG,
+        "blocked-write+shutdown must stay bounded"
+    );
+}
+
+/// D2-022 §47 — ≥10 create / I/O / bounded-shutdown cycles.
+#[test]
+fn control_repeated_lifecycle_ten_cycles() {
+    const CYCLES: usize = 10;
+    const CYCLE_BOUND: Duration = Duration::from_secs(8);
+    for i in 0..CYCLES {
+        let t0 = Instant::now();
+        let mut session = spawn(&["--windows-report"], Duration::from_secs(10));
+        let _ = session.wait_for_text("OMEN_COMPAT_READY", Duration::from_secs(5));
+        let _ = session.write_input(b"\r\n");
+        let obs = session.shutdown_bounded(CYCLE_BOUND);
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < WATCHDOG,
+            "cycle {i} exceeded safety bound: {elapsed:?}"
+        );
+        assert!(
+            obs.harness_shutdown_pass(CYCLE_BOUND),
+            "cycle {i} shutdown not clean: {obs:?}"
+        );
+        assert!(
+            session.write_input(b"x").is_err(),
+            "cycle {i}: write after shutdown must fail"
+        );
+    }
+    let r = judge_engine_shutdown_bounded(WATCHDOG, WATCHDOG);
+    assert_eq!(r.outcome, InvariantOutcome::Pass, "{r:?}");
+    println!("FACT\tREPEATED_LIFECYCLE\tcycles={CYCLES}");
+}
+
+/// D2-022 §30E — outer helper watchdog can contain a hypothetical close hang.
+#[test]
+fn control_hostile_close_helper_watchdog() {
+    let driver = workspace_root()
+        .join("target")
+        .join("debug")
+        .join("examples")
+        .join("windows_conpty_teardown_driver.exe");
+    if !driver.exists() {
+        let build = std::process::Command::new("cargo")
+            .args([
+                "build",
+                "-p",
+                "omen-compat",
+                "--example",
+                "windows_conpty_teardown_driver",
+            ])
+            .current_dir(workspace_root())
+            .status()
+            .expect("build teardown driver");
+        assert!(build.success());
+    }
+    assert!(driver.exists(), "teardown driver missing at {driver:?}");
+
+    let mut child = std::process::Command::new(&driver)
+        .current_dir(workspace_root())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn teardown driver");
+
+    // Outer absolute bound: if helper wedges, terminate it and FAIL fast.
+    let outer = Duration::from_secs(20);
+    let deadline = Instant::now() + outer;
+    let mut exited = false;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                exited = true;
+                break;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => break,
+        }
+    }
+    if !exited {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("teardown helper wedged; parent contained it via kill (hostile-close FAIL)");
+    }
+    let out = child.wait_with_output().expect("read helper output");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    println!(
+        "FACT\tTEARDOWN_DRIVER\tstatus={:?}\n{stdout}\n{stderr}",
+        out.status
+    );
+    assert!(
+        stdout.contains("\"scenario\":\"normal_exit\",\"ok\":true") || out.status.success(),
+        "helper must report successful bounded teardown:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"ok\":false"),
+        "helper reported failed scenario:\n{stdout}"
+    );
+    assert!(out.status.success(), "helper exit: {:?}", out.status.code());
+}
+
+/// Optional modern Windows capability — reported, never required (§23/§48).
+#[test]
+fn control_release_pseudoconsole_capability_report() {
+    let avail = release_pseudoconsole_available();
+    println!("FACT\tRELEASE_PSEUDOCONSOLE\tavailable={avail} used=NO baseline=threaded_close");
+    // Never assert failure on older Windows; optional control only.
 }

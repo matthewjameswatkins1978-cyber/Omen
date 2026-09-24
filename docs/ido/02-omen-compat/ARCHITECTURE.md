@@ -117,13 +117,19 @@ Production Omen is not repaired in this layer (D2-014).
 
 - **Harness:** Compat-owned independent ConPTY (`CreatePseudoConsole`,
   `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`, `CreateProcessW`) — never
-  omen-engine (D2-020). Bounded `PeekNamedPipe` reads, bounded writes,
-  bounded `WaitForSingleObject`, single-close handle ownership.
+  omen-engine (D2-020). Synchronous channels are serviced only by dedicated
+  workers (D2-022): serial input worker + `CancelSynchronousIo`, output
+  drain worker (live through close), close worker for `ClosePseudoConsole`.
+  Caller-facing writes/close use explicit deadlines and bounded completion
+  observation; no unbounded join; single-close handle ownership; Drop never
+  performs unbounded `ClosePseudoConsole`.
 - **Observations:** Windows std-handle/console-mode/dimensions/ctrl-receipt/
   process-liveness/exit/conpty-lifecycle facts with explicit availability.
 - **Judges:** twelve canonical IDs in `compat/invariants/windows.md` with
   D2-019/020/021 honesty (console events ≠ POSIX signals; control ≠ product
-  ConPTY; exit bits ≠ cause).
+  ConPTY; exit bits ≠ cause). Harness boundedness controls (blocked write,
+  close modes, repeated lifecycle, hostile helper watchdog) are control-tier
+  assertions, not product invariant IDs.
 - **Product access:** Windows-only `omen-engine` **dev-dependency** solely
   to invoke public `NativePtyHandle` / `PtyExecutionHandle`. Production
   never depends on omen-compat; production files are never modified.

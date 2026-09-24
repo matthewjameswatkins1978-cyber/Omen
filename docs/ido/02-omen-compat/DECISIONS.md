@@ -200,3 +200,35 @@ facts. `WindowsExitObservation` records `raw_status`, `product_code`, and an
 explicit `cause_context` (`NormalExit`, `CtrlCObserved`, `ProductTerminateRequested`,
 `TimeoutTerminationRequested`, `Unknown`, …). Never infer cause from the
 integer alone. Ctrl-C receipt PASS and exit-cause INCONCLUSIVE can coexist.
+
+## D2-022 — SYNCHRONOUS DOES NOT MEAN UNBOUNDED
+
+The syscall may block. Compat may not.
+
+1. **ConPTY channels are synchronous-I/O handles.** Do not reconfigure
+   `CreatePseudoConsole` pipes as OVERLAPPED async streams to dodge
+   blocking. The architecture is: synchronous Win32 I/O → dedicated worker
+   threads → bounded caller-facing protocol.
+2. **Input writes never run on the test/caller thread.** One serial input
+   worker per session owns the active `WriteFile`. Requests carry explicit
+   identities; a generic thread pool is forbidden (cancellation must target
+   one known thread).
+3. **Worker identity is observed at startup** (`GetCurrentThreadId` →
+   owner). On caller deadline expiry the owner `OpenThread`s that exact
+   thread and issues `CancelSynchronousIo` (minimum access rights). Cancellation
+   is a request: the owner then waits a second bounded interval and observes
+   `Completed` / `Cancelled` / `Failed` / `TimedOut`. An unresolved active
+   write poisons the writer; no further writes are accepted; teardown
+   proceeds without an unbounded join.
+4. **Output is serviced by a dedicated drain worker** that remains live
+   through `ClosePseudoConsole`. Callers read a shared bounded transcript;
+   they are not responsible for preventing teardown deadlock.
+5. **`ClosePseudoConsole` never runs on the test thread.** A dedicated close
+   worker performs it; the caller waits only on a bounded completion. A
+   successful close observation means the call returned, not that it was
+   requested. Pathological stalls hit an explicit `ClosePseudoConsoleTimedOut`
+   bounded-out result; hostile-close regressions use an outer helper-process
+   watchdog. No `TerminateThread`, no `CloseHandle(HPCON)`, no unbounded join.
+6. **Drop must not freeze `cargo test`.** Explicit `shutdown_bounded` is the
+   test path; Drop is already-closed no-op or best-effort bounded-safe
+   reaping only.

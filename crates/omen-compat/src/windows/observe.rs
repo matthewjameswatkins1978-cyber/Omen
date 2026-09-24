@@ -464,3 +464,170 @@ pub fn poll_until(budget: Duration, mut pred: impl FnMut() -> bool) -> bool {
         std::thread::sleep(Duration::from_millis(WIN_POLL_SLICE_MS));
     }
 }
+
+/// Terminal outcome of one caller-visible write attempt (observation, not judgment).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowsWriteOutcome {
+    /// Worker finished the requested bytes before the caller deadline.
+    Completed,
+    /// Worker returned after `CancelSynchronousIo` (or equivalent request).
+    Cancelled,
+    /// Synchronous `WriteFile` failed (including broken pipe / zero write).
+    Failed,
+    /// Caller deadline expired and worker completion was not observed within
+    /// the cancellation bound (writer is poisoned; session must not reuse it).
+    TimedOut,
+}
+
+impl WindowsWriteOutcome {
+    pub fn stable_id(&self) -> &'static str {
+        match self {
+            WindowsWriteOutcome::Completed => "completed",
+            WindowsWriteOutcome::Cancelled => "cancelled",
+            WindowsWriteOutcome::Failed => "failed",
+            WindowsWriteOutcome::TimedOut => "timed_out",
+        }
+    }
+}
+
+/// Bounded evidence for one caller-visible write (D2-022).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowsWriteObservation {
+    pub request_id: u64,
+    pub requested_bytes: usize,
+    pub written_bytes: usize,
+    pub outcome: WindowsWriteOutcome,
+    pub elapsed: Duration,
+    pub cancel_requested: bool,
+    pub worker_completed: bool,
+    pub source: String,
+}
+
+impl WindowsWriteObservation {
+    pub fn observation(&self) -> Observation {
+        Observation::HarnessFailed {
+            phase: format!("write.{}", self.outcome.stable_id()),
+            detail: format!(
+                "request_id={} requested={} written={} cancel_requested={} \
+                 worker_completed={} elapsed_ms={} source={}",
+                self.request_id,
+                self.requested_bytes,
+                self.written_bytes,
+                self.cancel_requested,
+                self.worker_completed,
+                self.elapsed.as_millis(),
+                self.source
+            ),
+        }
+    }
+}
+
+/// Explicit Compat teardown stages (not implicit Drop side effects).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowsConPtyTeardownStage {
+    Running,
+    StopAcceptingInput,
+    CancelActiveWrite,
+    TerminateWaitClient,
+    BeginConPtyClose,
+    OutputDrainContinues,
+    CloseReturned,
+    PipeBreakObserved,
+    WorkersExit,
+    HandlesClosedOnce,
+    Closed,
+}
+
+impl WindowsConPtyTeardownStage {
+    pub fn stable_id(&self) -> &'static str {
+        match self {
+            WindowsConPtyTeardownStage::Running => "running",
+            WindowsConPtyTeardownStage::StopAcceptingInput => "stop_accepting_input",
+            WindowsConPtyTeardownStage::CancelActiveWrite => "cancel_active_write",
+            WindowsConPtyTeardownStage::TerminateWaitClient => "terminate_wait_client",
+            WindowsConPtyTeardownStage::BeginConPtyClose => "begin_conpty_close",
+            WindowsConPtyTeardownStage::OutputDrainContinues => "output_drain_continues",
+            WindowsConPtyTeardownStage::CloseReturned => "close_returned",
+            WindowsConPtyTeardownStage::PipeBreakObserved => "pipe_break_observed",
+            WindowsConPtyTeardownStage::WorkersExit => "workers_exit",
+            WindowsConPtyTeardownStage::HandlesClosedOnce => "handles_closed_once",
+            WindowsConPtyTeardownStage::Closed => "closed",
+        }
+    }
+}
+
+/// Bounded evidence for one Compat ConPTY `shutdown_bounded` call (D2-022).
+///
+/// PASS law (control tier): `close_returned` AND input/output workers stopped
+/// AND handles closed once AND elapsed within limit AND not `bounded_out`.
+/// Escape via watchdog alone is HARNESS FAILURE, never PASS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowsConPtyShutdownObservation {
+    pub input_worker_stopped: bool,
+    pub active_write_cancelled: bool,
+    pub client_exit_observed: bool,
+    pub close_started: bool,
+    pub close_returned: bool,
+    pub close_timed_out: bool,
+    pub output_pipe_broken: bool,
+    pub output_worker_stopped: bool,
+    pub handles_closed_once: bool,
+    pub elapsed: Duration,
+    pub bounded_out: bool,
+    pub source: String,
+}
+
+impl WindowsConPtyShutdownObservation {
+    pub fn already_closed(source: &str) -> Self {
+        Self {
+            input_worker_stopped: true,
+            active_write_cancelled: false,
+            client_exit_observed: true,
+            close_started: true,
+            close_returned: true,
+            close_timed_out: false,
+            output_pipe_broken: false,
+            output_worker_stopped: true,
+            handles_closed_once: true,
+            elapsed: Duration::ZERO,
+            bounded_out: false,
+            source: format!("{source}:already_closed"),
+        }
+    }
+
+    /// Control-tier harness shutdown law (not a product invariant).
+    pub fn harness_shutdown_pass(&self, limit: Duration) -> bool {
+        !self.bounded_out
+            && !self.close_timed_out
+            && self.elapsed <= limit
+            && self.close_started
+            && self.close_returned
+            && self.input_worker_stopped
+            && self.output_worker_stopped
+            && self.handles_closed_once
+    }
+
+    pub fn observation(&self) -> Observation {
+        Observation::WindowsConPtyLifecycleObservation {
+            phase: "shutdown_bounded".into(),
+            ok: self.harness_shutdown_pass(Duration::from_secs(u64::MAX)),
+            detail: format!(
+                "input_stopped={} write_cancelled={} client_exit={} close_started={} \
+                 close_returned={} close_timed_out={} pipe_broken={} output_stopped={} \
+                 handles_closed={} elapsed_ms={} bounded_out={}",
+                self.input_worker_stopped,
+                self.active_write_cancelled,
+                self.client_exit_observed,
+                self.close_started,
+                self.close_returned,
+                self.close_timed_out,
+                self.output_pipe_broken,
+                self.output_worker_stopped,
+                self.handles_closed_once,
+                self.elapsed.as_millis(),
+                self.bounded_out,
+            ),
+            source: self.source.clone(),
+        }
+    }
+}

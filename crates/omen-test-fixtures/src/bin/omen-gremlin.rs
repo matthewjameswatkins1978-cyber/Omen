@@ -133,6 +133,11 @@ struct GremlinArgs {
     #[arg(long)]
     windows_child_hold: bool,
 
+    /// Windows: emit READY + controlled bounded final-output burst, then hold
+    /// so teardown can race with pending output drain (D2-022 close controls).
+    #[arg(long)]
+    windows_final_output_hold: bool,
+
     /// Windows: exit with this exact DWORD status (raw bit pattern).
     /// Use with `--windows-exit-status` always when set; 0 is the default
     /// process exit path so `0` alone does not force a special exit mode.
@@ -394,7 +399,10 @@ fn main() {
         }
         if args.windows_child_hold {
             run_windows_child_hold(args.exit);
-            std::process::exit(args.exit);
+        }
+
+        if args.windows_final_output_hold {
+            run_windows_final_output_hold(args.exit);
         }
         if args.windows_exit_status != 0 {
             std::process::exit(args.windows_exit_status as i32);
@@ -408,6 +416,7 @@ fn main() {
             || args.windows_console_mode_dirty_exit
             || args.windows_tree_report
             || args.windows_child_hold
+            || args.windows_final_output_hold
             || args.windows_exit_status != 0;
         if requested_windows {
             println!(
@@ -1271,6 +1280,22 @@ mod win_fixture {
         let _ = io::stdout().flush();
         // Hold boundedly for containment calibration.
         std::thread::sleep(Duration::from_millis(3500));
+        std::process::exit(exit_code);
+    }
+
+    /// Controlled bounded final-output burst then hold (close-with-output control).
+    pub fn run_windows_final_output_hold(exit_code: i32) {
+        println!("OMEN_COMPAT_READY");
+        println!("{}", windows_report_json());
+        let _ = io::stdout().flush();
+        // Bounded burst only — never unbounded output.
+        for i in 0..64 {
+            println!("OMEN_COMPAT_FINAL_LINE {i:03} {}", "F".repeat(48));
+        }
+        println!("OMEN_COMPAT_FINAL_OUTPUT_DONE");
+        let _ = io::stdout().flush();
+        // Hold so shutdown can race with pending/concurrent drain.
+        std::thread::sleep(Duration::from_millis(6000));
         std::process::exit(exit_code);
     }
 }
