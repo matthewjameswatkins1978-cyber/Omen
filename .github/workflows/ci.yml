@@ -423,6 +423,9 @@ jobs:
           if ($authOut -notmatch 'companion') { throw "AUTHORITY_FAILURE_NOT_TRUTHFUL :: $authOut" }
           "authority fail-closed after cycle: PASS"
           "LIFECYCLE_22_23_22_23: PASS"
+          # The fail-closed authority probe above exits nonzero by design;
+          # every assertion passed, so close the step green explicitly.
+          exit 0
 
   h2-gate-e2e:
     needs: check-and-lint
