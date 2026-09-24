@@ -507,7 +507,7 @@ fn package(root: &Path, ci_run_id: Option<u64>, artifact_id: Option<u64>) -> Res
         ci_run_id,
         artifact_id,
         fixture_files,
-        daemon_binary_sha256: Some(daemon_bin_hash),
+        daemon_binary_sha256: Some(daemon_bin_hash.clone()),
     };
     let suffix = if matches!(manifest.provenance, Provenance::Ci) {
         "windows-x86_64"
@@ -555,6 +555,30 @@ fn package(root: &Path, ci_run_id: Option<u64>, artifact_id: Option<u64>) -> Res
     }
     zip.finish().unwrap();
     manifest.package_sha256 = digest_file(&out)?;
+    // Canonical per-release manifest (Lucy repair B1): derived from the
+    // exact same candidate build — never hand-maintained. Published beside
+    // the package on the GitHub Release; the update path binds
+    // manifest.package_asset -> exact release asset -> asset URL.
+    let release_manifest = serde_json::json!({
+        "schema_version": 1,
+        "version": version,
+        "git_sha": manifest.git_sha,
+        "channel": if version.contains("preview") { "preview" } else { "stable" },
+        "package_asset": out.file_name().and_then(|n| n.to_str()).unwrap_or("package.zip"),
+        "package_sha256": manifest.package_sha256,
+        "package_size": fs::metadata(&out).map(|m| m.len()).ok(),
+        "binary_sha256": bin_hash,
+        "daemon_binary_sha256": daemon_bin_hash,
+        "min_state_schema": 1,
+        "machine_contract": CONTRACT_VERSION,
+    });
+    let release_path = root.join("work").join("omen-release.json");
+    fs::write(
+        &release_path,
+        serde_json::to_vec_pretty(&release_manifest).unwrap(),
+    )
+    .map_err(|e| e.to_string())?;
+    println!("RELEASE_MANIFEST: {}", release_path.display());
     println!(
         "PACKAGE: {}\nPROVENANCE: {:?}\nLOCAL_PROOF_PASS: NOT_RUN\nREADY_FOR_CI: YES\nREADY_FOR_EXTERNAL_TRIAL: {}",
         out.display(),
@@ -718,10 +742,44 @@ fn install(_root: &Path, artifact: Option<PathBuf>) -> Result<(), String> {
     }
     let mut s = read_state();
     s.previous_slot = s.active_slot.take();
-    s.active_slot = Some(slot);
-    s.active = Some(manifest);
+    s.active_slot = Some(slot.clone());
+    s.active = Some(manifest.clone());
     s.ci_green = false;
     write_state(&s)?;
+    // H runtime provenance: the conveyor placement IS an Omen-owned managed
+    // install, so record canonical ownership for `omen doctor/update`.
+    // Channel is preserved when the user already chose one; default Preview.
+    // Slot ids are opaque: runtime update/rollback flows resolve
+    // `versions/<slot>/omen(.exe)` and never re-derive the name.
+    {
+        let base = omen_lifecycle::state::state_base_dir();
+        let prev_record = omen_lifecycle::install::load_install_record(&base)
+            .ok()
+            .flatten();
+        let channel = prev_record
+            .as_ref()
+            .map(|r| r.channel)
+            .unwrap_or(omen_lifecycle::install::Channel::Preview);
+        let mut record = omen_lifecycle::install::InstallRecord::new(
+            omen_lifecycle::install::Ownership::Omen,
+            channel,
+            &manifest.preview_version,
+            &manifest.git_sha,
+        );
+        record.active_slot = Some(slot.clone());
+        record.previous_slot = prev_record
+            .as_ref()
+            .and_then(|r| r.active_slot.clone())
+            .or(s.previous_slot.clone());
+        record.package_sha256 = Some(manifest.package_sha256.clone());
+        record.binary_sha256 = Some(manifest.binary_sha256.clone());
+        if let Err(e) = omen_lifecycle::install::save_install_record(&base, &record) {
+            return Err(fail("OMEN_INSTALL_RECORD_FAILED", e));
+        }
+        if let Err(e) = omen_lifecycle::update::write_active_pointer(&base, &slot) {
+            return Err(fail("OMEN_INSTALL_RECORD_FAILED", e));
+        }
+    }
     println!("INSTALLED: {}", stable.display());
     Ok(())
 }
@@ -1127,6 +1185,15 @@ fn promote(root: &Path, expected: &str) -> Result<(), String> {
             format!("tag already exists: {tag}"),
         ));
     }
+    // The canonical release manifest must exist beside the package: the
+    // release publishes BOTH assets from this one authority.
+    let release_manifest = root.join("work").join("omen-release.json");
+    if !release_manifest.is_file() {
+        return Err(fail(
+            "OMEN_PREVIEW_ARTIFACT_NOT_FOUND",
+            "work/omen-release.json missing; run preview package first",
+        ));
+    }
     command_output(root, "gh", &["--version"])?;
     command_output(root, "gh", &["auth", "status"])?;
     let notes = format!(
@@ -1149,6 +1216,12 @@ fn promote(root: &Path, expected: &str) -> Result<(), String> {
                 fail(
                     "OMEN_PREVIEW_ARTIFACT_NOT_FOUND",
                     "package path is not UTF-8",
+                )
+            })?,
+            release_manifest.to_str().ok_or_else(|| {
+                fail(
+                    "OMEN_PREVIEW_ARTIFACT_NOT_FOUND",
+                    "release manifest path is not UTF-8",
                 )
             })?,
             "--target",

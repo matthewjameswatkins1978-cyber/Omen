@@ -15,6 +15,7 @@ members = [
     "crates/omen-cli",
     "crates/omen-agent",
     "crates/omen-agent-adapter",    "crates/omen-mcp",
+    "crates/omen-lifecycle",
     "crates/omen-test-fixtures",
     "crates/omen-semantic",
     "crates/xtask",
@@ -24,7 +25,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.9.0-preview.15"
+version = "0.9.0-preview.21"
 edition = "2024"
 rust-version = "1.98.1"
 publish = false
@@ -46,6 +47,7 @@ omen-client = { path = "crates/omen-client", version = "0.9.0-preview.7" }
 omen-agent = { path = "crates/omen-agent", version = "0.9.0-preview.7" }
 omen-agent-adapter = { path = "crates/omen-agent-adapter", version = "0.9.0-preview.7" }
 omen-mcp = { path = "crates/omen-mcp", version = "0.9.0-preview.7" }
+omen-lifecycle = { path = "crates/omen-lifecycle", version = "0.9.0-preview.7" }
 omen-test-fixtures = { path = "crates/omen-test-fixtures", version = "0.9.0-preview.7" }
 omen-semantic = { path = "crates/omen-semantic", version = "0.9.0-preview.7" }
 
@@ -72,3 +74,5 @@ fuzzy-matcher = "0.3.7"
 uuid = { version = "1.15", features = ["v4"] }
 prost = "0.13"
 ureq = { version = "3.4", default-features = false, features = ["rustls", "json"] }
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+fs2 = "0.4"
