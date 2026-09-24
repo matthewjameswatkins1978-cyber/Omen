@@ -236,9 +236,28 @@ impl Workspace {
         #[cfg(windows)]
         {
             let hd = self.host_data.to_string_lossy().into_owned();
-            let drive = format!("{}:\\", hd.chars().next().unwrap_or('?'));
+            let drive = hd.chars().next().unwrap_or('?').to_string();
             d.push_str(&format!("whoami={}\n", cap(&run("whoami", &[]))));
+            d.push_str(&format!(
+                "whoami_groups={}\n",
+                cap(&run("whoami", &["/groups"]))
+            ));
             d.push_str(&format!("icacls={}\n", cap(&run("icacls", &[hd.as_str()]))));
+            // Owner + inheritance detail: icacls shows only the DACL, while
+            // the Gate requires the directory owner to equal the process
+            // token user. Capture both explicitly (pwsh is already required
+            // by the Workspace ACL hardening above).
+            let acl_probe = format!(
+                "$a=Get-Acl -LiteralPath '{}'; 'OWNER='+$a.Owner; $a.Access | Format-Table IdentityReference,FileSystemRights,AccessControlType,IsInherited -AutoSize | Out-String -Width 200",
+                hd
+            );
+            d.push_str(&format!(
+                "get_acl={}\n",
+                cap(&run(
+                    "pwsh.exe",
+                    &["-NoProfile", "-Command", acl_probe.as_str()]
+                ))
+            ));
             d.push_str(&format!(
                 "fsinfo_volume={}\n",
                 cap(&run("fsutil", &["fsinfo", "volumeinfo", drive.as_str()]))
