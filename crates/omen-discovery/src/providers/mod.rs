@@ -45,5 +45,5 @@ pub use path_commands::{PathCommandCache, PathCommandsProvider};
 pub use subcommands::SubcommandProvider;
 pub use tool_spec::{
     Arity, OptionSpec, SpecOrigin, SubcommandSpec, ToolSpec, ToolSpecProvider, ToolSpecRegistry,
-    ValueHint,
+    ValueHint, default_tool_specs,
 };

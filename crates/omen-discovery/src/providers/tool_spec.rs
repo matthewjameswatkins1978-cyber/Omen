@@ -192,6 +192,80 @@ impl ToolSpecProvider {
     }
 }
 
+/// Builds the Omen-owned declarative tool specs (authority-ladder rung 3).
+///
+/// These are inert data under a bounded schema. They assert *syntax* (which
+/// options/subcommands exist and what they mean), not executable behaviour.
+/// Where a structured tool-native source exists it outranks these on merge; the
+/// strict help harvest fills gaps and is outranked by both.
+pub fn default_tool_specs() -> ToolSpecRegistry {
+    let mut reg = ToolSpecRegistry::new();
+
+    reg.register(ToolSpec {
+        tool: "git".into(),
+        origin: SpecOrigin::OmenOwned,
+        options: vec![
+            opt("verbose", Some('v'), "be more verbose", 0),
+            opt("quiet", Some('q'), "be quiet", 1),
+            opt("help", None, "show help", 2),
+            opt("version", None, "show version", 3),
+            opt("git-dir", None, "set the path to the repository", 4),
+            opt("work-tree", None, "set the working tree", 5),
+        ],
+        subcommands: vec![
+            sub("status", "show the working tree status", 0),
+            sub("commit", "record changes to the repository", 1),
+            sub("checkout", "switch branches or restore files", 2),
+            sub("push", "update remote refs", 3),
+            sub("log", "show commit logs", 4),
+        ],
+    });
+
+    reg.register(ToolSpec {
+        tool: "cargo".into(),
+        origin: SpecOrigin::OmenOwned,
+        options: vec![
+            opt("help", None, "show help", 0),
+            opt("version", Some('V'), "show version", 1),
+            opt("verbose", Some('v'), "use verbose output", 2),
+            opt("quiet", Some('q'), "do not print cargo log messages", 3),
+        ],
+        subcommands: vec![
+            sub("build", "compile the current package", 0),
+            sub("check", "check the current package", 1),
+            sub("test", "run tests", 2),
+            sub("run", "run a binary or example", 3),
+            sub("clippy", "run clippy lints", 4),
+            sub("fmt", "format the source", 5),
+        ],
+    });
+
+    reg
+}
+
+fn opt(long: &str, short: Option<char>, description: &str, ordinal: u32) -> OptionSpec {
+    OptionSpec {
+        long: Some(long.to_string()),
+        short: short.map(|c| c.to_string()),
+        description: Some(Description::short(description)),
+        arity: Arity::None,
+        required: false,
+        value_hint: None,
+        order_ordinal: ordinal,
+        safety: SafetyAnnotation::UnknownImpact,
+        deprecated: false,
+        hidden: false,
+    }
+}
+
+fn sub(name: &str, description: &str, ordinal: u32) -> SubcommandSpec {
+    SubcommandSpec {
+        name: name.to_string(),
+        description: Some(Description::short(description)),
+        order_ordinal: ordinal,
+    }
+}
+
 impl DiscoveryProvider for ToolSpecProvider {
     fn id(&self) -> ProviderId {
         ProviderId::new("tool-spec")
