@@ -179,7 +179,10 @@ impl Workspace {
     /// owner, DACL, emptiness) on failure. It changes no production
     /// semantics: the caller still fails closed after printing.
     fn diagnose(&self) -> String {
-        const CAP: usize = 2000;
+        // Order is load-bearing: hosted logs truncate the tail, so the
+        // decisive owner/volume evidence prints before the verbose DACL
+        // and group dumps.
+        const CAP: usize = 6000;
         fn cap(s: &str) -> String {
             let out: String = s.chars().take(CAP).collect();
             if out.len() < s.len() {
@@ -205,8 +208,6 @@ impl Workspace {
         }
         let mut d = String::new();
         d.push_str(&format!("host_data={}\n", self.host_data.display()));
-        d.push_str(&format!("config={}\n", self.config.display()));
-        d.push_str(&format!("trail={}\n", self.trail.display()));
         d.push_str(&format!(
             "temp_dir={} TEMP={:?} TMP={:?}\n",
             std::env::temp_dir().display(),
@@ -237,35 +238,36 @@ impl Workspace {
         {
             let hd = self.host_data.to_string_lossy().into_owned();
             let drive = hd.chars().next().unwrap_or('?').to_string();
-            d.push_str(&format!("whoami={}\n", cap(&run("whoami", &[]))));
+            // Decisive first: directory owner (Gate demands owner ==
+            // process token user) and volume truth.
+            let owner_probe = format!("(Get-Acl -LiteralPath '{}').Owner", hd);
             d.push_str(&format!(
-                "whoami_groups={}\n",
-                cap(&run("whoami", &["/groups"]))
-            ));
-            d.push_str(&format!("icacls={}\n", cap(&run("icacls", &[hd.as_str()]))));
-            // Owner + inheritance detail: icacls shows only the DACL, while
-            // the Gate requires the directory owner to equal the process
-            // token user. Capture both explicitly (pwsh is already required
-            // by the Workspace ACL hardening above).
-            let acl_probe = format!(
-                "$a=Get-Acl -LiteralPath '{}'; 'OWNER='+$a.Owner; $a.Access | Format-Table IdentityReference,FileSystemRights,AccessControlType,IsInherited -AutoSize | Out-String -Width 200",
-                hd
-            );
-            d.push_str(&format!(
-                "get_acl={}\n",
-                cap(&run(
+                "owner={}\n",
+                run(
                     "pwsh.exe",
-                    &["-NoProfile", "-Command", acl_probe.as_str()]
-                ))
+                    &["-NoProfile", "-Command", owner_probe.as_str()]
+                )
+                .trim()
             ));
             d.push_str(&format!(
                 "fsinfo_volume={}\n",
-                cap(&run("fsutil", &["fsinfo", "volumeinfo", drive.as_str()]))
+                run("fsutil", &["fsinfo", "volumeinfo", drive.as_str()]).trim()
             ));
             d.push_str(&format!(
                 "fsinfo_drivetype={}\n",
-                cap(&run("fsutil", &["fsinfo", "drivetype", drive.as_str()]))
+                run("fsutil", &["fsinfo", "drivetype", drive.as_str()]).trim()
             ));
+            d.push_str(&format!("whoami={}\n", run("whoami", &[]).trim()));
+            d.push_str(&format!("icacls={}\n", run("icacls", &[hd.as_str()])));
+            let acl_probe = format!(
+                "$a=Get-Acl -LiteralPath '{}'; $a.Access | Format-Table IdentityReference,FileSystemRights,AccessControlType,IsInherited -AutoSize | Out-String -Width 200",
+                hd
+            );
+            d.push_str(&format!(
+                "get_acl_access={}\n",
+                run("pwsh.exe", &["-NoProfile", "-Command", acl_probe.as_str()])
+            ));
+            d.push_str(&format!("whoami_groups={}\n", run("whoami", &["/groups"])));
         }
         cap(&d)
     }
