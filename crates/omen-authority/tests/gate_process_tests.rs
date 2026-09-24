@@ -179,12 +179,19 @@ async fn g09_startup_failure_zero_spawn() {
     let (dir, marker, journal) = harness_bits();
     let cfg = spawn_config("exit-now", vec![]);
     let mut gate = GateProcess::spawn(&cfg).expect("spawn of exit-now works");
+    // The child exits at once: hello fails either on write (broken pipe
+    // won the race) or on read (EOF). Both are handshake failure —
+    // the phase is timing, the invariant (zero spawn) is not.
     let err = gate
         .hello(Duration::from_secs(3))
         .expect_err("hello must fail on instant exit");
+    let msg = format!("{err:?}");
     assert!(
-        format!("{err:?}").contains("eof") || format!("{err:?}").contains("closed"),
-        "got: {err:?}"
+        msg.contains("eof")
+            || msg.contains("closed")
+            || msg.contains("write.failed")
+            || msg.contains("Broken pipe"),
+        "got: {msg}"
     );
     let intent = test_intent(dir.path());
     let mut driver = AdmitExecute::new(gate);
