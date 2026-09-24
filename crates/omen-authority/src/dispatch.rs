@@ -8,6 +8,14 @@
 //! (`authorizes_physical_execution_by_tethers` MUST be false — Tethers
 //! did not and does not execute; `host_must_report_outcome` MUST be
 //! true). Any mismatch is zero spawn.
+//!
+//! Scope note: `tethers.dispatch/1` carries no separate scope field.
+//! Scope binds through the two digests — the manifest digest covers the
+//! capability's `permission_scope` (prefixes, pointer), and the argument
+//! digest covers the scoped argument values (e.g. `/path`). A scope
+//! violation therefore cannot survive verification: either the manifest
+//! differs (digest mismatch) or the scoped values differ (digest
+//! mismatch).
 
 use crate::AuthorityError;
 use crate::protocol::DispatchRecord;

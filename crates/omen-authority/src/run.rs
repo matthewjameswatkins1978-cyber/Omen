@@ -274,7 +274,17 @@ where
     let spawn_count = u64::from(attempt.attempted);
 
     // OUTCOME (or deferral when nothing was attempted).
-    let payload = outcome_payload(&verified, &attempt, &intent.success_result, None);
+    // Evidence: digest over the captured streams (bounded by the
+    // executor); the Gate binds it to the execution, Omen keeps the
+    // bytes in its own evidence store.
+    let evidence = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(&attempt.stdout);
+        h.update(&attempt.stderr);
+        Some(format!("sha256:{:x}", h.finalize()))
+    };
+    let payload = outcome_payload(&verified, &attempt, &intent.success_result, evidence);
     let (outcome_state, terminal, human) = match payload {
         None => {
             journal.record(OutcomeRecord {

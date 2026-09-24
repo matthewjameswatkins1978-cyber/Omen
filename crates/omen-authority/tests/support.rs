@@ -52,6 +52,8 @@ pub enum CommitScript {
     Admit,
     /// Mutate one dispatch field before returning.
     AdmitMutated(DispatchMutation),
+    /// Refuse the commit with a machine code (replay/refusal paths).
+    Refuse { code: String, message: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -341,6 +343,13 @@ impl GateTransport for FakeGate {
                     return Err(RoundtripError::Refused {
                         code: "commit.deny".to_string(),
                         message: "fresh current authority denies (revoked)".to_string(),
+                        data: None,
+                    });
+                }
+                if let CommitScript::Refuse { code, message } = &self.commit {
+                    return Err(RoundtripError::Refused {
+                        code: code.clone(),
+                        message: message.clone(),
                         data: None,
                     });
                 }

@@ -195,6 +195,36 @@ async fn m05_revoke_before_commit_zero_spawn() {
     assert_eq!(driver.transport().outcome_calls, 0);
 }
 
+// 5b. Replay refusal at COMMIT: a previous admission is never a
+// reusable permission slip. Zero spawn.
+#[tokio::test]
+async fn m05b_replay_refusal_zero_spawn() {
+    let (_dir, intent, gate, marker, journal) = harness(
+        PrepareScript::Allow,
+        CommitScript::Refuse {
+            code: "commit.replay_blocked".to_string(),
+            message: "replay refused a second admission: replay_blocked_completed_success".to_string(),
+        },
+        "eval_05b",
+    );
+    let mut driver = AdmitExecute::new(gate);
+    let mut exec = succeeding(&marker);
+    let report = run_once(
+        &mut driver,
+        Some("gate_fake".to_string()),
+        &intent,
+        AskPolicy::Defer,
+        &mut exec,
+        &journal,
+    )
+    .await
+    .expect("replay refusal surfaces");
+    assert!(matches!(report.human, HumanOutcome::StaleRevoked(_)));
+    assert_eq!(report.spawn_count, 0);
+    assert_eq!(exec.calls, 0);
+    assert!(marker_text(&marker).is_none(), "replay-blocked admission executed");
+}
+
 // 6. RE-ADMIT after revocation: fresh COMMIT -> exactly one spawn.
 #[tokio::test]
 async fn m06_readmit_after_revocation_exactly_one_spawn() {
