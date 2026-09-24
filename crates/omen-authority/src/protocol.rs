@@ -74,8 +74,13 @@ impl ResponseFrame {
                 "frame.oversized: response exceeds 1 MiB".to_string(),
             ));
         }
-        let frame: ResponseFrame = serde_json::from_str(line)
-            .map_err(|e| crate::AuthorityError::Receive(format!("frame.invalid_json: {e}")))?;
+        // Bounded snippet: a Gate that prints envelopes or diagnostics
+        // on stdout (e.g. failed startup) must be identifiable without
+        // dumping unbounded bytes.
+        let snippet: String = line.chars().take(160).collect();
+        let frame: ResponseFrame = serde_json::from_str(line).map_err(|e| {
+            crate::AuthorityError::Receive(format!("frame.invalid_json: {e} :: {snippet}"))
+        })?;
         if frame.schema != AUTHORITY_PROTOCOL {
             return Err(crate::AuthorityError::Receive(format!(
                 "frame.unsupported_schema: {}",

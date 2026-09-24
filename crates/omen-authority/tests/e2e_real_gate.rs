@@ -195,7 +195,12 @@ impl Workspace {
         };
         // Fixture paths resolve relative to the config dir (Gate-side).
         let mut gate = GateProcess::spawn(&cfg).expect("gate spawns");
-        let hello = gate.hello(Duration::from_secs(30)).expect("hello works");
+        let hello = gate.hello(Duration::from_secs(30)).unwrap_or_else(|e| {
+            panic!(
+                "hello works: {e:?} :: gate stderr: {}",
+                String::from_utf8_lossy(&gate.stderr_tail())
+            )
+        });
         ExpectedGate::pinned("canonical".to_string(), None)
             .verify_hello(&hello)
             .expect("canonical gate identity verifies");

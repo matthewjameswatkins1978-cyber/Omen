@@ -352,6 +352,14 @@ jobs:
           cd "$TETHERS_BUILD_DIR/tethers-0.1/engine-ocaml"
           opam install . --deps-only -y
           opam exec -- dune build @all
+          if [ ! -f "_build/default/bin/tethers_mcp_main" ] && [ ! -f "_build/default/bin/tethers_mcp_main.exe" ]; then
+            echo "ENGINE BUILD OUTPUT MISSING; bin dir:"
+            ls -la _build/default/bin/ || true
+            echo "--- dune diagnostics ---"
+            opam exec -- dune build @all --verbose 2>&1 | tail -n 30 || true
+            exit 1
+          fi
+          ls -la _build/default/bin/tethers_mcp_main* || true
 
       - name: Wire canonical Gate environment
         shell: pwsh
