@@ -364,9 +364,11 @@ jobs:
       - name: Wire canonical Gate environment
         shell: pwsh
         run: |
+          # Dune names the engine executable with .exe on every platform.
           $ext = if ($IsWindows) { '.exe' } else { '' }
           $gate = Join-Path $env:TETHERS_BUILD_DIR "tethers-0.1/host-rust/target/release/tethers$ext"
-          $engine = Join-Path $env:TETHERS_BUILD_DIR "tethers-0.1/engine-ocaml/_build/default/bin/tethers_mcp_main$ext"
+          $engineBase = Join-Path $env:TETHERS_BUILD_DIR "tethers-0.1/engine-ocaml/_build/default/bin/tethers_mcp_main"
+          $engine = if (Test-Path "$engineBase$ext") { "$engineBase$ext" } elseif (Test-Path "$engineBase.exe") { "$engineBase.exe" } else { $engineBase }
           if (-not (Test-Path $gate)) { throw "gate binary missing: $gate" }
           if (-not (Test-Path $engine)) { throw "engine binary missing: $engine" }
           "OMEN_H2_GATE_EXE=$gate" >> $env:GITHUB_ENV

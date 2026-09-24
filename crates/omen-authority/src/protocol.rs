@@ -76,8 +76,8 @@ impl ResponseFrame {
         }
         // Bounded snippet: a Gate that prints envelopes or diagnostics
         // on stdout (e.g. failed startup) must be identifiable without
-        // dumping unbounded bytes.
-        let snippet: String = line.chars().take(160).collect();
+        // dumping unbounded bytes. Sized to carry a full CLI envelope.
+        let snippet: String = line.chars().take(512).collect();
         let frame: ResponseFrame = serde_json::from_str(line).map_err(|e| {
             crate::AuthorityError::Receive(format!("frame.invalid_json: {e} :: {snippet}"))
         })?;
