@@ -1,9 +1,16 @@
 //! Bounded candidate interrogation (Lucy repair B2, hardened Preview 19,
-//! atomic Windows containment Preview 20).
+//! atomic Windows containment Preview 20, fail-closed Preview 21).
 //!
 //! The staged candidate is asked exactly one question (`--version`) under
 //! a hard deadline with file-backed output capture. A corrupt, hostile, or
 //! merely broken candidate can never hang `omen update`.
+//!
+//! HARD H RULE (Preview 21): on Windows, successful candidate execution
+//! during health checking MUST imply atomic containment by construction.
+//! If the Job Object cannot be created or the atomic job-list spawn is
+//! refused, the probe FAILS CLOSED before executing the candidate — no
+//! plain-spawn fallback, no post-hoc assign, no timing reliance. There is
+//! therefore no production path that runs uncontained candidate code.
 //!
 //! ONE bounded supervision model (no unbounded operation after supervision
 //! begins — no `Child::wait()`, no `Command::output()`, no `read_to_end()`
@@ -18,10 +25,10 @@
 //!   ATOMICALLY at process creation (`STARTUPINFOEX` +
 //!   `PROC_THREAD_ATTRIBUTE_JOB_LIST` — the kernel places the candidate in
 //!   the job before any candidate code executes, so no pre-assignment
-//!   descendant can escape; supervised taskkill fallback when no job can
-//!   be used) / Unix own process group (`SIGKILL` to the group, set
-//!   pre-exec — likewise no window). Strays are swept on both the timeout
-//!   AND the clean-exit path;
+//!   descendant can escape; establishment failure FAILS CLOSED — the
+//!   candidate never executes) / Unix own process group (`SIGKILL` to the
+//!   group, set pre-exec — likewise no window). Strays are swept on both
+//!   the timeout AND the clean-exit path;
 //! - cleanup: [`CLEANUP_BUDGET`] (3 s) covering termination, tree
 //!   containment, and CONFIRMED reap (job empty / group empty / helper
 //!   done). Every waiter polls `try_wait`; expiry classifies
@@ -76,9 +83,11 @@ pub struct ProbeOutcome {
     pub cleanup: CleanupState,
     /// True when the candidate ran inside atomically-established
     /// containment: Windows job-list spawn (no pre-containment execution
-    /// window), Unix pre-exec process group. False on the degraded
-    /// Windows fallback (nested-job host) and on platforms with no
-    /// containment set — never inferred, always reported.
+    /// window), Unix pre-exec process group. On Windows the production
+    /// probe fails closed, so a successful Windows outcome ALWAYS reports
+    /// true here (kept for diagnostics/API compatibility); false is
+    /// possible only on platforms with no containment set — never
+    /// inferred, always reported.
     pub atomically_contained: bool,
 }
 
@@ -120,31 +129,25 @@ pub fn probe_candidate_with_budget(
     // + PROC_THREAD_ATTRIBUTE_JOB_LIST. The kernel assigns job membership
     // as part of process creation — there is no spawn-then-assign window
     // in which a pre-containment descendant could escape.
+    //
+    // FAIL CLOSED (Preview 21): if the job cannot be created or the
+    // atomic spawn is refused, return a Health error BEFORE executing the
+    // candidate. There is deliberately NO plain-spawn fallback and NO
+    // post-hoc AssignProcessToJobObject in this path: a successful probe
+    // MUST imply atomic containment by construction. The updater reports
+    // "atomic containment unavailable / candidate health unavailable" and
+    // preserves the previous slot. Running uncontained candidate code is
+    // not an option this function can express.
     #[cfg(windows)]
-    let job = create_contained_job();
+    let job_guard = create_contained_job()?;
     #[cfg(windows)]
-    let (mut child, atomic): (ProbeChild, bool) =
-        match spawn_contained(binary, &out_clone, &err_clone, job.as_ref()) {
-            Some(atom) => (ProbeChild::Atomic(atom), true),
-            None => {
-                // Degraded path (nested-job hosts where the OS refuses the
-                // job list): Preview 19 behavior — plain spawn, best-effort
-                // post-hoc assign into the existing job, supervised
-                // taskkill fallback when no job covers the tree.
-                let mut cmd = std::process::Command::new(binary);
-                cmd.arg("--version")
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::from(out_clone))
-                    .stderr(Stdio::from(err_clone));
-                let plain = cmd.spawn().map_err(|e| {
-                    LifecycleError::Health(format!("candidate would not spawn: {e}"))
-                })?;
-                if let Some(j) = job.as_ref() {
-                    assign_to_job(j, &plain);
-                }
-                (ProbeChild::Plain(plain), false)
-            }
-        };
+    let mut child =
+        ProbeChild::Atomic(spawn_contained(binary, &out_clone, &err_clone, &job_guard)?);
+    // Always Some on Windows (fail-closed above): keeps the shared
+    // supervision signatures; the no-job backstop inside
+    // `contain_terminate` is unreachable from production.
+    #[cfg(windows)]
+    let job: Option<JobGuard> = Some(job_guard);
     #[cfg(not(windows))]
     let job: Option<JobGuard> = None;
     #[cfg(not(windows))]
@@ -210,11 +213,12 @@ pub fn probe_candidate_with_budget(
     drop(out_file);
     drop(err_file);
 
-    // Containment provenance: Windows reports whether the atomic job-list
-    // spawn was used; Unix containment is pre-exec by construction; other
-    // platforms have no containment set (false, not unknown-by-silence).
+    // Containment provenance: Windows success implies the atomic
+    // job-list spawn was used (anything else fails closed above); Unix
+    // containment is pre-exec by construction; other platforms have no
+    // containment set (false, not unknown-by-silence).
     #[cfg(windows)]
-    let atomically_contained = atomic;
+    let atomically_contained = true;
     #[cfg(unix)]
     let atomically_contained = true;
     #[cfg(not(any(windows, unix)))]
@@ -366,10 +370,12 @@ fn sweep_strays(_child: &std::process::Child, _job: &Option<()>) {}
 type JobGuard = ();
 
 /// Bounded termination after the health deadline (public so integration
-/// tests exercise the SAME fallback primitive production uses when no Job
-/// Object is available — no replicas): supervised process-tree kill
-/// (Windows), direct-child kill, and reap polled under the budget — never
-/// an unbounded wait.
+/// tests exercise the SAME supervised tree-kill primitive — no replicas):
+/// supervised process-tree kill (Windows), direct-child kill, and reap
+/// polled under the budget — never an unbounded wait. (Preview 21: the
+/// production probe always has its Job; this remains for already-spawned
+/// test children and as the documented no-job backstop inside
+/// `contain_terminate`.)
 ///
 /// A candidate that exits during cleanup classifies
 /// [`CleanupState::TerminatedAndReaped`] (no spurious fatal). A candidate
@@ -512,22 +518,47 @@ fn supervised_tree_kill(pid: u32, deadline: Instant) -> Option<String> {
     }
 }
 
-/// Windows Job Object containment (Preview 20): a fresh job with
-/// KILL_ON_JOB_CLOSE, created BEFORE the candidate exists. The candidate
-/// is then created atomically inside it ([`spawn_contained`]), so the job
-/// covers the candidate from its first instruction — every descendant
-/// joins automatically, and closing the last handle kills the whole tree
-/// on BOTH the timeout and the clean-exit path. Creation failure returns
-/// None (nested-job hosts) and the caller falls back to the degraded
-/// plain-spawn + supervised taskkill path. Contained in this section: no
+/// Windows Job Object containment (Preview 20, fail-closed Preview 21):
+/// a fresh job with KILL_ON_JOB_CLOSE, created BEFORE the candidate
+/// exists. The candidate is then created atomically inside it
+/// ([`spawn_contained`]), so the job covers the candidate from its first
+/// instruction — every descendant joins automatically, and closing the
+/// last handle kills the whole tree on BOTH the timeout and the clean-exit
+/// path. Creation failure returns Err (never None): the probe fails closed
+/// before executing the candidate. Contained in this section: no
 /// architectural spread.
+///
+/// Fail-closed error shape: every establishment failure names the phase
+/// and states the consequence (health unavailable, previous preserved).
+#[cfg(windows)]
+fn atomic_unavailable(phase: &'static str) -> LifecycleError {
+    LifecycleError::Health(format!(
+        "atomic containment unavailable at {phase}: candidate health unavailable, previous preserved"
+    ))
+}
+
+/// Deterministic forced-failure seam (tests only, compiled out of
+/// production): a binary whose file name is exactly
+/// `force_atomic_unavailable.exe` is REFUSED at containment
+/// establishment — job creation and the atomic spawn both fail closed for
+/// it, before any candidate code could execute. Name-triggered (not a
+/// global flag) so parallel tests cannot interfere with each other.
+/// Refusal-only: this seam can only make health MORE strict, never less —
+/// no production entry point can reach uncontained execution through it.
+#[cfg(all(windows, test))]
+fn atomic_failure_forced(binary: &Path) -> bool {
+    binary
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case("force_atomic_unavailable.exe"))
+}
 #[cfg(windows)]
 struct JobGuard {
     handle: windows_sys::Win32::Foundation::HANDLE,
 }
 
 #[cfg(windows)]
-fn create_contained_job() -> Option<JobGuard> {
+fn create_contained_job() -> Result<JobGuard, LifecycleError> {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::JobObjects::{
         CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -536,7 +567,7 @@ fn create_contained_job() -> Option<JobGuard> {
     unsafe {
         let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
         if job.is_null() {
-            return None;
+            return Err(atomic_unavailable("create_contained_job.create"));
         }
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -548,20 +579,10 @@ fn create_contained_job() -> Option<JobGuard> {
         );
         if set == 0 {
             CloseHandle(job);
-            return None;
+            return Err(atomic_unavailable("create_contained_job.set-limits"));
         }
-        Some(JobGuard { handle: job })
+        Ok(JobGuard { handle: job })
     }
-}
-
-/// Best-effort post-hoc assignment, used ONLY on the degraded path where
-/// the atomic job-list spawn was refused (nested-job hosts). Returns
-/// whether the child joined the job.
-#[cfg(windows)]
-fn assign_to_job(job: &JobGuard, child: &std::process::Child) -> bool {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
-    unsafe { AssignProcessToJobObject(job.handle(), child.as_raw_handle()) != 0 }
 }
 
 /// A Windows candidate created atomically inside its Job Object. Owns the
@@ -624,14 +645,15 @@ impl Drop for AtomicProcess {
     }
 }
 
-/// The probe's child on Windows: either atomically contained (created in
-/// the job before executing a single instruction) or the degraded plain
-/// spawn. One narrow interface so the shared supervision body cannot tell
-/// the difference — except via `ProbeOutcome::atomically_contained`.
+/// The probe's child on Windows: atomically contained, created in the
+/// job before executing a single instruction. There is exactly one
+/// variant — the production probe cannot express an uncontained child.
+/// (The negative control in the atomicity test spawns a plain
+/// `std::process::Child` directly; it never enters this type and never
+/// reaches the supervision body.)
 #[cfg(windows)]
 enum ProbeChild {
     Atomic(AtomicProcess),
-    Plain(std::process::Child),
 }
 
 #[cfg(windows)]
@@ -639,21 +661,18 @@ impl ProbeChild {
     fn id(&self) -> u32 {
         match self {
             ProbeChild::Atomic(p) => p.id(),
-            ProbeChild::Plain(c) => c.id(),
         }
     }
 
     fn kill(&mut self) -> std::io::Result<()> {
         match self {
             ProbeChild::Atomic(p) => p.kill(),
-            ProbeChild::Plain(c) => c.kill(),
         }
     }
 
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         match self {
             ProbeChild::Atomic(p) => p.try_wait(),
-            ProbeChild::Plain(c) => c.try_wait(),
         }
     }
 }
@@ -698,18 +717,27 @@ impl WaitTarget for AtomicProcess {
 /// handles — nothing else leaks in). Batch files run via COMSPEC, as std
 /// does. No CREATE_SUSPENDED, no resume dance, no supervisor subsystem.
 ///
-/// Returns None when the OS refuses (nested-job hosts): the caller takes
-/// the degraded Preview-19 path. All syscalls here are synchronous and
+/// Fail closed: EVERY refusal returns Err — job-list refused, attribute
+/// setup failed, or CreateProcessW failed — and the caller propagates it
+/// before any candidate code runs. All syscalls here are synchronous and
 /// local — nothing waits, nothing blocks.
+///
+/// Takes `&JobGuard` (not Option): an uncontained spawn is unrepresentable
+/// in this signature. The test-only forced-failure seam
+/// ([`atomic_failure_forced`]) is checked first so the zero-execution
+/// regression can force establishment failure deterministically.
 #[cfg(windows)]
 fn spawn_contained(
     binary: &Path,
     stdout: &std::fs::File,
     stderr: &std::fs::File,
-    job: Option<&JobGuard>,
-) -> Option<AtomicProcess> {
+    job: &JobGuard,
+) -> Result<AtomicProcess, LifecycleError> {
+    #[cfg(test)]
+    if atomic_failure_forced(binary) {
+        return Err(atomic_unavailable("spawn_contained.forced"));
+    }
     use std::os::windows::io::AsRawHandle;
-    let job = job?;
     // Command line (safe code): `<binary> --version`; batch files via
     // COMSPEC (`cmd /c <script> --version`), mirroring std's .bat handling.
     let is_batch = matches!(
@@ -753,7 +781,8 @@ fn spawn_contained(
     unsafe {
         // Private stdio handles, marked inheritable and whitelisted: the
         // ONLY handles the candidate inherits.
-        let nul = std::fs::File::open("NUL").ok()?;
+        let nul =
+            std::fs::File::open("NUL").map_err(|_| atomic_unavailable("spawn_contained.stdio"))?;
         for f in [&nul, stdout, stderr] {
             if SetHandleInformation(
                 f.as_raw_handle() as HANDLE,
@@ -761,7 +790,7 @@ fn spawn_contained(
                 HANDLE_FLAG_INHERIT,
             ) == 0
             {
-                return None;
+                return Err(atomic_unavailable("spawn_contained.stdio"));
             }
         }
         let mut inherit = [
@@ -774,12 +803,12 @@ fn spawn_contained(
         let mut size: usize = 0;
         InitializeProcThreadAttributeList(std::ptr::null_mut(), 2, 0, &mut size);
         if size == 0 {
-            return None;
+            return Err(atomic_unavailable("spawn_contained.attribute-list"));
         }
         let mut buf = vec![0u8; size];
         let list = buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
         if InitializeProcThreadAttributeList(list, 2, 0, &mut size) == 0 {
-            return None;
+            return Err(atomic_unavailable("spawn_contained.attribute-list"));
         }
         // Every failure path from here deletes the list before returning.
         let mut job_handle: HANDLE = job.handle();
@@ -803,7 +832,7 @@ fn spawn_contained(
         ) != 0;
         if !ok_job || !ok_handles {
             DeleteProcThreadAttributeList(list);
-            return None;
+            return Err(atomic_unavailable("spawn_contained.job-list-attribute"));
         }
         let mut si: STARTUPINFOEXW = std::mem::zeroed();
         si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
@@ -827,13 +856,13 @@ fn spawn_contained(
         );
         DeleteProcThreadAttributeList(list);
         if created == 0 {
-            return None;
+            return Err(atomic_unavailable("spawn_contained.create-process"));
         }
         CloseHandle(pi.hThread);
         if pi.hProcess.is_null() {
-            return None;
+            return Err(atomic_unavailable("spawn_contained.process-handle"));
         }
-        Some(AtomicProcess {
+        Ok(AtomicProcess {
             handle: pi.hProcess,
             pid: pi.dwProcessId,
         })
@@ -1047,7 +1076,7 @@ mod tests {
         let bat = dir.path().join("quick.bat");
         std::fs::write(
             &bat,
-            "@echo off\r\necho omen 0.9.0-preview.20 contract:0.8 commit:abc123\r\n",
+            "@echo off\r\necho omen 0.9.0-preview.21 contract:0.8 commit:abc123\r\n",
         )
         .unwrap();
         (dir, bat)
@@ -1060,7 +1089,7 @@ mod tests {
         let sh = dir.path().join("quick.sh");
         std::fs::write(
             &sh,
-            "#!/bin/sh\necho 'omen 0.9.0-preview.20 contract:0.8 commit:abc123'\n",
+            "#!/bin/sh\necho 'omen 0.9.0-preview.21 contract:0.8 commit:abc123'\n",
         )
         .unwrap();
         std::fs::set_permissions(&sh, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1084,7 +1113,7 @@ mod tests {
         std::fs::write(
             &bat,
             format!(
-                "@echo off\r\nstart \"\" /b powershell -NoProfile -Command \"$PID | Out-File -FilePath '{}' -Encoding ascii; Start-Sleep 60\"\r\nset /a n=0\r\n:wait\r\nif exist \"{}\" goto done\r\nset /a n+=1\r\nif %n% GEQ 6 goto done\r\ntimeout /t 1 /nobreak >nul\r\ngoto wait\r\n:done\r\necho omen 0.9.0-preview.20 contract:0.8 commit:abc123\r\n",
+                "@echo off\r\nstart \"\" /b powershell -NoProfile -Command \"$PID | Out-File -FilePath '{}' -Encoding ascii; Start-Sleep 60\"\r\nset /a n=0\r\n:wait\r\nif exist \"{}\" goto done\r\nset /a n+=1\r\nif %n% GEQ 6 goto done\r\ntimeout /t 1 /nobreak >nul\r\ngoto wait\r\n:done\r\necho omen 0.9.0-preview.21 contract:0.8 commit:abc123\r\n",
                 marker.display(),
                 marker.display()
             ),
@@ -1102,7 +1131,7 @@ mod tests {
         std::fs::write(
             &sh,
             format!(
-                "#!/bin/sh\n( sleep 60 & echo $! > '{}' )\necho 'omen 0.9.0-preview.20 contract:0.8 commit:abc123'\n",
+                "#!/bin/sh\n( sleep 60 & echo $! > '{}' )\necho 'omen 0.9.0-preview.21 contract:0.8 commit:abc123'\n",
                 marker.display()
             ),
         )
@@ -1170,7 +1199,7 @@ fn main() {
     // immediately — no waiting, so any descendant is necessarily already
     // born when the root exits.
     spawn_sleeper();
-    println!("omen 0.9.0-preview.20 contract:0.8 commit:abc123");
+    println!("omen 0.9.0-preview.21 contract:0.8 commit:abc123");
 }
 "#;
 
@@ -1345,7 +1374,7 @@ fn main() {
         assert!(out.exit_ok);
         assert_eq!(out.cleanup, CleanupState::NotNeeded);
         let (v, c, _) = parse_identity(&out.stdout);
-        assert_eq!(v.as_deref(), Some("0.9.0-preview.20"));
+        assert_eq!(v.as_deref(), Some("0.9.0-preview.21"));
         assert_eq!(c.as_deref(), Some("0.8"));
         // No deadline dependence: root exits in ~1 s; the probe must be
         // nowhere near the 10 s deadline.
@@ -1414,7 +1443,7 @@ fn main() {
             assert_eq!(out.cleanup, CleanupState::NotNeeded);
             assert!(out.exit_ok);
             let (v, c, _) = parse_identity(&out.stdout);
-            assert_eq!(v.as_deref(), Some("0.9.0-preview.20"));
+            assert_eq!(v.as_deref(), Some("0.9.0-preview.21"));
             assert_eq!(c.as_deref(), Some("0.8"));
         }
     }
@@ -1548,9 +1577,24 @@ fn main() {
     fn immediate_descendant_is_contained_atomically() {
         let (_dir, bin, gcpid) = atomic_fixture();
         let t0 = Instant::now();
-        let out =
-            probe_candidate_with_budget(&bin, Duration::from_secs(15), Duration::from_secs(3))
-                .unwrap();
+        // Fail-closed environments (nested-job host: the OS refuses the
+        // job list) cannot prove atomicity HERE — the probe refuses
+        // instead of running uncontained. Reported, not disguised.
+        let out = match probe_candidate_with_budget(
+            &bin,
+            Duration::from_secs(15),
+            Duration::from_secs(3),
+        ) {
+            Ok(o) => o,
+            Err(e) => {
+                let msg = format!("{e:?}");
+                if msg.contains("atomic containment unavailable") {
+                    eprintln!("SKIP-ATOMIC: job-list spawn unavailable (nested-job host?)");
+                    return;
+                }
+                panic!("probe failed unexpectedly: {e:?}");
+            }
+        };
         let total = t0.elapsed();
         assert!(
             !out.timed_out,
@@ -1559,15 +1603,15 @@ fn main() {
         assert!(out.exit_ok);
         assert_eq!(out.cleanup, CleanupState::NotNeeded);
         let (v, c, _) = parse_identity(&out.stdout);
-        assert_eq!(v.as_deref(), Some("0.9.0-preview.20"));
+        assert_eq!(v.as_deref(), Some("0.9.0-preview.21"));
         assert_eq!(c.as_deref(), Some("0.8"));
-        if !out.atomically_contained {
-            // Nested-job host: the OS refused the job list, so atomicity
-            // is unprovable in THIS environment. Reported, not disguised —
-            // the outcome flag (not inference) is the authority.
-            eprintln!("SKIP-ATOMIC: job-list spawn unavailable (nested-job host?)");
-            return;
-        }
+        // Fail-closed: a successful Windows production probe MUST imply
+        // atomic containment by construction — the flag is asserted, not
+        // skipped.
+        assert!(
+            out.atomically_contained,
+            "successful Windows probe must report atomic containment"
+        );
         assert!(
             total < Duration::from_secs(13),
             "atomic probe took {total:?} — deadline-dependent"
@@ -1600,7 +1644,9 @@ fn main() {
     /// PROC_THREAD_ATTRIBUTE_JOB_LIST happens at creation, before any
     /// candidate instruction — so the verdict cannot depend on scheduling,
     /// polling speed, or spawn-vs-assign races: there is no window to
-    /// race in. The negative control (plain spawn, same binary) must
+    /// race in. The negative control (plain spawn, same binary, direct
+    /// `std::process::Child` — a low-level test control that never enters
+    /// [`ProbeChild`] and never reaches the supervision body) must
     /// report NOT-a-member of the same job, proving the query
     /// discriminates. Together: TRUE iff the atomic mechanism placed the
     /// child. No hangs possible (no waits, one bounded reap each).
@@ -1610,14 +1656,22 @@ fn main() {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Foundation::HANDLE;
         let (_dir, helper) = native_helper();
-        let job = create_contained_job().expect("test env must allow job creation");
+        let job = match create_contained_job() {
+            Ok(j) => j,
+            Err(_) => {
+                eprintln!("SKIP-ATOMIC: job creation unavailable in this environment");
+                return;
+            }
+        };
         let tmp = tempfile::tempdir().unwrap();
         let cap_out = std::fs::File::create(tmp.path().join("o")).unwrap();
         let cap_err = std::fs::File::create(tmp.path().join("e")).unwrap();
-        let atom = spawn_contained(&helper, &cap_out, &cap_err, Some(&job));
-        let Some(mut atom) = atom else {
-            eprintln!("SKIP-ATOMIC: job-list spawn refused (nested-job host?)");
-            return;
+        let mut atom = match spawn_contained(&helper, &cap_out, &cap_err, &job) {
+            Ok(a) => a,
+            Err(_) => {
+                eprintln!("SKIP-ATOMIC: job-list spawn refused (nested-job host?)");
+                return;
+            }
         };
         assert!(
             in_explicit_job(atom.handle, job.handle()),
@@ -1647,6 +1701,96 @@ fn main() {
         assert!(
             reap_bounded(&mut plain, end).is_ok(),
             "control child must exit promptly"
+        );
+    }
+
+    /// Marker-first fixture source (Windows): its FIRST action on startup
+    /// is creating the `executed.marker` sibling — so marker absence after
+    /// a probe proves ZERO candidate execution, not merely later cleanup.
+    /// Afterwards it prints a valid identity and exits 0 (so that, were
+    /// it ever executed uncontained, the probe would SUCCEED — making
+    /// marker absence + probe failure jointly conclusive).
+    #[cfg(windows)]
+    const MARKER_RS: &str = r#"
+fn main() {
+    let exe = std::env::current_exe().expect("current exe");
+    let marker = exe.parent().expect("exe dir").join("executed.marker");
+    std::fs::write(&marker, std::process::id().to_string()).expect("marker write");
+    println!("omen 0.9.0-preview.21 contract:0.8 commit:abc123");
+}
+"#;
+
+    /// Build the marker fixture under the seam name
+    /// (`force_atomic_unavailable.exe`) that trips
+    /// [`atomic_failure_forced`]. Returns dir + exe + marker paths.
+    #[cfg(windows)]
+    fn marker_fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("marker.rs"), MARKER_RS).unwrap();
+        let out = std::process::Command::new("rustc")
+            .arg("--edition=2021")
+            .arg("--crate-name")
+            .arg("omen_h_marker")
+            .arg("marker.rs")
+            .arg("-o")
+            .arg("force_atomic_unavailable.exe")
+            .current_dir(dir.path())
+            .stdin(Stdio::null())
+            .output()
+            .expect("rustc must be on PATH to build the zero-execution fixture");
+        assert!(
+            out.status.success(),
+            "marker build failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let exe = dir.path().join("force_atomic_unavailable.exe");
+        let marker = dir.path().join("executed.marker");
+        (dir, exe, marker)
+    }
+
+    /// TEST 11 (Windows) — forced atomic-failure zero-execution proof,
+    /// deterministic: the seam trips containment establishment, so the
+    /// production probe must fail explicitly BEFORE executing the
+    /// candidate. Proves, in order: (1) probe returns Err naming atomic
+    /// containment unavailability; (2) the marker DOES NOT EXIST, i.e. the
+    /// candidate's first instruction never ran — ZERO execution, not
+    /// cleanup; (3) fail-fast return far below any deadline (no
+    /// deadline-dependence); (4) no descendant can exist (nothing was ever
+    /// spawned — verified by re-asserting marker absence after a
+    /// scheduling grace period, with hygiene). Name-triggered seam: no
+    /// global state, fully parallel-safe.
+    #[cfg(windows)]
+    #[test]
+    fn forced_atomic_failure_never_executes_candidate() {
+        let (_dir, exe, marker) = marker_fixture();
+        assert!(
+            !marker.exists(),
+            "fixture setup must not pre-create the marker"
+        );
+        let t0 = Instant::now();
+        let err =
+            probe_candidate_with_budget(&exe, Duration::from_secs(15), Duration::from_secs(3))
+                .expect_err("forced atomic failure must fail the probe");
+        let total = t0.elapsed();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("atomic containment unavailable"),
+            "probe must fail explicitly on containment establishment, got: {msg}"
+        );
+        assert!(
+            !marker.exists(),
+            "ZERO-EXECUTION VIOLATED: candidate ran despite failed containment"
+        );
+        assert!(
+            total < Duration::from_secs(10),
+            "fail-closed probe took {total:?} — must fail fast, not deadline-dependent"
+        );
+        // Scheduling grace: if anything had been spawned it would have
+        // written the marker by now. Re-assert absence, then hygiene.
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            !marker.exists(),
+            "ZERO-EXECUTION VIOLATED after grace period: candidate ran late"
         );
     }
 }
