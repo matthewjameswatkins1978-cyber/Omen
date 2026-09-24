@@ -250,10 +250,18 @@ jobs:
 
   h2-gate-e2e:
     needs: check-and-lint
+    # Ubuntu + Windows only (documented limitation): the canonical
+    # Tethers R2 Gate does not compile on macOS —
+    # tethers-0.1/host-rust/src/child_process.rs:405 calls Linux-only
+    # libc::prctl(PR_SET_PDEATHSIG) under plain #[cfg(unix)]. Smallest
+    # required Tethers seam: gate that call to #[cfg(target_os="linux")]
+    # (setsid stays unix). Reported, not worked around: Omen changes no
+    # Tethers code. Omen-side supervision is cfg-free and covered on
+    # macOS by the unit matrix + stub-supervision tests.
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout Omen repository
@@ -337,7 +345,7 @@ jobs:
         shell: bash
         run: |
           cd "$TETHERS_BUILD_DIR/tethers-0.1/engine-ocaml"
-          opam install . --deps-only --with-test=false -y
+          opam install . --deps-only -y
           opam exec -- dune build @all
 
       - name: Wire canonical Gate environment

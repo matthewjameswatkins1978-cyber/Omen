@@ -1313,7 +1313,6 @@ fn cycle(root: &Path, mcp_protocol: &str) -> Result<(), String> {
         "matrix-test (macos-latest)",
         "h2-gate-e2e (ubuntu-latest)",
         "h2-gate-e2e (windows-latest)",
-        "h2-gate-e2e (macos-latest)",
         "windows-preview-candidate",
     ];
     if required.iter().any(|n| !names.contains(n)) {
