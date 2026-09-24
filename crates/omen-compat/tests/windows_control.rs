@@ -5,13 +5,17 @@
 //!
 //! D2-022 boundedness seal: blocked-write cancellation, close modes,
 //! repeated lifecycle, and hostile helper watchdog are control facts.
+//!
+//! D2-023 error-path ownership seal: constructor-failure cleanup, join
+//! discipline, and HPCON invalidation are control facts.
 
 #![cfg(windows)]
 
 use omen_compat::{
-    InvariantOutcome, WIN_WRITE_CANCEL_BOUND, WindowsConPtySession, WindowsConsoleModeSnapshot,
-    WindowsCtrlReceipt, WindowsExitCauseContext, WindowsExitObservation, WindowsProcessLiveness,
-    WindowsWriteOutcome, control_blocked_write, judge_engine_shutdown_bounded,
+    ConPtyConstructionFailure, ConstructionFault, InvariantOutcome, WIN_CONSTRUCTION_CLEANUP_BOUND,
+    WIN_WRITE_CANCEL_BOUND, WindowsConPtySession, WindowsConsoleModeSnapshot, WindowsCtrlReceipt,
+    WindowsExitCauseContext, WindowsExitObservation, WindowsProcessLiveness, WindowsWriteOutcome,
+    control_blocked_write, join_after_exit_signal, judge_engine_shutdown_bounded,
     judge_terminal_ctrl_c_reaches_child, parse_windows_report, poll_until,
     release_pseudoconsole_available,
 };
@@ -85,6 +89,25 @@ fn spawn(args: &[&str], deadline: Duration) -> WindowsConPtySession {
         deadline.min(WATCHDOG),
     )
     .expect("ConPTY spawn")
+}
+
+/// Deterministic constructor-failure probe (D2-023 §19): the fault is an
+/// explicit argument — never an environment variable — and the caller keeps
+/// its own outer watchdog around the whole call.
+fn spawn_with_fault(
+    fault: ConstructionFault,
+    args: &[&str],
+) -> Result<WindowsConPtySession, ConPtyConstructionFailure> {
+    let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    WindowsConPtySession::spawn_with_fault(
+        gremlin_exe(),
+        &argv,
+        Some(&workspace_root()),
+        24,
+        80,
+        Duration::from_secs(15),
+        Some(fault),
+    )
 }
 
 /// Control 1 — real CreatePseudoConsole + fixture I/O (independent of omen-engine).
@@ -693,4 +716,427 @@ fn control_release_pseudoconsole_capability_report() {
     let avail = release_pseudoconsole_available();
     println!("FACT\tRELEASE_PSEUDOCONSOLE\tavailable={avail} used=NO baseline=threaded_close");
     // Never assert failure on older Windows; optional control only.
+}
+
+/// D2-023 §34 — injected failure immediately after the pseudoconsole exists.
+///
+/// The caller must return inside its bound, the close must run on the close
+/// worker rather than the caller thread, and the cleanup record must not
+/// claim completion it did not observe.
+#[test]
+fn control_constructor_failure_after_hpcon() {
+    let t0 = Instant::now();
+    let failure = spawn_with_fault(ConstructionFault::AfterPseudoConsole, &["--windows-report"])
+        .expect_err("injected after-pseudoconsole fault must fail construction");
+    let c = &failure.cleanup;
+    println!(
+        "FACT\tCONSTRUCT_FAIL_AFTER_HPCON\tstage={} hpcon={} client={} close_started={} \
+         close_returned={} close_tid={:?} caller_tid={} drain={} handles={} bounded_out={} \
+         elapsed_ms={}",
+        c.failure_stage,
+        c.hpcon_created,
+        c.client_existed,
+        c.close_started,
+        c.close_returned,
+        c.close_thread_id,
+        c.caller_thread_id,
+        c.output_drain_established,
+        c.handles_closed_once,
+        c.bounded_out,
+        c.elapsed.as_millis()
+    );
+    assert_eq!(c.failure_stage, "after_pseudoconsole");
+    assert!(
+        c.hpcon_created,
+        "the pseudoconsole existed before the fault"
+    );
+    assert!(!c.client_existed, "no client exists at this stage");
+    assert!(
+        failure.error.to_string().contains("after_pseudoconsole"),
+        "original constructor error must be preserved: {failure}"
+    );
+    assert!(c.close_started, "close must run through the close worker");
+    assert!(
+        c.close_ran_off_caller(),
+        "close must not execute on the caller thread: {c:?}"
+    );
+    assert!(
+        c.close_returned || c.bounded_out,
+        "close must return or be recorded as bounded-out: {c:?}"
+    );
+    assert!(
+        c.handles_closed_once || c.bounded_out,
+        "no handle may be claimed closed without its owner path completing: {c:?}"
+    );
+    assert!(
+        c.harness_cleanup_pass(WIN_CONSTRUCTION_CLEANUP_BOUND),
+        "bounded cleanup must be complete: {c:?}"
+    );
+    assert!(t0.elapsed() < WATCHDOG, "caller must stay bounded");
+}
+
+/// D2-023 §8 — pre-client failure still closes through the bounded worker.
+///
+/// There is no attached client here, which does NOT license a caller-thread
+/// close: the architectural guarantee is universal.
+#[test]
+fn control_constructor_failure_pre_client() {
+    let t0 = Instant::now();
+    let failure = spawn_with_fault(
+        ConstructionFault::AfterAttributeSetup,
+        &["--windows-report"],
+    )
+    .expect_err("injected pre-client fault must fail construction");
+    let c = &failure.cleanup;
+    println!(
+        "FACT\tCONSTRUCT_FAIL_PRE_CLIENT\tstage={} close_started={} close_returned={} \
+         close_tid={:?} caller_tid={} handles={} bounded_out={} elapsed_ms={}",
+        c.failure_stage,
+        c.close_started,
+        c.close_returned,
+        c.close_thread_id,
+        c.caller_thread_id,
+        c.handles_closed_once,
+        c.bounded_out,
+        c.elapsed.as_millis()
+    );
+    assert_eq!(c.failure_stage, "after_attribute_setup");
+    assert!(!c.client_existed, "failure occurred before CreateProcessW");
+    assert!(
+        c.close_started,
+        "pre-client failures still use the close worker"
+    );
+    assert!(
+        c.close_ran_off_caller(),
+        "no caller-thread close, even without a client: {c:?}"
+    );
+    assert!(
+        !c.output_drain_established,
+        "no client can have produced output"
+    );
+    assert_eq!(
+        c.output_worker_exit_observed, None,
+        "no output worker existed; do not invent an exit observation"
+    );
+    assert!(
+        c.harness_cleanup_pass(WIN_CONSTRUCTION_CLEANUP_BOUND),
+        "bounded cleanup must be complete: {c:?}"
+    );
+    assert!(t0.elapsed() < WATCHDOG);
+}
+
+/// D2-023 §35 — failure after the client is created but still suspended.
+///
+/// The suspended child must be terminated and observed, its handles closed
+/// once, and the pseudoconsole closed off the caller thread.
+#[test]
+fn control_constructor_failure_suspended_client() {
+    let t0 = Instant::now();
+    let failure = spawn_with_fault(ConstructionFault::AfterProcessCreate, &["--windows-report"])
+        .expect_err("injected suspended-client fault must fail construction");
+    let c = &failure.cleanup;
+    println!(
+        "FACT\tCONSTRUCT_FAIL_SUSPENDED\tstage={} client={} client_exit={} drain={} \
+         output_exit={:?} close_started={} close_returned={} close_tid={:?} caller_tid={} \
+         handles={} bounded_out={} elapsed_ms={}",
+        c.failure_stage,
+        c.client_existed,
+        c.client_exit_observed,
+        c.output_drain_established,
+        c.output_worker_exit_observed,
+        c.close_started,
+        c.close_returned,
+        c.close_thread_id,
+        c.caller_thread_id,
+        c.handles_closed_once,
+        c.bounded_out,
+        c.elapsed.as_millis()
+    );
+    assert_eq!(c.failure_stage, "after_process_create");
+    assert!(c.client_existed, "the client process was created");
+    assert!(
+        c.client_exit_observed,
+        "the suspended child must be terminated and its exit observed: {c:?}"
+    );
+    assert!(
+        c.output_drain_established,
+        "a client may have produced output, so drainage is established"
+    );
+    assert_eq!(
+        c.output_worker_exit_observed,
+        Some(true),
+        "the drain worker's exit must be observed before any join: {c:?}"
+    );
+    assert!(c.close_ran_off_caller(), "{c:?}");
+    assert!(
+        c.harness_cleanup_pass(WIN_CONSTRUCTION_CLEANUP_BOUND),
+        "bounded cleanup must be complete: {c:?}"
+    );
+    assert!(t0.elapsed() < WATCHDOG);
+}
+
+/// D2-023 §36 — output worker establishment fails while the client runs.
+///
+/// Cleanup must establish drainage, close off the caller thread, terminate
+/// the client, and record drain availability honestly.
+#[test]
+fn control_constructor_failure_output_worker() {
+    let t0 = Instant::now();
+    let failure = spawn_with_fault(
+        ConstructionFault::OutputWorkerSpawn,
+        &["--windows-child-hold"],
+    )
+    .expect_err("injected output-worker fault must fail construction");
+    let c = &failure.cleanup;
+    println!(
+        "FACT\tCONSTRUCT_FAIL_OUTPUT_WORKER\tstage={} client={} client_exit={} drain={} \
+         output_exit={:?} close_returned={} close_tid={:?} caller_tid={} handles={} \
+         bounded_out={} elapsed_ms={}",
+        c.failure_stage,
+        c.client_existed,
+        c.client_exit_observed,
+        c.output_drain_established,
+        c.output_worker_exit_observed,
+        c.close_returned,
+        c.close_thread_id,
+        c.caller_thread_id,
+        c.handles_closed_once,
+        c.bounded_out,
+        c.elapsed.as_millis()
+    );
+    assert_eq!(c.failure_stage, "output_worker_spawn");
+    assert!(c.client_existed, "the client was already resumed");
+    assert!(c.client_exit_observed, "{c:?}");
+    assert!(
+        c.output_drain_established,
+        "a temporary drain worker must be established while a client may produce output: {c:?}"
+    );
+    assert_eq!(
+        c.output_worker_exit_observed,
+        Some(true),
+        "drain exit must be observed, never assumed: {c:?}"
+    );
+    assert!(c.close_ran_off_caller(), "{c:?}");
+    assert!(
+        c.harness_cleanup_pass(WIN_CONSTRUCTION_CLEANUP_BOUND),
+        "bounded cleanup must be complete: {c:?}"
+    );
+    assert!(t0.elapsed() < WATCHDOG);
+}
+
+/// D2-023 §37 — input worker establishment fails with a live output drain.
+///
+/// The output exit is awaited boundedly and joined only once observed.
+#[test]
+fn control_constructor_failure_input_worker() {
+    let t0 = Instant::now();
+    let failure = spawn_with_fault(
+        ConstructionFault::InputWorkerSpawn,
+        &["--windows-child-hold"],
+    )
+    .expect_err("injected input-worker fault must fail construction");
+    let c = &failure.cleanup;
+    println!(
+        "FACT\tCONSTRUCT_FAIL_INPUT_WORKER\tstage={} client={} client_exit={} drain={} \
+         output_exit={:?} close_returned={} close_tid={:?} caller_tid={} handles={} \
+         bounded_out={} elapsed_ms={}",
+        c.failure_stage,
+        c.client_existed,
+        c.client_exit_observed,
+        c.output_drain_established,
+        c.output_worker_exit_observed,
+        c.close_returned,
+        c.close_thread_id,
+        c.caller_thread_id,
+        c.handles_closed_once,
+        c.bounded_out,
+        c.elapsed.as_millis()
+    );
+    assert_eq!(c.failure_stage, "input_worker_spawn");
+    assert!(c.client_existed && c.client_exit_observed, "{c:?}");
+    assert!(
+        c.output_drain_established,
+        "the normal output worker was already live: {c:?}"
+    );
+    assert_eq!(
+        c.output_worker_exit_observed,
+        Some(true),
+        "join must happen only after the exit signal: {c:?}"
+    );
+    assert!(c.close_ran_off_caller(), "{c:?}");
+    assert!(
+        c.harness_cleanup_pass(WIN_CONSTRUCTION_CLEANUP_BOUND),
+        "bounded cleanup must be complete: {c:?}"
+    );
+    assert!(
+        t0.elapsed() < WATCHDOG,
+        "caller must return inside watchdog"
+    );
+}
+
+/// D2-023 §38 — a withheld exit signal can never block the caller in join.
+///
+/// The worker cannot finish and its exit channel is never disconnected, so
+/// there is no exit evidence at all: the only legal outcome is a bounded
+/// timeout with no join attempted.
+#[test]
+fn control_join_discipline_withheld_exit() {
+    let (work_tx, work_rx) = std::sync::mpsc::channel::<()>();
+    let (exit_tx, exit_rx) = std::sync::mpsc::channel::<()>();
+    let mut worker = Some(std::thread::spawn(move || {
+        let _ = work_rx.recv();
+        let _ = exit_tx.send(());
+    }));
+
+    let t0 = Instant::now();
+    let outcome = join_after_exit_signal(&exit_rx, Duration::from_millis(300), &mut worker);
+    let elapsed = t0.elapsed();
+    println!(
+        "FACT\tJOIN_DISCIPLINE\texit_observed={} joined={} timed_out={} elapsed_ms={}",
+        outcome.exit_observed,
+        outcome.joined,
+        outcome.timed_out,
+        outcome.elapsed.as_millis()
+    );
+
+    assert!(!outcome.exit_observed, "no exit evidence exists");
+    assert!(
+        !outcome.joined,
+        "a timeout is never permission to join a worker"
+    );
+    assert!(outcome.timed_out, "the call must report a bounded timeout");
+    assert!(elapsed < Duration::from_secs(5), "caller must stay bounded");
+    assert!(
+        worker.is_some(),
+        "the handle must be handed back, not consumed by a timed wait"
+    );
+
+    // Release the worker and let it finish on its own schedule.
+    drop(worker);
+    drop(work_tx);
+}
+
+/// D2-023 §39 — resize after a clean shutdown is rejected without any API call.
+#[test]
+fn control_resize_after_shutdown_rejected() {
+    let mut session = spawn(&["--windows-report"], Duration::from_secs(12));
+    let _ = session.wait_for_text("OMEN_COMPAT_READY", Duration::from_secs(6));
+    let obs = session.shutdown_bounded(Duration::from_secs(8));
+    assert!(obs.harness_shutdown_pass(Duration::from_secs(8)), "{obs:?}");
+    assert!(
+        obs.close_ran_off_caller(),
+        "normal close must run off the caller thread: {obs:?}"
+    );
+    assert!(!session.has_live_hpcon(), "close must revoke the token");
+
+    let attempts_before = session.resize_attempt_count();
+    let api_before = session.resize_api_call_count();
+    let error = session
+        .resize(40, 120)
+        .expect_err("resize after shutdown must be rejected");
+    println!(
+        "FACT\tRESIZE_AFTER_SHUTDOWN\trejected={} attempts={} api_calls={} err={}",
+        error,
+        session.resize_attempt_count(),
+        session.resize_api_call_count(),
+        error
+    );
+    assert!(
+        error.to_string().contains("pseudoconsole"),
+        "rejection must name the pseudoconsole state: {error}"
+    );
+    assert_eq!(
+        session.resize_api_call_count(),
+        api_before,
+        "ResizePseudoConsole must not be invoked after shutdown"
+    );
+    assert_eq!(session.resize_attempt_count(), attempts_before + 1);
+}
+
+/// D2-023 §24 — resize is rejected from close START, not only after close ends.
+#[test]
+fn control_resize_during_close_rejected() {
+    let mut session = spawn(&["--windows-child-hold"], Duration::from_secs(12));
+    let _ = session.wait_for_text("windows-child-hold", Duration::from_secs(6));
+
+    session.begin_close();
+    assert!(
+        !session.has_live_hpcon(),
+        "HPCON ownership must transfer to the close worker at close initiation"
+    );
+    let error = session
+        .resize(40, 120)
+        .expect_err("resize while closing must be rejected");
+    assert_eq!(
+        session.resize_api_call_count(),
+        0,
+        "ResizePseudoConsole must not be invoked while closing: {error}"
+    );
+    assert_eq!(session.resize_attempt_count(), 1);
+    assert!(
+        session.resize(24, 80).is_err(),
+        "still rejected while closing"
+    );
+
+    let obs = session.shutdown_bounded(Duration::from_secs(8));
+    println!(
+        "FACT\tRESIZE_DURING_CLOSE\tapi_calls={} close_returned={} close_tid={:?} \
+         caller_tid={} elapsed_ms={}",
+        session.resize_api_call_count(),
+        obs.close_returned,
+        obs.close_thread_id,
+        obs.caller_thread_id,
+        obs.elapsed.as_millis()
+    );
+    assert!(obs.harness_shutdown_pass(Duration::from_secs(8)), "{obs:?}");
+    assert!(obs.close_ran_off_caller(), "{obs:?}");
+}
+
+/// D2-023 §25 — source audit: the ConPTY close API has exactly one call site,
+/// inside the dedicated bounded close worker.
+#[test]
+fn control_source_single_close_pseudoconsole_site() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("windows");
+    let mut sites: Vec<String> = Vec::new();
+    let mut scanned = 0usize;
+    for entry in std::fs::read_dir(&dir).expect("read windows source dir") {
+        let entry = entry.expect("directory entry");
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        scanned += 1;
+        let text = std::fs::read_to_string(&path).expect("read windows source");
+        for (index, line) in text.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with("use ") {
+                continue;
+            }
+            if line.contains("ClosePseudoConsole(") {
+                sites.push(format!(
+                    "{}:{}: {trimmed}",
+                    entry.file_name().to_string_lossy(),
+                    index + 1
+                ));
+            }
+        }
+    }
+    println!(
+        "FACT\tCLOSE_API_AUDIT\tfiles_scanned={} call_sites={}\n{}",
+        scanned,
+        sites.len(),
+        sites.join("\n")
+    );
+    assert_eq!(
+        sites.len(),
+        1,
+        "exactly one direct close call site (the bounded close worker): {sites:#?}"
+    );
+    assert!(
+        sites[0].contains("harness.rs"),
+        "the close call site must live in the harness close worker: {}",
+        sites[0]
+    );
 }

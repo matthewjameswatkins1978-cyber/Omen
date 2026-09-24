@@ -87,13 +87,24 @@ deserialization rejects Exact (D2-013).
 - Decisions D2-019 (console events ≠ POSIX signals), D2-020 (control vs
   product ConPTY authorities), D2-021 (exit code ≠ cause), D2-022
   (synchronous does not mean unbounded — worker I/O, targeted cancellation,
-  close off the test thread, outer hostile-close watchdog).
+  close off the test thread, outer hostile-close watchdog), D2-023
+  (boundedness includes construction failure — one post-HPCON cleanup
+  authority, join only after observed exit evidence, pseudoconsole token
+  revoked at close start).
 - Defect ledger: `WINDOWS_M0_DEFECTS.md`.
 - **Boundedness seal:** input `WriteFile` and `ClosePseudoConsole` never run
   on the caller/test thread; output drain remains live during close;
   deterministic blocked-write control; normal/live/final-output close
   controls; blocked-write + shutdown interaction; ≥10 repeated lifecycle
   cycles; helper-process hostile-close watchdog.
+- **Error-path ownership seal:** post-HPCON constructor failures (immediately
+  after pseudoconsole creation, pre-client, suspended client, output-worker
+  and input-worker establishment) return inside their bound through
+  `cleanup_bounded`, with close off the caller thread, a terminated and
+  observed client where one existed, established output drainage, and honest
+  `handles_closed_once` / `bounded_out` reporting; join-discipline control
+  with a deliberately withheld exit signal; resize rejected after shutdown
+  and while closing with no platform call; single-close-site source audit.
 
 After M0-W acceptance: **M0 COMPLETE** → **M1 real-application compatibility**.
 

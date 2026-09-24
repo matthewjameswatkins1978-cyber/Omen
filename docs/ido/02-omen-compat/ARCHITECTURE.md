@@ -116,13 +116,37 @@ Production Omen is not repaired in this layer (D2-014).
 `crates/omen-compat/src/windows/` is `cfg(windows)`-gated measurement code:
 
 - **Harness:** Compat-owned independent ConPTY (`CreatePseudoConsole`,
-  `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`, `CreateProcessW`) — never
+  `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`, `CreateProcessW`) - never
   omen-engine (D2-020). Synchronous channels are serviced only by dedicated
   workers (D2-022): serial input worker + `CancelSynchronousIo`, output
   drain worker (live through close), close worker for `ClosePseudoConsole`.
   Caller-facing writes/close use explicit deadlines and bounded completion
   observation; no unbounded join; single-close handle ownership; Drop never
   performs unbounded `ClosePseudoConsole`.
+- **Construction ownership (D2-023):** after `CreatePseudoConsole` succeeds,
+  the pseudoconsole and its surviving handles live in one
+  `ConPtyConstructionGuard`. Every post-HPCON constructor failure funnels
+  through a single `cleanup_bounded(stage)` that terminates and observes an
+  attached client, establishes output drainage when a client may have
+  produced output, moves the pseudoconsole to the close worker, waits
+  boundedly, joins only after exit evidence, and closes ordinary handles
+  exactly once - then returns the original constructor error augmented with
+  the cleanup record (`WindowsConstructionCleanupObservation`). Pre-client
+  failures use the same close worker; there is no caller-thread close path
+  and exactly one direct close call site in the layer.
+- **Join discipline (D2-023):** `join_after_exit_signal` is the only way a
+  worker handle is consumed. It joins only after an observed exit signal or a
+  channel disconnect that mechanically proves the worker finished; a timeout
+  hands the handle back and records the give-up. The withheld-exit control
+  proves an unhelpful worker cannot hang a caller.
+- **Pseudoconsole invalidation (D2-023):** the session holds
+  `Option<HPCON>`. `begin_close` takes it, so the close worker is the sole
+  semantic owner from close start; `resize` and every other pseudoconsole
+  operation reject on `close_started` / `closed` / missing token without
+  calling the platform API, and attempt/API counters prove it.
+- **Construction fault injection (D2-023):** `ConstructionFault` is an
+  explicit argument on the Compat harness seam - no environment variables,
+  no global state, no reliance on naturally failing Win32 calls.
 - **Observations:** Windows std-handle/console-mode/dimensions/ctrl-receipt/
   process-liveness/exit/conpty-lifecycle facts with explicit availability.
 - **Judges:** twelve canonical IDs in `compat/invariants/windows.md` with

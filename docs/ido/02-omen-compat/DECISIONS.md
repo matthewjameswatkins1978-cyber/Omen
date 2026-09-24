@@ -232,3 +232,40 @@ The syscall may block. Compat may not.
 6. **Drop must not freeze `cargo test`.** Explicit `shutdown_bounded` is the
    test path; Drop is already-closed no-op or best-effort bounded-safe
    reaping only.
+
+## D2-023 - BOUNDEDNESS INCLUDES CONSTRUCTION FAILURE
+
+The failure path is still the path.
+
+1. **Post-HPCON failures use the same bounded close authority as normal
+   teardown.** Immediately after `CreatePseudoConsole` succeeds, the
+   pseudoconsole and its surviving handles move into one construction guard.
+   Every later construction failure hands that guard to a single
+   `cleanup_bounded` operation. No spawn error branch calls the ConPTY close
+   API itself, and no branch special-cases "no client yet" as a reason to
+   close on the caller thread. The architectural guarantee is universal.
+2. **Construction cleanup is ordered and reported, never improvised:**
+   stop accepting work - terminate and observe an attached client (including
+   a never-resumed child) - stop an input worker - preserve or establish
+   output drainage while a client may have produced output - move the
+   pseudoconsole to the close worker - wait boundedly for close - join
+   workers only after exit evidence - close ordinary handles exactly once -
+   return structured cleanup status alongside the original constructor error.
+   Cleanup that could not finish reports `bounded_out` and does not claim
+   `handles_closed_once`.
+3. **A timed wait is not permission to join.** `JoinHandle::join` is allowed
+   only after an observed worker `Stopped`/completion message, or a channel
+   disconnect that mechanically proves the sender thread finished. A timeout
+   hands the handle back; the thread is detached only by explicit, recorded
+   give-up. Withheld exit evidence can never hang a caller or a test.
+4. **Raw pseudoconsole ownership transfers out of the session at close
+   initiation.** The session holds `Option<HPCON>`; `begin_close` takes it and
+   the close worker becomes the sole semantic owner. `resize` and any other
+   pseudoconsole operation reject on `close_started` / `closed` / missing
+   token, without invoking the platform API. Revocation happens at close
+   start, not after the close returns.
+5. **Incomplete cleanup is reported rather than hidden behind an unbounded
+   wait.** Bounded incomplete cleanup is more truthful than an unbounded
+   "perfect" cleanup attempt. Constructor fault injection is an explicit
+   argument on Compat's own harness seam - never an environment variable and
+   never a naturally failing Win32 call.

@@ -561,6 +561,9 @@ impl WindowsConPtyTeardownStage {
 /// PASS law (control tier): `close_returned` AND input/output workers stopped
 /// AND handles closed once AND elapsed within limit AND not `bounded_out`.
 /// Escape via watchdog alone is HARNESS FAILURE, never PASS.
+///
+/// `caller_thread_id` / `close_thread_id` are D2-023 §21 evidence that the
+/// ConPTY close runs off the thread that spawned the session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowsConPtyShutdownObservation {
     pub input_worker_stopped: bool,
@@ -572,13 +575,20 @@ pub struct WindowsConPtyShutdownObservation {
     pub output_pipe_broken: bool,
     pub output_worker_stopped: bool,
     pub handles_closed_once: bool,
+    pub caller_thread_id: u32,
+    /// Thread observed executing the ConPTY close, when close began.
+    pub close_thread_id: Option<u32>,
     pub elapsed: Duration,
     pub bounded_out: bool,
     pub source: String,
 }
 
 impl WindowsConPtyShutdownObservation {
-    pub fn already_closed(source: &str) -> Self {
+    pub fn already_closed(
+        source: &str,
+        caller_thread_id: u32,
+        close_thread_id: Option<u32>,
+    ) -> Self {
         Self {
             input_worker_stopped: true,
             active_write_cancelled: false,
@@ -589,10 +599,20 @@ impl WindowsConPtyShutdownObservation {
             output_pipe_broken: false,
             output_worker_stopped: true,
             handles_closed_once: true,
+            caller_thread_id,
+            close_thread_id,
             elapsed: Duration::ZERO,
             bounded_out: false,
             source: format!("{source}:already_closed"),
         }
+    }
+
+    /// True when the close was observed running on a thread other than the
+    /// caller's (D2-023 §21). False when close never began or its identity
+    /// was never observed — never guessed.
+    pub fn close_ran_off_caller(&self) -> bool {
+        self.close_thread_id
+            .is_some_and(|id| id != self.caller_thread_id)
     }
 
     /// Control-tier harness shutdown law (not a product invariant).
@@ -614,7 +634,7 @@ impl WindowsConPtyShutdownObservation {
             detail: format!(
                 "input_stopped={} write_cancelled={} client_exit={} close_started={} \
                  close_returned={} close_timed_out={} pipe_broken={} output_stopped={} \
-                 handles_closed={} elapsed_ms={} bounded_out={}",
+                 handles_closed={} caller_tid={} close_tid={:?} elapsed_ms={} bounded_out={}",
                 self.input_worker_stopped,
                 self.active_write_cancelled,
                 self.client_exit_observed,
@@ -623,6 +643,111 @@ impl WindowsConPtyShutdownObservation {
                 self.close_timed_out,
                 self.output_pipe_broken,
                 self.output_worker_stopped,
+                self.handles_closed_once,
+                self.caller_thread_id,
+                self.close_thread_id,
+                self.elapsed.as_millis(),
+                self.bounded_out,
+            ),
+            source: self.source.clone(),
+        }
+    }
+}
+
+/// Bounded evidence for post-HPCON construction-failure cleanup (D2-023).
+///
+/// Records only what was actually observed. `hpcon_created = false` means no
+/// pseudoconsole ever existed, so the `close_*` fields describe nothing that
+/// needed closing rather than a failed close.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowsConstructionCleanupObservation {
+    pub failure_stage: String,
+    pub hpcon_created: bool,
+    pub client_existed: bool,
+    pub client_exit_observed: bool,
+    /// A drain worker (normal or temporary) was live while the close ran.
+    pub output_drain_established: bool,
+    pub close_started: bool,
+    pub close_returned: bool,
+    pub close_timed_out: bool,
+    pub caller_thread_id: u32,
+    pub close_thread_id: Option<u32>,
+    /// `None` when no output worker existed (nothing to observe).
+    pub output_worker_exit_observed: Option<bool>,
+    pub handles_closed_once: bool,
+    pub bounded_out: bool,
+    pub elapsed: Duration,
+    pub source: String,
+}
+
+impl WindowsConstructionCleanupObservation {
+    pub(crate) fn pre_hpcon(
+        failure_stage: &str,
+        caller_thread_id: u32,
+        elapsed: Duration,
+        handles_closed_once: bool,
+    ) -> Self {
+        Self {
+            failure_stage: failure_stage.into(),
+            hpcon_created: false,
+            client_existed: false,
+            // Vacuously true: there was no client to terminate or observe.
+            client_exit_observed: true,
+            output_drain_established: false,
+            close_started: false,
+            close_returned: false,
+            close_timed_out: false,
+            caller_thread_id,
+            close_thread_id: None,
+            output_worker_exit_observed: None,
+            handles_closed_once,
+            bounded_out: false,
+            elapsed,
+            source: "conpty_construction.pre_hpcon".into(),
+        }
+    }
+
+    /// The ConPTY close was observed running off the caller's thread.
+    pub fn close_ran_off_caller(&self) -> bool {
+        self.close_thread_id
+            .is_some_and(|id| id != self.caller_thread_id)
+    }
+
+    /// Control-tier construction-cleanup law (not a product invariant):
+    /// cleanup returned inside `limit`, the close actually started on a
+    /// worker thread off the caller, the close returned, and every owner
+    /// path it claims completed.
+    pub fn harness_cleanup_pass(&self, limit: Duration) -> bool {
+        self.hpcon_created
+            && self.elapsed <= limit
+            && !self.bounded_out
+            && !self.close_timed_out
+            && self.close_started
+            && self.close_returned
+            && self.close_ran_off_caller()
+            && self.handles_closed_once
+    }
+
+    pub fn observation(&self) -> Observation {
+        Observation::WindowsConPtyLifecycleObservation {
+            phase: "construction_cleanup".into(),
+            ok: self.harness_cleanup_pass(Duration::from_secs(u64::MAX)),
+            detail: format!(
+                "stage={} hpcon_created={} client_existed={} client_exit={} \
+                 drain={} close_started={} close_returned={} close_timed_out={} \
+                 caller_tid={} close_tid={:?} output_exit={:?} handles_closed={} \
+                 elapsed_ms={} bounded_out={}",
+                self.failure_stage,
+                self.hpcon_created,
+                self.client_existed,
+                self.client_exit_observed,
+                self.output_drain_established,
+                self.close_started,
+                self.close_returned,
+                self.close_timed_out,
+                self.caller_thread_id,
+                self.close_thread_id,
+                self.output_worker_exit_observed,
                 self.handles_closed_once,
                 self.elapsed.as_millis(),
                 self.bounded_out,

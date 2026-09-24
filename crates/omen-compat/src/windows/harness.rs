@@ -9,10 +9,16 @@
 //! timeout); an output drain worker stays live through close; a close worker
 //! owns `ClosePseudoConsole`. All caller-facing waits are bounded; no
 //! unbounded join.
+//!
+//! D2-023 — the failure path is still the path: every post-HPCON construction
+//! failure runs through one construction guard and the same bounded close
+//! authority as normal teardown. A timed wait never grants permission to
+//! join, and close initiation revokes the session's usable pseudoconsole
+//! token immediately.
 
 use crate::windows::observe::{
     WinFileType, WinTranscript, WindowsConPtyShutdownObservation, WindowsConsoleDimensions,
-    WindowsWriteObservation, WindowsWriteOutcome,
+    WindowsConstructionCleanupObservation, WindowsWriteObservation, WindowsWriteOutcome,
 };
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -51,6 +57,10 @@ pub const WIN_CLOSE_BOUND: Duration = Duration::from_secs(3);
 pub const WIN_WORKER_BOUND: Duration = Duration::from_secs(2);
 /// Default caller write budget (min remaining scenario time).
 pub const WIN_WRITE_BUDGET: Duration = Duration::from_secs(5);
+/// Absolute wall-clock bound for one construction-failure cleanup (D2-023).
+pub const WIN_CONSTRUCTION_CLEANUP_BOUND: Duration = Duration::from_secs(10);
+/// Bounded wait for a terminated construction client to signal exit.
+pub const WIN_CLIENT_EXIT_BOUND: Duration = Duration::from_secs(2);
 
 const ERROR_OPERATION_ABORTED: i32 = 995;
 const WIN_POLL: u64 = 20;
@@ -459,16 +469,637 @@ fn sync_write_all(handle: HANDLE, bytes: &[u8]) -> (usize, Option<i32>) {
     (offset, None)
 }
 
-struct CloseDone(#[allow(dead_code)] Option<()>);
+/// Deterministic construction fault injection for Compat's own harness
+/// (D2-023 §19).
+///
+/// This is a test-only seam: it is driven by an explicit argument, never by
+/// an environment variable or global state, and no naturally failing Win32
+/// call is depended upon. Real construction always passes `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstructionFault {
+    /// Immediately after the pseudoconsole is created (no client yet).
+    AfterPseudoConsole,
+    /// After the process-thread attribute list is fully wired (no client yet).
+    AfterAttributeSetup,
+    /// After the client process is created, before it is resumed.
+    AfterProcessCreate,
+    /// Immediately before the suspended client is resumed.
+    BeforeResume,
+    /// When the normal output drain worker would be spawned (client running).
+    OutputWorkerSpawn,
+    /// When the input worker would be spawned (output drain already live).
+    InputWorkerSpawn,
+}
+
+impl ConstructionFault {
+    pub fn stable_id(&self) -> &'static str {
+        match self {
+            ConstructionFault::AfterPseudoConsole => "after_pseudoconsole",
+            ConstructionFault::AfterAttributeSetup => "after_attribute_setup",
+            ConstructionFault::AfterProcessCreate => "after_process_create",
+            ConstructionFault::BeforeResume => "before_resume",
+            ConstructionFault::OutputWorkerSpawn => "output_worker_spawn",
+            ConstructionFault::InputWorkerSpawn => "input_worker_spawn",
+        }
+    }
+}
+
+/// Outcome of a join attempted under join discipline (D2-023 §12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundedJoinOutcome {
+    /// An exit signal was received, or the channel disconnected in a way that
+    /// mechanically proves the sender thread finished.
+    pub exit_observed: bool,
+    /// A join was actually performed by this call.
+    pub joined: bool,
+    /// The bound expired before any exit evidence existed.
+    pub timed_out: bool,
+    pub elapsed: Duration,
+}
+
+/// Join discipline primitive: join ONLY after observed exit evidence.
+///
+/// A timeout alone is never permission to join (D2-023 §12). On timeout the
+/// handle is handed back untouched so the caller retains ownership and the
+/// thread is detached only when the caller explicitly gives up on it.
+pub fn join_after_exit_signal(
+    exit_rx: &Receiver<()>,
+    bound: Duration,
+    thread: &mut Option<JoinHandle<()>>,
+) -> BoundedJoinOutcome {
+    let started = Instant::now();
+    match exit_rx.recv_timeout(bound) {
+        Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+            // Disconnected proves the sender was dropped by the worker
+            // closure itself, i.e. the thread function returned.
+            let joined = match thread.take() {
+                Some(handle) => handle.join().is_ok(),
+                None => false,
+            };
+            BoundedJoinOutcome {
+                exit_observed: true,
+                joined,
+                timed_out: false,
+                elapsed: started.elapsed(),
+            }
+        }
+        Err(RecvTimeoutError::Timeout) => BoundedJoinOutcome {
+            exit_observed: false,
+            joined: false,
+            timed_out: true,
+            elapsed: started.elapsed(),
+        },
+    }
+}
+
+/// Worker → owner messages for the dedicated close worker.
+enum CloseWorkerMessage {
+    Started { thread_id: u32 },
+    Done,
+}
+
+/// The single bounded close authority for every pseudoconsole (D2-023 §25).
+///
+/// This type is the only place in Compat that invokes the ConPTY close API.
+/// It reports its own thread identity before closing so callers can prove the
+/// close did not run on the spawning test thread, and it joins only after the
+/// worker reports completion or the channel disconnects.
+struct CloseWorkerHandle {
+    thread: Option<JoinHandle<()>>,
+    rx: Receiver<CloseWorkerMessage>,
+    close_returned: Arc<AtomicBool>,
+    thread_id: Option<u32>,
+    timed_out: bool,
+}
+
+impl CloseWorkerHandle {
+    /// Launch the close worker. `orphan_out_read` is an output read handle no
+    /// worker owns (construction failure with no drain worker); the worker
+    /// closes it exactly once, after the close returns.
+    fn spawn(
+        hpcon: HPCON,
+        orphan_out_read: Option<HANDLE>,
+        close_returned: Arc<AtomicBool>,
+    ) -> std::io::Result<Self> {
+        let orphan = orphan_out_read.map(OwnedWriteHandle);
+        let worker_close_returned = Arc::clone(&close_returned);
+        let (tx, rx) = mpsc::channel::<CloseWorkerMessage>();
+        let thread = std::thread::Builder::new()
+            .name("compat-win-close".into())
+            .spawn(move || {
+                let _ = tx.send(CloseWorkerMessage::Started {
+                    thread_id: unsafe { GetCurrentThreadId() },
+                });
+                unsafe {
+                    ClosePseudoConsole(hpcon);
+                }
+                worker_close_returned.store(true, Ordering::SeqCst);
+                if let Some(handle) = orphan {
+                    let raw = handle.as_raw();
+                    if !raw.is_null() && raw != INVALID_HANDLE_VALUE {
+                        unsafe {
+                            CloseHandle(raw);
+                        }
+                    }
+                }
+                let _ = tx.send(CloseWorkerMessage::Done);
+            })
+            .map_err(|e| io_err("spawn_close_worker", e))?;
+        Ok(Self {
+            thread: Some(thread),
+            rx,
+            close_returned,
+            thread_id: None,
+            timed_out: false,
+        })
+    }
+
+    fn thread_id(&self) -> Option<u32> {
+        self.thread_id
+    }
+
+    /// Wait boundedly for close completion. Joins only after `Done` or a
+    /// channel disconnect; a timeout detaches the worker instead.
+    ///
+    /// Returns whether the close call was observed to return.
+    fn wait(&mut self, bound: Duration) -> bool {
+        let deadline = Instant::now() + bound;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                self.timed_out = true;
+                return false;
+            }
+            let message = self.rx.recv_timeout(remaining);
+            match message {
+                Ok(CloseWorkerMessage::Started { thread_id }) => {
+                    self.thread_id = Some(thread_id);
+                }
+                Ok(CloseWorkerMessage::Done) => {
+                    if let Some(handle) = self.thread.take() {
+                        let _ = handle.join();
+                    }
+                    return true;
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    self.timed_out = true;
+                    return false;
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    // The worker closure ended. It sets the shared flag before
+                    // reporting `Done`, so an abnormal exit must not be
+                    // reported as a completed close.
+                    let returned = self.close_returned.load(Ordering::SeqCst);
+                    if let Some(handle) = self.thread.take() {
+                        let _ = handle.join();
+                    }
+                    return returned;
+                }
+            }
+        }
+    }
+}
+
+/// Construction step failure: which phase failed and why.
+struct ConstructionStepError {
+    stage: &'static str,
+    error: std::io::Error,
+}
+
+/// RAII owner for the process-thread attribute list: exactly one delete.
+struct AttributeListGuard {
+    buf: Vec<u8>,
+    initialized: bool,
+}
+
+impl AttributeListGuard {
+    fn new(size: usize) -> Self {
+        Self {
+            buf: vec![0u8; size],
+            initialized: false,
+        }
+    }
+
+    fn as_mut_ptr(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
+        self.buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST
+    }
+
+    fn mark_initialized(&mut self) {
+        self.initialized = true;
+    }
+
+    fn delete_now(&mut self) {
+        if self.initialized {
+            unsafe {
+                DeleteProcThreadAttributeList(self.buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST);
+            }
+            self.initialized = false;
+        }
+    }
+}
+
+impl Drop for AttributeListGuard {
+    fn drop(&mut self) {
+        self.delete_now();
+    }
+}
+
+/// Output drain worker for `out_read`: owns and closes the handle on exit.
+///
+/// On spawn failure the handle is *not* consumed — the caller retains
+/// ownership and must account for it.
+fn spawn_output_drain(
+    out_read: HANDLE,
+    transcript: &Arc<Mutex<WinTranscript>>,
+    close_returned: &Arc<AtomicBool>,
+) -> std::io::Result<(JoinHandle<()>, Receiver<()>)> {
+    let handle = OwnedWriteHandle(out_read);
+    let drain_transcript = Arc::clone(transcript);
+    let drain_close_returned = Arc::clone(close_returned);
+    let (exit_tx, exit_rx) = mpsc::channel::<()>();
+    let thread = std::thread::Builder::new()
+        .name("compat-win-output".into())
+        .spawn(move || {
+            output_drain_loop(handle.as_raw(), &drain_transcript, &drain_close_returned);
+            let _ = exit_tx.send(());
+            unsafe {
+                let raw = handle.as_raw();
+                if !raw.is_null() && raw != INVALID_HANDLE_VALUE {
+                    CloseHandle(raw);
+                }
+            }
+        })
+        .map_err(|e| io_err("spawn_output_worker", e))?;
+    Ok((thread, exit_rx))
+}
+
+/// Single cleanup authority for everything that exists once the
+/// pseudoconsole has been created (D2-023 §5).
+///
+/// Every post-HPCON construction failure hands this guard to
+/// [`ConPtyConstructionGuard::cleanup_bounded`]; a successful construction
+/// transfers it into the session. There is no other cleanup path, so no
+/// spawn error branch can call the ConPTY close API itself.
+struct ConPtyConstructionGuard {
+    hpcon: Option<HPCON>,
+    input_write: Option<HANDLE>,
+    /// `Some` only while this guard still owns the output read handle.
+    out_read: Option<HANDLE>,
+    process: Option<HANDLE>,
+    primary_thread: Option<HANDLE>,
+    child_pid: u32,
+    input_worker: Option<WindowsSyncInputWorker>,
+    output_thread: Option<JoinHandle<()>>,
+    output_exit_rx: Option<Receiver<()>>,
+    output_worker_spawned: bool,
+    transcript: Arc<Mutex<WinTranscript>>,
+    stop_accepting_input: Arc<AtomicBool>,
+    close_returned: Arc<AtomicBool>,
+    caller_thread_id: u32,
+}
+
+impl ConPtyConstructionGuard {
+    fn new(hpcon: HPCON, input_write: HANDLE, out_read: HANDLE, caller_thread_id: u32) -> Self {
+        Self {
+            hpcon: Some(hpcon),
+            input_write: Some(input_write),
+            out_read: Some(out_read),
+            process: None,
+            primary_thread: None,
+            child_pid: 0,
+            input_worker: None,
+            output_thread: None,
+            output_exit_rx: None,
+            output_worker_spawned: false,
+            transcript: Arc::new(Mutex::new(WinTranscript::default())),
+            stop_accepting_input: Arc::new(AtomicBool::new(false)),
+            close_returned: Arc::new(AtomicBool::new(false)),
+            caller_thread_id,
+        }
+    }
+
+    fn adopt_client(&mut self, process: HANDLE, primary_thread: HANDLE, child_pid: u32) {
+        self.process = Some(process);
+        self.primary_thread = Some(primary_thread);
+        self.child_pid = child_pid;
+    }
+
+    /// Single close of the primary thread handle after a successful resume.
+    fn release_primary_thread(&mut self) {
+        if let Some(handle) = self.primary_thread.take()
+            && !handle.is_null()
+            && handle != INVALID_HANDLE_VALUE
+        {
+            unsafe {
+                CloseHandle(handle);
+            }
+        }
+    }
+
+    /// The output drain worker now owns the output read handle.
+    fn adopt_output_worker(&mut self, thread: JoinHandle<()>, exit_rx: Receiver<()>) {
+        self.out_read = None;
+        self.output_thread = Some(thread);
+        self.output_exit_rx = Some(exit_rx);
+        self.output_worker_spawned = true;
+    }
+
+    /// Transfer the fully built construction into the live session.
+    ///
+    /// Ownership moves once: the session becomes the sole holder of the
+    /// pseudoconsole, client process, workers, and shared signals.
+    fn into_session(self, deadline: Duration, rows: u16, cols: u16) -> WindowsConPtySession {
+        let ConPtyConstructionGuard {
+            hpcon,
+            input_write,
+            out_read,
+            process,
+            primary_thread: _,
+            child_pid,
+            input_worker,
+            output_thread,
+            output_exit_rx,
+            output_worker_spawned,
+            transcript,
+            stop_accepting_input,
+            close_returned,
+            caller_thread_id,
+        } = self;
+        debug_assert!(
+            hpcon.is_some(),
+            "construction succeeded with a pseudoconsole"
+        );
+        debug_assert!(out_read.is_none(), "output read handle must have an owner");
+        debug_assert!(process.is_some(), "construction succeeded with a client");
+        WindowsConPtySession {
+            hpcon,
+            process: process.unwrap_or(std::ptr::null_mut()),
+            input_write: input_write.unwrap_or(std::ptr::null_mut()),
+            transcript,
+            child_pid,
+            started: Instant::now(),
+            deadline,
+            rows,
+            cols,
+            closed: false,
+            stop_accepting_input,
+            close_returned,
+            input_worker,
+            input_worker_stopped: false,
+            output_thread,
+            output_exit_rx,
+            output_running: output_worker_spawned,
+            close_worker: None,
+            close_started: false,
+            close_timed_out: false,
+            close_thread_id: None,
+            caller_thread_id,
+            handles_closed: false,
+            resize_attempts: 0,
+            resize_api_calls: 0,
+        }
+    }
+
+    /// Bounded cleanup for one construction failure (D2-023 §7).
+    ///
+    /// Order: stop accepting work → terminate an attached client → stop an
+    /// input worker → establish output drainage if a client may have produced
+    /// output → move the pseudoconsole to the close worker → wait boundedly →
+    /// join workers only after exit evidence → close ordinary handles exactly
+    /// once → report what was and was not completed.
+    fn cleanup_bounded(mut self, failure_stage: &str) -> WindowsConstructionCleanupObservation {
+        let started = Instant::now();
+        let deadline = started + WIN_CONSTRUCTION_CLEANUP_BOUND;
+        let mut bounded_out = false;
+        let cap = |limit: Duration| -> Duration {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(limit)
+        };
+
+        // 1. STOP_ACCEPTING_WORK
+        self.stop_accepting_input.store(true, Ordering::SeqCst);
+
+        // 2. TERMINATE / WAIT CLIENT (including a never-resumed child)
+        let client_existed = self.process.is_some();
+        let mut client_exit_observed = !client_existed;
+        if let Some(process) = self.process {
+            unsafe {
+                TerminateProcess(process, 1);
+            }
+            let wait_ms = cap(WIN_CLIENT_EXIT_BOUND)
+                .max(Duration::from_millis(250))
+                .as_millis()
+                .min(u32::MAX as u128) as u32;
+            let observed = unsafe { WaitForSingleObject(process, wait_ms) } == WAIT_OBJECT_0;
+            client_exit_observed = observed;
+            if !observed {
+                bounded_out = true;
+            }
+        }
+
+        // 3. STOP INPUT WORKER (join only after an observed exit signal)
+        let input_worker_stopped = match self.input_worker.as_mut() {
+            Some(worker) => {
+                let bound = cap(WIN_WORKER_BOUND).max(Duration::from_millis(50));
+                let stopped = worker.stop_bounded(bound);
+                if !stopped {
+                    bounded_out = true;
+                }
+                stopped
+            }
+            None => true,
+        };
+
+        // 4. PRESERVE / ESTABLISH OUTPUT DRAINAGE for an attached client
+        if !self.output_worker_spawned
+            && client_existed
+            && let Some(handle) = self.out_read.take()
+        {
+            match spawn_output_drain(handle, &self.transcript, &self.close_returned) {
+                Ok((thread, exit_rx)) => {
+                    self.output_thread = Some(thread);
+                    self.output_exit_rx = Some(exit_rx);
+                    self.output_worker_spawned = true;
+                }
+                Err(_) => {
+                    // No drain could be established: keep the handle and
+                    // record the gap rather than pretending it is fine.
+                    self.out_read = Some(handle);
+                    bounded_out = true;
+                }
+            }
+        }
+
+        // 5 + 6. MOVE HPCON TO THE CLOSE WORKER, then wait boundedly
+        let mut close_started = false;
+        let mut close_returned = false;
+        let mut close_thread_id = None;
+        if let Some(hpcon) = self.hpcon.take() {
+            let orphan = self.out_read;
+            match CloseWorkerHandle::spawn(hpcon, orphan, Arc::clone(&self.close_returned)) {
+                Ok(mut close_worker) => {
+                    self.out_read = None;
+                    close_started = true;
+                    let bound = cap(WIN_CLOSE_BOUND).max(Duration::from_millis(50));
+                    close_returned = close_worker.wait(bound);
+                    close_thread_id = close_worker.thread_id();
+                    if !close_returned {
+                        bounded_out = true;
+                    }
+                }
+                Err(_) => {
+                    // The caller thread must never close the pseudoconsole.
+                    // Hand the token back so it can still be given away later.
+                    self.hpcon = Some(hpcon);
+                    bounded_out = true;
+                }
+            }
+        }
+
+        // 7. JOIN WORKERS ONLY AFTER EXIT EVIDENCE
+        let mut output_worker_exit_observed: Option<bool> = None;
+        if self.output_worker_spawned
+            && let Some(exit_rx) = self.output_exit_rx.take()
+        {
+            let bound = cap(WIN_WORKER_BOUND).max(Duration::from_millis(50));
+            let outcome = join_after_exit_signal(&exit_rx, bound, &mut self.output_thread);
+            output_worker_exit_observed = Some(outcome.exit_observed);
+            if !outcome.exit_observed {
+                bounded_out = true;
+            }
+        }
+
+        // 8. CLOSE ORDINARY HANDLES EXACTLY ONCE
+        let mut input_write_closed = true;
+        if input_worker_stopped {
+            if let Some(handle) = self.input_write.take()
+                && !handle.is_null()
+                && handle != INVALID_HANDLE_VALUE
+            {
+                unsafe {
+                    CloseHandle(handle);
+                }
+            }
+        } else {
+            input_write_closed = false;
+        }
+        if let Some(handle) = self.primary_thread.take()
+            && !handle.is_null()
+            && handle != INVALID_HANDLE_VALUE
+        {
+            unsafe {
+                CloseHandle(handle);
+            }
+        }
+        if let Some(handle) = self.process.take()
+            && !handle.is_null()
+            && handle != INVALID_HANDLE_VALUE
+        {
+            unsafe {
+                CloseHandle(handle);
+            }
+        }
+
+        // Output read ownership: a drain worker closed it when it exited, or
+        // the close worker closes it after the close returns. If neither
+        // happened, it is still owned here and must not be claimed closed.
+        let out_read_accounted = if self.output_worker_spawned {
+            output_worker_exit_observed == Some(true)
+        } else if close_started {
+            close_returned
+        } else {
+            self.out_read.is_none()
+        };
+
+        let handles_closed_once = input_write_closed && out_read_accounted;
+        let bounded_out = bounded_out || started.elapsed() > WIN_CONSTRUCTION_CLEANUP_BOUND;
+
+        WindowsConstructionCleanupObservation {
+            failure_stage: failure_stage.into(),
+            hpcon_created: true,
+            client_existed,
+            client_exit_observed,
+            output_drain_established: self.output_worker_spawned,
+            close_started,
+            close_returned,
+            close_timed_out: close_started && !close_returned,
+            caller_thread_id: self.caller_thread_id,
+            close_thread_id,
+            output_worker_exit_observed,
+            handles_closed_once,
+            bounded_out,
+            elapsed: started.elapsed(),
+            source: "conpty_construction.cleanup_bounded".into(),
+        }
+    }
+}
+
+/// A construction failure with its bounded cleanup record attached.
+#[derive(Debug)]
+pub struct ConPtyConstructionFailure {
+    pub error: std::io::Error,
+    pub cleanup: WindowsConstructionCleanupObservation,
+}
+
+impl std::fmt::Display for ConPtyConstructionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} at {} [hpcon_created={} client_existed={} close_started={} \
+             close_returned={} close_thread={} caller_thread={} handles_closed={} \
+             bounded_out={} elapsed_ms={}]",
+            self.error,
+            self.cleanup.failure_stage,
+            self.cleanup.hpcon_created,
+            self.cleanup.client_existed,
+            self.cleanup.close_started,
+            self.cleanup.close_returned,
+            self.cleanup
+                .close_thread_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "unobserved".into()),
+            self.cleanup.caller_thread_id,
+            self.cleanup.handles_closed_once,
+            self.cleanup.bounded_out,
+            self.cleanup.elapsed.as_millis(),
+        )
+    }
+}
+
+impl From<ConPtyConstructionFailure> for std::io::Error {
+    fn from(failure: ConPtyConstructionFailure) -> Self {
+        std::io::Error::other(failure.to_string())
+    }
+}
+
+fn pre_hpcon_failure(
+    stage: &str,
+    error: std::io::Error,
+    caller_thread_id: u32,
+    elapsed: Duration,
+    handles_closed_once: bool,
+) -> ConPtyConstructionFailure {
+    ConPtyConstructionFailure {
+        error,
+        cleanup: WindowsConstructionCleanupObservation::pre_hpcon(
+            stage,
+            caller_thread_id,
+            elapsed,
+            handles_closed_once,
+        ),
+    }
+}
 
 /// Live Compat-owned ConPTY session with one client process.
 pub struct WindowsConPtySession {
-    hpcon: HPCON,
+    /// Live pseudoconsole ownership. `None` from the moment close is
+    /// initiated: the close worker is then the sole semantic owner and no
+    /// operation can reach a stale token (D2-023 §15).
+    hpcon: Option<HPCON>,
     process: HANDLE,
     /// Harness input worker writes here (toward the ConPTY client).
     input_write: HANDLE,
-    /// Owned by the output drain worker after spawn (session does not read).
-    output_read: HANDLE,
     transcript: Arc<Mutex<WinTranscript>>,
     child_pid: u32,
     started: Instant,
@@ -483,15 +1114,201 @@ pub struct WindowsConPtySession {
     output_thread: Option<JoinHandle<()>>,
     output_exit_rx: Option<Receiver<()>>,
     output_running: bool,
-    close_thread: Option<JoinHandle<()>>,
-    close_done_rx: Option<Receiver<CloseDone>>,
+    close_worker: Option<CloseWorkerHandle>,
     close_started: bool,
     close_timed_out: bool,
+    close_thread_id: Option<u32>,
+    caller_thread_id: u32,
     handles_closed: bool,
+    resize_attempts: u32,
+    resize_api_calls: u32,
+}
+
+/// Build everything that must exist after the pseudoconsole is created.
+///
+/// Every post-HPCON failure funnels through this function's `Err` return, and
+/// the single caller runs the construction guard cleanup. No error branch can
+/// bypass it, so no error branch can close the pseudoconsole itself (D2-023).
+fn build_client(
+    guard: &mut ConPtyConstructionGuard,
+    fault: Option<ConstructionFault>,
+    program: &Path,
+    args: &[String],
+    cwd: Option<&Path>,
+) -> Result<(), ConstructionStepError> {
+    let injected = |fault: ConstructionFault| ConstructionStepError {
+        stage: fault.stable_id(),
+        error: std::io::Error::other(format!(
+            "injected construction fault: {}",
+            fault.stable_id()
+        )),
+    };
+
+    if fault == Some(ConstructionFault::AfterPseudoConsole) {
+        return Err(injected(ConstructionFault::AfterPseudoConsole));
+    }
+
+    let mut attr_size: usize = 0;
+    unsafe {
+        InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut attr_size);
+    }
+    let mut attr_list = AttributeListGuard::new(attr_size);
+    if unsafe { InitializeProcThreadAttributeList(attr_list.as_mut_ptr(), 1, 0, &mut attr_size) }
+        == 0
+    {
+        return Err(ConstructionStepError {
+            stage: "initialize_proc_thread_attribute_list",
+            error: last_os("InitializeProcThreadAttributeList"),
+        });
+    }
+    attr_list.mark_initialized();
+
+    let hpcon = guard
+        .hpcon
+        .expect("construction guard owns the pseudoconsole");
+    if unsafe {
+        UpdateProcThreadAttribute(
+            attr_list.as_mut_ptr(),
+            0,
+            PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
+            hpcon as *const std::ffi::c_void,
+            std::mem::size_of::<HPCON>(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(ConstructionStepError {
+            stage: "update_proc_thread_attribute",
+            error: last_os("UpdateProcThreadAttribute"),
+        });
+    }
+
+    if fault == Some(ConstructionFault::AfterAttributeSetup) {
+        return Err(injected(ConstructionFault::AfterAttributeSetup));
+    }
+
+    let mut argv_full: Vec<String> = vec![program.to_string_lossy().into_owned()];
+    argv_full.extend(args.iter().cloned());
+    let cmd_line = build_windows_cmd_line(&argv_full);
+    let mut cmd_wide = wide(&cmd_line);
+
+    let mut si_ex: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+    si_ex.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+    si_ex.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    si_ex.StartupInfo.hStdInput = std::ptr::null_mut();
+    si_ex.StartupInfo.hStdOutput = std::ptr::null_mut();
+    si_ex.StartupInfo.hStdError = std::ptr::null_mut();
+    si_ex.lpAttributeList = attr_list.as_mut_ptr();
+
+    let cwd_wide: Vec<u16> = cwd
+        .map(|p| {
+            p.as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect()
+        })
+        .unwrap_or_else(|| vec![0]);
+
+    let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    let flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED;
+    let cp_ok = unsafe {
+        CreateProcessW(
+            std::ptr::null(),
+            cmd_wide.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            flags,
+            std::ptr::null_mut(),
+            cwd_wide.as_ptr(),
+            &si_ex.StartupInfo,
+            &mut pi,
+        )
+    };
+    attr_list.delete_now();
+    if cp_ok == 0 {
+        return Err(ConstructionStepError {
+            stage: "create_process",
+            error: last_os("CreateProcessW"),
+        });
+    }
+
+    // The guard owns the client process and its primary thread from here on.
+    guard.adopt_client(pi.hProcess, pi.hThread, pi.dwProcessId);
+
+    if fault == Some(ConstructionFault::AfterProcessCreate) {
+        return Err(injected(ConstructionFault::AfterProcessCreate));
+    }
+    if fault == Some(ConstructionFault::BeforeResume) {
+        return Err(injected(ConstructionFault::BeforeResume));
+    }
+
+    if unsafe { ResumeThread(pi.hThread) } == u32::MAX {
+        return Err(ConstructionStepError {
+            stage: "resume_thread",
+            error: last_os("ResumeThread"),
+        });
+    }
+    guard.release_primary_thread();
+
+    if fault == Some(ConstructionFault::OutputWorkerSpawn) {
+        return Err(injected(ConstructionFault::OutputWorkerSpawn));
+    }
+
+    // Output drain worker owns the output read handle for the session life.
+    let out_handle = guard.out_read.expect("construction guard owns out_read");
+    let transcript = Arc::clone(&guard.transcript);
+    let close_returned = Arc::clone(&guard.close_returned);
+    match spawn_output_drain(out_handle, &transcript, &close_returned) {
+        Ok((thread, exit_rx)) => guard.adopt_output_worker(thread, exit_rx),
+        Err(error) => {
+            return Err(ConstructionStepError {
+                stage: "output_worker_spawn",
+                error,
+            });
+        }
+    }
+
+    if fault == Some(ConstructionFault::InputWorkerSpawn) {
+        return Err(injected(ConstructionFault::InputWorkerSpawn));
+    }
+
+    let input_write = guard
+        .input_write
+        .expect("construction guard owns input_write");
+    match WindowsSyncInputWorker::spawn(input_write, "session_input") {
+        Ok(worker) => guard.input_worker = Some(worker),
+        Err(error) => {
+            return Err(ConstructionStepError {
+                stage: "input_worker_spawn",
+                error,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+impl std::fmt::Debug for WindowsConPtySession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WindowsConPtySession")
+            .field("child_pid", &self.child_pid)
+            .field("hpcon_live", &self.hpcon.is_some())
+            .field("closed", &self.closed)
+            .field("close_started", &self.close_started)
+            .field("close_timed_out", &self.close_timed_out)
+            .field("caller_thread_id", &self.caller_thread_id)
+            .field("close_thread_id", &self.close_thread_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl WindowsConPtySession {
     /// Spawn `program` as a ConPTY client attached to this session's HPCON.
+    ///
+    /// Failures after the pseudoconsole exists are cleaned up by the bounded
+    /// construction guard; the caller never runs the ConPTY close call.
     pub fn spawn(
         program: impl AsRef<Path>,
         args: &[String],
@@ -500,8 +1317,33 @@ impl WindowsConPtySession {
         cols: u16,
         deadline: Duration,
     ) -> std::io::Result<Self> {
+        Self::spawn_with_fault(program, args, cwd, rows, cols, deadline, None)
+            .map_err(std::io::Error::from)
+    }
+
+    /// Construction with deterministic fault injection (D2-023 §19).
+    ///
+    /// The fault argument is the only injection seam: no environment
+    /// variables, no global state, no reliance on naturally failing calls.
+    pub fn spawn_with_fault(
+        program: impl AsRef<Path>,
+        args: &[String],
+        cwd: Option<&Path>,
+        rows: u16,
+        cols: u16,
+        deadline: Duration,
+        fault: Option<ConstructionFault>,
+    ) -> Result<Self, ConPtyConstructionFailure> {
+        let started = Instant::now();
+        let caller_thread_id = unsafe { GetCurrentThreadId() };
         if deadline.is_zero() {
-            return Err(std::io::Error::other("deadline must be > 0"));
+            return Err(pre_hpcon_failure(
+                "deadline",
+                std::io::Error::other("deadline must be > 0"),
+                caller_thread_id,
+                started.elapsed(),
+                true,
+            ));
         }
 
         let mut in_read: HANDLE = std::ptr::null_mut();
@@ -510,12 +1352,24 @@ impl WindowsConPtySession {
         let mut out_write: HANDLE = std::ptr::null_mut();
         unsafe {
             if CreatePipe(&mut in_read, &mut in_write, std::ptr::null(), 0) == 0 {
-                return Err(last_os("create_pipe_in"));
+                return Err(pre_hpcon_failure(
+                    "create_pipe_in",
+                    last_os("create_pipe_in"),
+                    caller_thread_id,
+                    started.elapsed(),
+                    true,
+                ));
             }
             if CreatePipe(&mut out_read, &mut out_write, std::ptr::null(), 0) == 0 {
                 CloseHandle(in_read);
                 CloseHandle(in_write);
-                return Err(last_os("create_pipe_out"));
+                return Err(pre_hpcon_failure(
+                    "create_pipe_out",
+                    last_os("create_pipe_out"),
+                    caller_thread_id,
+                    started.elapsed(),
+                    true,
+                ));
             }
         }
 
@@ -534,191 +1388,24 @@ impl WindowsConPtySession {
                 CloseHandle(in_write);
                 CloseHandle(out_read);
             }
-            return Err(std::io::Error::other(format!(
-                "CreatePseudoConsole failed: {res:#x}"
-            )));
+            return Err(pre_hpcon_failure(
+                "create_pseudoconsole",
+                std::io::Error::other(format!("CreatePseudoConsole failed: {res:#x}")),
+                caller_thread_id,
+                started.elapsed(),
+                true,
+            ));
         }
 
-        let mut attr_size: usize = 0;
-        unsafe {
-            InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut attr_size);
+        // The pseudoconsole exists: from here ONE cleanup authority owns it.
+        let mut guard = ConPtyConstructionGuard::new(hpcon, in_write, out_read, caller_thread_id);
+        match build_client(&mut guard, fault, program.as_ref(), args, cwd) {
+            Ok(()) => Ok(guard.into_session(deadline, rows, cols)),
+            Err(step) => Err(ConPtyConstructionFailure {
+                cleanup: guard.cleanup_bounded(step.stage),
+                error: step.error,
+            }),
         }
-        let mut attr_buf = vec![0u8; attr_size];
-        let attr_list = attr_buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
-        if unsafe { InitializeProcThreadAttributeList(attr_list, 1, 0, &mut attr_size) } == 0 {
-            unsafe {
-                ClosePseudoConsole(hpcon);
-                CloseHandle(in_write);
-                CloseHandle(out_read);
-            }
-            return Err(last_os("InitializeProcThreadAttributeList"));
-        }
-        if unsafe {
-            UpdateProcThreadAttribute(
-                attr_list,
-                0,
-                PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
-                hpcon as *const std::ffi::c_void,
-                std::mem::size_of::<HPCON>(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        } == 0
-        {
-            unsafe {
-                DeleteProcThreadAttributeList(attr_list);
-                ClosePseudoConsole(hpcon);
-                CloseHandle(in_write);
-                CloseHandle(out_read);
-            }
-            return Err(last_os("UpdateProcThreadAttribute"));
-        }
-
-        let mut argv_full: Vec<String> = vec![program.as_ref().to_string_lossy().into_owned()];
-        argv_full.extend(args.iter().cloned());
-        let cmd_line = build_windows_cmd_line(&argv_full);
-        let mut cmd_wide = wide(&cmd_line);
-
-        let mut si_ex: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
-        si_ex.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
-        si_ex.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-        si_ex.StartupInfo.hStdInput = std::ptr::null_mut();
-        si_ex.StartupInfo.hStdOutput = std::ptr::null_mut();
-        si_ex.StartupInfo.hStdError = std::ptr::null_mut();
-        si_ex.lpAttributeList = attr_list;
-
-        let cwd_wide: Vec<u16> = cwd
-            .map(|p| {
-                p.as_os_str()
-                    .encode_wide()
-                    .chain(std::iter::once(0))
-                    .collect()
-            })
-            .unwrap_or_else(|| vec![0]);
-
-        let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-        let flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED;
-        let cp_ok = unsafe {
-            CreateProcessW(
-                std::ptr::null(),
-                cmd_wide.as_mut_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-                0,
-                flags,
-                std::ptr::null_mut(),
-                cwd_wide.as_ptr(),
-                &si_ex.StartupInfo,
-                &mut pi,
-            )
-        };
-        unsafe {
-            DeleteProcThreadAttributeList(attr_list);
-        }
-        if cp_ok == 0 {
-            unsafe {
-                ClosePseudoConsole(hpcon);
-                CloseHandle(in_write);
-                CloseHandle(out_read);
-            }
-            return Err(last_os("CreateProcessW"));
-        }
-        if unsafe { ResumeThread(pi.hThread) } == u32::MAX {
-            unsafe {
-                TerminateProcess(pi.hProcess, 1);
-                CloseHandle(pi.hThread);
-                CloseHandle(pi.hProcess);
-                ClosePseudoConsole(hpcon);
-                CloseHandle(in_write);
-                CloseHandle(out_read);
-            }
-            return Err(last_os("ResumeThread"));
-        }
-        unsafe {
-            CloseHandle(pi.hThread);
-        }
-
-        let transcript = Arc::new(Mutex::new(WinTranscript::default()));
-        let stop_accepting_input = Arc::new(AtomicBool::new(false));
-        let close_returned = Arc::new(AtomicBool::new(false));
-
-        // Output drain worker owns out_read for the session lifetime.
-        let out_handle = OwnedWriteHandle(out_read);
-        let out_transcript = Arc::clone(&transcript);
-        let out_close_returned = Arc::clone(&close_returned);
-        let (out_exit_tx, out_exit_rx) = mpsc::channel::<()>();
-        let out_thread = std::thread::Builder::new()
-            .name("compat-win-output".into())
-            .spawn(move || {
-                output_drain_loop(out_handle.as_raw(), &out_transcript, &out_close_returned);
-                let _ = out_exit_tx.send(());
-                unsafe {
-                    let raw = out_handle.as_raw();
-                    if !raw.is_null() && raw != INVALID_HANDLE_VALUE {
-                        CloseHandle(raw);
-                    }
-                }
-            })
-            .map_err(|e| {
-                unsafe {
-                    ClosePseudoConsole(hpcon);
-                    CloseHandle(in_write);
-                    CloseHandle(out_read);
-                    CloseHandle(pi.hProcess);
-                }
-                io_err("spawn_output_worker", e)
-            })?;
-
-        let input_worker = match WindowsSyncInputWorker::spawn(in_write, "session_input") {
-            Ok(w) => w,
-            Err(e) => {
-                // Best-effort: request close on worker thread; abandon join if slow.
-                let (ctx, crx) = mpsc::channel::<CloseDone>();
-                let h = hpcon;
-                let _ct = std::thread::Builder::new()
-                    .name("compat-win-close".into())
-                    .spawn(move || {
-                        unsafe {
-                            ClosePseudoConsole(h);
-                        }
-                        let _ = ctx.send(CloseDone(Some(())));
-                    });
-                let _ = crx.recv_timeout(WIN_CLOSE_BOUND);
-                unsafe {
-                    CloseHandle(in_write);
-                    CloseHandle(pi.hProcess);
-                }
-                let _ = out_exit_rx.recv_timeout(WIN_WORKER_BOUND);
-                let _ = out_thread.join();
-                return Err(e);
-            }
-        };
-
-        Ok(Self {
-            hpcon,
-            process: pi.hProcess,
-            input_write: in_write,
-            output_read: out_read,
-            transcript,
-            child_pid: pi.dwProcessId,
-            started: Instant::now(),
-            deadline,
-            rows,
-            cols,
-            closed: false,
-            stop_accepting_input,
-            close_returned,
-            input_worker: Some(input_worker),
-            input_worker_stopped: false,
-            output_thread: Some(out_thread),
-            output_exit_rx: Some(out_exit_rx),
-            output_running: true,
-            close_thread: None,
-            close_done_rx: None,
-            close_started: false,
-            close_timed_out: false,
-            handles_closed: false,
-        })
     }
 
     pub fn child_pid(&self) -> u32 {
@@ -799,12 +1486,28 @@ impl WindowsConPtySession {
     }
 
     /// Resize this session's HPCON (API success ≠ client observation).
+    ///
+    /// Rejected as soon as close begins: ownership of the pseudoconsole has
+    /// moved to the close worker and the session holds no usable token
+    /// (D2-023 §16).
     pub fn resize(&mut self, rows: u16, cols: u16) -> std::io::Result<()> {
+        self.resize_attempts += 1;
+        if self.close_started || self.closed {
+            return Err(std::io::Error::other(
+                "pseudoconsole closing/closed: resize rejected",
+            ));
+        }
+        let Some(hpcon) = self.hpcon else {
+            return Err(std::io::Error::other(
+                "pseudoconsole unavailable: resize rejected",
+            ));
+        };
+        self.resize_api_calls += 1;
         let size = COORD {
             X: cols as i16,
             Y: rows as i16,
         };
-        let res = unsafe { ResizePseudoConsole(self.hpcon, size) };
+        let res = unsafe { ResizePseudoConsole(hpcon, size) };
         if res != 0 {
             return Err(std::io::Error::other(format!(
                 "ResizePseudoConsole failed: {res:#x}"
@@ -813,6 +1516,34 @@ impl WindowsConPtySession {
         self.rows = rows;
         self.cols = cols;
         Ok(())
+    }
+
+    /// How many times callers asked to resize (including rejected calls).
+    pub fn resize_attempt_count(&self) -> u32 {
+        self.resize_attempts
+    }
+
+    /// How many times the Win32 resize API was actually invoked.
+    ///
+    /// The difference from [`Self::resize_attempt_count`] proves rejected
+    /// resizes never reached the platform (D2-023 §23).
+    pub fn resize_api_call_count(&self) -> u32 {
+        self.resize_api_calls
+    }
+
+    /// True while this session still holds a usable pseudoconsole token.
+    pub fn has_live_hpcon(&self) -> bool {
+        self.hpcon.is_some()
+    }
+
+    /// Thread id that spawned this session (for close-off-caller evidence).
+    pub fn caller_thread_id(&self) -> u32 {
+        self.caller_thread_id
+    }
+
+    /// Thread id observed running the ConPTY close, if close has begun.
+    pub fn close_thread_id(&self) -> Option<u32> {
+        self.close_thread_id
     }
 
     /// Bounded wait for process exit; returns raw exit code when observed.
@@ -865,53 +1596,58 @@ impl WindowsConPtySession {
         self.wait_exit(bound)
     }
 
+    /// Initiate the bounded ConPTY close without waiting for it.
+    ///
+    /// HPCON ownership transfers to the close worker at this moment; every
+    /// later operation needing the pseudoconsole is rejected (D2-023 §15).
+    pub fn begin_close(&mut self) {
+        self.begin_close_locked();
+    }
+
     fn begin_close_locked(&mut self) {
         if self.close_started {
             return;
         }
-        self.close_started = true;
-        let hpcon = self.hpcon;
+        let Some(hpcon) = self.hpcon else {
+            // No live pseudoconsole: nothing to transfer or close.
+            return;
+        };
         let close_returned = Arc::clone(&self.close_returned);
-        let (done_tx, done_rx) = mpsc::channel::<CloseDone>();
-        let thread = std::thread::Builder::new()
-            .name("compat-win-close".into())
-            .spawn(move || {
-                unsafe {
-                    ClosePseudoConsole(hpcon);
-                }
-                close_returned.store(true, Ordering::SeqCst);
-                let _ = done_tx.send(CloseDone(Some(())));
-            })
-            .expect("spawn close worker");
-        self.close_thread = Some(thread);
-        self.close_done_rx = Some(done_rx);
+        match CloseWorkerHandle::spawn(hpcon, None, close_returned) {
+            Ok(close_worker) => {
+                // Ownership transfer: this session no longer holds a usable
+                // pseudoconsole token from this instant onward.
+                self.hpcon = None;
+                self.close_started = true;
+                self.close_worker = Some(close_worker);
+            }
+            Err(_) => {
+                // The caller thread must never close the pseudoconsole
+                // (D2-022/D2-023). Leave close unstarted so a later bounded
+                // attempt can retry; shutdown records this as not started.
+                self.close_started = false;
+            }
+        }
     }
 
     fn wait_close(&mut self, bound: Duration) -> bool {
-        let Some(rx) = self.close_done_rx.as_ref() else {
-            return !self.close_started;
+        let Some(mut close_worker) = self.close_worker.take() else {
+            // No pending worker: report the observed close fact, never a guess.
+            return self.close_started && self.close_returned.load(Ordering::SeqCst);
         };
-        match rx.recv_timeout(bound) {
-            Ok(CloseDone(_)) => {
-                if let Some(t) = self.close_thread.take() {
-                    let _ = t.join();
-                }
-                self.close_done_rx = None;
-                self.close_returned.store(true, Ordering::SeqCst);
-                true
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                self.close_timed_out = true;
-                false
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                self.close_returned.store(true, Ordering::SeqCst);
-                if let Some(t) = self.close_thread.take() {
-                    let _ = t.join();
-                }
-                self.close_done_rx = None;
-                true
-            }
+        let returned = close_worker.wait(bound);
+        if let Some(thread_id) = close_worker.thread_id() {
+            self.close_thread_id = Some(thread_id);
+        }
+        self.close_timed_out |= close_worker.timed_out;
+        if returned {
+            self.close_returned.store(true, Ordering::SeqCst);
+            true
+        } else {
+            // Retain the worker for a later bounded attempt. Never join here:
+            // a timeout is not permission to join (D2-023 §12).
+            self.close_worker = Some(close_worker);
+            false
         }
     }
 
@@ -919,30 +1655,20 @@ impl WindowsConPtySession {
         if !self.output_running {
             return true;
         }
-        let Some(rx) = self.output_exit_rx.take() else {
+        let Some(exit_rx) = self.output_exit_rx.take() else {
             self.output_running = false;
             return true;
         };
-        match rx.recv_timeout(bound) {
-            Ok(()) => {
-                if let Some(t) = self.output_thread.take() {
-                    let _ = t.join();
-                }
-                self.output_running = false;
-                true
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                // Keep receiver for a later attempt; do not unbounded-join.
-                self.output_exit_rx = Some(rx);
-                false
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                if let Some(t) = self.output_thread.take() {
-                    let _ = t.join();
-                }
-                self.output_running = false;
-                true
-            }
+        // Joins only after an observed exit signal or a channel disconnect
+        // that mechanically proves the worker finished (D2-023 §12).
+        let outcome = join_after_exit_signal(&exit_rx, bound, &mut self.output_thread);
+        if outcome.exit_observed {
+            self.output_running = false;
+            true
+        } else {
+            // Keep the receiver for a later attempt; no join, no hang.
+            self.output_exit_rx = Some(exit_rx);
+            false
         }
     }
 
@@ -967,10 +1693,8 @@ impl WindowsConPtySession {
             }
             self.process = std::ptr::null_mut();
         }
-        // output_read: owned/closed by output worker when it exits.
-        if !self.output_running {
-            self.output_read = std::ptr::null_mut();
-        }
+        // The output read handle is never owned here: the output drain worker
+        // closes it exactly once when it exits (D2-023 §28).
         // Mark only when every owned close path completed (no leak claim on partial).
         if self.input_worker_stopped && !self.output_running {
             self.handles_closed = true;
@@ -980,12 +1704,16 @@ impl WindowsConPtySession {
     /// Explicit bounded teardown (D2-022). Returns typed evidence.
     ///
     /// Stages: stop accepting input → cancel active write → terminate/wait
-    /// client → close worker (`ClosePseudoConsole` off this thread) → output
+    /// client → close worker (ConPTY close off this thread) → output
     /// drain continues → close completion observed → workers joined only
     /// after exit signal → single-close handles.
     pub fn shutdown_bounded(&mut self, budget: Duration) -> WindowsConPtyShutdownObservation {
         if self.closed {
-            return WindowsConPtyShutdownObservation::already_closed("session");
+            return WindowsConPtyShutdownObservation::already_closed(
+                "session",
+                self.caller_thread_id,
+                self.close_thread_id,
+            );
         }
         let started = Instant::now();
         let budget = budget.max(Duration::from_millis(1));
@@ -1079,6 +1807,8 @@ impl WindowsConPtySession {
             output_pipe_broken,
             output_worker_stopped,
             handles_closed_once: self.handles_closed,
+            caller_thread_id: self.caller_thread_id,
+            close_thread_id: self.close_thread_id,
             elapsed: started.elapsed(),
             bounded_out: bounded_out || started.elapsed() > budget,
             source: "session.shutdown_bounded".into(),
