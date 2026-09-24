@@ -172,6 +172,84 @@ impl Workspace {
         std::fs::write(&self.config, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
     }
 
+    /// H2 forensics: the canonical Gate redacts every Windows
+    /// replay-provision failure to `PersistenceUnavailable` by design, so a
+    /// hello refusal carries no failing-condition detail. This harness-only
+    /// probe dumps the Gate-side validation inputs (path spelling, volume,
+    /// owner, DACL, emptiness) on failure. It changes no production
+    /// semantics: the caller still fails closed after printing.
+    fn diagnose(&self) -> String {
+        const CAP: usize = 2000;
+        fn cap(s: &str) -> String {
+            let out: String = s.chars().take(CAP).collect();
+            if out.len() < s.len() {
+                format!("{out}…[truncated]")
+            } else {
+                out
+            }
+        }
+        fn run(prog: &str, args: &[&str]) -> String {
+            match std::process::Command::new(prog).args(args).output() {
+                Ok(o) => {
+                    let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
+                    let e = String::from_utf8_lossy(&o.stderr);
+                    if !e.trim().is_empty() {
+                        s.push_str("\n[stderr] ");
+                        s.push_str(&e);
+                    }
+                    s
+                }
+                Err(e) => format!("<spawn failed: {e}>"),
+            }
+        }
+        let mut d = String::new();
+        d.push_str(&format!("host_data={}\n", self.host_data.display()));
+        d.push_str(&format!("config={}\n", self.config.display()));
+        d.push_str(&format!("trail={}\n", self.trail.display()));
+        d.push_str(&format!(
+            "temp_dir={} TEMP={:?} TMP={:?}\n",
+            std::env::temp_dir().display(),
+            std::env::var("TEMP"),
+            std::env::var("TMP"),
+        ));
+        let spelling = self.host_data.to_string_lossy().into_owned();
+        d.push_str(&format!(
+            "absolute={} contains_slash={} contains_ext_prefix={}\n",
+            self.host_data.is_absolute(),
+            spelling.contains('/'),
+            spelling.contains("\\\\."),
+        ));
+        match std::fs::read_dir(&self.host_data) {
+            Ok(rd) => {
+                let mut names: Vec<String> = rd
+                    .map(|e| {
+                        e.map(|x| x.file_name().to_string_lossy().into_owned())
+                            .unwrap_or_else(|e| format!("<entry-err: {e}>"))
+                    })
+                    .collect();
+                names.sort();
+                d.push_str(&format!("host_data_entries={names:?}\n"));
+            }
+            Err(e) => d.push_str(&format!("host_data_readdir_err={e}\n")),
+        }
+        #[cfg(windows)]
+        {
+            let hd = self.host_data.to_string_lossy().into_owned();
+            let drive = format!("{}:\\", hd.chars().next().unwrap_or('?'));
+            d.push_str(&format!("whoami={}\n", cap(&run("whoami", &[]))));
+            d.push_str(&format!("icacls={}\n", cap(&run("icacls", &[hd.as_str()]))));
+            d.push_str(&format!(
+                "fsinfo_volume={}\n",
+                cap(&run("fsutil", &["fsinfo", "volumeinfo", drive.as_str()]))
+            ));
+            d.push_str(&format!(
+                "fsinfo_drivetype={}\n",
+                cap(&run("fsutil", &["fsinfo", "drivetype", drive.as_str()]))
+            ));
+        }
+        cap(&d)
+    }
+
     fn spawn_gate(&self, env: &GateEnv) -> GateProcess {
         let cfg = GateSpawnConfig {
             exe: env.gate_exe.clone(),
@@ -197,8 +275,9 @@ impl Workspace {
         let mut gate = GateProcess::spawn(&cfg).expect("gate spawns");
         let hello = gate.hello(Duration::from_secs(30)).unwrap_or_else(|e| {
             panic!(
-                "hello works: {e:?} :: gate stderr: {}",
-                String::from_utf8_lossy(&gate.stderr_tail())
+                "hello works: {e:?} :: gate stderr: {} :: h2_forensics:\n{}",
+                String::from_utf8_lossy(&gate.stderr_tail()),
+                self.diagnose()
             )
         });
         ExpectedGate::pinned("canonical".to_string(), None)
