@@ -342,8 +342,13 @@ jobs:
           dune-cache: true
 
       - name: Build canonical Tethers engine
+        # setup-ocaml provides the compiler but each step starts with
+        # no switch selected: discover and select it explicitly.
         shell: bash
         run: |
+          SWITCH=$(opam switch list --short | head -n 1)
+          echo "opam switch: $SWITCH"
+          eval $(opam env --switch="$SWITCH" --set-switch)
           cd "$TETHERS_BUILD_DIR/tethers-0.1/engine-ocaml"
           opam install . --deps-only -y
           opam exec -- dune build @all
