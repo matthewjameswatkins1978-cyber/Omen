@@ -11,9 +11,9 @@
 //! marker fixture Omen owns: marker presence == physical execution.
 
 use omen_authority::{
-    AdmitExecute, AskPolicy, AuthorityIntent, CommitOutcome, ExpectedGate, GateProcess,
-    GateSpawnConfig, GateTransport, HumanOutcome, OutcomeJournal, PrepareOutcome,
-    SupervisorExecutor, run::run_once,
+    AdmitExecute, AskPolicy, AuthorityIntent, CommitOutcome, ExpectedGate, FixtureProvision,
+    GateProcess, GateSpawnConfig, GateTransport, HumanOutcome, OutcomeJournal, PrepareOutcome,
+    SupervisorExecutor, resolve_execution, run::run_once,
 };
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -344,8 +344,12 @@ impl Workspace {
     /// unavailability truthfully; ZERO spawn, ZERO ALLOW, ZERO outcome,
     /// no fallback path. Panics on ANY deviation — including an
     /// unexpected hello success (upstream seam fixed without review).
+    ///
+    /// The intent is semantic-only; the marker path below is DERIVED by
+    /// the trusted resolver (not supplied), proving the resolver owns
+    /// the physical relationship even on the seam path.
     #[cfg(windows)]
-    async fn characterise_owner_seam(&self, env: &GateEnv, dir: &Path, marker: &Path, name: &str) {
+    async fn characterise_owner_seam(&self, env: &GateEnv, fixture: &Path, dir: &Path, name: &str) {
         let cfg = self.spawn_config(env);
         // Fixture paths resolve relative to the config dir (Gate-side).
         let mut gate = GateProcess::spawn(&cfg).expect("gate spawns");
@@ -363,9 +367,16 @@ impl Workspace {
             }
         }
         // Attempted admission through the refused session must fail closed.
-        let fixture = marker_fixture(dir);
+        let provision = FixtureProvision {
+            exe: fixture.to_path_buf(),
+            workdir: dir.to_path_buf(),
+        };
         let digest = manifest_digest(&env.manifest_text);
-        let intent = intent_for(&fixture, marker, &format!("eval_e2e_seam_{name}"), &digest);
+        let intent = intent_for(&format!("eval_e2e_seam_{name}"), &digest);
+        let marker = resolve_execution(&intent, &provision)
+            .expect("fixture resolves")
+            .marker_path()
+            .to_path_buf();
         let journal_path = dir.join(format!("seam-{name}.jsonl"));
         let journal = OutcomeJournal::open(journal_path.clone());
         let mut driver = AdmitExecute::new(gate);
@@ -374,6 +385,7 @@ impl Workspace {
             &mut driver,
             Some("gate_e2e".to_string()),
             &intent,
+            &provision,
             AskPolicy::Defer,
             &mut exec,
             &journal,
@@ -432,12 +444,10 @@ fn marker_fixture(dir: &Path) -> PathBuf {
         .clone()
 }
 
-fn intent_for(
-    fixture_exe: &Path,
-    marker: &Path,
-    eval: &str,
-    manifest_digest: &str,
-) -> AuthorityIntent {
+/// Semantic-only intent: NO argv, NO cwd. After COMMIT the trusted
+/// resolver derives the exact physical command (fixture exe + derived
+/// marker in the provisioned workdir) from these semantics.
+fn intent_for(eval: &str, manifest_digest: &str) -> AuthorityIntent {
     AuthorityIntent {
         tether_id: "r2-complete".to_string(),
         tether_version: "1".to_string(),
@@ -452,14 +462,26 @@ fn intent_for(
         expected_capability_version: 1,
         expected_manifest_digest: manifest_digest.to_string(),
         expected_provider: "tethers-stdio-fixture".to_string(),
-        argv: vec![
-            fixture_exe.to_string_lossy().into_owned(),
-            marker.to_string_lossy().into_owned(),
-        ],
-        cwd: fixture_exe.parent().unwrap().to_path_buf(),
         timeout_ms: 30_000,
         success_result: json!({"echo": "marker-ok"}),
     }
+}
+
+/// Trusted provision: the compiled fixture exe (installation truth) +
+/// the sandbox workdir. The resolver-derived marker path is the ONLY
+/// marker any test may assert on.
+fn provision_for(fixture_exe: &Path, workdir: &Path) -> FixtureProvision {
+    FixtureProvision {
+        exe: fixture_exe.to_path_buf(),
+        workdir: workdir.to_path_buf(),
+    }
+}
+
+fn bound_marker(intent: &AuthorityIntent, provision: &FixtureProvision) -> PathBuf {
+    resolve_execution(intent, provision)
+        .expect("fixture resolves")
+        .marker_path()
+        .to_path_buf()
 }
 
 fn manifest_digest(manifest_text: &str) -> String {
@@ -481,15 +503,16 @@ async fn e2e_allow_executes_once_and_reports() {
     let tmp = tempfile::tempdir().unwrap();
     let ws = Workspace::create("allow", &env.manifest_text);
     let fixture = marker_fixture(tmp.path());
-    let marker = tmp.path().join("allow.marker");
+    let provision = provision_for(&fixture, tmp.path());
     #[cfg(windows)]
     if ws.windows_owner_seam_active() {
-        ws.characterise_owner_seam(&env, tmp.path(), &marker, "allow")
+        ws.characterise_owner_seam(&env, &fixture, tmp.path(), "allow")
             .await;
         return;
     }
     let digest = manifest_digest(&env.manifest_text);
-    let intent = intent_for(&fixture, &marker, "eval_e2e_allow", &digest);
+    let intent = intent_for("eval_e2e_allow", &digest);
+    let marker = bound_marker(&intent, &provision);
     let journal = OutcomeJournal::open(tmp.path().join("j.jsonl"));
 
     let gate = ws.spawn_gate(&env);
@@ -499,6 +522,7 @@ async fn e2e_allow_executes_once_and_reports() {
         &mut driver,
         Some("gate_e2e".to_string()),
         &intent,
+        &provision,
         AskPolicy::Defer,
         &mut exec,
         &journal,
@@ -544,15 +568,16 @@ async fn e2e_deny_zero_spawn() {
     let tmp = tempfile::tempdir().unwrap();
     let ws = Workspace::create("deny", &env.manifest_text);
     let fixture = marker_fixture(tmp.path());
-    let marker = tmp.path().join("deny.marker");
+    let provision = provision_for(&fixture, tmp.path());
     #[cfg(windows)]
     if ws.windows_owner_seam_active() {
-        ws.characterise_owner_seam(&env, tmp.path(), &marker, "deny")
+        ws.characterise_owner_seam(&env, &fixture, tmp.path(), "deny")
             .await;
         return;
     }
     let digest = manifest_digest(&env.manifest_text);
-    let intent = intent_for(&fixture, &marker, "eval_e2e_deny", &digest);
+    let intent = intent_for("eval_e2e_deny", &digest);
+    let marker = bound_marker(&intent, &provision);
     let journal = OutcomeJournal::open(tmp.path().join("j.jsonl"));
 
     let gate = ws.spawn_gate(&env);
@@ -562,6 +587,7 @@ async fn e2e_deny_zero_spawn() {
         &mut driver,
         Some("gate_e2e".to_string()),
         &intent,
+        &provision,
         AskPolicy::Approve,
         &mut exec,
         &journal,
@@ -583,10 +609,10 @@ async fn e2e_ask_approve_executes_once() {
     let tmp = tempfile::tempdir().unwrap();
     let ws = Workspace::create("ask", &env.manifest_text);
     let fixture = marker_fixture(tmp.path());
-    let marker = tmp.path().join("ask.marker");
+    let provision = provision_for(&fixture, tmp.path());
     #[cfg(windows)]
     if ws.windows_owner_seam_active() {
-        ws.characterise_owner_seam(&env, tmp.path(), &marker, "ask")
+        ws.characterise_owner_seam(&env, &fixture, tmp.path(), "ask")
             .await;
         return;
     }
@@ -596,11 +622,13 @@ async fn e2e_ask_approve_executes_once() {
     let gate = ws.spawn_gate(&env);
     let mut driver = AdmitExecute::new(gate);
     let mut exec = SupervisorExecutor::new();
-    let intent = intent_for(&fixture, &marker, "eval_e2e_ask", &digest);
+    let intent = intent_for("eval_e2e_ask", &digest);
+    let marker = bound_marker(&intent, &provision);
     let ask = run_once(
         &mut driver,
         Some("gate_e2e".to_string()),
         &intent,
+        &provision,
         AskPolicy::Defer,
         &mut exec,
         &journal,
@@ -610,11 +638,12 @@ async fn e2e_ask_approve_executes_once() {
     assert!(matches!(ask.human, HumanOutcome::ApprovalRequired(_)));
     assert!(!marker.exists(), "ASK executed before approval");
 
-    let intent2 = intent_for(&fixture, &marker, "eval_e2e_ask2", &digest);
+    let intent2 = intent_for("eval_e2e_ask2", &digest);
     let done = run_once(
         &mut driver,
         Some("gate_e2e".to_string()),
         &intent2,
+        &provision,
         AskPolicy::Approve,
         &mut exec,
         &journal,
@@ -637,15 +666,16 @@ async fn e2e_revoke_before_commit_zero_spawn() {
     let tmp = tempfile::tempdir().unwrap();
     let ws = Workspace::create("allow", &env.manifest_text);
     let fixture = marker_fixture(tmp.path());
-    let marker = tmp.path().join("revoke.marker");
+    let provision = provision_for(&fixture, tmp.path());
     #[cfg(windows)]
     if ws.windows_owner_seam_active() {
-        ws.characterise_owner_seam(&env, tmp.path(), &marker, "revoke")
+        ws.characterise_owner_seam(&env, &fixture, tmp.path(), "revoke")
             .await;
         return;
     }
     let digest = manifest_digest(&env.manifest_text);
-    let intent = intent_for(&fixture, &marker, "eval_e2e_revoke", &digest);
+    let intent = intent_for("eval_e2e_revoke", &digest);
+    let marker = bound_marker(&intent, &provision);
 
     let gate = ws.spawn_gate(&env);
     let mut driver = AdmitExecute::new(gate);
@@ -668,12 +698,13 @@ async fn e2e_revoke_before_commit_zero_spawn() {
     // Re-admission on fresh truth executes exactly once.
     ws.write_config("allow");
     let journal = OutcomeJournal::open(tmp.path().join("j.jsonl"));
-    let intent2 = intent_for(&fixture, &marker, "eval_e2e_revoke2", &digest);
+    let intent2 = intent_for("eval_e2e_revoke2", &digest);
     let mut exec = SupervisorExecutor::new();
     let done = run_once(
         &mut driver,
         Some("gate_e2e".to_string()),
         &intent2,
+        &provision,
         AskPolicy::Defer,
         &mut exec,
         &journal,
@@ -695,15 +726,16 @@ async fn e2e_gate_down_zero_spawn() {
     let tmp = tempfile::tempdir().unwrap();
     let ws = Workspace::create("allow", &env.manifest_text);
     let fixture = marker_fixture(tmp.path());
-    let marker = tmp.path().join("down.marker");
+    let provision = provision_for(&fixture, tmp.path());
     #[cfg(windows)]
     if ws.windows_owner_seam_active() {
-        ws.characterise_owner_seam(&env, tmp.path(), &marker, "down")
+        ws.characterise_owner_seam(&env, &fixture, tmp.path(), "down")
             .await;
         return;
     }
     let digest = manifest_digest(&env.manifest_text);
-    let intent = intent_for(&fixture, &marker, "eval_e2e_down", &digest);
+    let intent = intent_for("eval_e2e_down", &digest);
+    let marker = bound_marker(&intent, &provision);
     let journal = OutcomeJournal::open(tmp.path().join("j.jsonl"));
 
     let gate = ws.spawn_gate(&env);
@@ -715,6 +747,7 @@ async fn e2e_gate_down_zero_spawn() {
         &mut driver,
         Some("gate_e2e".to_string()),
         &intent,
+        &provision,
         AskPolicy::Defer,
         &mut exec,
         &journal,
@@ -736,8 +769,8 @@ async fn e2e_multistep_readmission() {
     let ws = Workspace::create("allow", &env.manifest_text);
     #[cfg(windows)]
     if ws.windows_owner_seam_active() {
-        let seam_marker = tmp.path().join("seam-multistep.marker");
-        ws.characterise_owner_seam(&env, tmp.path(), &seam_marker, "multistep")
+        let fixture = marker_fixture(tmp.path());
+        ws.characterise_owner_seam(&env, &fixture, tmp.path(), "multistep")
             .await;
         return;
     }
@@ -745,18 +778,26 @@ async fn e2e_multistep_readmission() {
     let digest = manifest_digest(&env.manifest_text);
     let journal = OutcomeJournal::open(tmp.path().join("j.jsonl"));
 
+    // Distinct provisioned sandboxes per step: the resolver derives each
+    // step's marker from the authorised message inside its own workdir,
+    // so step-2 denial is proven by its own marker's absence.
+    let step1_dir = tmp.path().join("step1");
+    let step2_dir = tmp.path().join("step2");
+    std::fs::create_dir_all(&step1_dir).unwrap();
+    std::fs::create_dir_all(&step2_dir).unwrap();
+    let provision1 = provision_for(&fixture, &step1_dir);
+    let provision2 = provision_for(&fixture, &step2_dir);
+
     let gate = ws.spawn_gate(&env);
     let mut driver = AdmitExecute::new(gate);
     let mut exec = SupervisorExecutor::new();
-    let marker1 = tmp.path().join("step1.marker");
-    let intent1 = intent_for(&fixture, &marker1, "eval_e2e_s1", &digest);
-    // Step 1 marker path must be inside argv: rebuild with its own marker.
-    let mut intent1 = intent1;
-    intent1.argv[1] = marker1.to_string_lossy().into_owned();
+    let intent1 = intent_for("eval_e2e_s1", &digest);
+    let marker1 = bound_marker(&intent1, &provision1);
     let s1 = run_once(
         &mut driver,
         Some("gate_e2e".to_string()),
         &intent1,
+        &provision1,
         AskPolicy::Defer,
         &mut exec,
         &journal,
@@ -767,13 +808,13 @@ async fn e2e_multistep_readmission() {
     assert!(marker1.is_file());
 
     ws.write_config("deny");
-    let marker2 = tmp.path().join("step2.marker");
-    let mut intent2 = intent_for(&fixture, &marker2, "eval_e2e_s2", &digest);
-    intent2.argv[1] = marker2.to_string_lossy().into_owned();
+    let intent2 = intent_for("eval_e2e_s2", &digest);
+    let marker2 = bound_marker(&intent2, &provision2);
     let s2 = run_once(
         &mut driver,
         Some("gate_e2e".to_string()),
         &intent2,
+        &provision2,
         AskPolicy::Approve,
         &mut exec,
         &journal,
@@ -812,7 +853,7 @@ async fn e2e_windows_owner_seam_characterised() {
         driver.transport_mut().shutdown();
         return;
     }
-    let marker = tmp.path().join("seam.marker");
-    ws.characterise_owner_seam(&env, tmp.path(), &marker, "seam")
+    let fixture = marker_fixture(tmp.path());
+    ws.characterise_owner_seam(&env, &fixture, tmp.path(), "seam")
         .await;
 }

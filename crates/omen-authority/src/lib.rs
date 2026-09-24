@@ -19,6 +19,7 @@
 //! never a reusable permission slip.
 
 pub mod admission;
+pub mod binding;
 pub mod contract;
 pub mod digest;
 pub mod dispatch;
@@ -35,6 +36,9 @@ pub mod transport;
 
 pub use admission::{
     AdmitExecute, ApprovalDecision, ApprovalOutcome, AuthorityIntent, CommitOutcome, PrepareOutcome,
+};
+pub use binding::{
+    ExecutionBinding, FixtureProvision, VerifiedExecutionBinding, resolve_execution,
 };
 pub use contract::{AuthorityProjection, AuthorityState, HumanOutcome};
 pub use digest::{canonical_digest, verify_argument_digest};

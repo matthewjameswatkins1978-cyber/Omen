@@ -11,7 +11,7 @@
 //! grants no authority and competes with nothing.
 
 use crate::AuthorityError;
-use crate::dispatch::VerifiedDispatch;
+use crate::binding::VerifiedExecutionBinding;
 use crate::executor::ExecAttempt;
 use crate::protocol::OutcomeResult;
 use crate::transport::{GateTransport, RoundtripError};
@@ -96,11 +96,11 @@ impl OutcomeJournal {
     }
 }
 
-/// Build the OUTCOME payload from a verified dispatch + real attempt.
+/// Build the OUTCOME payload from a verified execution binding + real attempt.
 /// `attempted == false` yields `None`: nothing is sent (the Gate would
 /// refuse `not_attempted`); the caller journals the deferral instead.
 pub fn outcome_payload(
-    dispatch: &VerifiedDispatch,
+    binding: &VerifiedExecutionBinding,
     attempt: &ExecAttempt,
     success_result: &Value,
     evidence: Option<String>,
@@ -110,7 +110,7 @@ pub fn outcome_payload(
     }
     let classification = attempt.classification().as_str().to_string();
     let mut payload = json!({
-        "execution_id": dispatch.execution_id,
+        "execution_id": binding.execution_id(),
         "classification": classification,
         "attempted": true,
         "external_execution_identity": attempt.omen_exec_id,

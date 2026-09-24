@@ -137,7 +137,9 @@ fn harness_bits() -> (tempfile::TempDir, std::path::PathBuf, OutcomeJournal) {
     (dir, marker, journal)
 }
 
-fn test_intent(dir: &std::path::Path) -> omen_authority::AuthorityIntent {
+fn test_intent(_dir: &std::path::Path) -> omen_authority::AuthorityIntent {
+    // Semantic-only. These sessions die before COMMIT, so the trusted
+    // resolver is never reached — the provision below is never consumed.
     omen_authority::AuthorityIntent {
         tether_id: "t".to_string(),
         tether_version: "1".to_string(),
@@ -152,10 +154,15 @@ fn test_intent(dir: &std::path::Path) -> omen_authority::AuthorityIntent {
         expected_capability_version: 1,
         expected_manifest_digest: "sha256:0".to_string(),
         expected_provider: "p".to_string(),
-        argv: vec!["x".to_string()],
-        cwd: dir.to_path_buf(),
         timeout_ms: 1000,
         success_result: serde_json::json!({"echo": "x"}),
+    }
+}
+
+fn dead_session_provision(dir: &std::path::Path) -> omen_authority::FixtureProvision {
+    omen_authority::FixtureProvision {
+        exe: dir.join("unused-fixture-exe"),
+        workdir: dir.to_path_buf(),
     }
 }
 
@@ -209,12 +216,14 @@ async fn g09_startup_failure_zero_spawn() {
         "got: {msg}"
     );
     let intent = test_intent(dir.path());
+    let provision = dead_session_provision(dir.path());
     let mut driver = AdmitExecute::new(gate);
     let mut exec = CountingExecutor::succeeding(Some(marker.clone()));
     let err = run_once(
         &mut driver,
         None,
         &intent,
+        &provision,
         AskPolicy::Defer,
         &mut exec,
         &journal,
@@ -234,12 +243,14 @@ async fn g10_crash_before_commit_zero_spawn() {
     let mut gate = GateProcess::spawn(&cfg).expect("spawn works");
     gate.hello(Duration::from_secs(5)).expect("hello works");
     let intent = test_intent(dir.path());
+    let provision = dead_session_provision(dir.path());
     let mut driver = AdmitExecute::new(gate);
     let mut exec = CountingExecutor::succeeding(Some(marker.clone()));
     let err = run_once(
         &mut driver,
         Some("gate_stub".to_string()),
         &intent,
+        &provision,
         AskPolicy::Defer,
         &mut exec,
         &journal,
@@ -336,12 +347,14 @@ async fn g16b_hung_gate_timeout_zero_spawn() {
         .expect_err("hung gate must time out");
     assert!(format!("{err:?}").contains("timeout"), "got: {err:?}");
     let intent = test_intent(dir.path());
+    let provision = dead_session_provision(dir.path());
     let mut driver = AdmitExecute::new(gate);
     let mut exec = CountingExecutor::succeeding(Some(marker.clone()));
     let _ = run_once(
         &mut driver,
         None,
         &intent,
+        &provision,
         AskPolicy::Defer,
         &mut exec,
         &journal,

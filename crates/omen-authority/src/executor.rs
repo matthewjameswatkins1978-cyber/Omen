@@ -1,17 +1,26 @@
 //! Physical execution: Omen's substrate remains authoritative.
 //!
-//! Once a [`VerifiedDispatch`] exists, execution runs through the
-//! existing `omen_engine` supervision unchanged (argv-only, environment
-//! isolation, timeouts, cancellation, process-tree cleanup, capture,
-//! evidence). H2 adds no executor, no replacement semantics — only the
-//! admission seam before it.
+//! The executor accepts ONLY [`VerifiedExecutionBinding`]: a value whose
+//! physical command was produced by the Omen-owned trusted resolver from
+//! the authorised semantic action and verified against the Tethers
+//! dispatch. There is no argv/cwd parameter left to supply, so
+//! post-COMMIT physical substitution is impossible by type — the old
+//! `execute(&verified_dispatch, arbitrary_argv, arbitrary_cwd, ...)`
+//! shape no longer exists.
+//!
+//! Execution itself still runs through the existing `omen_engine`
+//! supervision unchanged (argv-only, environment isolation, timeouts,
+//! cancellation, process-tree cleanup, capture, evidence). H2 adds no
+//! executor, no replacement semantics — only the admission seam before
+//! it, now closed through the trusted binding.
 //!
 //! The [`PhysicalExecutor`] trait lets the matrix prove spawn counts
 //! deterministically (counting fakes with marker files); production uses
-//! [`SupervisorExecutor`].
+//! [`SupervisorExecutor`], which re-verifies executable identity
+//! immediately before spawn (bind -> spawn window).
 
 use crate::AuthorityError;
-use crate::dispatch::VerifiedDispatch;
+use crate::binding::VerifiedExecutionBinding;
 use omen_core::{ProcessExit, RuntimeStatus};
 use omen_engine::supervisor::{ExecutionOutput, ExecutionRequest, ProcessSupervisor};
 
@@ -75,12 +84,12 @@ impl ExecAttempt {
 }
 
 pub trait PhysicalExecutor: Send {
+    /// Execute EXACTLY the verified binding. No argv, no cwd, no
+    /// timeout parameter: every physical input is inside `binding`,
+    /// already verified against the Tethers dispatch.
     fn execute(
         &mut self,
-        dispatch: &VerifiedDispatch,
-        argv: &[String],
-        cwd: &std::path::Path,
-        timeout_ms: u64,
+        binding: &VerifiedExecutionBinding,
     ) -> impl std::future::Future<Output = Result<ExecAttempt, AuthorityError>> + Send;
 }
 
@@ -106,13 +115,32 @@ impl Default for SupervisorExecutor {
 impl PhysicalExecutor for SupervisorExecutor {
     async fn execute(
         &mut self,
-        dispatch: &VerifiedDispatch,
-        argv: &[String],
-        cwd: &std::path::Path,
-        timeout_ms: u64,
+        binding: &VerifiedExecutionBinding,
     ) -> Result<ExecAttempt, AuthorityError> {
-        let mut req = ExecutionRequest::simple(argv.to_vec(), cwd.to_path_buf());
-        req.timeout_ms = timeout_ms;
+        // Bind -> spawn window: re-verify TARGET executable identity
+        // immediately before spawn. A binary swapped after binding
+        // refuses here with zero spawn.
+        let current = match std::fs::read(binding.exe()) {
+            Ok(b) => format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(b)),
+            Err(e) => {
+                return Err(AuthorityError::Execute(format!(
+                    "exec.exe_unreadable: {}: {e}",
+                    binding.exe().display()
+                )));
+            }
+        };
+        if current != binding.exe_sha256() {
+            return Err(AuthorityError::Execute(format!(
+                "exec.exe_identity_changed: {} (zero spawn)",
+                binding.exe().display()
+            )));
+        }
+        let mut req =
+            ExecutionRequest::simple(binding.argv().to_vec(), binding.cwd().to_path_buf());
+        // Bounded empty environment projection: the engine's argv-only
+        // isolation policy governs (no second environment model).
+        req.env = binding.env().to_vec();
+        req.timeout_ms = binding.timeout_ms();
         let out: ExecutionOutput =
             self.supervisor.execute(req).await.map_err(|e| {
                 AuthorityError::Execute(format!("supervisor.execute.failed: {e:?}"))
@@ -124,18 +152,22 @@ impl PhysicalExecutor for SupervisorExecutor {
             stdout: out.stdout_bounded,
             stderr: out.stderr_bounded,
             duration_ms: out.duration_ms,
-            omen_exec_id: format!("omen-exec-{}", dispatch.execution_id),
+            omen_exec_id: format!("omen-exec-{}", binding.execution_id()),
         })
     }
 }
 
-/// Deterministic test executor: records calls, writes the spawn sentinel
-/// marker (proving a physical execution WOULD have happened), and
-/// returns a scripted attempt. Zero calls + absent marker == zero spawn.
+/// Deterministic test executor: records calls AND the exact physical
+/// values it was asked to execute, writes the spawn sentinel marker
+/// (proving a physical execution WOULD have happened), and returns a
+/// scripted attempt. Zero calls + absent marker == zero spawn. The
+/// recorded argv/cwd prove the executed command IS the verified binding.
 pub struct CountingExecutor {
     pub calls: u64,
     pub marker: Option<std::path::PathBuf>,
     pub scripted: ExecAttempt,
+    pub last_argv: Vec<String>,
+    pub last_cwd: Option<std::path::PathBuf>,
 }
 
 impl CountingExecutor {
@@ -144,6 +176,8 @@ impl CountingExecutor {
             calls: 0,
             marker,
             scripted,
+            last_argv: Vec::new(),
+            last_cwd: None,
         }
     }
 
@@ -166,12 +200,11 @@ impl CountingExecutor {
 impl PhysicalExecutor for CountingExecutor {
     async fn execute(
         &mut self,
-        _dispatch: &VerifiedDispatch,
-        _argv: &[String],
-        _cwd: &std::path::Path,
-        _timeout_ms: u64,
+        binding: &VerifiedExecutionBinding,
     ) -> Result<ExecAttempt, AuthorityError> {
         self.calls += 1;
+        self.last_argv = binding.argv().to_vec();
+        self.last_cwd = Some(binding.cwd().to_path_buf());
         // Physical truth: the sentinel is written ONLY when a process
         // was actually spawned. A cancelled-before-dispatch attempt
         // writes nothing — marker absence == zero spawn.

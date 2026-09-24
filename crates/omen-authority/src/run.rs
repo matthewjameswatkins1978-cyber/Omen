@@ -2,18 +2,22 @@
 //!
 //! ```text
 //! journal terminal? -> status recovery? -> PREPARE -> [ASK -> approval]
-//!   -> fresh COMMIT -> verify dispatch -> journal committed -> EXECUTE once
-//!   -> OUTCOME -> journal recorded
+//!   -> fresh COMMIT -> verify dispatch -> trusted resolve + bind physical
+//!   -> EXECUTE once -> OUTCOME -> journal recorded
 //! ```
 //!
 //! Every arrow-kink fails closed with zero spawn except the single
 //! admitted execution. No cached admission, no reused preparation, no
-//! second execution for one admission.
+//! second execution for one admission. The physical command is resolved
+//! by the Omen-owned trusted resolver AFTER the COMMIT is verified and
+//! executed ONLY as a `VerifiedExecutionBinding`: authorised A executes
+//! A, nothing else.
 
 use crate::AuthorityError;
 use crate::admission::{
     AdmitExecute, ApprovalDecision, AuthorityIntent, CommitOutcome, PrepareOutcome,
 };
+use crate::binding::{FixtureProvision, VerifiedExecutionBinding, resolve_execution};
 use crate::contract::{AuthorityProjection, AuthorityState, HumanOutcome};
 use crate::dispatch::{DispatchContext, verify_dispatch};
 use crate::executor::{ExecAttempt, PhysicalExecutor};
@@ -46,12 +50,17 @@ pub struct RunReport {
 
 /// Drive one authority-required step to its conclusion.
 ///
-/// `ask` controls the ASK branch. `spawn_count` is 0/1 by construction:
-/// the executor is invoked at most once, only after a verified COMMIT.
+/// `ask` controls the ASK branch. `provision` is the trusted
+/// Omen-side installation truth the physical resolver maps the
+/// authorised semantic action onto (pre-authority provisioning, never
+/// caller argv). `spawn_count` is 0/1 by construction: the executor is
+/// invoked at most once, only after a verified COMMIT bound to a
+/// verified physical execution.
 pub async fn run_once<T, E>(
     driver: &mut AdmitExecute<T>,
     gate_instance_id: Option<String>,
     intent: &AuthorityIntent,
+    provision: &FixtureProvision,
     ask: AskPolicy,
     executor: &mut E,
     journal: &OutcomeJournal,
@@ -245,15 +254,24 @@ where
         // executes nothing. Surface as malformed authority.
         AuthorityError::Validate(format!("{e}"))
     })?;
-    if journal.is_terminal(&verified.execution_id) {
+    // Exact physical binding AFTER the verified COMMIT: the trusted
+    // Omen resolver derives the physical command from the authorised
+    // semantic action, and `bind` verifies it against the dispatch.
+    // Binding failure AFTER commit: the admission is spent but Omen
+    // executes nothing. Surface as malformed authority.
+    let binding = resolve_execution(intent, provision)
+        .map_err(|e| AuthorityError::Validate(format!("{e:?}")))?;
+    let bound = VerifiedExecutionBinding::bind(&verified, &binding)
+        .map_err(|e| AuthorityError::Validate(format!("{e:?}")))?;
+    if journal.is_terminal(bound.execution_id()) {
         return Ok(RunReport {
             human: HumanOutcome::StaleRevoked(format!(
                 "execution {} already terminal: no duplicate execution",
-                verified.execution_id
+                bound.execution_id()
             )),
             projection: base_projection(
                 AuthorityState::StaleRevoked,
-                Some(verified.execution_id),
+                Some(bound.execution_id().to_string()),
                 Some(prepared_id),
                 approval_id,
                 approval_consumed,
@@ -267,10 +285,8 @@ where
         });
     }
 
-    // Exactly one physical execution.
-    let attempt: ExecAttempt = executor
-        .execute(&verified, &intent.argv, &intent.cwd, intent.timeout_ms)
-        .await?;
+    // Exactly one physical execution of EXACTLY the verified binding.
+    let attempt: ExecAttempt = executor.execute(&bound).await?;
     let spawn_count = u64::from(attempt.attempted);
 
     // OUTCOME (or deferral when nothing was attempted).
@@ -284,13 +300,13 @@ where
         h.update(&attempt.stderr);
         Some(format!("sha256:{:x}", h.finalize()))
     };
-    let payload = outcome_payload(&verified, &attempt, &intent.success_result, evidence);
+    let payload = outcome_payload(&bound, &attempt, &intent.success_result, evidence);
     let (outcome_state, terminal, human) = match payload {
         None => {
             journal.record(OutcomeRecord {
-                execution_id: verified.execution_id.clone(),
-                action_id: verified.action_id.clone(),
-                capability: verified.capability_name.clone(),
+                execution_id: bound.execution_id().to_string(),
+                action_id: bound.action_id().to_string(),
+                capability: bound.capability_name().to_string(),
                 attempted: false,
                 classification: "not_attempted".to_string(),
                 outcome_sent: false,
@@ -309,9 +325,9 @@ where
         Some(payload) => match deliver_outcome(driver.transport_mut(), &payload)? {
             OutcomeDelivered::Recorded(res) => {
                 journal.record(OutcomeRecord {
-                    execution_id: verified.execution_id.clone(),
-                    action_id: verified.action_id.clone(),
-                    capability: verified.capability_name.clone(),
+                    execution_id: bound.execution_id().to_string(),
+                    action_id: bound.action_id().to_string(),
+                    capability: bound.capability_name().to_string(),
                     attempted: true,
                     classification: attempt.classification().as_str().to_string(),
                     outcome_sent: true,
@@ -336,9 +352,9 @@ where
             }
             OutcomeDelivered::Refused { code, message } => {
                 journal.record(OutcomeRecord {
-                    execution_id: verified.execution_id.clone(),
-                    action_id: verified.action_id.clone(),
-                    capability: verified.capability_name.clone(),
+                    execution_id: bound.execution_id().to_string(),
+                    action_id: bound.action_id().to_string(),
+                    capability: bound.capability_name().to_string(),
                     attempted: true,
                     classification: attempt.classification().as_str().to_string(),
                     outcome_sent: false,
@@ -359,7 +375,7 @@ where
         human,
         projection: base_projection(
             state,
-            Some(verified.execution_id),
+            Some(bound.execution_id().to_string()),
             Some(prepared_id),
             approval_id,
             approval_consumed,

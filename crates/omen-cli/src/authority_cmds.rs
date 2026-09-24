@@ -6,8 +6,9 @@
 
 use clap::{Args, Subcommand};
 use omen_authority::{
-    AdmitExecute, AuthorityIntent, ExpectedGate, GateProcess, GateSpawnConfig, GateTransport,
-    OutcomeJournal, SupervisorExecutor, parse_ask_policy, report_json, run::run_once,
+    AdmitExecute, AuthorityIntent, ExpectedGate, FixtureProvision, GateProcess, GateSpawnConfig,
+    GateTransport, OutcomeJournal, SupervisorExecutor, parse_ask_policy, report_json,
+    run::run_once,
 };
 use std::path::PathBuf;
 use std::time::Duration;
@@ -46,6 +47,14 @@ pub struct ExecArgs {
     /// Outcome journal path (default: temp/omen-authority/journal.jsonl).
     #[arg(long)]
     pub journal: Option<PathBuf>,
+    /// Trusted fixture-provider executable (installation truth for the
+    /// Omen-owned resolver; the spec carries NO argv).
+    #[arg(long)]
+    pub fixture_exe: PathBuf,
+    /// Trusted fixture sandbox dir: resolver-derived marker scope AND
+    /// physical cwd.
+    #[arg(long)]
+    pub fixture_workdir: PathBuf,
 }
 
 #[derive(Args, Debug)]
@@ -66,7 +75,14 @@ pub struct FetchCompanionArgs {
     pub companion_dir: Option<PathBuf>,
 }
 
+/// Intent spec: SEMANTIC ONLY. There is deliberately no `argv`/`cwd`
+/// field: the exact physical command is derived after COMMIT by the
+/// Omen-owned trusted resolver from these semantics plus the
+/// `--fixture-exe`/`--fixture-workdir` installation truth. Unknown
+/// fields (including stale `argv`/`cwd`) are rejected loudly so a
+/// caller can never pair authorised semantics with arbitrary argv.
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SpecFile {
     tether_id: String,
     tether_version: String,
@@ -81,8 +97,6 @@ struct SpecFile {
     expected_capability_version: u32,
     expected_manifest_digest: String,
     expected_provider: String,
-    argv: Vec<String>,
-    cwd: Option<PathBuf>,
     timeout_ms: Option<u64>,
     success_result: Option<serde_json::Value>,
 }
@@ -183,9 +197,6 @@ pub async fn run_exec(args: &ExecArgs, machine: bool) -> Result<(), Box<dyn std:
     })?;
     let text = std::fs::read_to_string(&args.spec).map_err(|e| format!("spec unreadable: {e}"))?;
     let spec: SpecFile = serde_json::from_str(&text).map_err(|e| format!("spec malformed: {e}"))?;
-    if spec.argv.is_empty() {
-        return Err("spec.argv must name the exact physical command".into());
-    }
     let intent = AuthorityIntent {
         tether_id: spec.tether_id,
         tether_version: spec.tether_version,
@@ -200,12 +211,14 @@ pub async fn run_exec(args: &ExecArgs, machine: bool) -> Result<(), Box<dyn std:
         expected_capability_version: spec.expected_capability_version,
         expected_manifest_digest: spec.expected_manifest_digest,
         expected_provider: spec.expected_provider,
-        argv: spec.argv,
-        cwd: spec.cwd.unwrap_or_else(std::env::temp_dir),
         timeout_ms: spec.timeout_ms.unwrap_or(30_000),
         success_result: spec
             .success_result
             .unwrap_or(serde_json::json!({"echo": ""})),
+    };
+    let provision = FixtureProvision {
+        exe: args.fixture_exe.clone(),
+        workdir: args.fixture_workdir.clone(),
     };
     let runtime = gate_runtime_dir(args.gate_runtime.clone())?;
     let (gate, instance, _companion) = spawn_session(args.companion_dir.clone(), &runtime)?;
@@ -216,6 +229,7 @@ pub async fn run_exec(args: &ExecArgs, machine: bool) -> Result<(), Box<dyn std:
         &mut driver,
         Some(instance),
         &intent,
+        &provision,
         ask,
         &mut exec,
         &journal,

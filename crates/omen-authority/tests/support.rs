@@ -6,7 +6,9 @@
 //! Real-process supervision (crash, malformed, timeout, secrets) lives
 //! in `gate_process_tests.rs` with a scripted stub executable.
 
-use omen_authority::{AuthorityIntent, GateTransport, RoundtripError, canonical_digest};
+use omen_authority::{
+    AuthorityIntent, FixtureProvision, GateTransport, RoundtripError, canonical_digest,
+};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
@@ -16,7 +18,10 @@ pub const MANIFEST_DIGEST: &str =
     "sha256:eb61b62bde489e00a4d15c37c83e6cdb1e9e378b8f13b910d4b68bd6d68c19da";
 pub const PROVIDER: &str = "tethers-stdio-fixture";
 
-pub fn test_intent(evaluation_id: &str, dir: &std::path::Path) -> AuthorityIntent {
+/// Semantic-only intent: NO physical fields. The physical command is
+/// derived after COMMIT by the trusted resolver from these semantics
+/// plus the provision below.
+pub fn test_intent(evaluation_id: &str, _dir: &std::path::Path) -> AuthorityIntent {
     let args = json!({"message": "LK-39", "path": "projects/r2-stdio"});
     AuthorityIntent {
         tether_id: "r2-complete".to_string(),
@@ -32,13 +37,28 @@ pub fn test_intent(evaluation_id: &str, dir: &std::path::Path) -> AuthorityInten
         expected_capability_version: CAPABILITY_VERSION,
         expected_manifest_digest: MANIFEST_DIGEST.to_string(),
         expected_provider: PROVIDER.to_string(),
-        argv: vec!["fixture-exe".to_string(), "--write-marker".to_string()],
-        cwd: dir.to_path_buf(),
         timeout_ms: 10_000,
         success_result: json!({"echo": "marker-ok"}),
     }
 }
 
+/// Trusted installation truth for the matrix: a real (dummy-bytes)
+/// executable file plus the sandbox dir. The resolver hashes the exe
+/// and derives argv/cwd/marker from this + the semantic intent.
+pub fn test_provision(dir: &std::path::Path) -> FixtureProvision {
+    let exe = dir.join("fixture-exe");
+    if !exe.is_file() {
+        std::fs::write(&exe, b"fixture-installation-bytes-v1").unwrap();
+    }
+    FixtureProvision {
+        exe,
+        workdir: dir.to_path_buf(),
+    }
+}
+
+/// Script enums are shared across matrix/binding suites; each suite
+/// uses a subset (dead-code allowed per-target by design).
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrepareScript {
     Allow,
@@ -47,6 +67,7 @@ pub enum PrepareScript {
     Unavailable,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommitScript {
     Admit,
@@ -59,6 +80,7 @@ pub enum CommitScript {
     },
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DispatchMutation {
     PreparedId,
@@ -70,6 +92,7 @@ pub enum DispatchMutation {
     OwnershipFlag,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutcomeScript {
     Record,
@@ -80,6 +103,7 @@ pub enum OutcomeScript {
     LoseAll,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StatusScript {
     Clean,
@@ -87,6 +111,7 @@ pub enum StatusScript {
 }
 
 /// Revocation modelling: real Gates re-read policy at COMMIT.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RevokeMode {
     None,
@@ -457,6 +482,7 @@ pub fn register_intent(gate: &mut FakeGate, intent: &AuthorityIntent) {
 fn stub_intent(prepared_id: &str, args: Value) -> AuthorityIntent {
     // Session truth supplies evaluation/action at commit time (see the
     // `prepared` map); the stub only needs the registered arguments.
+    // Semantic-only: no physical fields exist to stub.
     let _ = prepared_id;
     AuthorityIntent {
         tether_id: "r2-complete".to_string(),
@@ -472,8 +498,6 @@ fn stub_intent(prepared_id: &str, args: Value) -> AuthorityIntent {
         expected_capability_version: CAPABILITY_VERSION,
         expected_manifest_digest: MANIFEST_DIGEST.to_string(),
         expected_provider: PROVIDER.to_string(),
-        argv: vec![],
-        cwd: std::path::PathBuf::from("."),
         timeout_ms: 10_000,
         success_result: json!({"echo": "x"}),
     }

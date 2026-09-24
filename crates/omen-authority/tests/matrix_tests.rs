@@ -27,6 +27,7 @@ fn harness(
     FakeGate,
     std::path::PathBuf,
     OutcomeJournal,
+    omen_authority::FixtureProvision,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let intent = test_intent(eval, dir.path());
@@ -34,7 +35,8 @@ fn harness(
     register_intent(&mut gate, &intent);
     let marker = dir.path().join("spawn.marker");
     let journal = OutcomeJournal::open(dir.path().join("outcome-journal.jsonl"));
-    (dir, intent, gate, marker, journal)
+    let provision = test_provision(dir.path());
+    (dir, intent, gate, marker, journal, provision)
 }
 
 fn succeeding(marker: &std::path::Path) -> CountingExecutor {
@@ -48,7 +50,7 @@ fn marker_text(marker: &std::path::Path) -> Option<String> {
 // 1. ALLOW: prepare -> commit -> exactly one spawn -> outcome success.
 #[tokio::test]
 async fn m01_allow_exactly_one_spawn_and_success_outcome() {
-    let (_dir, intent, gate, marker, journal) =
+    let (_dir, intent, gate, marker, journal, provision) =
         harness(PrepareScript::Allow, CommitScript::Admit, "eval_01");
     let mut driver = AdmitExecute::new(gate);
     let mut exec = succeeding(&marker);
@@ -56,6 +58,7 @@ async fn m01_allow_exactly_one_spawn_and_success_outcome() {
         &mut driver,
         Some("gate_fake".to_string()),
         &intent,
+        &provision,
         AskPolicy::Defer,
         &mut exec,
         &journal,
@@ -80,7 +83,7 @@ async fn m01_allow_exactly_one_spawn_and_success_outcome() {
 // 2. DENY: zero spawn.
 #[tokio::test]
 async fn m02_deny_zero_spawn() {
-    let (_dir, intent, gate, marker, journal) =
+    let (_dir, intent, gate, marker, journal, provision) =
         harness(PrepareScript::Deny, CommitScript::Admit, "eval_02");
     let mut driver = AdmitExecute::new(gate);
     let mut exec = succeeding(&marker);
@@ -88,6 +91,7 @@ async fn m02_deny_zero_spawn() {
         &mut driver,
         Some("gate_fake".to_string()),
         &intent,
+        &provision,
         AskPolicy::Approve,
         &mut exec,
         &journal,
@@ -112,7 +116,7 @@ async fn m02_deny_zero_spawn() {
 // 3. ASK before approval: zero spawn.
 #[tokio::test]
 async fn m03_ask_before_approval_zero_spawn() {
-    let (_dir, intent, gate, marker, journal) =
+    let (_dir, intent, gate, marker, journal, provision) =
         harness(PrepareScript::Ask, CommitScript::Admit, "eval_03");
     let mut driver = AdmitExecute::new(gate);
     let mut exec = succeeding(&marker);
@@ -120,6 +124,7 @@ async fn m03_ask_before_approval_zero_spawn() {
         &mut driver,
         Some("gate_fake".to_string()),
         &intent,
+        &provision,
         AskPolicy::Defer,
         &mut exec,
         &journal,
@@ -144,7 +149,7 @@ async fn m03_ask_before_approval_zero_spawn() {
 // 4. ASK + APPROVE + COMMIT: exactly one spawn.
 #[tokio::test]
 async fn m04_ask_approve_commit_exactly_one_spawn() {
-    let (_dir, intent, gate, marker, journal) =
+    let (_dir, intent, gate, marker, journal, provision) =
         harness(PrepareScript::Ask, CommitScript::Admit, "eval_04");
     let mut driver = AdmitExecute::new(gate);
     let mut exec = succeeding(&marker);
@@ -152,6 +157,7 @@ async fn m04_ask_approve_commit_exactly_one_spawn() {
         &mut driver,
         Some("gate_fake".to_string()),
         &intent,
+        &provision,
         AskPolicy::Approve,
         &mut exec,
         &journal,
@@ -170,7 +176,7 @@ async fn m04_ask_approve_commit_exactly_one_spawn() {
 // 5. PREPARE then REVOKE before COMMIT: zero spawn.
 #[tokio::test]
 async fn m05_revoke_before_commit_zero_spawn() {
-    let (_dir, intent, mut gate, marker, journal) =
+    let (_dir, intent, mut gate, marker, journal, provision) =
         harness(PrepareScript::Allow, CommitScript::Admit, "eval_05");
     gate.revoke = RevokeMode::CommitOnly;
     let mut driver = AdmitExecute::new(gate);
@@ -179,6 +185,7 @@ async fn m05_revoke_before_commit_zero_spawn() {
         &mut driver,
         Some("gate_fake".to_string()),
         &intent,
+        &provision,
         AskPolicy::Defer,
         &mut exec,
         &journal,
@@ -199,7 +206,7 @@ async fn m05_revoke_before_commit_zero_spawn() {
 // reusable permission slip. Zero spawn.
 #[tokio::test]
 async fn m05b_replay_refusal_zero_spawn() {
-    let (_dir, intent, gate, marker, journal) = harness(
+    let (_dir, intent, gate, marker, journal, provision) = harness(
         PrepareScript::Allow,
         CommitScript::Refuse {
             code: "commit.replay_blocked".to_string(),
@@ -214,6 +221,7 @@ async fn m05b_replay_refusal_zero_spawn() {
         &mut driver,
         Some("gate_fake".to_string()),
         &intent,
+        &provision,
         AskPolicy::Defer,
         &mut exec,
         &journal,
@@ -232,7 +240,7 @@ async fn m05b_replay_refusal_zero_spawn() {
 // 6. RE-ADMIT after revocation: fresh COMMIT -> exactly one spawn.
 #[tokio::test]
 async fn m06_readmit_after_revocation_exactly_one_spawn() {
-    let (_dir, intent, mut gate, marker, journal) =
+    let (dir, intent, mut gate, marker, journal, provision) =
         harness(PrepareScript::Allow, CommitScript::Admit, "eval_06");
     gate.revoke = RevokeMode::CommitOnly;
     let mut driver = AdmitExecute::new(gate);
@@ -241,6 +249,7 @@ async fn m06_readmit_after_revocation_exactly_one_spawn() {
         &mut driver,
         Some("gate_fake".to_string()),
         &intent,
+        &provision,
         AskPolicy::Defer,
         &mut exec,
         &journal,
@@ -250,12 +259,14 @@ async fn m06_readmit_after_revocation_exactly_one_spawn() {
     assert_eq!(first.spawn_count, 0);
     // Authority is valid again: a NEW admission path (fresh evaluation).
     driver.transport_mut().revoke = RevokeMode::None;
-    let intent2 = test_intent("eval_06b", &intent.cwd);
+    let intent2 = test_intent("eval_06b", dir.path());
     register_intent(driver.transport_mut(), &intent2);
+    let provision2 = test_provision(dir.path());
     let second = run_once(
         &mut driver,
         Some("gate_fake".to_string()),
         &intent2,
+        &provision2,
         AskPolicy::Defer,
         &mut exec,
         &journal,
@@ -271,7 +282,7 @@ async fn m06_readmit_after_revocation_exactly_one_spawn() {
 // 7. Multi-step: step 1 executes; revoked; step 2 zero spawn, no inheritance.
 #[tokio::test]
 async fn m07_multistep_each_step_readmitted() {
-    let (_dir, intent1, gate, marker, journal) =
+    let (dir, intent1, gate, marker, journal, provision) =
         harness(PrepareScript::Allow, CommitScript::Admit, "eval_07a");
     let mut driver = AdmitExecute::new(gate);
     let mut exec = succeeding(&marker);
@@ -279,6 +290,7 @@ async fn m07_multistep_each_step_readmitted() {
         &mut driver,
         Some("gate_fake".to_string()),
         &intent1,
+        &provision,
         AskPolicy::Defer,
         &mut exec,
         &journal,
@@ -292,12 +304,14 @@ async fn m07_multistep_each_step_readmitted() {
     );
     // Authority revoked before step 2.
     driver.transport_mut().revoke = RevokeMode::PrepareAndCommit;
-    let intent2 = test_intent("eval_07b", &intent1.cwd);
+    let intent2 = test_intent("eval_07b", dir.path());
     register_intent(driver.transport_mut(), &intent2);
+    let provision2 = test_provision(dir.path());
     let step2 = run_once(
         &mut driver,
         Some("gate_fake".to_string()),
         &intent2,
+        &provision2,
         AskPolicy::Approve,
         &mut exec,
         &journal,
@@ -316,7 +330,7 @@ async fn m07_multistep_each_step_readmitted() {
 // 13. Malformed/mismatched dispatch proof: zero spawn.
 #[tokio::test]
 async fn m13_dispatch_prepared_id_mismatch_zero_spawn() {
-    let (_dir, intent, gate, marker, journal) = harness(
+    let (_dir, intent, gate, marker, journal, provision) = harness(
         PrepareScript::Allow,
         CommitScript::AdmitMutated(support::DispatchMutation::PreparedId),
         "eval_13",
@@ -327,6 +341,7 @@ async fn m13_dispatch_prepared_id_mismatch_zero_spawn() {
         &mut driver,
         Some("gate_fake".to_string()),
         &intent,
+        &provision,
         AskPolicy::Defer,
         &mut exec,
         &journal,
@@ -344,7 +359,7 @@ async fn m13_dispatch_prepared_id_mismatch_zero_spawn() {
 // 14. Argument digest mismatch: zero spawn.
 #[tokio::test]
 async fn m14_argument_digest_mismatch_zero_spawn() {
-    let (_dir, intent, gate, marker, journal) = harness(
+    let (_dir, intent, gate, marker, journal, provision) = harness(
         PrepareScript::Allow,
         CommitScript::AdmitMutated(support::DispatchMutation::ArgumentDigest),
         "eval_14",
@@ -355,6 +370,7 @@ async fn m14_argument_digest_mismatch_zero_spawn() {
         &mut driver,
         Some("gate_fake".to_string()),
         &intent,
+        &provision,
         AskPolicy::Defer,
         &mut exec,
         &journal,
@@ -379,7 +395,7 @@ async fn m15_capability_scope_mismatch_zero_spawn() {
         support::DispatchMutation::Provider,
         support::DispatchMutation::OwnershipFlag,
     ] {
-        let (_dir, intent, gate, marker, journal) = harness(
+        let (_dir, intent, gate, marker, journal, provision) = harness(
             PrepareScript::Allow,
             CommitScript::AdmitMutated(mutation),
             "eval_15",
@@ -390,6 +406,7 @@ async fn m15_capability_scope_mismatch_zero_spawn() {
             &mut driver,
             Some("gate_fake".to_string()),
             &intent,
+            &provision,
             AskPolicy::Defer,
             &mut exec,
             &journal,
@@ -412,7 +429,7 @@ async fn m15_capability_scope_mismatch_zero_spawn() {
 // 16. Response timeout: zero spawn.
 #[tokio::test]
 async fn m16_authority_response_timeout_zero_spawn() {
-    let (_dir, intent, mut gate, marker, journal) =
+    let (_dir, intent, mut gate, marker, journal, provision) =
         harness(PrepareScript::Allow, CommitScript::Admit, "eval_16");
     // Commit never answers within any bound: simulate at the transport
     // layer by refusing the roundtrip as a timeout.
@@ -442,6 +459,7 @@ async fn m16_authority_response_timeout_zero_spawn() {
         &mut driver,
         Some("gate_fake".to_string()),
         &intent,
+        &provision,
         AskPolicy::Defer,
         &mut exec,
         &journal,
@@ -456,7 +474,7 @@ async fn m16_authority_response_timeout_zero_spawn() {
 // Direct binding unit: prepare -> commit -> verify_dispatch accepts.
 #[tokio::test]
 async fn m13b_faithful_dispatch_verifies() {
-    let (_dir, intent, gate, _marker, _journal) =
+    let (_dir, intent, gate, _marker, _journal, _provision) =
         harness(PrepareScript::Allow, CommitScript::Admit, "eval_13b");
     let mut driver = AdmitExecute::new(gate);
     register_intent(driver.transport_mut(), &intent);
@@ -485,7 +503,7 @@ async fn m13b_faithful_dispatch_verifies() {
 // 17. Physical execution failure after valid COMMIT: one spawn + failed outcome.
 #[tokio::test]
 async fn m17_exec_failure_truthful_failed_outcome() {
-    let (_dir, intent, gate, marker, journal) =
+    let (_dir, intent, gate, marker, journal, provision) =
         harness(PrepareScript::Allow, CommitScript::Admit, "eval_17");
     let mut driver = AdmitExecute::new(gate);
     let mut exec = CountingExecutor::new(
@@ -504,6 +522,7 @@ async fn m17_exec_failure_truthful_failed_outcome() {
         &mut driver,
         Some("gate_fake".to_string()),
         &intent,
+        &provision,
         AskPolicy::Defer,
         &mut exec,
         &journal,
@@ -520,7 +539,7 @@ async fn m17_exec_failure_truthful_failed_outcome() {
 // 18. Cancellation after COMMIT (before dispatch): zero spawn, deferred outcome.
 #[tokio::test]
 async fn m18_cancel_before_dispatch_zero_spawn_deferred() {
-    let (_dir, intent, gate, marker, journal) =
+    let (_dir, intent, gate, marker, journal, provision) =
         harness(PrepareScript::Allow, CommitScript::Admit, "eval_18");
     let mut driver = AdmitExecute::new(gate);
     let mut exec = CountingExecutor::new(
@@ -542,6 +561,7 @@ async fn m18_cancel_before_dispatch_zero_spawn_deferred() {
         &mut driver,
         Some("gate_fake".to_string()),
         &intent,
+        &provision,
         AskPolicy::Defer,
         &mut exec,
         &journal,
@@ -568,7 +588,7 @@ async fn m18_cancel_before_dispatch_zero_spawn_deferred() {
 // 19. OUTCOME response lost: retry succeeds, no second execution.
 #[tokio::test]
 async fn m19_outcome_loss_no_reexecution() {
-    let (_dir, intent, mut gate, marker, journal) =
+    let (_dir, intent, mut gate, marker, journal, provision) =
         harness(PrepareScript::Allow, CommitScript::Admit, "eval_19");
     gate.outcome = support::OutcomeScript::DropFirstThenRecord;
     let mut driver = AdmitExecute::new(gate);
@@ -577,6 +597,7 @@ async fn m19_outcome_loss_no_reexecution() {
         &mut driver,
         Some("gate_fake".to_string()),
         &intent,
+        &provision,
         AskPolicy::Defer,
         &mut exec,
         &journal,
@@ -593,7 +614,7 @@ async fn m19_outcome_loss_no_reexecution() {
 // 19c. OUTCOME refused with conflict: surfaces incomplete, no re-execution.
 #[tokio::test]
 async fn m19c_outcome_conflict_incomplete_no_reexec() {
-    let (_dir, intent, mut gate, marker, journal) =
+    let (_dir, intent, mut gate, marker, journal, provision) =
         harness(PrepareScript::Allow, CommitScript::Admit, "eval_19c");
     gate.outcome = support::OutcomeScript::RefuseConflict;
     let mut driver = AdmitExecute::new(gate);
@@ -602,6 +623,7 @@ async fn m19c_outcome_conflict_incomplete_no_reexec() {
         &mut driver,
         Some("gate_fake".to_string()),
         &intent,
+        &provision,
         AskPolicy::Defer,
         &mut exec,
         &journal,
@@ -619,7 +641,7 @@ async fn m19c_outcome_conflict_incomplete_no_reexec() {
 // 19b. OUTCOME loss total: surfaces incomplete, still no re-execution.
 #[tokio::test]
 async fn m19b_outcome_total_loss_incomplete_no_reexec() {
-    let (_dir, intent, mut gate, marker, journal) =
+    let (_dir, intent, mut gate, marker, journal, provision) =
         harness(PrepareScript::Allow, CommitScript::Admit, "eval_19b");
     gate.outcome = support::OutcomeScript::LoseAll;
     let mut driver = AdmitExecute::new(gate);
@@ -628,6 +650,7 @@ async fn m19b_outcome_total_loss_incomplete_no_reexec() {
         &mut driver,
         Some("gate_fake".to_string()),
         &intent,
+        &provision,
         AskPolicy::Defer,
         &mut exec,
         &journal,
@@ -644,7 +667,7 @@ async fn m19b_outcome_total_loss_incomplete_no_reexec() {
 // 20. Restart/recovery terminal-known: no duplicate execution.
 #[tokio::test]
 async fn m20_terminal_known_no_duplicate_execution() {
-    let (_dir, intent, gate, marker, journal) =
+    let (_dir, intent, gate, marker, journal, provision) =
         harness(PrepareScript::Allow, CommitScript::Admit, "eval_20");
     journal
         .record(omen_authority::OutcomeRecord {
@@ -664,6 +687,7 @@ async fn m20_terminal_known_no_duplicate_execution() {
         &mut driver,
         Some("gate_fake".to_string()),
         &intent,
+        &provision,
         AskPolicy::Defer,
         &mut exec,
         &journal,
@@ -682,7 +706,7 @@ async fn m20_terminal_known_no_duplicate_execution() {
 // 21. Durable reconciliation recovery_required: zero new spawn.
 #[tokio::test]
 async fn m21_recovery_required_zero_new_spawn() {
-    let (_dir, intent, mut gate, marker, journal) =
+    let (_dir, intent, mut gate, marker, journal, provision) =
         harness(PrepareScript::Allow, CommitScript::Admit, "eval_21");
     gate.status = support::StatusScript::RecoveryRequired;
     let mut driver = AdmitExecute::new(gate);
@@ -691,6 +715,7 @@ async fn m21_recovery_required_zero_new_spawn() {
         &mut driver,
         Some("gate_fake".to_string()),
         &intent,
+        &provision,
         AskPolicy::Defer,
         &mut exec,
         &journal,
@@ -712,7 +737,7 @@ async fn m21_recovery_required_zero_new_spawn() {
 // Unavailable prepare: authority unavailable, zero spawn.
 #[tokio::test]
 async fn m_unavailable_prepare_zero_spawn() {
-    let (_dir, intent, gate, marker, journal) =
+    let (_dir, intent, gate, marker, journal, provision) =
         harness(PrepareScript::Unavailable, CommitScript::Admit, "eval_u");
     let mut driver = AdmitExecute::new(gate);
     let mut exec = succeeding(&marker);
@@ -720,6 +745,7 @@ async fn m_unavailable_prepare_zero_spawn() {
         &mut driver,
         Some("gate_fake".to_string()),
         &intent,
+        &provision,
         AskPolicy::Defer,
         &mut exec,
         &journal,
@@ -737,7 +763,7 @@ async fn m_unavailable_prepare_zero_spawn() {
 // Stale preparation: committing an unknown prepared_id refuses.
 #[tokio::test]
 async fn m_stale_preparation_commit_refuses() {
-    let (_dir, intent, gate, marker, journal) =
+    let (_dir, intent, gate, marker, journal, _provision) =
         harness(PrepareScript::Allow, CommitScript::Admit, "eval_s");
     let mut driver = AdmitExecute::new(gate);
     register_intent(driver.transport_mut(), &intent);
@@ -759,7 +785,10 @@ fn matrix_compiles_and_intent_sane() {
     let dir = tempfile::tempdir().unwrap();
     let intent = test_intent("eval_x", dir.path());
     assert_eq!(intent.expected_capability, "fixture.ping");
-    assert!(!intent.argv.is_empty());
+    // No physical fields exist on the intent: the resolver owns argv.
+    let provision = test_provision(dir.path());
+    let binding = omen_authority::resolve_execution(&intent, &provision).unwrap();
+    assert!(!binding.argv().is_empty());
     let d = omen_authority::canonical_digest(&intent.expected_arguments).unwrap();
     assert!(d.starts_with("sha256:"));
     let _ = json!({"ok": true});
@@ -769,7 +798,7 @@ fn matrix_compiles_and_intent_sane() {
 // outcome can never be recorded — surfaces incomplete, never success.
 #[tokio::test]
 async fn m22_journal_unavailable_outcome_incomplete_no_success_claim() {
-    let (dir, intent, gate, marker, _journal) =
+    let (dir, intent, gate, marker, _journal, provision) =
         harness(PrepareScript::Allow, CommitScript::Admit, "eval_22");
     // Trap the journal path under a regular file: every journal write fails.
     let blocker = dir.path().join("blocker");
@@ -781,6 +810,7 @@ async fn m22_journal_unavailable_outcome_incomplete_no_success_claim() {
         &mut driver,
         Some("gate_fake".to_string()),
         &intent,
+        &provision,
         AskPolicy::Defer,
         &mut exec,
         &journal,

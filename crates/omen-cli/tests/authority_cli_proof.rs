@@ -110,6 +110,8 @@ struct CliWorld {
     _tmp: tempfile::TempDir,
     companion: PathBuf,
     runtime: PathBuf,
+    fixture: PathBuf,
+    workdir: PathBuf,
     marker: PathBuf,
     spec: PathBuf,
     journal: PathBuf,
@@ -230,8 +232,13 @@ fn build_world(env: &LiveEnv, name: &str, decision: &str, eval: &str) -> CliWorl
         assert!(st.success());
     }
 
-    let marker = root.join(format!("{name}.marker"));
+    let marker = root.join("LK-39.marker");
     let fixture = marker_fixture();
+    let workdir = root.clone();
+    // Spec is SEMANTIC ONLY: no argv, no cwd. The physical command is
+    // derived by the trusted resolver from these semantics plus the
+    // --fixture-exe/--fixture-workdir installation truth; the marker
+    // below is asserted at the resolver-derived path only.
     let spec = json!({
         "tether_id": "r2-complete", "tether_version": "1",
         "evaluation_id": eval, "action_id": "action_1",
@@ -242,8 +249,6 @@ fn build_world(env: &LiveEnv, name: &str, decision: &str, eval: &str) -> CliWorl
         "expected_capability": "fixture.ping", "expected_capability_version": 1,
         "expected_manifest_digest": manifest["digest"].as_str().unwrap(),
         "expected_provider": "tethers-stdio-fixture",
-        "argv": [fixture.to_string_lossy(), marker.to_string_lossy()],
-        "cwd": tmp.path().to_string_lossy(),
         "timeout_ms": 30_000,
         "success_result": {"echo": "marker-ok"},
     });
@@ -254,6 +259,8 @@ fn build_world(env: &LiveEnv, name: &str, decision: &str, eval: &str) -> CliWorl
         _tmp: tmp,
         companion,
         runtime,
+        fixture,
+        workdir,
         marker,
         spec: spec_path,
         journal,
@@ -266,6 +273,8 @@ struct ExecOut {
 }
 
 /// Run `omen authority exec` synchronously; never invents authority.
+/// Physical execution derives from the trusted resolver + the
+/// --fixture-exe/--fixture-workdir installation truth (never spec argv).
 fn cli_exec(world: &CliWorld, on_ask: &str) -> ExecOut {
     let out = Command::new(env!("CARGO_BIN_EXE_omen"))
         .args([
@@ -281,6 +290,10 @@ fn cli_exec(world: &CliWorld, on_ask: &str) -> ExecOut {
             &world.runtime.to_string_lossy(),
             "--journal",
             &world.journal.to_string_lossy(),
+            "--fixture-exe",
+            &world.fixture.to_string_lossy(),
+            "--fixture-workdir",
+            &world.workdir.to_string_lossy(),
         ])
         .output()
         .expect("omen authority exec spawns");
@@ -401,4 +414,53 @@ fn cli_ask_approve_executes_with_marker() {
     let world = build_world(&env, "cli-ask", "ask", "eval_cli_ask");
     let out = cli_exec(&world, "approve");
     verdict("cli-ask", &world, &out, true, "admitted:");
+}
+
+/// CLI free-form argv disposition: a spec pairing authorised semantics
+/// with caller-supplied argv/cwd is REJECTED at parse (no Gate
+/// contact, zero spawn). Needs no live env — rejection precedes spawn.
+#[test]
+fn cli_spec_with_freeform_argv_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let spec_path = tmp.path().join("evil-spec.json");
+    std::fs::write(
+        &spec_path,
+        serde_json::to_vec_pretty(&json!({
+            "tether_id": "r2-complete", "tether_version": "1",
+            "evaluation_id": "eval_evil", "action_id": "action_1",
+            "event_id": "evt_evil", "event_name": "coding.task_completed",
+            "event_data": {}, "facts": {},
+            "expected_arguments": {"message": "LK-39", "path": "projects/r2-stdio"},
+            "expected_capability": "fixture.ping", "expected_capability_version": 1,
+            "expected_manifest_digest": "sha256:0", "expected_provider": "tethers-stdio-fixture",
+            "argv": ["C:\\evil\\payload.exe", "--pwn"],
+            "cwd": "C:\\evil",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_omen"))
+        .args([
+            "authority",
+            "exec",
+            "--spec",
+            &spec_path.to_string_lossy(),
+            "--fixture-exe",
+            &tmp.path().join("unused-exe").to_string_lossy(),
+            "--fixture-workdir",
+            &tmp.path().to_string_lossy(),
+        ])
+        .output()
+        .expect("omen authority exec spawns");
+    let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&out.stderr));
+    assert!(
+        !out.status.success(),
+        "free-form argv spec must refuse, output:\n{combined}"
+    );
+    assert!(
+        combined.contains("unknown field"),
+        "must name the rejected argv/cwd fields, output:\n{combined}"
+    );
+    println!("CLI-BINDING-PROOF (spec-argv): free-form argv/cwd rejected at parse, zero spawn");
 }

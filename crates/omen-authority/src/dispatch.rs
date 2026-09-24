@@ -34,14 +34,16 @@ pub struct DispatchContext {
     pub expected_arguments: serde_json::Value,
 }
 
-/// A dispatch that survived every binding check. The ONLY value the
-/// executor accepts.
+/// A dispatch that survived every binding check. Binds the semantic
+/// authority; the physical side binds separately against this value
+/// (see [`crate::binding::VerifiedExecutionBinding`]).
 #[derive(Debug, Clone)]
 pub struct VerifiedDispatch {
     pub execution_id: String,
     pub action_id: String,
     pub capability_name: String,
     pub capability_version: u32,
+    pub provider_identity: String,
     pub argument_digest: String,
     pub raw: DispatchRecord,
 }
@@ -118,6 +120,7 @@ pub fn verify_dispatch(
         action_id: c.action_id.clone(),
         capability_name: c.capability.name.clone(),
         capability_version: c.capability.version,
+        provider_identity: c.provider_identity.clone(),
         argument_digest: c.argument_digest.clone(),
         raw: dispatch.clone(),
     })

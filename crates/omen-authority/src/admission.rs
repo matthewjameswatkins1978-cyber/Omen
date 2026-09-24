@@ -12,9 +12,16 @@ use crate::protocol::{ApprovalInfo, DispatchRecord, PrepareDecision, PrepareResu
 use crate::transport::{GateTransport, RoundtripError};
 use serde_json::{Value, json};
 
-/// Omen's current intent for one consequential step. Everything the Gate
-/// needs is derived here; Omen never sends a caller `plan` or any
-/// authority boolean (the Gate recomputes every decision).
+/// Omen's current intent for one consequential step. SEMANTIC ONLY:
+/// everything the Gate needs is derived here; Omen never sends a caller
+/// `plan` or any authority boolean (the Gate recomputes every decision).
+///
+/// There are deliberately NO physical fields (`argv`, `cwd`): the exact
+/// physical command is produced after COMMIT by the Omen-owned trusted
+/// resolver (`crate::binding::resolve_execution`) from the authorised
+/// capability + provider + semantic arguments, and verified against the
+/// dispatch before the executor may run. A caller describes semantic
+/// intent; it can never pair authorised arguments with arbitrary argv.
 #[derive(Debug, Clone)]
 pub struct AuthorityIntent {
     pub tether_id: String,
@@ -26,15 +33,13 @@ pub struct AuthorityIntent {
     pub event_data: Value,
     pub facts: Value,
     /// Exact action arguments Omen embedded in the event (the digest of
-    /// these must equal the admitted `argument_digest`).
+    /// these must equal the admitted `argument_digest`, and the trusted
+    /// resolver derives the physical command from these alone).
     pub expected_arguments: Value,
     pub expected_capability: String,
     pub expected_capability_version: u32,
     pub expected_manifest_digest: String,
     pub expected_provider: String,
-    /// Physical command Omen will run after admission (argv-only, exact).
-    pub argv: Vec<String>,
-    pub cwd: std::path::PathBuf,
     pub timeout_ms: u64,
     /// Success projection Omen will report (`result` on succeeded).
     pub success_result: Value,

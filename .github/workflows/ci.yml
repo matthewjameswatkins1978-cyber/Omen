@@ -413,12 +413,14 @@ jobs:
           if ((Get-Content $sentinel -Raw) -ne 'user-state-must-survive-22-23-22-23') { throw "USER_STATE_LOST_RESTORE" }
           # Authority stays truthfully fail-closed after the full cycle: no
           # companion is fetched here, so exec must refuse (never allow).
+          # Spec is semantic-only (no argv — the resolver owns physical
+          # execution); the probe fails at companion resolution.
           $spec = Join-Path $env:RUNNER_TEMP 'h2-lifecycle-spec.json'
-          '{"tether_id":"t","tether_version":"1","evaluation_id":"e","action_id":"a","event_id":"ev","event_name":"n","event_data":{},"facts":{},"expected_arguments":{},"expected_capability":"c","expected_capability_version":1,"expected_manifest_digest":"sha256:0","expected_provider":"p","argv":["x"]}' | Set-Content $spec
+          '{"tether_id":"t","tether_version":"1","evaluation_id":"e","action_id":"a","event_id":"ev","event_name":"n","event_data":{},"facts":{},"expected_arguments":{},"expected_capability":"c","expected_capability_version":1,"expected_manifest_digest":"sha256:0","expected_provider":"p"}' | Set-Content $spec
           $emptyComp = Join-Path $env:RUNNER_TEMP 'h2-lifecycle-empty-companion'
           if (Test-Path $emptyComp) { Remove-Item -Recurse -Force $emptyComp }
           New-Item -ItemType Directory -Path $emptyComp | Out-Null
-          $authOut = & $bin authority exec --spec $spec --gate-runtime "$env:RUNNER_TEMP\h2-lifecycle-no-runtime" --companion-dir $emptyComp --journal "$env:RUNNER_TEMP\h2-lifecycle-j.jsonl" 2>&1 | Out-String
+          $authOut = & $bin authority exec --spec $spec --gate-runtime "$env:RUNNER_TEMP\h2-lifecycle-no-runtime" --companion-dir $emptyComp --journal "$env:RUNNER_TEMP\h2-lifecycle-j.jsonl" --fixture-exe "$env:RUNNER_TEMP\h2-lifecycle-unused-exe" --fixture-workdir $env:RUNNER_TEMP 2>&1 | Out-String
           if ($LASTEXITCODE -eq 0) { throw "AUTHORITY_FABRICATED_AFTER_CYCLE :: $authOut" }
           if ($authOut -notmatch 'companion') { throw "AUTHORITY_FAILURE_NOT_TRUTHFUL :: $authOut" }
           "authority fail-closed after cycle: PASS"
