@@ -163,8 +163,6 @@ The lower layers of Omen should be deliberately boring. Parsing, routing, state 
 ### 30. Every Important Claim Should Be Provable
 When we say Omen guarantees something, turn that claim into a proof/test. Architecture claims without executable evidence tend to decay into folklore.
 
-
-
 ### 31. Licence Compatibility Is an Engineering Constraint, Not a Rewrite Trigger
 Omen is reuse-first. Do not reject mature open-source code merely because it uses MPL-2.0, EUPL, or another copyleft licence.
 
@@ -175,3 +173,7 @@ A licence that needs review is not the same thing as a forbidden licence. Likewi
 The canonical policy is [docs/LICENSING_AND_REUSE.md](docs/LICENSING_AND_REUSE.md).
 
 Until Omen's own project licence is formally selected, keep `deny.toml` conservative and use narrow, documented exceptions or policy changes for intentionally accepted dependencies rather than broadly weakening the licence gate.
+
+## Verification discipline
+
+During implementation, use focused formatting, checks, and tests appropriate to the changed package. Do not repeatedly run the complete repository gate as a substitute for targeted feedback. At final handoff, run `cargo run -p xtask -- verify` once after the final source change. Do not call a partial check complete verification; if source changes afterward, rerun the canonical gate.

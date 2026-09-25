@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [ main, feature/* ]
+    branches: [ main ]
   pull_request:
     branches: [ main ]
   workflow_dispatch:
@@ -66,23 +66,20 @@ jobs:
           key: rust-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: rust-${{ runner.os }}-
 
-      - name: Check Formatting
-        run: cargo fmt --check
-
-      - name: Clippy Lints
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-      - name: Verify JSON Schemas
-        run: cargo run --package xtask -- verify-schemas
-
+      - name: Restore pinned cargo-deny
+        id: cargo-deny-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: cargo-deny-${{ runner.os }}-${{ runner.arch }}-0.20.2
       - name: Install cargo-deny
+        if: steps.cargo-deny-cache.outputs.cache-hit != 'true'
         run: cargo install cargo-deny --version 0.20.2 --locked
 
       - name: Verify Repository
         run: cargo run --package xtask -- verify
 
   rust-analyzer-acceptance:
-    needs: check-and-lint
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -119,7 +116,6 @@ jobs:
         run: cargo test -p omen-cli --test semantic_environment_proofs test_proof_c_real_lsp_symbol_definition_and_references -- --exact --nocapture
 
   matrix-test:
-    needs: check-and-lint
     strategy:
       fail-fast: false
       matrix:
@@ -154,6 +150,7 @@ jobs:
           rustup default 1.98.1
 
       - name: Restore Rust cache
+        id: rust-cache
         uses: actions/cache@v4
         with:
           path: |
@@ -179,8 +176,21 @@ jobs:
           OMEN_REQUIRE_SEMANTIC_EXTERNAL_PROOFS: "1"
         run: cargo test -p omen-cli --test semantic_environment_proofs test_proof_c_real_lsp_symbol_definition_and_references -- --exact --nocapture
 
+      - name: Report Rust target cache footprint
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        env:
+          RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+        run: |
+          $targetFiles = Get-ChildItem -LiteralPath target -File -Recurse -ErrorAction SilentlyContinue
+          $targetBytes = ($targetFiles | Measure-Object -Property Length -Sum).Sum
+          $incrementalFiles = Get-ChildItem -LiteralPath target/debug/incremental -File -Recurse -ErrorAction SilentlyContinue
+          $incrementalBytes = ($incrementalFiles | Measure-Object -Property Length -Sum).Sum
+          "Rust cache hit: $env:RUST_CACHE_HIT"
+          "Target directory bytes: $targetBytes"
+          "Incremental directory bytes: $incrementalBytes"
+
   windows-preview-candidate:
-    needs: check-and-lint
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -430,7 +440,6 @@ jobs:
           exit 0
 
   h2-gate-e2e:
-    needs: check-and-lint
     # Ubuntu + Windows only (documented limitation): the canonical
     # Tethers R2 Gate does not compile on macOS —
     # tethers-0.1/host-rust/src/child_process.rs:405 calls Linux-only
