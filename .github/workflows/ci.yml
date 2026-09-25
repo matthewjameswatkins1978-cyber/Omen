@@ -280,6 +280,26 @@ jobs:
           if ($compHash -ne $rel.gate_companion_sha256.ToLowerInvariant()) { throw "GATE_COMPANION_DIGEST_MISMATCH: $compHash != $($rel.gate_companion_sha256)" }
           if ((Split-Path -Leaf $compZip) -ne $rel.gate_companion_asset) { throw "GATE_COMPANION_ASSET_MISMATCH" }
           "GATE_COMPANION: PASS ($compZip)"
+          # Provenance-truth law: PAYLOAD HASH DESCRIBES CONTENT IDENTITY,
+          # PACKAGE HASH DESCRIBES FINAL ARCHIVE BYTES. The embedded manifest
+          # carries payload identity only (v2 payload_sha256; v1 legacy
+          # field is payload identity under its historical name). The
+          # archive digest is hashed here from the produced ZIP bytes and
+          # required to equal the release manifest's package_sha256. On
+          # disagreement CI FAILS. The two classes are emitted side by side
+          # and must normally differ.
+          $zipHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zipPath).Hash.ToLowerInvariant()
+          if (-not $rel.PSObject.Properties['package_sha256'].Value) { throw "RELEASE_MANIFEST_UNBOUND: release manifest lacks package_sha256" }
+          if ($zipHash -ne $rel.package_sha256.ToLowerInvariant()) { throw "PACKAGE_SHA_MISMATCH: actual ZIP $zipHash != release manifest $($rel.package_sha256)" }
+          $payloadHash = $manifest.payload_sha256
+          if (-not $payloadHash) {
+            # Schema v1 packages predate the explicit field: the legacy
+            # embedded value is payload identity, surfaced for continuity.
+            $payloadHash = $manifest.package_sha256
+          }
+          if (-not $payloadHash) { throw "PAYLOAD_IDENTITY_MISSING: embedded manifest carries no payload identity" }
+          if ($zipHash -eq $payloadHash.ToLowerInvariant()) { throw "PROVENANCE_ONTOLOGY_COLLAPSE: archive and payload digests must be different values" }
+          "PACKAGE_SHA: PASS ($zipHash)"
           [ordered]@{
             workflow = 'CI'
             control_plane_sha = $env:CONTROL_PLANE_SHA
@@ -287,10 +307,12 @@ jobs:
             requested_product_sha = $env:OMEN_REQUESTED_PRODUCT_SHA
             checked_out_product_sha = $env:OMEN_CHECKED_OUT_PRODUCT_SHA
             embedded_git_sha = $manifest.git_sha
+            embedded_schema_version = $manifest.schema_version
             runtime_version = $manifest.preview_version
             artifact_name = (Split-Path -Leaf $zipPath)
             binary_sha256 = $manifest.binary_sha256
-            package_sha256 = $manifest.package_sha256
+            package_sha256 = $zipHash
+            payload_sha256 = $payloadHash
             gate_companion_asset = $rel.gate_companion_asset
             gate_companion_sha256 = $compHash
             gate_tethers_sha = $rel.gate_tethers_sha

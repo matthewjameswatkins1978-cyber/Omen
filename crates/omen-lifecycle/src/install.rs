@@ -74,7 +74,14 @@ pub struct InstallRecord {
     pub previous_slot: Option<String>,
     pub version: String,
     pub git_sha: String,
+    /// SHA-256 of the final installed ARTIFACT bytes. Never a payload
+    /// digest under this name: payload identity travels in `payload_sha256`.
     pub package_sha256: Option<String>,
+    /// Deterministic payload/content identity of the installed package
+    /// (embedded manifest `payload_sha256`, or the legacy v1 field value).
+    /// Optional and additive: old records without it still parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_sha256: Option<String>,
     pub binary_sha256: Option<String>,
     pub installed_at: String,
     pub state_schema_version: u32,
@@ -92,6 +99,7 @@ impl InstallRecord {
             version: version.to_string(),
             git_sha: git_sha.to_string(),
             package_sha256: None,
+            payload_sha256: None,
             binary_sha256: None,
             installed_at: chrono::Utc::now().to_rfc3339(),
             state_schema_version: crate::migrate::STATE_SCHEMA_VERSION,

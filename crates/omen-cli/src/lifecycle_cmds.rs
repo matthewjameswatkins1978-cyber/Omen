@@ -493,9 +493,24 @@ fn adopt_conveyor_state(
         .get("previous_slot")
         .and_then(|s| s.as_str())
         .map(str::to_string);
-    let pkg = get("package_sha256");
     let bin = get("binary_sha256");
-    record.package_sha256 = if pkg.is_empty() { None } else { Some(pkg) };
+    // Provenance-truth law: embedded manifests NEVER carry archive identity.
+    // v2 exposes payload_sha256; v1's legacy `package_sha256` field is
+    // payload identity under a historical misnomer. Adopt the payload
+    // identity under its correct name and leave package_sha256 unknown
+    // rather than recording a payload digest as an archive digest.
+    let payload = get("payload_sha256");
+    let legacy_payload = get("package_sha256");
+    record.package_sha256 = None;
+    record.payload_sha256 = if payload.is_empty() {
+        if legacy_payload.is_empty() {
+            None
+        } else {
+            Some(legacy_payload)
+        }
+    } else {
+        Some(payload)
+    };
     record.binary_sha256 = if bin.is_empty() { None } else { Some(bin) };
     omen_lifecycle::install::save_install_record(b, &record)
         .map_err(|e| std::io::Error::other(e.to_string()))?;

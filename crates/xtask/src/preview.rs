@@ -99,7 +99,16 @@ pub struct Manifest {
     pub target: String,
     pub profile: String,
     pub binary_sha256: String,
-    pub package_sha256: String,
+    /// Schema v1 only: the historical payload digest under its legacy
+    /// (misnamed) field. This was NEVER the enclosing ZIP's digest, even
+    /// though the name suggests it. Absent in v2 emits. Do not reinterpret
+    /// a v1 value as archive identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_sha256: Option<String>,
+    /// Schema v2: explicit payload identity (see `payload_digest_v2`).
+    /// Absent in v1 manifests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_sha256: Option<String>,
     pub ci_run_id: Option<u64>,
     pub artifact_id: Option<u64>,
     pub fixture_files: std::collections::BTreeMap<String, String>,
@@ -107,6 +116,50 @@ pub struct Manifest {
     /// same package. `None` only for packages produced before Preview 8.
     #[serde(default)]
     pub daemon_binary_sha256: Option<String>,
+}
+
+/// Embedded package-manifest schema versions. Canonical law:
+/// PAYLOAD HASH DESCRIBES CONTENT IDENTITY. PACKAGE HASH DESCRIBES FINAL
+/// ARCHIVE BYTES. NEVER CALL ONE THE OTHER. The enclosing archive's SHA
+/// therefore lives OUTSIDE the archive (release manifest, CI provenance,
+/// install record) and never inside the embedded manifest.
+pub const EMBEDDED_MANIFEST_SCHEMA_V1: u32 = 1;
+pub const EMBEDDED_MANIFEST_SCHEMA_V2: u32 = 2;
+
+impl Manifest {
+    /// Explicit version dispatch for payload identity. No serde ambiguity:
+    /// v1 reads the legacy field AS legacy payload identity; v2 reads the
+    /// explicit field and REFUSES a manifest that also carries the legacy
+    /// name (an archive SHA can never truthfully sit inside its archive).
+    /// Unknown schema versions fail closed.
+    pub fn payload_identity(&self) -> Result<&str, String> {
+        match self.schema_version {
+            EMBEDDED_MANIFEST_SCHEMA_V1 => self.package_sha256.as_deref().ok_or_else(|| {
+                fail(
+                    "OMEN_PREVIEW_MANIFEST_IDENTITY",
+                    "v1 manifest lacks legacy package_sha256 (legacy payload digest)",
+                )
+            }),
+            EMBEDDED_MANIFEST_SCHEMA_V2 => {
+                if self.package_sha256.is_some() {
+                    return Err(fail(
+                        "OMEN_PREVIEW_MANIFEST_IDENTITY",
+                        "v2 manifest must not carry package_sha256; enclosing-archive SHA lives outside the archive",
+                    ));
+                }
+                self.payload_sha256.as_deref().ok_or_else(|| {
+                    fail(
+                        "OMEN_PREVIEW_MANIFEST_IDENTITY",
+                        "v2 manifest lacks payload_sha256",
+                    )
+                })
+            }
+            v => Err(fail(
+                "OMEN_PREVIEW_MANIFEST_IDENTITY",
+                format!("unsupported embedded manifest schema_version {v}"),
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -211,6 +264,12 @@ fn digest_file(path: &Path) -> Result<String, String> {
     let bytes = fs::read(path).map_err(|e| fail("OMEN_PREVIEW_HASH_MISMATCH", e))?;
     Ok(hex::encode(Sha256::digest(bytes)))
 }
+/// Legacy v1 payload algorithm. BYTE-EXACT preservation: v1 packages
+/// (Preview 22/23 and older) verified against this digest, and rollback/
+/// install of those packages must reproduce it bit-for-bit. Covers the omen
+/// binary digest plus fixture names + digests in BTreeMap (deterministic)
+/// order. Deliberately does NOT cover the daemon digest (v1 checked the
+/// daemon binary directly instead). Never alter; v2 uses `payload_digest_v2`.
 fn payload_digest(binary: &str, fixtures: &std::collections::BTreeMap<String, String>) -> String {
     let mut h = Sha256::new();
     h.update(binary.as_bytes());
@@ -219,6 +278,177 @@ fn payload_digest(binary: &str, fixtures: &std::collections::BTreeMap<String, St
         h.update(digest.as_bytes());
     }
     hex::encode(h.finalize())
+}
+
+/// v2 payload algorithm: explicit canonical encoding with a domain
+/// separator, covering the omen digest, the omend digest (or the literal
+/// `absent` marker for daemon-less packages), and fixture names + digests
+/// in deterministic (BTreeMap) order. Never covers the final ZIP digest:
+/// payload identity and archive identity are different ontologies.
+fn payload_digest_v2(
+    binary: &str,
+    daemon: Option<&str>,
+    fixtures: &std::collections::BTreeMap<String, String>,
+) -> String {
+    let mut h = Sha256::new();
+    h.update(b"omen-payload/2\x00");
+    h.update(b"omen\x00");
+    h.update(binary.as_bytes());
+    h.update(b"\x00");
+    h.update(b"omend\x00");
+    h.update(daemon.unwrap_or("absent").as_bytes());
+    h.update(b"\x00");
+    for (name, digest) in fixtures {
+        h.update(b"fixture\x00");
+        h.update(name.as_bytes());
+        h.update(b"\x00");
+        h.update(digest.as_bytes());
+        h.update(b"\x00");
+    }
+    hex::encode(h.finalize())
+}
+
+/// Constructor for new (schema v2) embedded manifests. The ONLY manifest
+/// shape `package` emits. Carries `payload_sha256` and NEVER `package_sha256`:
+/// the enclosing archive's SHA cannot truthfully sit inside the archive.
+// Allow: nine parameters map 1:1 onto manifest fields; a params struct
+// would obscure that mapping without adding safety.
+#[allow(clippy::too_many_arguments)]
+fn new_v2_manifest(
+    provenance: Provenance,
+    preview_version: String,
+    git_sha: String,
+    target: String,
+    binary_sha256: String,
+    daemon_binary_sha256: Option<String>,
+    fixture_files: std::collections::BTreeMap<String, String>,
+    ci_run_id: Option<u64>,
+    artifact_id: Option<u64>,
+) -> Manifest {
+    let payload_sha256 = payload_digest_v2(
+        &binary_sha256,
+        daemon_binary_sha256.as_deref(),
+        &fixture_files,
+    );
+    Manifest {
+        schema_version: EMBEDDED_MANIFEST_SCHEMA_V2,
+        provenance,
+        preview_version,
+        git_sha,
+        contract_version: CONTRACT_VERSION.into(),
+        target,
+        profile: "release".into(),
+        binary_sha256,
+        package_sha256: None,
+        payload_sha256: Some(payload_sha256),
+        ci_run_id,
+        artifact_id,
+        fixture_files,
+        daemon_binary_sha256,
+    }
+}
+
+/// Pure package-content verification over archive BYTES (no filesystem
+/// globals), shared by `install` and unit tests. `daemon_bytes` is `None`
+/// only for pre-Preview-8 packages that ship no daemon executable.
+/// v1 preserves the exact legacy checks; v2 additionally verifies every
+/// fixture's bytes against the manifest map (v1 never did).
+fn verify_package_contents(
+    manifest: &Manifest,
+    binary_bytes: &[u8],
+    daemon_bytes: Option<&[u8]>,
+    fixture_bytes: &std::collections::BTreeMap<String, Vec<u8>>,
+) -> Result<(), String> {
+    let actual_binary = hex::encode(Sha256::digest(binary_bytes));
+    if actual_binary != manifest.binary_sha256 {
+        return Err(fail(
+            "OMEN_PREVIEW_HASH_MISMATCH",
+            "binary digest differs from manifest",
+        ));
+    }
+    let actual_daemon = daemon_bytes.map(|b| hex::encode(Sha256::digest(b)));
+    // v1 preserves the exact legacy daemon check (pre-Preview-8 packages
+    // ship no daemon; a recorded digest mismatching shipped bytes fails).
+    // v2 is stricter: a shipped daemon the manifest does not record also
+    // fails — unrecorded executables must never ride inside a v2 package.
+    let daemon_strict = manifest.schema_version == EMBEDDED_MANIFEST_SCHEMA_V2;
+    match (&manifest.daemon_binary_sha256, &actual_daemon) {
+        (Some(expected), Some(actual)) if expected != actual => {
+            return Err(fail(
+                "OMEN_PREVIEW_HASH_MISMATCH",
+                "daemon digest differs from manifest",
+            ));
+        }
+        (None, Some(_)) if daemon_strict => {
+            return Err(fail(
+                "OMEN_PREVIEW_HASH_MISMATCH",
+                "package ships a daemon executable the manifest does not record",
+            ));
+        }
+        _ => {}
+    }
+    match manifest.schema_version {
+        EMBEDDED_MANIFEST_SCHEMA_V1 => {
+            // Byte-exact legacy semantics: internal consistency of the
+            // manifest's recorded binary digest + fixture map against the
+            // legacy field. Fixture BYTES were never checked in v1.
+            if payload_digest(&manifest.binary_sha256, &manifest.fixture_files)
+                != manifest.payload_identity()?
+            {
+                return Err(fail(
+                    "OMEN_PREVIEW_HASH_MISMATCH",
+                    "package digest differs from manifest",
+                ));
+            }
+        }
+        EMBEDDED_MANIFEST_SCHEMA_V2 => {
+            for (name, expected) in &manifest.fixture_files {
+                let actual = fixture_bytes.get(name).ok_or_else(|| {
+                    fail(
+                        "OMEN_PREVIEW_HASH_MISMATCH",
+                        format!("fixture {name} missing from package"),
+                    )
+                })?;
+                if hex::encode(Sha256::digest(actual)) != *expected {
+                    return Err(fail(
+                        "OMEN_PREVIEW_HASH_MISMATCH",
+                        format!("fixture {name} digest differs from manifest"),
+                    ));
+                }
+            }
+            if payload_digest_v2(
+                &manifest.binary_sha256,
+                manifest.daemon_binary_sha256.as_deref(),
+                &manifest.fixture_files,
+            ) != manifest.payload_identity()?
+            {
+                return Err(fail(
+                    "OMEN_PREVIEW_HASH_MISMATCH",
+                    "payload digest differs from manifest",
+                ));
+            }
+        }
+        v => {
+            return Err(fail(
+                "OMEN_PREVIEW_MANIFEST_IDENTITY",
+                format!("unsupported embedded manifest schema_version {v}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Canonical artifact-identity assignment for the install record.
+/// `actual_package_sha256` is ALWAYS the SHA-256 of the final artifact
+/// bytes (computed before extraction); the payload identity travels under
+/// its own name. Pure for testability; called by `install`.
+fn assign_artifact_identity(
+    record: &mut omen_lifecycle::install::InstallRecord,
+    actual_package_sha256: &str,
+    payload_identity: &str,
+) {
+    record.package_sha256 = Some(actual_package_sha256.to_string());
+    record.payload_sha256 = Some(payload_identity.to_string());
 }
 fn preview_version(root: &Path) -> Result<String, String> {
     let text = fs::read_to_string(root.join("Cargo.toml")).map_err(|e| e.to_string())?;
@@ -446,7 +676,7 @@ fn mcp_text(response: &serde_json::Value) -> String {
 fn status(root: &Path, json: bool) -> Result<(), String> {
     let state = read_state();
     let source = serde_json::json!({"version":preview_version(root)?,"SHA":git(root,&["rev-parse","HEAD"])? ,"branch":git(root,&["branch","--show-current"])? ,"worktree_clean":git(root,&["status","--porcelain"] )?.is_empty()});
-    let installed=state.active.as_ref().map(|m| serde_json::json!({"version":m.preview_version,"SHA":m.git_sha,"provenance":m.provenance,"binary_hash":m.binary_sha256,"package_hash":m.package_sha256,"slot":state.active_slot,"active_path":install_root().join("bin").join(if cfg!(windows){"omen.exe"}else{"omen"})})).unwrap_or(serde_json::Value::Null);
+    let installed=state.active.as_ref().map(|m| serde_json::json!({"version":m.preview_version,"SHA":m.git_sha,"provenance":m.provenance,"binary_hash":m.binary_sha256,"payload_hash":m.payload_identity().unwrap_or("unknown"),"slot":state.active_slot,"active_path":install_root().join("bin").join(if cfg!(windows){"omen.exe"}else{"omen"})})).unwrap_or(serde_json::Value::Null);
     let v =
         serde_json::json!({"source":source,"installed":installed,"last_proof":state.last_proof});
     if json {
@@ -521,25 +751,21 @@ fn package(
     let version = preview_version(root)?;
     let sha = git(root, &["rev-parse", "HEAD"])?;
     let fixture_files = fixture_hashes(root)?;
-    let mut manifest = Manifest {
-        schema_version: 1,
-        provenance: if ci_run_id.is_some() {
+    let manifest = new_v2_manifest(
+        if ci_run_id.is_some() {
             Provenance::Ci
         } else {
             Provenance::Local
         },
-        preview_version: version.clone(),
-        git_sha: sha,
-        contract_version: CONTRACT_VERSION.into(),
-        target: target_triple()?,
-        profile: "release".into(),
-        binary_sha256: bin_hash.clone(),
-        package_sha256: payload_digest(&bin_hash, &fixture_files),
+        version.clone(),
+        sha,
+        target_triple()?,
+        bin_hash.clone(),
+        Some(daemon_bin_hash.clone()),
+        fixture_files,
         ci_run_id,
         artifact_id,
-        fixture_files,
-        daemon_binary_sha256: Some(daemon_bin_hash.clone()),
-    };
+    );
     let suffix = if matches!(manifest.provenance, Provenance::Ci) {
         "windows-x86_64"
     } else {
@@ -585,18 +811,27 @@ fn package(
         zip.write_all(&fixture_bytes).map_err(|e| e.to_string())?;
     }
     zip.finish().unwrap();
-    manifest.package_sha256 = digest_file(&out)?;
+    // Archive identity is computed DIRECTLY from the finalised ZIP bytes and
+    // lives OUTSIDE the archive: the embedded manifest truthfully cannot
+    // contain its own enclosing SHA (self-reference). The release manifest
+    // below is the authority for `package_sha256`.
+    let archive_sha256 = digest_file(&out)?;
     // Canonical per-release manifest (Lucy repair B1): derived from the
     // exact same candidate build — never hand-maintained. Published beside
     // the package on the GitHub Release; the update path binds
     // manifest.package_asset -> exact release asset -> asset URL.
+    let payload_sha256 = manifest
+        .payload_identity()
+        .map(str::to_string)
+        .map_err(|e| e.to_string())?;
     let mut release_manifest = serde_json::json!({
         "schema_version": 1,
         "version": version,
         "git_sha": manifest.git_sha,
         "channel": if version.contains("preview") { "preview" } else { "stable" },
         "package_asset": out.file_name().and_then(|n| n.to_str()).unwrap_or("package.zip"),
-        "package_sha256": manifest.package_sha256,
+        "package_sha256": archive_sha256,
+        "payload_sha256": payload_sha256,
         "package_size": fs::metadata(&out).map(|m| m.len()).ok(),
         "binary_sha256": bin_hash,
         "daemon_binary_sha256": daemon_bin_hash,
@@ -872,6 +1107,10 @@ fn install(_root: &Path, artifact: Option<PathBuf>) -> Result<(), String> {
             "default install requires an exact CI artifact; use --artifact for local debugging",
         )
     })?;
+    // Archive identity FIRST, independently of extraction: the InstallRecord
+    // represents the installed ARTIFACT, so its package_sha256 is the
+    // SHA-256 of these final bytes — never anything from inside the archive.
+    let actual_package_sha256 = digest_file(&path)?;
     let file = fs::File::open(&path).map_err(|e| fail("OMEN_PREVIEW_ARTIFACT_NOT_FOUND", e))?;
     let mut archive =
         zip::ZipArchive::new(file).map_err(|e| fail("OMEN_PREVIEW_HASH_MISMATCH", e))?;
@@ -883,47 +1122,59 @@ fn install(_root: &Path, artifact: Option<PathBuf>) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let manifest: Manifest =
         serde_json::from_str(&m).map_err(|e| fail("OMEN_PREVIEW_HASH_MISMATCH", e))?;
+    let payload_id = manifest.payload_identity()?.to_string();
     let mut archive_binary = Vec::new();
     archive
         .by_name(if cfg!(windows) { "omen.exe" } else { "omen" })
         .map_err(|e| fail("OMEN_PREVIEW_HASH_MISMATCH", e))?
         .read_to_end(&mut archive_binary)
         .map_err(|e| e.to_string())?;
-    let actual_binary = hex::encode(Sha256::digest(&archive_binary));
-    if actual_binary != manifest.binary_sha256 {
-        return Err(fail(
-            "OMEN_PREVIEW_HASH_MISMATCH",
-            "binary digest differs from manifest",
-        ));
-    }
     let daemon_name = if cfg!(windows) { "omend.exe" } else { "omend" };
     let mut archive_daemon = Vec::new();
-    match archive.by_name(daemon_name) {
+    let daemon_bytes = match archive.by_name(daemon_name) {
         Ok(mut entry) => {
             entry
                 .read_to_end(&mut archive_daemon)
                 .map_err(|e| e.to_string())?;
-            if let Some(expected) = manifest.daemon_binary_sha256.as_deref()
-                && hex::encode(Sha256::digest(&archive_daemon)) != expected
-            {
-                return Err(fail(
-                    "OMEN_PREVIEW_HASH_MISMATCH",
-                    "daemon digest differs from manifest",
-                ));
-            }
+            Some(archive_daemon.as_slice())
         }
         Err(_) => {
             // Packages before Preview 8 ship no daemon executable; install
             // stays compatible and `omen daemon start` keeps its PATH fallback.
+            // (v2 packages always ship one; the verifier refuses unrecorded
+            // daemons, so a v2 package without a recorded daemon but WITH
+            // daemon bytes still fails below.)
             archive_daemon.clear();
+            // Re-check: entry missing means no bytes; but a v2 manifest with
+            // daemon_binary_sha256 recorded and no shipped daemon must fail.
+            // verify_package_contents compares recorded-vs-actual only when
+            // bytes exist, so enforce presence here for v2.
+            if manifest.schema_version == EMBEDDED_MANIFEST_SCHEMA_V2
+                && manifest.daemon_binary_sha256.is_some()
+            {
+                return Err(fail(
+                    "OMEN_PREVIEW_HASH_MISMATCH",
+                    "manifest records a daemon the package does not ship",
+                ));
+            }
+            None
         }
+    };
+    let mut archive_fixtures = std::collections::BTreeMap::new();
+    for rel in FIXTURE {
+        let mut fixture_bytes = Vec::new();
+        archive
+            .by_name(&format!("fixture/{rel}"))
+            .map_err(|e| fail("OMEN_PREVIEW_HASH_MISMATCH", e))?
+            .read_to_end(&mut fixture_bytes)
+            .map_err(|e| e.to_string())?;
+        archive_fixtures.insert((*rel).to_string(), fixture_bytes);
     }
-    if payload_digest(&manifest.binary_sha256, &manifest.fixture_files) != manifest.package_sha256 {
-        return Err(fail(
-            "OMEN_PREVIEW_HASH_MISMATCH",
-            "package digest differs from manifest",
-        ));
-    }
+    verify_package_contents(&manifest, &archive_binary, daemon_bytes, &archive_fixtures)?;
+    // Slot identity: opaque after creation; never renamed. For new installs
+    // the trailing component is the PAYLOAD digest prefix (v1: the legacy
+    // field value, so v1 slot names are unchanged; v2: payload_sha256).
+    // This names content identity, not archive identity, and is explicit.
     let slot = format!(
         "{}-{}-{}-{}-{}",
         manifest.preview_version,
@@ -934,7 +1185,7 @@ fn install(_root: &Path, artifact: Option<PathBuf>) -> Result<(), String> {
             Provenance::Release => "release",
         },
         &manifest.binary_sha256[..8],
-        &manifest.package_sha256[..8]
+        &payload_id[..8.min(payload_id.len())]
     );
     let dir = install_root().join("versions").join(&slot);
     if dir.exists() {
@@ -1014,7 +1265,10 @@ fn install(_root: &Path, artifact: Option<PathBuf>) -> Result<(), String> {
             .as_ref()
             .and_then(|r| r.active_slot.clone())
             .or(s.previous_slot.clone());
-        record.package_sha256 = Some(manifest.package_sha256.clone());
+        // InstallRecord.package_sha256 is the ARTIFACT identity, filled by
+        // assign_artifact_identity below from the independently hashed ZIP
+        // bytes — never from embedded manifest fields.
+        assign_artifact_identity(&mut record, &actual_package_sha256, &payload_id);
         record.binary_sha256 = Some(manifest.binary_sha256.clone());
         if let Err(e) = omen_lifecycle::install::save_install_record(&base, &record) {
             return Err(fail("OMEN_INSTALL_RECORD_FAILED", e));
@@ -1471,13 +1725,36 @@ fn promote(root: &Path, expected: &str) -> Result<(), String> {
     }
     command_output(root, "gh", &["--version"])?;
     command_output(root, "gh", &["auth", "status"])?;
+    // Release notes carry the ARCHIVE identity from the release manifest
+    // (verified against the packaged ZIP below) — never embedded fields.
+    let rel_text = fs::read_to_string(&release_manifest).map_err(|e| e.to_string())?;
+    let rel_json: serde_json::Value = serde_json::from_str(&rel_text).map_err(|e| e.to_string())?;
+    let archive_sha = rel_json
+        .get("package_sha256")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            fail(
+                "OMEN_PREVIEW_ARTIFACT_NOT_FOUND",
+                "release manifest lacks package_sha256",
+            )
+        })?;
+    // The published bytes must BE the bytes the release manifest vouches
+    // for: hash the packaged ZIP independently and require equality.
+    // Sourcing the digest from anywhere else (notably the embedded
+    // manifest) would reintroduce the payload/archive conflation.
+    if digest_file(&pkg)? != archive_sha {
+        return Err(fail(
+            "OMEN_PREVIEW_SHA_MISMATCH",
+            "packaged ZIP digest differs from release manifest package_sha256; refusing to publish",
+        ));
+    }
     let notes = format!(
         "Preview: {}\nSource SHA: {}\nCI run: {:?}\nArtifact: {:?}\nPackage SHA256: {}\nBinary SHA256: {}",
         manifest.preview_version,
         manifest.git_sha,
         manifest.ci_run_id,
         manifest.artifact_id,
-        manifest.package_sha256,
+        archive_sha,
         manifest.binary_sha256
     );
     command_output(
@@ -1510,8 +1787,7 @@ fn promote(root: &Path, expected: &str) -> Result<(), String> {
     )?;
     // H2 companion asset: published beside the main package when the
     // release manifest binds one (built by `package --gate-companion`).
-    let rel_text = fs::read_to_string(&release_manifest).map_err(|e| e.to_string())?;
-    let rel_json: serde_json::Value = serde_json::from_str(&rel_text).map_err(|e| e.to_string())?;
+    // Reuses rel_json parsed above: single authority, single read.
     if let Some(companion_asset) = rel_json
         .get("gate_companion_asset")
         .and_then(|v| v.as_str())
@@ -1574,7 +1850,8 @@ mod tests {
             target: "x86_64".into(),
             profile: "release".into(),
             binary_sha256: "bin".into(),
-            package_sha256: "pkg".into(),
+            package_sha256: Some("pkg".into()),
+            payload_sha256: None,
             ci_run_id: None,
             artifact_id: None,
             fixture_files: Default::default(),
@@ -1601,6 +1878,299 @@ mod tests {
         });
         let parsed: Manifest = serde_json::from_value(legacy).unwrap();
         assert_eq!(parsed.daemon_binary_sha256, None);
+        assert_eq!(parsed.payload_sha256, None);
+    }
+
+    fn synthetic_v2_manifest() -> (Manifest, Vec<u8>, Vec<u8>, Vec<u8>) {
+        // Fixed synthetic payload: binary + daemon + one fixture.
+        let binary = b"OMEN-BINARY".to_vec();
+        let daemon = b"OMEND-BINARY".to_vec();
+        let fixture = b"FIXTURE-BYTES".to_vec();
+        let bin_hash = hex::encode(Sha256::digest(&binary));
+        let daemon_hash = hex::encode(Sha256::digest(&daemon));
+        let fixture_hash = hex::encode(Sha256::digest(&fixture));
+        let mut fixtures = std::collections::BTreeMap::new();
+        fixtures.insert("Cargo.toml".to_string(), fixture_hash);
+        let m = new_v2_manifest(
+            Provenance::Ci,
+            "0.9.0-preview.23".into(),
+            "a".repeat(40),
+            "x86_64-pc-windows-msvc".into(),
+            bin_hash,
+            Some(daemon_hash),
+            fixtures,
+            Some(1),
+            Some(2),
+        );
+        (m, binary, daemon, fixture)
+    }
+
+    fn synthetic_fixture_map(fixture: &[u8]) -> std::collections::BTreeMap<String, Vec<u8>> {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("Cargo.toml".to_string(), fixture.to_vec());
+        map
+    }
+
+    // 1. New schema-v2 embedded manifest emits payload_sha256.
+    #[test]
+    fn v2_manifest_emits_payload_identity() {
+        let (m, _, _, _) = synthetic_v2_manifest();
+        assert_eq!(m.schema_version, EMBEDDED_MANIFEST_SCHEMA_V2);
+        let id = m.payload_identity().unwrap();
+        assert_eq!(id, m.payload_sha256.as_deref().unwrap());
+        assert_eq!(
+            id,
+            &payload_digest_v2(
+                &m.binary_sha256,
+                m.daemon_binary_sha256.as_deref(),
+                &m.fixture_files
+            )
+        );
+    }
+
+    // 2. New embedded manifest does NOT claim package_sha256.
+    #[test]
+    fn v2_manifest_carries_no_package_field() {
+        let (m, _, _, _) = synthetic_v2_manifest();
+        assert_eq!(m.package_sha256, None);
+        let json = serde_json::to_value(&m).unwrap();
+        assert!(
+            json.get("package_sha256").is_none(),
+            "v2 JSON must not contain package_sha256"
+        );
+        assert!(json.get("payload_sha256").is_some());
+    }
+
+    // 3. v2 payload digest verifies successfully.
+    #[test]
+    fn v2_payload_verifies() {
+        let (m, binary, daemon, fixture) = synthetic_v2_manifest();
+        verify_package_contents(&m, &binary, Some(&daemon), &synthetic_fixture_map(&fixture))
+            .unwrap();
+    }
+
+    // 4. Mutated omen binary fails payload/binary verification.
+    #[test]
+    fn mutated_binary_fails_verification() {
+        let (m, _, daemon, fixture) = synthetic_v2_manifest();
+        let err = verify_package_contents(
+            &m,
+            b"TAMPERED-BINARY",
+            Some(&daemon),
+            &synthetic_fixture_map(&fixture),
+        )
+        .expect_err("mutated binary must fail");
+        assert!(err.contains("OMEN_PREVIEW_HASH_MISMATCH"), "got: {err}");
+    }
+
+    // 5. Mutated omend binary fails verification.
+    #[test]
+    fn mutated_daemon_fails_verification() {
+        let (m, binary, _, fixture) = synthetic_v2_manifest();
+        let err = verify_package_contents(
+            &m,
+            &binary,
+            Some(b"TAMPERED-DAEMON"),
+            &synthetic_fixture_map(&fixture),
+        )
+        .expect_err("mutated daemon must fail");
+        assert!(err.contains("OMEN_PREVIEW_HASH_MISMATCH"), "got: {err}");
+    }
+
+    // 6. Mutated fixture fails verification.
+    #[test]
+    fn mutated_fixture_fails_verification() {
+        let (m, binary, daemon, _) = synthetic_v2_manifest();
+        let err = verify_package_contents(
+            &m,
+            &binary,
+            Some(&daemon),
+            &synthetic_fixture_map(b"TAMPERED-FIXTURE"),
+        )
+        .expect_err("mutated fixture must fail");
+        assert!(err.contains("OMEN_PREVIEW_HASH_MISMATCH"), "got: {err}");
+    }
+
+    // 7+8. Actual ZIP SHA equals the external release-manifest value and is
+    // a different ontology from the payload digest: build a synthetic
+    // package ZIP, hash its bytes, record the hash release-style, and
+    // require equality — while the payload identity differs.
+    #[test]
+    fn archive_identity_is_release_hash_not_payload() {
+        use std::io::Write;
+        let (m, binary, daemon, fixture) = synthetic_v2_manifest();
+        let payload_id = m.payload_identity().unwrap().to_string();
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("pkg.zip");
+        {
+            let file = fs::File::create(&zip_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let opts = zip::write::SimpleFileOptions::default();
+            zip.start_file("omen.exe", opts).unwrap();
+            zip.write_all(&binary).unwrap();
+            zip.start_file("omend.exe", opts).unwrap();
+            zip.write_all(&daemon).unwrap();
+            zip.start_file("manifest.json", opts).unwrap();
+            zip.write_all(serde_json::to_vec(&m).unwrap().as_slice())
+                .unwrap();
+            zip.start_file("fixture/Cargo.toml", opts).unwrap();
+            zip.write_all(&fixture).unwrap();
+            zip.finish().unwrap();
+        }
+        let archive_sha = digest_file(&zip_path).unwrap();
+        // Release-manifest law: package_sha256 IS the archive bytes digest.
+        let release = serde_json::json!({
+            "schema_version": 1,
+            "package_sha256": archive_sha,
+            "payload_sha256": payload_id,
+        });
+        assert_eq!(
+            digest_file(&zip_path).unwrap(),
+            release
+                .get("package_sha256")
+                .and_then(|v| v.as_str())
+                .unwrap(),
+            "actual ZIP SHA must equal release-manifest package_sha256"
+        );
+        // Ontology law: payload identity and archive identity differ for any
+        // real package (different bytes hashed under different encodings).
+        assert_ne!(
+            payload_id, archive_sha,
+            "payload and archive digests must be different values"
+        );
+    }
+
+    // 9. Installer records actual ZIP SHA in InstallRecord.package_sha256.
+    #[test]
+    fn install_record_carries_archive_identity() {
+        let mut record = omen_lifecycle::install::InstallRecord::new(
+            omen_lifecycle::install::Ownership::Omen,
+            omen_lifecycle::install::Channel::Preview,
+            "0.9.0-preview.23",
+            &"a".repeat(40),
+        );
+        assign_artifact_identity(&mut record, "ARCHIVE-SHA", "PAYLOAD-ID");
+        assert_eq!(record.package_sha256.as_deref(), Some("ARCHIVE-SHA"));
+        assert_eq!(record.payload_sha256.as_deref(), Some("PAYLOAD-ID"));
+        assert_ne!(
+            record.package_sha256, record.payload_sha256,
+            "the two identities must never share one value by construction"
+        );
+    }
+
+    // 10. Legacy schema-v1 Preview package remains installable: parses and
+    // verifies through the preserved legacy path.
+    #[test]
+    fn legacy_v1_manifest_verifies_legacy_path() {
+        let binary = b"OMEN-BINARY-V1".to_vec();
+        let bin_hash = hex::encode(Sha256::digest(&binary));
+        let mut fixtures = std::collections::BTreeMap::new();
+        fixtures.insert("Cargo.toml".to_string(), hex::encode(Sha256::digest(b"F")));
+        let legacy_field = payload_digest(&bin_hash, &fixtures);
+        let json = serde_json::json!({
+            "schema_version": 1,
+            "provenance": "ci",
+            "preview_version": "0.9.0-preview.22",
+            "git_sha": "b".repeat(40),
+            "contract_version": "0.8",
+            "target": "x86_64-pc-windows-msvc",
+            "profile": "release",
+            "binary_sha256": bin_hash,
+            "package_sha256": legacy_field,
+            "ci_run_id": null,
+            "artifact_id": null,
+            "fixture_files": fixtures,
+        });
+        let m: Manifest = serde_json::from_value(json).unwrap();
+        assert_eq!(m.payload_identity().unwrap(), legacy_field);
+        // Legacy verification is content-agnostic for fixtures (exact v1
+        // semantics): binary bytes must match, legacy field must match.
+        verify_package_contents(&m, &binary, None, &std::collections::BTreeMap::new()).unwrap();
+    }
+
+    // 11. Legacy v1 `package_sha256` is payload identity, NOT archive
+    // identity: the identity accessor returns the legacy field, which must
+    // not equal an enclosing archive's digest.
+    #[test]
+    fn legacy_field_is_payload_not_archive() {
+        let binary = b"OMEN-BINARY-V1".to_vec();
+        let bin_hash = hex::encode(Sha256::digest(&binary));
+        let mut fixtures = std::collections::BTreeMap::new();
+        fixtures.insert("Cargo.toml".to_string(), hex::encode(Sha256::digest(b"F")));
+        let legacy_field = payload_digest(&bin_hash, &fixtures);
+        let m = Manifest {
+            schema_version: EMBEDDED_MANIFEST_SCHEMA_V1,
+            provenance: Provenance::Ci,
+            preview_version: "0.9.0-preview.22".into(),
+            git_sha: "b".repeat(40),
+            contract_version: "0.8".into(),
+            target: "x".into(),
+            profile: "release".into(),
+            binary_sha256: bin_hash,
+            package_sha256: Some(legacy_field.clone()),
+            payload_sha256: None,
+            ci_run_id: None,
+            artifact_id: None,
+            fixture_files: fixtures,
+            daemon_binary_sha256: None,
+        };
+        // The accessor exposes the legacy value AS payload identity...
+        assert_eq!(m.payload_identity().unwrap(), legacy_field);
+        // ...and that value is definitionally not an archive digest: it was
+        // computed over digests-of-contents, never over ZIP bytes.
+        let fake_archive_sha = hex::encode(Sha256::digest(b"ZIP-BYTES"));
+        assert_ne!(m.payload_identity().unwrap(), fake_archive_sha);
+    }
+
+    // Digest-algorithm regression vectors (independent preimages hashed
+    // outside this codebase): legacy v1 pins byte-exact preservation, v2
+    // pins the canonical encoding. Inputs: binary "BINHASH", one fixture
+    // "Cargo.toml" -> "CHASH", daemon "DAEMONHASH" where present.
+    #[test]
+    fn digest_regression_vectors() {
+        let mut fixtures = std::collections::BTreeMap::new();
+        fixtures.insert("Cargo.toml".to_string(), "CHASH".to_string());
+        assert_eq!(
+            payload_digest("BINHASH", &fixtures),
+            "0f8b32c83fd25421ce6885c94427b085852461c91752eab23411f0462381e4ff",
+            "legacy v1 algorithm must never change"
+        );
+        assert_eq!(
+            payload_digest_v2("BINHASH", Some("DAEMONHASH"), &fixtures),
+            "63fd219144f321ab181ca732efbe678a40e526624349016ffe38d5735e1b6e53",
+            "v2 canonical encoding must never change silently"
+        );
+        assert_eq!(
+            payload_digest_v2("BINHASH", None, &std::collections::BTreeMap::new()),
+            "52ce1721df690fc808b2c48f52dd958ea8d215ca0003236bd3d14ab0c89e3dd8",
+            "v2 daemon-absent encoding must never change silently"
+        );
+        assert_ne!(
+            payload_digest("BINHASH", &fixtures),
+            payload_digest_v2("BINHASH", Some("DAEMONHASH"), &fixtures),
+            "v1 and v2 are distinct algorithms by design"
+        );
+    }
+
+    // Unknown embedded schema versions fail closed instead of guessing.
+    #[test]
+    fn unknown_schema_version_refused() {
+        let (mut m, binary, daemon, fixture) = synthetic_v2_manifest();
+        m.schema_version = 99;
+        assert!(m.payload_identity().is_err());
+        assert!(
+            verify_package_contents(&m, &binary, Some(&daemon), &synthetic_fixture_map(&fixture))
+                .is_err()
+        );
+    }
+
+    // v2 manifests smuggling the legacy archive-name field are refused:
+    // an archive SHA can never truthfully sit inside its own archive.
+    #[test]
+    fn v2_with_package_field_refused() {
+        let (mut m, _binary, _daemon, _fixture) = synthetic_v2_manifest();
+        m.package_sha256 = Some("smuggled".into());
+        assert!(m.payload_identity().is_err());
     }
     #[test]
     fn local_never_external() {
