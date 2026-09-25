@@ -98,6 +98,8 @@ enum Commands {
     Daemon(DaemonArgs),
     /// Model Context Protocol (MCP) server over stdio
     Mcp(McpArgs),
+    /// Tethers-admitted consequential execution (H2 admission seam)
+    Authority(authority_cmds::AuthorityArgs),
 }
 
 #[derive(Args, Debug)]
@@ -589,6 +591,7 @@ struct PinArgs {
     remove: Option<String>,
 }
 
+mod authority_cmds;
 mod lifecycle_cmds;
 
 #[tokio::main]
@@ -1952,6 +1955,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let server = omen_mcp::McpServer::new(ws, client);
             server.run_stdio().await?;
+        }
+        Some(Commands::Authority(auth_args)) => {
+            use authority_cmds::AuthoritySubcommands as AuthSub;
+            match auth_args.subcommand {
+                AuthSub::Exec(exec_args) => {
+                    authority_cmds::run_exec(&exec_args, json_mode).await?;
+                }
+                AuthSub::Status(status_args) => {
+                    authority_cmds::run_status(&status_args).await?;
+                }
+                AuthSub::FetchCompanion(fetch_args) => {
+                    authority_cmds::run_fetch_companion(&fetch_args).await?;
+                }
+            }
         }
         None => {
             if std::io::IsTerminal::is_terminal(&std::io::stdin()) {

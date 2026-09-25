@@ -240,7 +240,7 @@ fn real_product_identity_recorded() {
         "version string must have 6 fields, got: {version_str}"
     );
     assert_eq!(
-        parts[1], "0.9.0-preview.22",
+        parts[1], "0.9.0-preview.23",
         "exact version required, got: {version_str}"
     );
     assert_eq!(

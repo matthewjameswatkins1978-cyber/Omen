@@ -26,6 +26,7 @@ omen-client = { workspace = true }
 omen-daemon = { workspace = true }
 omen-mcp = { workspace = true }
 omen-lifecycle = { workspace = true }
+omen-authority = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 serde = { workspace = true }

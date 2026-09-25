@@ -41,6 +41,11 @@ pub enum PreviewCommand {
         ci_run_id: Option<u64>,
         #[arg(long)]
         artifact_id: Option<u64>,
+        /// Provisioned gate-companion dir (gate exe + engine exe +
+        /// provenance.json, built from the canonical Tethers SHA via
+        /// `provision-gate`). Adds the companion zip + release binding.
+        #[arg(long)]
+        gate_companion: Option<PathBuf>,
     },
     Install {
         #[arg(long)]
@@ -58,6 +63,21 @@ pub enum PreviewCommand {
     Promote {
         #[arg(long)]
         expect_sha: String,
+    },
+    /// Build the managed Gate companion from an exact Tethers checkout:
+    /// verifies the source SHA, builds the release Gate binary, requires
+    /// the canonical engine binary, and writes provenance.json. Never
+    /// modifies Tethers semantics; packaging only.
+    ProvisionGate {
+        /// Tethers checkout at the exact canonical SHA.
+        #[arg(long)]
+        tethers_dir: PathBuf,
+        /// Expected canonical source SHA (fail closed on mismatch).
+        #[arg(long)]
+        expect_sha: String,
+        /// Output dir for tethers-gate + tethers-engine + provenance.json.
+        #[arg(long)]
+        out: PathBuf,
     },
 }
 
@@ -122,12 +142,18 @@ pub fn run(args: PreviewArgs, root: &Path) {
         PreviewCommand::Package {
             ci_run_id,
             artifact_id,
-        } => package(root, ci_run_id, artifact_id),
+            gate_companion,
+        } => package(root, ci_run_id, artifact_id, gate_companion),
         PreviewCommand::Install { artifact } => install(root, artifact),
         PreviewCommand::Prove { mcp_protocol } => prove(root, &mcp_protocol),
         PreviewCommand::Cycle { mcp_protocol } => cycle(root, &mcp_protocol),
         PreviewCommand::Rollback => rollback(root),
         PreviewCommand::Promote { expect_sha } => promote(root, &expect_sha),
+        PreviewCommand::ProvisionGate {
+            tethers_dir,
+            expect_sha,
+            out,
+        } => provision_gate(root, &tethers_dir, &expect_sha, &out),
     };
     if let Err(e) = result {
         eprintln!("{e}");
@@ -474,7 +500,12 @@ fn preflight(root: &Path, package: Option<String>) -> Result<(), String> {
     Ok(())
 }
 
-fn package(root: &Path, ci_run_id: Option<u64>, artifact_id: Option<u64>) -> Result<(), String> {
+fn package(
+    root: &Path,
+    ci_run_id: Option<u64>,
+    artifact_id: Option<u64>,
+    gate_companion: Option<PathBuf>,
+) -> Result<(), String> {
     run_cmd(root, "cargo", &["build", "--release", "-p", "omen-cli"])?;
     run_cmd(root, "cargo", &["build", "--release", "-p", "omen-daemon"])?;
     let exe =
@@ -559,7 +590,7 @@ fn package(root: &Path, ci_run_id: Option<u64>, artifact_id: Option<u64>) -> Res
     // exact same candidate build — never hand-maintained. Published beside
     // the package on the GitHub Release; the update path binds
     // manifest.package_asset -> exact release asset -> asset URL.
-    let release_manifest = serde_json::json!({
+    let mut release_manifest = serde_json::json!({
         "schema_version": 1,
         "version": version,
         "git_sha": manifest.git_sha,
@@ -572,6 +603,51 @@ fn package(root: &Path, ci_run_id: Option<u64>, artifact_id: Option<u64>) -> Res
         "min_state_schema": 1,
         "machine_contract": CONTRACT_VERSION,
     });
+    // H2 managed Gate companion: separate release asset (never inside
+    // the main zip — the archive allowlist forbids nested executables,
+    // and the previous updater must keep accepting the main package).
+    // Binding fields are optional and ignored by old readers.
+    if let Some(comp_dir) = gate_companion {
+        let comp_zip = package_gate_companion(root, &version, suffix, &comp_dir)?;
+        let comp_manifest: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(comp_dir.join("provenance.json")).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        let obj = release_manifest.as_object_mut().ok_or_else(|| {
+            fail(
+                "OMEN_PREVIEW_GATE_COMPANION",
+                "release manifest is not an object",
+            )
+        })?;
+        obj.insert(
+            "gate_companion_asset".to_string(),
+            serde_json::Value::String(
+                comp_zip
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("gate-companion.zip")
+                    .to_string(),
+            ),
+        );
+        obj.insert(
+            "gate_companion_sha256".to_string(),
+            serde_json::Value::String(digest_file(&comp_zip)?),
+        );
+        for (prov_key, rel_key) in [
+            ("tethers_source_sha", "gate_tethers_sha"),
+            ("gate_exe_sha256", "gate_exe_sha256"),
+            ("engine_exe_sha256", "gate_engine_sha256"),
+        ] {
+            let value = comp_manifest.get(prov_key).cloned().ok_or_else(|| {
+                fail(
+                    "OMEN_PREVIEW_GATE_COMPANION",
+                    format!("provenance.json lacks {prov_key}"),
+                )
+            })?;
+            obj.insert(rel_key.to_string(), value);
+        }
+        println!("GATE_COMPANION: {}", comp_zip.display());
+    }
     let release_path = root.join("work").join("omen-release.json");
     fs::write(
         &release_path,
@@ -588,6 +664,173 @@ fn package(root: &Path, ci_run_id: Option<u64>, artifact_id: Option<u64>) -> Res
         } else {
             "YES"
         }
+    );
+    Ok(())
+}
+
+fn package_gate_companion(
+    root: &Path,
+    version: &str,
+    suffix: &str,
+    comp_dir: &Path,
+) -> Result<PathBuf, String> {
+    let gate_name = if cfg!(windows) {
+        "tethers-gate.exe"
+    } else {
+        "tethers-gate"
+    };
+    let engine_name = if cfg!(windows) {
+        "tethers-engine.exe"
+    } else {
+        "tethers-engine"
+    };
+    for name in [gate_name, engine_name, "provenance.json"] {
+        if !comp_dir.join(name).is_file() {
+            return Err(fail(
+                "OMEN_PREVIEW_GATE_COMPANION",
+                format!("companion dir lacks {name}: {}", comp_dir.display()),
+            ));
+        }
+    }
+    // Provenance pins must match the shipped bytes (fail closed here so
+    // a stale/mismatched companion can never be published).
+    let prov_text =
+        fs::read_to_string(comp_dir.join("provenance.json")).map_err(|e| e.to_string())?;
+    let prov: serde_json::Value = serde_json::from_str(&prov_text).map_err(|e| e.to_string())?;
+    for (file, key) in [
+        (gate_name, "gate_exe_sha256"),
+        (engine_name, "engine_exe_sha256"),
+    ] {
+        let actual = digest_file(&comp_dir.join(file))?;
+        let pinned = prov.get(key).and_then(|v| v.as_str()).ok_or_else(|| {
+            fail(
+                "OMEN_PREVIEW_GATE_COMPANION",
+                format!("provenance lacks {key}"),
+            )
+        })?;
+        if actual.to_lowercase() != pinned.to_lowercase() {
+            return Err(fail(
+                "OMEN_PREVIEW_GATE_COMPANION",
+                format!("companion {file} hash {actual} != pinned {pinned}"),
+            ));
+        }
+    }
+    let out = root
+        .join("work")
+        .join(format!("omen-{version}-gate-companion-{suffix}.zip"));
+    let file = fs::File::create(&out).map_err(|e| e.to_string())?;
+    let mut zip = zip::ZipWriter::new(file);
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    for name in [gate_name, engine_name, "provenance.json"] {
+        let mut bytes = Vec::new();
+        fs::File::open(comp_dir.join(name))
+            .map_err(|e| e.to_string())?
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        zip.start_file(name, opts).unwrap();
+        zip.write_all(&bytes).unwrap();
+    }
+    zip.finish().unwrap();
+    Ok(out)
+}
+
+/// Build the managed Gate companion from an exact Tethers checkout.
+/// Verifies the source SHA, builds the release Gate, requires the
+/// canonical engine binary, writes provenance. Packaging only — never
+/// touches Tethers semantics.
+fn provision_gate(
+    root: &Path,
+    tethers_dir: &Path,
+    expect_sha: &str,
+    out: &Path,
+) -> Result<(), String> {
+    let actual = git(tethers_dir, &["rev-parse", "HEAD"])?;
+    if actual.to_lowercase() != expect_sha.to_lowercase() {
+        return Err(fail(
+            "OMEN_PREVIEW_GATE_SHA_MISMATCH",
+            format!("tethers checkout {actual} != expected {expect_sha}"),
+        ));
+    }
+    if !git(
+        tethers_dir,
+        &["status", "--porcelain", "--untracked-files=no"],
+    )?
+    .is_empty()
+    {
+        // A dirty Tethers worktree would poison provenance: refuse.
+        // (Untracked build outputs like target/ and _build/ do not count.)
+        return Err(fail(
+            "OMEN_PREVIEW_GATE_DIRTY",
+            "tethers checkout has uncommitted changes; refusing to provision",
+        ));
+    }
+    let host_rust = tethers_dir.join("tethers-0.1").join("host-rust");
+    run_cmd(
+        &host_rust,
+        "cargo",
+        &["build", "--release", "-p", "tethers-reference-host"],
+    )?;
+    let gate_built = host_rust
+        .join("target")
+        .join("release")
+        .join(if cfg!(windows) {
+            "tethers.exe"
+        } else {
+            "tethers"
+        });
+    let engine_built = tethers_dir
+        .join("tethers-0.1")
+        .join("engine-ocaml")
+        .join("_build")
+        .join("default")
+        .join("bin")
+        .join(if cfg!(windows) {
+            "tethers_mcp_main.exe"
+        } else {
+            "tethers_mcp_main"
+        });
+    if !engine_built.is_file() {
+        return Err(fail(
+            "OMEN_PREVIEW_GATE_ENGINE_MISSING",
+            format!(
+                "canonical engine not built: {}; build with dune (opam) in tethers-0.1/engine-ocaml first",
+                engine_built.display()
+            ),
+        ));
+    }
+    fs::create_dir_all(out).map_err(|e| e.to_string())?;
+    let gate_name = if cfg!(windows) {
+        "tethers-gate.exe"
+    } else {
+        "tethers-gate"
+    };
+    let engine_name = if cfg!(windows) {
+        "tethers-engine.exe"
+    } else {
+        "tethers-engine"
+    };
+    fs::copy(&gate_built, out.join(gate_name)).map_err(|e| e.to_string())?;
+    fs::copy(&engine_built, out.join(engine_name)).map_err(|e| e.to_string())?;
+    let provenance = serde_json::json!({
+        "schema": "omen.gate-companion/1",
+        "tethers_source_sha": actual.to_lowercase(),
+        "gate_exe_sha256": digest_file(&out.join(gate_name))?,
+        "engine_exe_sha256": digest_file(&out.join(engine_name))?,
+        "protocol": "tethers.authority/1",
+        "product_version": "0.8.0",
+        "gate_exe_name": gate_name,
+        "engine_exe_name": engine_name,
+    });
+    fs::write(
+        out.join("provenance.json"),
+        serde_json::to_vec_pretty(&provenance).unwrap(),
+    )
+    .map_err(|e| e.to_string())?;
+    let _ = root;
+    println!(
+        "GATE_COMPANION_PROVISIONED: {}\nTETHERS_SHA: {actual}",
+        out.display()
     );
     Ok(())
 }
@@ -1068,6 +1311,8 @@ fn cycle(root: &Path, mcp_protocol: &str) -> Result<(), String> {
         "matrix-test (ubuntu-latest)",
         "matrix-test (windows-latest)",
         "matrix-test (macos-latest)",
+        "h2-gate-e2e (ubuntu-latest)",
+        "h2-gate-e2e (windows-latest)",
         "windows-preview-candidate",
     ];
     if required.iter().any(|n| !names.contains(n)) {
@@ -1103,6 +1348,34 @@ fn cycle(root: &Path, mcp_protocol: &str) -> Result<(), String> {
     state.ci_green = true;
     write_state(&state)?;
     prove(root, mcp_protocol)
+}
+/// Main candidate zip under work/: the CI package, never the
+/// gate-companion asset (read_dir order is OS-defined; the companion
+/// name always contains "gate-companion").
+fn find_main_package(dir: &Path) -> Option<PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries {
+            let Ok(e) = e else { continue };
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().and_then(|x| x.to_str()) == Some("zip") {
+                out.push(p);
+            }
+        }
+    }
+    let mut zips = Vec::new();
+    walk(dir, &mut zips);
+    zips.sort();
+    zips.into_iter().find(|p| {
+        !p.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .contains("gate-companion")
+    })
 }
 fn walk_zip(dir: &Path) -> Option<PathBuf> {
     for e in fs::read_dir(dir).ok()? {
@@ -1171,7 +1444,9 @@ fn promote(root: &Path, expected: &str) -> Result<(), String> {
             "candidate has no qualifying proof",
         ));
     }
-    let pkg = walk_zip(&root.join("work")).ok_or_else(|| {
+    // Main package: the CI candidate zip (never the gate-companion
+    // asset — walk_zip order is OS-defined, so select explicitly).
+    let pkg = find_main_package(&root.join("work")).ok_or_else(|| {
         fail(
             "OMEN_PREVIEW_ARTIFACT_NOT_FOUND",
             "proven CI package not found",
@@ -1233,6 +1508,38 @@ fn promote(root: &Path, expected: &str) -> Result<(), String> {
             &notes,
         ],
     )?;
+    // H2 companion asset: published beside the main package when the
+    // release manifest binds one (built by `package --gate-companion`).
+    let rel_text = fs::read_to_string(&release_manifest).map_err(|e| e.to_string())?;
+    let rel_json: serde_json::Value = serde_json::from_str(&rel_text).map_err(|e| e.to_string())?;
+    if let Some(companion_asset) = rel_json
+        .get("gate_companion_asset")
+        .and_then(|v| v.as_str())
+    {
+        let companion_path = root.join("work").join(companion_asset);
+        if !companion_path.is_file() {
+            return Err(fail(
+                "OMEN_PREVIEW_ARTIFACT_NOT_FOUND",
+                format!("bound companion asset missing: {companion_asset}"),
+            ));
+        }
+        command_output(
+            root,
+            "gh",
+            &[
+                "release",
+                "upload",
+                &tag,
+                companion_path.to_str().ok_or_else(|| {
+                    fail(
+                        "OMEN_PREVIEW_ARTIFACT_NOT_FOUND",
+                        "companion path is not UTF-8",
+                    )
+                })?,
+            ],
+        )?;
+        println!("COMPANION_PUBLISHED: {companion_asset}");
+    }
     if let Some(active) = s.active.as_mut() {
         active.provenance = Provenance::Release;
     }

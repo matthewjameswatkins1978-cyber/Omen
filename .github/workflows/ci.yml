@@ -206,8 +206,41 @@ jobs:
         run: |
           rustup toolchain install 1.98.1 --profile minimal
           rustup default 1.98.1
+      - name: Clone canonical Tethers source (out-of-tree)
+        # provision-gate builds the Gate with cargo INSIDE the given
+        # tethers dir; a checkout nested in the Omen tree would attach to
+        # Omen's workspace (same seam as h2-gate-e2e). Clone out-of-tree.
+        shell: pwsh
+        run: |
+          $dst = Join-Path $env:RUNNER_TEMP 'tethers-pkg-src'
+          if (Test-Path $dst) { Remove-Item -Recurse -Force $dst }
+          git clone https://github.com/matthewjameswatkins1978-cyber/tethers-lang $dst
+          git -C $dst checkout 7e29110319c554a6586865ec6c47a45498696d16
+          $sha = (git -C $dst rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($sha -ne '7e29110319c554a6586865ec6c47a45498696d16') { throw "TETHERS_SHA_GUARD_FAILED: $sha" }
+          if (git -C $dst status --porcelain --untracked-files=no) { throw "TETHERS_DIRTY: fresh clone must be clean" }
+          "TETHERS_PKG_SRC=$dst" >> $env:GITHUB_ENV
+          "TETHERS_SHA_GUARD: PASS ($sha)"
+      - name: Setup OCaml
+        uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: 5.5.0
+          dune-cache: true
+      - name: Build canonical Tethers engine
+        shell: bash
+        run: |
+          SWITCH=$(opam switch list --short | head -n 1)
+          echo "opam switch: $SWITCH"
+          eval $(opam env --switch="$SWITCH" --set-switch)
+          cd "$TETHERS_PKG_SRC/tethers-0.1/engine-ocaml"
+          opam install . --deps-only -y
+          opam exec -- dune build @all
+          ls -la _build/default/bin/tethers_mcp_main* || true
+      - name: Provision canonical Gate companion
+        shell: pwsh
+        run: cargo run --package xtask -- preview provision-gate --tethers-dir "${{ env.TETHERS_PKG_SRC }}" --expect-sha 7e29110319c554a6586865ec6c47a45498696d16 --out work/gate-companion
       - name: Build exact Windows candidate
-        run: cargo run --package xtask -- preview package --ci-run-id ${{ github.run_id }}
+        run: cargo run --package xtask -- preview package --ci-run-id ${{ github.run_id }} --gate-companion work/gate-companion
       - name: Emit exact-SHA provenance
         shell: pwsh
         env:
@@ -215,7 +248,7 @@ jobs:
           WORKFLOW_RUN_ID: ${{ github.run_id }}
         run: |
           Add-Type -AssemblyName System.IO.Compression.FileSystem
-          $zipPath = (Get-ChildItem -LiteralPath work -Filter 'omen-*-windows-x86_64.zip' -File | Select-Object -First 1).FullName
+          $zipPath = (Get-ChildItem -LiteralPath work -Filter 'omen-*-windows-x86_64.zip' -File -Exclude '*-gate-companion-*' | Select-Object -First 1).FullName
           $zip = [IO.Compression.ZipFile]::OpenRead($zipPath)
           try {
             $entry = $zip.GetEntry('manifest.json')
@@ -226,6 +259,17 @@ jobs:
               $manifest.git_sha.ToLowerInvariant() -ne $env:OMEN_CHECKED_OUT_PRODUCT_SHA.ToLowerInvariant()) {
             throw "EXACT_SHA_GUARD_FAILED: manifest embedded SHA does not match requested/checked-out product SHA"
           }
+          $compZip = (Get-ChildItem -LiteralPath work -Filter 'omen-*-gate-companion-*.zip' -File | Select-Object -First 1).FullName
+          if (-not $compZip) { throw "GATE_COMPANION_MISSING: no companion zip in work/" }
+          $rel = Get-Content work/omen-release.json | ConvertFrom-Json
+          foreach ($f in @('gate_companion_asset','gate_companion_sha256','gate_exe_sha256','gate_tethers_sha')) {
+            if (-not $rel.PSObject.Properties[$f].Value) { throw "GATE_COMPANION_UNBOUND: release manifest lacks $f" }
+          }
+          if ($rel.gate_tethers_sha.ToLowerInvariant() -ne '7e29110319c554a6586865ec6c47a45498696d16') { throw "GATE_TETHERS_SHA_MISMATCH: $($rel.gate_tethers_sha)" }
+          $compHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $compZip).Hash.ToLowerInvariant()
+          if ($compHash -ne $rel.gate_companion_sha256.ToLowerInvariant()) { throw "GATE_COMPANION_DIGEST_MISMATCH: $compHash != $($rel.gate_companion_sha256)" }
+          if ((Split-Path -Leaf $compZip) -ne $rel.gate_companion_asset) { throw "GATE_COMPANION_ASSET_MISMATCH" }
+          "GATE_COMPANION: PASS ($compZip)"
           [ordered]@{
             workflow = 'CI'
             control_plane_sha = $env:CONTROL_PLANE_SHA
@@ -237,6 +281,9 @@ jobs:
             artifact_name = (Split-Path -Leaf $zipPath)
             binary_sha256 = $manifest.binary_sha256
             package_sha256 = $manifest.package_sha256
+            gate_companion_asset = $rel.gate_companion_asset
+            gate_companion_sha256 = $compHash
+            gate_tethers_sha = $rel.gate_tethers_sha
           } | ConvertTo-Json | Set-Content -Encoding utf8 work/provenance.json
           Get-Content work/provenance.json
       - name: Upload Windows candidate
@@ -245,5 +292,283 @@ jobs:
           name: omen-preview-candidate-windows-x86_64
           path: |
             work/omen-*-windows-x86_64.zip
+            work/omen-*-gate-companion-*.zip
             work/omen-release.json
             work/provenance.json
+
+  preview-lifecycle-proof:
+    # Hosted Preview 22 -> 23 -> 22 -> 23 proof on the exact candidate
+    # (Lucy ruling). Uses each version's own conveyor (--artifact installs,
+    # slot machine, conveyor rollback); asserts exact binary identities,
+    # release records, slot preservation, sentinel user state, and the P23
+    # companion binding at every transition. Companion activation is
+    # on-demand and fetch-verified (see fetch tests + gate E2E); this job
+    # proves no stale companion can be active across transitions, and that
+    # authority stays truthfully fail-closed after the full cycle.
+    needs: windows-preview-candidate
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || inputs.target_sha || github.sha }}
+          fetch-depth: 0
+      - name: Verify exact product source
+        shell: pwsh
+        env:
+          REQUESTED_PRODUCT_SHA: ${{ github.event.pull_request.head.sha || inputs.target_sha || github.sha }}
+        run: |
+          $requested = $env:REQUESTED_PRODUCT_SHA.Trim().ToLowerInvariant()
+          if ($requested -notmatch '^[0-9a-f]{40}$') { throw "target_sha must be a full 40-character commit SHA" }
+          $resolved = (git rev-parse "$requested^{commit}").Trim().ToLowerInvariant()
+          $checkedOut = (git rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($resolved -ne $requested -or $checkedOut -ne $requested) {
+            throw "EXACT_SHA_GUARD_FAILED: requested=$requested resolved=$resolved checked_out=$checkedOut"
+          }
+          "H2_SHA=$checkedOut" >> $env:GITHUB_ENV
+          "EXACT_SHA_GUARD: PASS ($checkedOut)"
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup default 1.98.1
+      - name: Download Preview 23 candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: omen-preview-candidate-windows-x86_64
+          path: work/
+      - name: Checkout Preview 22 baseline
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: 9561fce4b5b4912729a836d50507188168f99ee6
+          fetch-depth: 0
+          path: omen-p22
+      - name: Build Preview 22 baseline package
+        working-directory: omen-p22
+        run: cargo run --package xtask -- preview package
+      - name: Run 22-23-22-23 lifecycle proof
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Xtask { param([string[]]$a) cargo run --package xtask -- @a; if ($LASTEXITCODE -ne 0) { throw "XTASK_FAILED: $($a -join ' ')" } }
+          $p22zip = (Get-ChildItem -LiteralPath omen-p22/work -Filter 'omen-0.9.0-preview.22-*.zip' -File | Select-Object -First 1).FullName
+          if (-not $p22zip) { throw "P22_PACKAGE_MISSING" }
+          $p23zip = (Get-ChildItem -LiteralPath work -Filter 'omen-0.9.0-preview.23-windows-x86_64.zip' -File | Select-Object -First 1).FullName
+          if (-not $p23zip) { throw "P23_PACKAGE_MISSING" }
+          $bin = Join-Path $env:LOCALAPPDATA 'Omen\bin\omen.exe'
+          function Assert-Doctor($ver, $sha, $phase) {
+            $out = & $bin doctor 2>&1 | Out-String
+            if ($out -notmatch "Omen $ver") { throw "$phase identity: want Omen $ver :: $out" }
+            if ($out -notmatch 'Machine Contract: 0\.8') { throw "$phase contract" }
+            if ($out -notmatch $sha) { throw "$phase sha: want $sha" }
+            "$phase identity: PASS ($ver)"
+          }
+          function Assert-Status($ver, $sha, $phase) {
+            $st = (Xtask @('preview','status','--json') | ConvertFrom-Json).installed
+            if ($st.version -ne $ver) { throw "$phase record version: $($st.version)" }
+            if ($st.SHA -ne $sha) { throw "$phase record sha" }
+            "$phase record: PASS ($ver)"
+          }
+          # 22: install with its own conveyor.
+          Push-Location omen-p22
+          try { Xtask @('preview','install','--artifact', "work/$((Split-Path -Leaf $p22zip))") } finally { Pop-Location }
+          $sentinel = Join-Path $env:LOCALAPPDATA 'Omen\h2-lifecycle-sentinel.txt'
+          'user-state-must-survive-22-23-22-23' | Set-Content -NoNewline $sentinel
+          Assert-Doctor '0.9.0-preview.22' '9561fce4b5b4912729a836d50507188168f99ee6' 'p22-install'
+          # 22 -> 23: update with the H2 conveyor.
+          Xtask @('preview','install','--artifact', $p23zip)
+          Assert-Doctor '0.9.0-preview.23' $env:H2_SHA 'p23-update'
+          Assert-Status '0.9.0-preview.23' $env:H2_SHA 'p23-update'
+          # Companion binding: release manifest pins the verified companion.
+          $rel = Get-Content work/omen-release.json | ConvertFrom-Json
+          $compZip = (Get-ChildItem -LiteralPath work -Filter 'omen-*-gate-companion-*.zip' -File | Select-Object -First 1).FullName
+          if (-not $compZip) { throw "GATE_COMPANION_MISSING" }
+          $compHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $compZip).Hash.ToLowerInvariant()
+          if ($compHash -ne $rel.gate_companion_sha256.ToLowerInvariant()) { throw "GATE_COMPANION_DIGEST_MISMATCH" }
+          if ($rel.gate_tethers_sha.ToLowerInvariant() -ne '7e29110319c554a6586865ec6c47a45498696d16') { throw "GATE_TETHERS_SHA_MISMATCH" }
+          "p23-update companion binding: PASS"
+          # No stale companion active: fetch is on-demand; a live dir must be
+          # absent or carry exactly the P23 SHAs (P22 never ships one).
+          $compLive = Join-Path $env:LOCALAPPDATA 'Omen\gate-companion'
+          if (Test-Path $compLive) {
+            $prov = Get-Content (Join-Path $compLive 'provenance.json') | ConvertFrom-Json
+            if ($prov.gate_exe_sha256.ToLowerInvariant() -ne $rel.gate_exe_sha256.ToLowerInvariant()) { throw "STALE_COMPANION_ACTIVE" }
+            "companion live with P23 identity: PASS"
+          } else {
+            "companion live dir absent (fetch on-demand): PASS"
+          }
+          # Slots preserved: previous (P22) slot still present for rollback.
+          $slots = (Get-ChildItem -LiteralPath (Join-Path $env:LOCALAPPDATA 'Omen\versions') -Directory).Count
+          if ($slots -lt 2) { throw "SLOT_NOT_PRESERVED: $slots" }
+          "slots preserved: PASS ($slots)"
+          if ((Get-Content $sentinel -Raw) -ne 'user-state-must-survive-22-23-22-23') { throw "USER_STATE_LOST" }
+          "user state preserved: PASS"
+          # 23 -> 22: conveyor rollback re-activates the P22 slot.
+          Xtask @('preview','rollback')
+          Assert-Doctor '0.9.0-preview.22' '9561fce4b5b4912729a836d50507188168f99ee6' 'p23-rollback'
+          Assert-Status '0.9.0-preview.22' '9561fce4b5b4912729a836d50507188168f99ee6' 'p23-rollback'
+          if ((Get-Content $sentinel -Raw) -ne 'user-state-must-survive-22-23-22-23') { throw "USER_STATE_LOST_ROLLBACK" }
+          # 22 -> 23: restore via the accepted install mechanism.
+          Xtask @('preview','install','--artifact', $p23zip)
+          Assert-Doctor '0.9.0-preview.23' $env:H2_SHA 'p23-restore'
+          Assert-Status '0.9.0-preview.23' $env:H2_SHA 'p23-restore'
+          if ((Get-Content $sentinel -Raw) -ne 'user-state-must-survive-22-23-22-23') { throw "USER_STATE_LOST_RESTORE" }
+          # Authority stays truthfully fail-closed after the full cycle: no
+          # companion is fetched here, so exec must refuse (never allow).
+          # Spec is semantic-only (no argv — the resolver owns physical
+          # execution); the probe fails at companion resolution.
+          $spec = Join-Path $env:RUNNER_TEMP 'h2-lifecycle-spec.json'
+          '{"tether_id":"t","tether_version":"1","evaluation_id":"e","action_id":"a","event_id":"ev","event_name":"n","event_data":{},"facts":{},"expected_arguments":{},"expected_capability":"c","expected_capability_version":1,"expected_manifest_digest":"sha256:0","expected_provider":"p"}' | Set-Content $spec
+          $emptyComp = Join-Path $env:RUNNER_TEMP 'h2-lifecycle-empty-companion'
+          if (Test-Path $emptyComp) { Remove-Item -Recurse -Force $emptyComp }
+          New-Item -ItemType Directory -Path $emptyComp | Out-Null
+          $authOut = & $bin authority exec --spec $spec --gate-runtime "$env:RUNNER_TEMP\h2-lifecycle-no-runtime" --companion-dir $emptyComp --journal "$env:RUNNER_TEMP\h2-lifecycle-j.jsonl" --fixture-exe "$env:RUNNER_TEMP\h2-lifecycle-unused-exe" --fixture-workdir $env:RUNNER_TEMP 2>&1 | Out-String
+          if ($LASTEXITCODE -eq 0) { throw "AUTHORITY_FABRICATED_AFTER_CYCLE :: $authOut" }
+          if ($authOut -notmatch 'companion') { throw "AUTHORITY_FAILURE_NOT_TRUTHFUL :: $authOut" }
+          "authority fail-closed after cycle: PASS"
+          "LIFECYCLE_22_23_22_23: PASS"
+          # The fail-closed authority probe above exits nonzero by design;
+          # every assertion passed, so close the step green explicitly.
+          exit 0
+
+  h2-gate-e2e:
+    needs: check-and-lint
+    # Ubuntu + Windows only (documented limitation): the canonical
+    # Tethers R2 Gate does not compile on macOS —
+    # tethers-0.1/host-rust/src/child_process.rs:405 calls Linux-only
+    # libc::prctl(PR_SET_PDEATHSIG) under plain #[cfg(unix)]. Smallest
+    # required Tethers seam: gate that call to #[cfg(target_os="linux")]
+    # (setsid stays unix). Reported, not worked around: Omen changes no
+    # Tethers code. Omen-side supervision is cfg-free and covered on
+    # macOS by the unit matrix + stub-supervision tests.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout Omen repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || inputs.target_sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Verify exact Omen product source
+        shell: pwsh
+        env:
+          REQUESTED_PRODUCT_SHA: ${{ github.event.pull_request.head.sha || inputs.target_sha || github.sha }}
+        run: |
+          $requested = $env:REQUESTED_PRODUCT_SHA.Trim().ToLowerInvariant()
+          if ($requested -notmatch '^[0-9a-f]{40}$') { throw "target_sha must be a full 40-character commit SHA" }
+          $resolved = (git rev-parse "$requested^{commit}").Trim().ToLowerInvariant()
+          $checkedOut = (git rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($resolved -ne $requested -or $checkedOut -ne $requested) {
+            throw "EXACT_SHA_GUARD_FAILED: requested=$requested resolved=$resolved checked_out=$checkedOut"
+          }
+          "EXACT_SHA_GUARD: PASS ($checkedOut)"
+
+      - name: Checkout canonical Tethers source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: matthewjameswatkins1978-cyber/tethers-lang
+          ref: 7e29110319c554a6586865ec6c47a45498696d16
+          path: tethers-canonical
+
+      - name: Verify canonical Tethers SHA
+        shell: pwsh
+        run: |
+          $sha = (git -C tethers-canonical rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($sha -ne '7e29110319c554a6586865ec6c47a45498696d16') {
+            throw "TETHERS_SHA_GUARD_FAILED: $sha"
+          }
+          "OMEN_H2_TETHERS_SHA=$sha" >> $env:GITHUB_ENV
+          "TETHERS_SHA_GUARD: PASS ($sha)"
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup default 1.98.1
+
+      - name: Restore Rust cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            tethers-canonical/tethers-0.1/host-rust/target
+          key: rust-h2-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-h2-${{ runner.os }}-
+
+      - name: Build canonical Tethers Gate
+        # Cargo discovers workspaces by walking UP from CWD: a checkout
+        # nested inside the Omen tree would attach to Omen's workspace.
+        # Copy the SHA-verified sources outside the Omen tree first
+        # (byte-identical; SHA already proven above) and build there.
+        shell: pwsh
+        run: |
+          $dst = Join-Path $env:RUNNER_TEMP 'tethers-build'
+          if (Test-Path $dst) { Remove-Item -Recurse -Force $dst }
+          Copy-Item -Recurse -Force tethers-canonical $dst
+          Push-Location (Join-Path $dst 'tethers-0.1/host-rust')
+          try {
+            cargo build --release -p tethers-reference-host
+          } finally {
+            Pop-Location
+          }
+          "TETHERS_BUILD_DIR=$dst" >> $env:GITHUB_ENV
+
+      - name: Setup OCaml
+        uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: 5.5.0
+          dune-cache: true
+
+      - name: Build canonical Tethers engine
+        # setup-ocaml provides the compiler but each step starts with
+        # no switch selected: discover and select it explicitly.
+        shell: bash
+        run: |
+          SWITCH=$(opam switch list --short | head -n 1)
+          echo "opam switch: $SWITCH"
+          eval $(opam env --switch="$SWITCH" --set-switch)
+          cd "$TETHERS_BUILD_DIR/tethers-0.1/engine-ocaml"
+          opam install . --deps-only -y
+          opam exec -- dune build @all
+          if [ ! -f "_build/default/bin/tethers_mcp_main" ] && [ ! -f "_build/default/bin/tethers_mcp_main.exe" ]; then
+            echo "ENGINE BUILD OUTPUT MISSING; bin dir:"
+            ls -la _build/default/bin/ || true
+            echo "--- dune diagnostics ---"
+            opam exec -- dune build @all --verbose 2>&1 | tail -n 30 || true
+            exit 1
+          fi
+          ls -la _build/default/bin/tethers_mcp_main* || true
+
+      - name: Wire canonical Gate environment
+        shell: pwsh
+        run: |
+          # Dune names the engine executable with .exe on every platform.
+          $ext = if ($IsWindows) { '.exe' } else { '' }
+          $gate = Join-Path $env:TETHERS_BUILD_DIR "tethers-0.1/host-rust/target/release/tethers$ext"
+          $engineBase = Join-Path $env:TETHERS_BUILD_DIR "tethers-0.1/engine-ocaml/_build/default/bin/tethers_mcp_main"
+          $engine = if (Test-Path "$engineBase$ext") { "$engineBase$ext" } elseif (Test-Path "$engineBase.exe") { "$engineBase.exe" } else { $engineBase }
+          if (-not (Test-Path $gate)) { throw "gate binary missing: $gate" }
+          if (-not (Test-Path $engine)) { throw "engine binary missing: $engine" }
+          "OMEN_H2_GATE_EXE=$gate" >> $env:GITHUB_ENV
+          "OMEN_H2_ENGINE_EXE=$engine" >> $env:GITHUB_ENV
+          "OMEN_H2_TETHERS_SRC=$((Get-Location).Path)/tethers-canonical" >> $env:GITHUB_ENV
+
+      - name: Run Omen authority proofs (matrix + supervision + fetch + live E2E + CLI)
+        run: |
+          cargo test -p omen-authority --all-targets
+          cargo test -p omen-cli --test authority_cli_proof
+
+      - name: Windows seam-characterisation note
+        # Preview-23 documented exclusion (Lucy ruling): on hosted Windows
+        # the canonical Gate deterministically refuses with the Tethers
+        # owner seam (GATE_REPLAY_UNAVAILABLE). GREEN on this job means the
+        # exact seam was characterised and Omen proved fail-closed
+        # (e2e_windows_owner_seam_characterised) — NOT live-authority proof.
+        # Ubuntu owns the positive live-Gate proof. This step changes no
+        # authority semantics; it states the job's acceptance meaning.
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: 'echo "H2 Windows Gate expectation: EXACT-SEAM characterisation (Tethers owner seam, fail-closed) — NOT live-authority proof (see e2e_windows_owner_seam_characterised)."'
