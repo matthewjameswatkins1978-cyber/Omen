@@ -164,6 +164,17 @@ pub fn extract_validated(archive: &Path, dest: &Path) -> Result<Vec<PathBuf>, Li
         let mut f = std::fs::File::create(&out).map_err(|e| LifecycleError::Io(e.to_string()))?;
         std::io::copy(&mut entry, &mut f)
             .map_err(|e| LifecycleError::Stage(format!("archive payload unreadable: {e}")))?;
+        #[cfg(unix)]
+        if matches!(entry.name(), "omen" | "omend") {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = std::fs::metadata(&out)
+                .map_err(|e| LifecycleError::Io(e.to_string()))?
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&out, permissions)
+                .map_err(|e| LifecycleError::Io(e.to_string()))?;
+        }
         extracted.push(rel);
     }
     Ok(extracted)
@@ -251,5 +262,41 @@ mod tests {
             w.finish().unwrap();
         }
         assert!(extract_validated(&evil, &dir.path().join("out2")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extracted_runtime_binaries_are_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("runtime.zip");
+        {
+            let file = std::fs::File::create(&archive).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            for (name, bytes) in [
+                ("omen", b"main".as_slice()),
+                ("omend", b"daemon".as_slice()),
+                ("manifest.json", b"{}".as_slice()),
+            ] {
+                writer
+                    .start_file(name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                use std::io::Write;
+                writer.write_all(bytes).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+
+        let destination = directory.path().join("extracted");
+        extract_validated(&archive, &destination).unwrap();
+        for name in ["omen", "omend"] {
+            let mode = std::fs::metadata(destination.join(name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o755, "{name} must be executable after extraction");
+        }
     }
 }

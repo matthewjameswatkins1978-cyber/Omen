@@ -536,6 +536,20 @@ fn run_capture(
     }
     c.output().map_err(|e| fail("OMEN_MCP_PROOF_FAILED", e))
 }
+#[cfg(unix)]
+fn set_executable(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = fs::metadata(path).map_err(|e| e.to_string())?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).map_err(|e| e.to_string())
+}
+
+#[cfg(not(unix))]
+fn set_executable(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
 fn rpc_frame(value: &serde_json::Value) -> Vec<u8> {
     let mut out = serde_json::to_vec(value).unwrap();
     out.push(b'\n');
@@ -1207,11 +1221,14 @@ fn install(_root: &Path, artifact: Option<PathBuf>) -> Result<(), String> {
             .unwrap()
             .read_to_end(&mut b)
             .unwrap();
-        fs::write(dir.join(if cfg!(windows) { "omen.exe" } else { "omen" }), b)
-            .map_err(|e| e.to_string())?;
+        let installed_binary = dir.join(if cfg!(windows) { "omen.exe" } else { "omen" });
+        fs::write(&installed_binary, b).map_err(|e| e.to_string())?;
+        set_executable(&installed_binary)?;
         fs::write(dir.join("manifest.json"), m).map_err(|e| e.to_string())?;
         if !archive_daemon.is_empty() {
-            fs::write(dir.join(daemon_name), &archive_daemon).map_err(|e| e.to_string())?;
+            let installed_daemon = dir.join(daemon_name);
+            fs::write(&installed_daemon, &archive_daemon).map_err(|e| e.to_string())?;
+            set_executable(&installed_daemon)?;
         }
         for rel in FIXTURE {
             let mut fixture_bytes = Vec::new();
@@ -1231,12 +1248,14 @@ fn install(_root: &Path, artifact: Option<PathBuf>) -> Result<(), String> {
         .join("bin")
         .join(if cfg!(windows) { "omen.exe" } else { "omen" });
     let candidate = dir.join(if cfg!(windows) { "omen.exe" } else { "omen" });
+    set_executable(&candidate)?;
     fs::copy(candidate, &stable).map_err(|e| fail("OMEN_INSTALL_IDENTITY_MISMATCH", e))?;
     // Sibling daemon follows the active slot so `omen daemon start` finds
     // the exact matching omend next to the running binary.
     let stable_daemon = install_root().join("bin").join(daemon_name);
     let candidate_daemon = dir.join(daemon_name);
     if candidate_daemon.exists() {
+        set_executable(&candidate_daemon)?;
         fs::copy(candidate_daemon, &stable_daemon)
             .map_err(|e| fail("OMEN_INSTALL_IDENTITY_MISMATCH", e))?;
     }
@@ -1879,6 +1898,20 @@ fn promote(root: &Path, expected: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn installed_executables_have_execute_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        for name in ["omen", "omend"] {
+            let path = directory.path().join(name);
+            fs::write(&path, b"executable").unwrap();
+            set_executable(&path).unwrap();
+            let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o755, "{name} must be executable by its owner");
+        }
+    }
     #[test]
     fn version_increment_is_deterministic() {
         assert_eq!(parse_preview("0.8.0-preview.3").unwrap() + 1, 4);
