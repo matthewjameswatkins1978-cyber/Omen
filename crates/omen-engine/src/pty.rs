@@ -835,8 +835,6 @@ impl crate::backend::PtyExecutionHandle for NativePtyHandle {
             }
             unsafe {
                 windows_sys::Win32::System::Threading::TerminateProcess(con.process_handle, 1);
-                windows_sys::Win32::System::Console::ClosePseudoConsole(con.hpcon);
-                windows_sys::Win32::Foundation::CloseHandle(con.process_handle);
             }
         }
         #[cfg(unix)]
