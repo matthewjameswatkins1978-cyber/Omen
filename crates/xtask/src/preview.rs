@@ -1710,7 +1710,7 @@ fn rollback(_root: &Path) -> Result<(), String> {
         .map_err(|e| fail("OMEN_INSTALL_RECORD_FAILED", e))?;
     let channel = existing_record
         .as_ref()
-        .map(|record| record.channel.clone())
+        .map(|record| record.channel)
         .unwrap_or(omen_lifecycle::install::Channel::Preview);
     let record = rollback_install_record(&manifest, &prev, restored_package_sha256, channel)?;
     omen_lifecycle::install::save_install_record(&base, &record)
