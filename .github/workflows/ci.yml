@@ -76,6 +76,9 @@ jobs:
         if: steps.cargo-deny-cache.outputs.cache-hit != 'true'
         run: cargo install cargo-deny --version 0.20.2 --locked
 
+      - name: Build Test Fixtures
+        run: cargo build --bin omen-gremlin
+
       - name: Verify Repository
         run: cargo run --package xtask -- verify
 
