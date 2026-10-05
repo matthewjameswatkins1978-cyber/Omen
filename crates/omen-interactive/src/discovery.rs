@@ -807,6 +807,18 @@ mod tests {
     use std::sync::Condvar;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    // Discovery integration tests share the process-wide scheduler worker.
+    // Serialize only tests that dispatch work so deliberately gated providers
+    // cannot starve unrelated subprocess-harvest assertions under test parallelism.
+    fn async_provider_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn run_discovery_serialized(req: &DiscoveryRequest<'_>) -> DiscoveryResult {
+        let _serial = async_provider_test_lock();
+        super::run_discovery(req)
+    }
     fn path_cache(cmds: &[&str]) -> PathCommandCache {
         let c = PathCommandCache::new();
         c.set(cmds.iter().map(|s| s.to_string()).collect(), false);
@@ -849,7 +861,7 @@ mod tests {
     #[test]
     fn command_name_position_offers_omen_actions_and_commands() {
         let cache = path_cache(&["cargo", "git"]);
-        let r = run_discovery(&req("ca", 2, ".", &cache));
+        let r = run_discovery_serialized(&req("ca", 2, ".", &cache));
         let kinds: Vec<Kind> = r.ranked.iter().map(|x| x.semantic().kind).collect();
         assert!(
             kinds.contains(&Kind::Command),
@@ -860,7 +872,7 @@ mod tests {
     #[test]
     fn option_name_position_uses_tool_context() {
         let cache = path_cache(&["git"]);
-        let r = run_discovery(&req("git --ver", 9, ".", &cache));
+        let r = run_discovery_serialized(&req("git --ver", 9, ".", &cache));
         assert!(!r.ranked.is_empty());
         for c in &r.ranked {
             assert!(c.value().insert.starts_with("--"), "{:?}", c.value());
@@ -870,7 +882,7 @@ mod tests {
     #[test]
     fn zero_candidate_is_clean_decline() {
         let cache = path_cache(&[]);
-        let r = run_discovery(&req("zzzznothingmatches", 18, ".", &cache));
+        let r = run_discovery_serialized(&req("zzzznothingmatches", 18, ".", &cache));
         assert!(r.ranked.is_empty());
         assert!(r.is_clean_decline());
     }
@@ -887,7 +899,7 @@ mod tests {
     #[test]
     fn flow_a_git_options_with_descriptions() {
         let cache = path_cache(&["git"]);
-        let r = run_discovery(&req("git --", 6, ".", &cache));
+        let r = run_discovery_serialized(&req("git --", 6, ".", &cache));
         assert!(
             !r.ranked.is_empty(),
             "git --<Tab> must surface real options"
@@ -913,7 +925,7 @@ mod tests {
     #[test]
     fn flow_b_cargo_subcommands() {
         let cache = path_cache(&["cargo"]);
-        let r = run_discovery(&req("cargo ", 6, ".", &cache));
+        let r = run_discovery_serialized(&req("cargo ", 6, ".", &cache));
         assert!(!r.ranked.is_empty(), "cargo <Tab> must surface subcommands");
         let subcommands: Vec<String> = r
             .ranked
@@ -933,7 +945,7 @@ mod tests {
     #[test]
     fn flow_d_omen_action_surface_comes_from_canonical_truth() {
         let cache = path_cache(&[]);
-        let r = run_discovery(&req(":sta", 4, ".", &cache));
+        let r = run_discovery_serialized(&req(":sta", 4, ".", &cache));
         let actions: Vec<String> = r
             .ranked
             .iter()
@@ -956,8 +968,8 @@ mod tests {
     #[test]
     fn flow_e_long_tail_remains_reachable_and_deterministic() {
         let cache = path_cache(&["git"]);
-        let a = run_discovery(&req("git --", 6, ".", &cache));
-        let b = run_discovery(&req("git --", 6, ".", &cache));
+        let a = run_discovery_serialized(&req("git --", 6, ".", &cache));
+        let b = run_discovery_serialized(&req("git --", 6, ".", &cache));
         let names = |r: &DiscoveryResult| -> Vec<String> {
             r.ranked.iter().map(|c| c.value().insert.clone()).collect()
         };
@@ -968,7 +980,7 @@ mod tests {
     #[test]
     fn flow_f_mistyped_command_declines_without_fuzzy_invention() {
         let cache = path_cache(&["cargo", "git"]);
-        let r = run_discovery(&req("mistypedcomm", 12, ".", &cache));
+        let r = run_discovery_serialized(&req("mistypedcomm", 12, ".", &cache));
         assert!(
             r.ranked.is_empty(),
             "M1 deterministic mode invents nothing for a mistyped command: {:?}",
@@ -982,7 +994,7 @@ mod tests {
     #[test]
     fn flow_h_multi_provider_collision_merges_semantic_candidate() {
         let cache = path_cache(&["git"]);
-        let r = run_discovery(&req("git --verbose", 13, ".", &cache));
+        let r = run_discovery_serialized(&req("git --verbose", 13, ".", &cache));
         let matches: Vec<_> = r
             .ranked
             .iter()
@@ -1285,8 +1297,7 @@ mod tests {
     /// must not run concurrently or they would serialise against each other's
     /// gates. One gated test at a time.
     fn gated_serial() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        async_provider_test_lock()
     }
 
     fn gated_runtime(
@@ -1461,6 +1472,7 @@ mod tests {
 
     #[test]
     fn help_harvest_runs_through_the_deferred_path_with_subprocess_tier() {
+        let _serial = async_provider_test_lock();
         // `cargo` is guaranteed wherever `cargo test` runs.
         let cache = path_cache(&["cargo"]);
         let mut rt = runtime_with_path(&cache);
@@ -1523,6 +1535,7 @@ mod tests {
 
     #[test]
     fn prose_help_harvest_declines_rather_than_guessing() {
+        let _serial = async_provider_test_lock();
         // `git --help` is prose with zero strict option lines: the harvest
         // must decline through the integrated path (fail-closed).
         let cache = path_cache(&["git"]);
@@ -1558,7 +1571,7 @@ mod tests {
     #[test]
     fn human_and_machine_projections_agree() {
         let cache = path_cache(&["cargo", "git"]);
-        let r = run_discovery(&req("ca", 2, ".", &cache));
+        let r = run_discovery_serialized(&req("ca", 2, ".", &cache));
         assert!(!r.ranked.is_empty());
 
         let machine: Vec<RankedCandidate> =
