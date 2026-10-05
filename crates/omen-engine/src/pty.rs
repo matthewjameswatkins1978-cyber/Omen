@@ -556,6 +556,7 @@ impl NativePtyHandle {
         use rustix::termios::{Winsize, tcsetwinsize};
         use std::io::{Read, Write};
         use std::os::fd::OwnedFd;
+        use std::os::unix::process::CommandExt;
 
         let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY)
             .map_err(|e| CoreError::ExecutionFailed(format!("openpt failed: {e}")))?;
@@ -602,7 +603,20 @@ impl NativePtyHandle {
         cmd.stdin(std::process::Stdio::from(slave_in));
         cmd.stdout(std::process::Stdio::from(slave_out));
         cmd.stderr(std::process::Stdio::from(slave_err));
-        cmd.process_group(0);
+
+        // Become a session leader and make the slave the controlling terminal.
+        // The PTY size alone is insufficient if the child inherits an unrelated
+        // controlling terminal from its launching shell.
+        unsafe {
+            cmd.as_std_mut().pre_exec(|| {
+                rustix::process::setsid().map_err(std::io::Error::from)?;
+                let result = libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY, 0);
+                if result == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
 
         let child = cmd.spawn().map_err(|e| {
             CoreError::ExecutionFailed(format!("Failed to spawn child process on PTY: {e}"))
