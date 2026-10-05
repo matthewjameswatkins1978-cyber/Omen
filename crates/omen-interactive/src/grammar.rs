@@ -161,10 +161,19 @@ impl GrammarScanner {
         // for a plain command so Windows quoting/path behavior remains stable.
         let portable_input = Self::escape_argv_word_pipes(trimmed);
         match crate::shell_grammar::parse(&portable_input) {
+            Ok(line) if line.contains_unsupported_control_flow() => {
+                return Err(CoreError::ExecutionFailedCode {
+                    code: omen_core::ErrorCode::Unsupported,
+                    message: "shell control-flow constructs are not supported by Omen".into(),
+                });
+            }
             Ok(line) if line.requires_portable_shell() => {
                 return Ok(InputLane::PortableShell { line });
             }
-            Err(error) if Self::contains_unquoted_shell_construct(trimmed) => {
+            Err(error)
+                if Self::contains_unquoted_shell_construct(trimmed)
+                    || Self::starts_with_unsupported_control_flow(trimmed) =>
+            {
                 return Err(CoreError::ExecutionFailedCode {
                     code: omen_core::ErrorCode::Unsupported,
                     message: error.to_string(),
@@ -262,6 +271,25 @@ impl GrammarScanner {
                 }
                 _ => {}
             }
+        }
+        false
+    }
+
+    fn starts_with_unsupported_control_flow(input: &str) -> bool {
+        for word in scan_words_with_spans(input) {
+            let raw = &input[word.span.clone()];
+            if let Some((name, _)) = raw.split_once('=') {
+                let mut chars = name.chars();
+                let valid_name = chars
+                    .next()
+                    .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
+                    && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric());
+                if valid_name {
+                    continue;
+                }
+            }
+            return raw == word.literal
+                && crate::shell_grammar::is_unsupported_control_flow_word(raw);
         }
         false
     }

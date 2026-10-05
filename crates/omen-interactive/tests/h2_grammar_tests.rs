@@ -228,6 +228,37 @@ fn visible_git_alias_is_listed_and_dispatched_through_portable_shell() {
 }
 
 #[test]
+fn shell_control_flow_words_fail_closed_instead_of_becoming_executables() {
+    for input in [
+        "if true",
+        "MODE=\"two words\" if true",
+        "if true; then echo unsafe; fi",
+        "for item in *.rs; do echo $item; done",
+        "while true; do echo unsafe; done",
+        "function run() { echo unsafe; }",
+    ] {
+        assert_eq!(
+            GrammarScanner::scan(input).unwrap_err().code(),
+            omen_core::ErrorCode::Unsupported,
+            "{input}"
+        );
+    }
+
+    assert!(matches!(
+        GrammarScanner::scan("echo if for while").unwrap(),
+        InputLane::Executable { .. }
+    ));
+    assert!(matches!(
+        GrammarScanner::scan("ifconfig --version").unwrap(),
+        InputLane::Executable { .. }
+    ));
+    assert!(matches!(
+        GrammarScanner::scan("'if' true").unwrap(),
+        InputLane::Executable { .. }
+    ));
+}
+
+#[test]
 fn test_typed_reference_parsing() {
     assert_eq!(TypedReference::parse("@last"), Some(TypedReference::Last));
     assert_eq!(

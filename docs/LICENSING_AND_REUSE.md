@@ -186,7 +186,7 @@ This matrix describes parser/lowering compatibility only. It does **not** claim 
 | Visible aliases | No alias grammar (ordinary command word) | Yes | Omen owns the canonical alias table and one-level argv expansion. |
 | Brace expansion | Yes | Optional | Reject/defer; not part of Omen's frozen grammar. |
 | Subshell / negated pipeline / `|&` | Parsed by upstream in relevant cases | No | Reject during Omen lowering; never invoke Deno's executor. |
-| Functions / loops / conditionals | No Omen control-flow AST | No | Do not add programming-language semantics; require fail-closed parser/lowering tests before any grammar expansion. |
+| Functions / loops / conditionals | No control-flow AST | No | Reject reserved words at command position before external dispatch; do not implement programming-language semantics. |
 
 The required portable grammar has substantially more than 70% reusable parser coverage. The chosen route is therefore to keep `deno_task_shell` as a pinned parser-only dependency, lower into Omen-owned nodes, and retain Omen ownership of expansion, aliases, execution planning, authority, process lifecycle, and projections. This is not adoption of Deno's shell runtime or builtin semantics.
 

@@ -135,6 +135,44 @@ impl ShellLine {
                     }
             })
     }
+
+    /// Whether a command-position shell control word must be refused instead
+    /// of accidentally dispatched as an external executable.
+    pub(crate) fn contains_unsupported_control_flow(&self) -> bool {
+        self.items.iter().any(|item| {
+            let ShellSequence::BooleanChain { first, rest } = &item.sequence;
+            pipeline_contains_unsupported_control_flow(first)
+                || rest
+                    .iter()
+                    .any(|(_, pipeline)| pipeline_contains_unsupported_control_flow(pipeline))
+        })
+    }
+}
+
+const UNSUPPORTED_CONTROL_FLOW_WORDS: &[&str] = &[
+    "case", "do", "done", "elif", "else", "esac", "fi", "for", "function", "if", "select", "then",
+    "until", "while",
+];
+
+pub(crate) fn is_unsupported_control_flow_word(name: &str) -> bool {
+    UNSUPPORTED_CONTROL_FLOW_WORDS.contains(&name)
+}
+
+fn command_name(word: &ShellWord) -> Option<&str> {
+    match word.parts.as_slice() {
+        [ShellWordPart::Text(name)] => Some(name),
+        _ => None,
+    }
+}
+
+fn pipeline_contains_unsupported_control_flow(pipeline: &ShellPipeline) -> bool {
+    pipeline.commands.iter().any(|command| {
+        command
+            .words
+            .first()
+            .and_then(command_name)
+            .is_some_and(|name| UNSUPPORTED_CONTROL_FLOW_WORDS.contains(&name))
+    })
 }
 
 fn pipeline_requires_portable_shell(pipeline: &ShellPipeline) -> bool {
@@ -143,13 +181,14 @@ fn pipeline_requires_portable_shell(pipeline: &ShellPipeline) -> bool {
             !command.environment.is_empty()
                 || !command.redirects.is_empty()
                 || command.words.iter().any(word_requires_portable_shell)
-                || command.words.first().is_some_and(|word| {
-                    word.parts.len() == 1
-                        && matches!(
-                            &word.parts[0],
-                            ShellWordPart::Text(name) if crate::commands::is_shell_alias(name)
-                        )
-                })
+                || command
+                    .words
+                    .first()
+                    .and_then(command_name)
+                    .is_some_and(|name| {
+                        crate::commands::is_shell_alias(name)
+                            || UNSUPPORTED_CONTROL_FLOW_WORDS.contains(&name)
+                    })
         })
 }
 
