@@ -143,6 +143,13 @@ fn pipeline_requires_portable_shell(pipeline: &ShellPipeline) -> bool {
             !command.environment.is_empty()
                 || !command.redirects.is_empty()
                 || command.words.iter().any(word_requires_portable_shell)
+                || command.words.first().is_some_and(|word| {
+                    word.parts.len() == 1
+                        && matches!(
+                            &word.parts[0],
+                            ShellWordPart::Text(name) if crate::commands::is_shell_alias(name)
+                        )
+                })
         })
 }
 

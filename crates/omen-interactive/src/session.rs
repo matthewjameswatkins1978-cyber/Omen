@@ -755,6 +755,7 @@ impl InteractiveSession {
                         |error| unsupported(format!("shell word expansion failed: {error}")),
                     )?);
                 }
+                let argv = crate::commands::expand_shell_alias(&argv);
                 let argv = crate::resolver::ReferenceResolver::resolve_argv(
                     &argv,
                     &self.session_id,
@@ -807,6 +808,7 @@ impl InteractiveSession {
                 })?,
             );
         }
+        let argv = crate::commands::expand_shell_alias(&argv);
         let argv = crate::resolver::ReferenceResolver::resolve_argv(
             &argv,
             &self.session_id,

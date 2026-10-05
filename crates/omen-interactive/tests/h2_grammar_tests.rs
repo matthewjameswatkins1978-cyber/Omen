@@ -199,6 +199,35 @@ fn portable_shell_dispatches_byte_pipelines_through_supervision() {
 }
 
 #[test]
+fn visible_git_alias_is_listed_and_dispatched_through_portable_shell() {
+    use omen_interactive::commands::{SHELL_ALIASES, expand_shell_alias};
+
+    let expanded = expand_shell_alias(&["g".into(), "--version".into()]);
+    assert_eq!(expanded, ["git", "--version"]);
+    assert!(SHELL_ALIASES.iter().any(|alias| alias.name == "g"));
+
+    assert!(matches!(
+        GrammarScanner::scan("g --version").unwrap(),
+        InputLane::PortableShell { .. }
+    ));
+
+    let workspace = tempfile::tempdir().unwrap();
+    let workspace = workspace.path().canonicalize().unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let _guard = runtime.enter();
+    let mut session = InteractiveSession::new_with_client(
+        omen_core::InteractiveSessionId::generate(),
+        workspace,
+        None,
+        None,
+    )
+    .unwrap();
+
+    let exit = session.dispatch_input("g --version").unwrap();
+    assert_eq!(exit.code, Some(0));
+}
+
+#[test]
 fn test_typed_reference_parsing() {
     assert_eq!(TypedReference::parse("@last"), Some(TypedReference::Last));
     assert_eq!(

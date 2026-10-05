@@ -49,6 +49,21 @@ impl SemanticDispatcher {
                     signal: None,
                 })
             }
+            "aliases" => {
+                println!("Omen shell aliases:");
+                for alias in crate::commands::SHELL_ALIASES {
+                    println!(
+                        "  {:<4} -> {:<20} {}",
+                        alias.name,
+                        alias.expansion.join(" "),
+                        alias.description
+                    );
+                }
+                Ok(ProcessExit {
+                    code: Some(0),
+                    signal: None,
+                })
+            }
             "doctor" => {
                 println!("Omen Runtime Doctor: OK");
                 println!("Platform Backend: {}", std::env::consts::OS);

@@ -194,6 +194,7 @@ fn test_omen_actions_authority_is_shared_with_dispatcher() {
     let expected: Vec<&str> = vec![
         "actions",
         "agent",
+        "aliases",
         "backend",
         "capabilities",
         "def",

@@ -79,11 +79,15 @@ commands separated by `;`, with `&&` / `||` short-circuiting. Each command is
 dispatched separately through Omen's existing execution boundary; shell syntax
 does not create or grant action authority.
 
-The lane supports variable and tilde expansion plus deterministic pathname
-globbing. Pipelines, redirections, command-local environment assignments,
-command substitution, background jobs, and interactive terminal handoff inside
-a shell expression are currently refused as unsupported. Unsupported shell
-syntax is never passed through as literal argv.
+The lane supports supervised byte pipelines, command-local environment
+assignments, variable and tilde expansion, deterministic pathname globbing,
+and the visible one-level argv aliases listed by `:aliases` (for example,
+`g` expands to `git`). Pipeline stages and ordinary commands use Omen's
+existing execution broker; shell syntax does not create or grant authority.
+
+Redirections, command substitution, background jobs, and interactive terminal
+handoff inside a shell expression are still refused as unsupported. Unsupported
+shell syntax is never passed through as literal argv.
 
 ### Lane 4: Optional AI Reasoning Lane (Prefix: `?`)
 Advisory reasoning invoked only when explicit human judgement is requested:

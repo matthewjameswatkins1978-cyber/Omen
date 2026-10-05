@@ -13,10 +13,11 @@
 //! [`list_path_commands`] for the bounded out-of-hot-path discovery used by
 //! completion.
 
-/// Shell intrinsic commands handled by the interactive session itself.
+/// Command-position words handled by Omen: session intrinsics and visible aliases.
 ///
-/// Authority: `InteractiveSession::dispatch_input` (cd navigation, exit/quit).
-pub const SHELL_INTRINSICS: &[&str] = &["cd", "exit", "quit"];
+/// Alias entries are included so command discovery can suggest them.
+/// Authority: `InteractiveSession::dispatch_input` and `SHELL_ALIASES`.
+pub const SHELL_INTRINSICS: &[&str] = &["cd", "exit", "g", "gd", "gs", "quit"];
 
 /// Canonical Omen semantic action names accepted by `SemanticDispatcher`.
 ///
@@ -27,6 +28,7 @@ pub const SHELL_INTRINSICS: &[&str] = &["cd", "exit", "quit"];
 pub const OMEN_ACTIONS: &[&str] = &[
     "actions",
     "agent",
+    "aliases",
     "backend",
     "capabilities",
     "def",
@@ -59,6 +61,57 @@ pub fn is_omen_action(name: &str) -> bool {
 /// Returns `true` when `name` is a shell intrinsic handled by the session.
 pub fn is_shell_intrinsic(name: &str) -> bool {
     SHELL_INTRINSICS.contains(&name)
+}
+
+/// A deliberately small, visible argv-prefix alias. Aliases are expanded
+/// exactly once at command position; they cannot contain shell syntax.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShellAlias {
+    pub name: &'static str,
+    pub expansion: &'static [&'static str],
+    pub description: &'static str,
+}
+
+/// Omen-owned cross-platform developer shortcuts. Targets remain ordinary
+/// argv commands and still pass through the normal execution broker.
+pub const SHELL_ALIASES: &[ShellAlias] = &[
+    ShellAlias {
+        name: "g",
+        expansion: &["git"],
+        description: "Git with the remaining arguments",
+    },
+    ShellAlias {
+        name: "gd",
+        expansion: &["git", "diff"],
+        description: "Show the working-tree diff",
+    },
+    ShellAlias {
+        name: "gs",
+        expansion: &["git", "status", "--short"],
+        description: "Show concise repository status",
+    },
+];
+
+/// Returns whether a command-position token is one of Omen's visible aliases.
+pub fn is_shell_alias(name: &str) -> bool {
+    SHELL_ALIASES.iter().any(|alias| alias.name == name)
+}
+
+/// Expand one alias level while preserving the caller's remaining argv.
+pub fn expand_shell_alias(argv: &[String]) -> Vec<String> {
+    let Some(alias) = argv
+        .first()
+        .and_then(|name| SHELL_ALIASES.iter().find(|alias| alias.name == name))
+    else {
+        return argv.to_vec();
+    };
+
+    alias
+        .expansion
+        .iter()
+        .map(|word| (*word).to_string())
+        .chain(argv.iter().skip(1).cloned())
+        .collect()
 }
 
 /// Returns `Some(drive_letter)` when `s` is a bare Windows drive designator
