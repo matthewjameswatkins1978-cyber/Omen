@@ -100,6 +100,16 @@ pub struct ExecutionOutput {
     pub duration_ms: u64,
 }
 
+/// Supervised byte-pipeline result. `execution.process_exit` follows the
+/// conventional shell rule (the last stage), while `stage_exits` preserves
+/// the observed exit evidence for every stage.
+#[derive(Debug, Clone)]
+pub struct PipelineExecutionOutput {
+    pub execution: ExecutionOutput,
+    pub stage_exits: Vec<ProcessExit>,
+    pub stderr_by_stage: Vec<Vec<u8>>,
+}
+
 impl ExecutionOutput {
     pub fn stdout_sanitized(&self) -> String {
         crate::pty::sanitize_terminal_escapes(&self.stdout_bounded)
@@ -203,6 +213,140 @@ impl ProcessSupervisor {
 
     pub async fn execute(&self, req: ExecutionRequest) -> Result<ExecutionOutput, CoreError> {
         self.execute_inner(req, None).await
+    }
+
+    pub async fn execute_pipeline(
+        &self,
+        stages: Vec<ExecutionRequest>,
+    ) -> Result<PipelineExecutionOutput, CoreError> {
+        self.execute_pipeline_inner(stages, None).await
+    }
+
+    pub async fn execute_pipeline_cancelable(
+        &self,
+        stages: Vec<ExecutionRequest>,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<PipelineExecutionOutput, CoreError> {
+        self.execute_pipeline_inner(stages, Some(cancel)).await
+    }
+
+    async fn execute_pipeline_inner(
+        &self,
+        stages: Vec<ExecutionRequest>,
+        cancel: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<PipelineExecutionOutput, CoreError> {
+        if stages.is_empty() {
+            return Err(CoreError::ExecutionFailed(
+                "pipeline cannot contain zero stages".into(),
+            ));
+        }
+        for (index, stage) in stages.iter().enumerate() {
+            self.backend
+                .preflight(&stage.required_assurance)
+                .map_err(|error| {
+                    CoreError::ExecutionFailed(format!(
+                        "pipeline stage {index} failed execution preflight: {error}"
+                    ))
+                })?;
+            if stage.argv.is_empty() {
+                return Err(CoreError::ExecutionFailed(format!(
+                    "pipeline stage {index} has empty argv"
+                )));
+            }
+        }
+
+        let start_time = std::time::Instant::now();
+        let timeout = Duration::from_millis(
+            stages
+                .iter()
+                .map(|stage| stage.timeout_ms)
+                .min()
+                .unwrap_or(0),
+        );
+        let inline_budget = stages
+            .iter()
+            .map(|stage| stage.inline_budget)
+            .min()
+            .unwrap_or(DEFAULT_INLINE_BUDGET);
+
+        if cancel.as_ref().is_some_and(|flag| *flag.borrow()) {
+            let stage_exits = vec![
+                ProcessExit {
+                    code: None,
+                    signal: Some("CANCELLED_BEFORE_DISPATCH".into()),
+                };
+                stages.len()
+            ];
+            let execution = ExecutionOutput {
+                runtime_status: RuntimeStatus::Cancelled,
+                process_exit: stage_exits.last().cloned().unwrap_or(ProcessExit {
+                    code: None,
+                    signal: Some("CANCELLED_BEFORE_DISPATCH".into()),
+                }),
+                adapter_classification: AdapterClassification::Failure,
+                enforcement: self.enforcement_report(),
+                stdout_bounded: Vec::new(),
+                stderr_bounded: Vec::new(),
+                stdout_all: Vec::new(),
+                stderr_all: Vec::new(),
+                duration_ms: start_time.elapsed().as_millis() as u64,
+            };
+            return Ok(PipelineExecutionOutput {
+                execution,
+                stage_exits,
+                stderr_by_stage: vec![Vec::new(); stages.len()],
+            });
+        }
+
+        let handle = self.backend.spawn_pipeline(&stages)?;
+        let (runtime_status, stage_exits, stdout_all, stderr_by_stage) = match cancel {
+            Some(flag) => handle.wait_cancelable(timeout, flag).await?,
+            None => handle.wait_bounded(timeout).await?,
+        };
+
+        let process_exit = stage_exits.last().cloned().unwrap_or(ProcessExit {
+            code: None,
+            signal: Some("PIPELINE_STAGE_EXIT_MISSING".into()),
+        });
+        let stderr_all = stderr_by_stage
+            .iter()
+            .flat_map(|stage| stage.iter().copied())
+            .collect::<Vec<_>>();
+        let stdout_bounded = bounded_prefix(&stdout_all, inline_budget);
+        let stderr_bounded = bounded_prefix(&stderr_all, inline_budget);
+        let adapter_classification =
+            if runtime_status == RuntimeStatus::Completed && process_exit.is_zero() {
+                AdapterClassification::Success
+            } else {
+                AdapterClassification::Failure
+            };
+        let execution = ExecutionOutput {
+            runtime_status,
+            process_exit,
+            adapter_classification,
+            enforcement: self.enforcement_report(),
+            stdout_bounded,
+            stderr_bounded,
+            stdout_all,
+            stderr_all,
+            duration_ms: start_time.elapsed().as_millis() as u64,
+        };
+
+        Ok(PipelineExecutionOutput {
+            execution,
+            stage_exits,
+            stderr_by_stage,
+        })
+    }
+
+    fn enforcement_report(&self) -> EnforcementReport {
+        let caps = self.backend.capabilities();
+        EnforcementReport {
+            filesystem: caps.filesystem,
+            network: caps.network,
+            descendant_processes: caps.descendants,
+            symlink_escape: caps.symlink_escape,
+        }
     }
 
     /// Execute with an external cancellation flag.
@@ -331,13 +475,7 @@ impl ProcessSupervisor {
             AdapterClassification::Failure
         };
 
-        let caps = self.backend.capabilities();
-        let enforcement = EnforcementReport {
-            filesystem: caps.filesystem,
-            network: caps.network,
-            descendant_processes: caps.descendants,
-            symlink_escape: caps.symlink_escape,
-        };
+        let enforcement = self.enforcement_report();
 
         let duration_ms = start_time.elapsed().as_millis() as u64;
 
@@ -353,6 +491,10 @@ impl ProcessSupervisor {
             duration_ms,
         })
     }
+}
+
+fn bounded_prefix(output: &[u8], budget: usize) -> Vec<u8> {
+    output[..output.len().min(budget)].to_vec()
 }
 
 impl Default for ProcessSupervisor {

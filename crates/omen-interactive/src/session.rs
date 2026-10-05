@@ -716,18 +716,83 @@ impl InteractiveSession {
             code: omen_core::ErrorCode::Unsupported,
             message,
         };
-        if pipeline.commands.len() != 1 {
-            return Err(unsupported(
-                "pipelines require the supervised byte-pipeline dispatcher".into(),
-            ));
+        let needs_pipeline_dispatch = pipeline.commands.len() > 1
+            || pipeline
+                .commands
+                .iter()
+                .any(|command| !command.environment.is_empty());
+
+        if needs_pipeline_dispatch {
+            let mut stages = Vec::with_capacity(pipeline.commands.len());
+            for command in &pipeline.commands {
+                if !command.redirects.is_empty() {
+                    return Err(unsupported(
+                        "redirection requires the supervised redirection dispatcher".into(),
+                    ));
+                }
+
+                let mut env = Vec::with_capacity(command.environment.len());
+                for assignment in &command.environment {
+                    let expanded = crate::shell_grammar::expand_word(&assignment.value, &self.cwd)
+                        .map_err(|error| {
+                            unsupported(format!("environment assignment expansion failed: {error}"))
+                        })?;
+                    let value = match expanded.as_slice() {
+                        [value] => value.clone(),
+                        _ => {
+                            return Err(unsupported(format!(
+                                "environment assignment '{}' must expand to exactly one value",
+                                assignment.name
+                            )));
+                        }
+                    };
+                    env.push((assignment.name.clone(), value));
+                }
+
+                let mut argv = Vec::new();
+                for word in &command.words {
+                    argv.extend(crate::shell_grammar::expand_word(word, &self.cwd).map_err(
+                        |error| unsupported(format!("shell word expansion failed: {error}")),
+                    )?);
+                }
+                let argv = crate::resolver::ReferenceResolver::resolve_argv(
+                    &argv,
+                    &self.session_id,
+                    self.db.as_ref(),
+                );
+                let Some(program) = argv.first() else {
+                    return Err(unsupported(
+                        "every pipeline stage must contain an executable".into(),
+                    ));
+                };
+
+                if program == "cd" {
+                    return Err(unsupported(
+                        "the Omen `cd` intrinsic cannot run as a pipeline stage".into(),
+                    ));
+                }
+                if ChildHandoff::classify(&argv)
+                    == crate::child::ChildClassification::InteractiveHandoff
+                {
+                    return Err(unsupported(
+                        "interactive terminal handoff cannot run inside a portable shell expression yet"
+                            .into(),
+                    ));
+                }
+                if let Some(blast) = crate::preflight::BlastPreflight::assess(&argv) {
+                    println!(
+                        "[Preflight Warning: {:?}] Command '{}' will affect: {}",
+                        blast.severity, blast.command, blast.summary
+                    );
+                }
+
+                stages.push(omen_ipc::PipelineStageRequest { argv, env });
+            }
+
+            return self.execute_pipeline_via_broker(stages, None);
         }
+
         let command = &pipeline.commands[0];
-        if !command.environment.is_empty() {
-            return Err(unsupported(
-                "per-command environment assignments are not available in this dispatcher yet"
-                    .into(),
-            ));
-        }
         if !command.redirects.is_empty() {
             return Err(unsupported(
                 "redirection requires the supervised redirection dispatcher".into(),
@@ -775,6 +840,131 @@ impl InteractiveSession {
         }
 
         self.execute_via_broker("exec", "", argv, None)
+    }
+
+    fn execute_pipeline_via_broker(
+        &mut self,
+        stages: Vec<omen_ipc::PipelineStageRequest>,
+        cwd: Option<PathBuf>,
+    ) -> Result<ProcessExit, CoreError> {
+        let exec_cwd = cwd.unwrap_or_else(|| self.cwd.clone());
+        let command_label = stages
+            .iter()
+            .map(|stage| stage.argv.join(" "))
+            .collect::<Vec<_>>()
+            .join(" | ");
+
+        if let Some(client) = self.client.as_ref().filter(|client| client.is_connected()) {
+            print!(
+                "{}",
+                omen_ui::SemanticBlock::osc133_command_executed(&self.caps)
+            );
+            let summary = block_on_async(client.submit_pipeline(
+                stages,
+                exec_cwd.to_string_lossy().to_string(),
+                60000,
+            ))
+            .map_err(|error| CoreError::Internal(format!("Daemon pipeline error: {error}")))?;
+            print!(
+                "{}",
+                omen_ui::SemanticBlock::osc133_command_finished(
+                    summary.exit_code.unwrap_or(0),
+                    &self.caps
+                )
+            );
+            if !summary.stdout_preview.is_empty() {
+                print!("{}", summary.stdout_preview);
+            }
+            if !summary.stderr_preview.is_empty() {
+                eprint!("{}", summary.stderr_preview);
+            }
+            let exit = ProcessExit {
+                code: summary.exit_code,
+                signal: None,
+            };
+            self.last_exit = Some(exit.clone());
+            self.update_prompt_state();
+            return Ok(exit);
+        }
+
+        let requests = stages
+            .iter()
+            .map(|stage| ExecutionRequest {
+                argv: stage.argv.clone(),
+                cwd: exec_cwd.clone(),
+                env: stage.env.clone(),
+                stdin_mode: StdioMode::Closed,
+                stdin_payload: None,
+                timeout_ms: 60000,
+                inline_budget: 65536,
+                required_assurance: RequiredAssurance::default(),
+                secrets: vec![],
+            })
+            .collect();
+        print!(
+            "{}",
+            omen_ui::SemanticBlock::osc133_command_executed(&self.caps)
+        );
+        let output = block_on_async(self.supervisor.execute_pipeline(requests))?;
+        print!(
+            "{}",
+            omen_ui::SemanticBlock::osc133_command_finished(
+                output.execution.process_exit.code.unwrap_or(0),
+                &self.caps
+            )
+        );
+
+        let execution_id = omen_core::ExecutionId::generate();
+        let cas = omen_knowledge::ContentAddressedStore::new(
+            omen_knowledge::resolve_workspace_dir(&self.workspace_root).join("cas"),
+        );
+        if let Some(db) = &mut self.db {
+            let stdout_artifact = if output.execution.stdout_all.is_empty() {
+                None
+            } else {
+                cas.store(
+                    db,
+                    &output.execution.stdout_all,
+                    "application/octet-stream",
+                    "pipeline",
+                    omen_core::RetentionClass::Referenced,
+                )
+                .ok()
+                .map(|artifact| artifact.uri.as_str().to_string())
+            };
+            let stderr_artifact = if output.execution.stderr_all.is_empty() {
+                None
+            } else {
+                cas.store(
+                    db,
+                    &output.execution.stderr_all,
+                    "application/octet-stream",
+                    "pipeline",
+                    omen_core::RetentionClass::Referenced,
+                )
+                .ok()
+                .map(|artifact| artifact.uri.as_str().to_string())
+            };
+            let record = omen_knowledge::ExecutionRecord {
+                execution_id,
+                session_id: self.session_id.clone(),
+                command: command_label,
+                exit_code: output.execution.process_exit.code,
+                duration_ms: Some(output.execution.duration_ms as i64),
+                stdout_artifact,
+                stderr_artifact,
+                envelope_json: None,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            };
+            let _ = omen_knowledge::ExecutionHistory::record_execution(db, &record, &[], &[], &[]);
+        }
+
+        print!("{}", String::from_utf8_lossy(&output.execution.stdout_all));
+        eprint!("{}", String::from_utf8_lossy(&output.execution.stderr_all));
+        let exit = output.execution.process_exit;
+        self.last_exit = Some(exit.clone());
+        self.update_prompt_state();
+        Ok(exit)
     }
 
     /// Navigates the session cwd to `target`, updating all dependent state.

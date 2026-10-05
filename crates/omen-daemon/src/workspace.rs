@@ -10,7 +10,7 @@ use omen_core::{CoreError, ExecutionId, InteractiveSessionId};
 use omen_engine::{ExecutionRequest, ProcessSupervisor};
 use omen_ipc::{
     CancelOutcome, CancelRecord, EventPayload, ExecutionResultSummary, FactInfo, IpcEvent,
-    LocalIpcError, ManagedServiceInfo, SharedIndexSnapshot,
+    LocalIpcError, ManagedServiceInfo, PipelineStageRequest, SharedIndexSnapshot,
 };
 use omen_knowledge::{
     Database, ExecutionHistory, ExecutionRecord, FactRegistry, HistoryStatusEnvelope,
@@ -168,6 +168,15 @@ pub struct BrokerExecutionParams<'a> {
     pub tool: &'a str,
     pub operation: &'a str,
     pub args: &'a [String],
+    pub cwd: &'a str,
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct BrokerPipelineParams<'a> {
+    pub dedup_id: &'a str,
+    pub session_id: &'a str,
+    pub stages: &'a [PipelineStageRequest],
     pub cwd: &'a str,
     pub timeout_ms: u64,
 }
@@ -1521,6 +1530,7 @@ impl WorkspaceState {
             stdout_artifact: rec.stdout_artifact,
             stderr_artifact: rec.stderr_artifact,
             dispatch_prevented,
+            pipeline_stage_exits: None,
         };
         self.execution_cache
             .write()
@@ -1549,6 +1559,31 @@ impl WorkspaceState {
     pub async fn execute_broker(
         self: &Arc<Self>,
         params: BrokerExecutionParams<'_>,
+    ) -> Result<ExecutionResultSummary, LocalIpcError> {
+        self.execute_broker_inner(params, None).await
+    }
+
+    pub async fn execute_pipeline_broker(
+        self: &Arc<Self>,
+        params: BrokerPipelineParams<'_>,
+    ) -> Result<ExecutionResultSummary, LocalIpcError> {
+        let request = BrokerExecutionParams {
+            dedup_id: params.dedup_id,
+            session_id: params.session_id,
+            tool: "pipeline",
+            operation: "",
+            args: &[],
+            cwd: params.cwd,
+            timeout_ms: params.timeout_ms,
+        };
+        self.execute_broker_inner(request, Some(params.stages.to_vec()))
+            .await
+    }
+
+    async fn execute_broker_inner(
+        self: &Arc<Self>,
+        params: BrokerExecutionParams<'_>,
+        pipeline_stages: Option<Vec<PipelineStageRequest>>,
     ) -> Result<ExecutionResultSummary, LocalIpcError> {
         let dedup_id = params.dedup_id;
         let session_id = params.session_id;
@@ -1632,17 +1667,26 @@ impl WorkspaceState {
         let exec_id_str = execution_id.to_string();
 
         // 3. Construct argv (pure validation input; no side effects yet).
-        let mut argv = Vec::new();
-        if !tool.is_empty() && tool != "exec" {
-            argv.push(tool.to_string());
-        }
-        if !operation.is_empty() {
-            argv.push(operation.to_string());
-        }
-        argv.extend(args.iter().cloned());
-        if argv.is_empty() && tool == "exec" && !args.is_empty() {
-            argv = args.to_vec();
-        }
+        let argv = if let Some(stages) = &pipeline_stages {
+            if stages.is_empty() || stages.iter().any(|stage| stage.argv.is_empty()) {
+                Vec::new()
+            } else {
+                stages[0].argv.clone()
+            }
+        } else {
+            let mut argv = Vec::new();
+            if !tool.is_empty() && tool != "exec" {
+                argv.push(tool.to_string());
+            }
+            if !operation.is_empty() {
+                argv.push(operation.to_string());
+            }
+            argv.extend(args.iter().cloned());
+            if argv.is_empty() && tool == "exec" && !args.is_empty() {
+                argv = args.to_vec();
+            }
+            argv
+        };
         if argv.is_empty() {
             // Malformed requests never reach physical work. The Failed
             // annotation is best-effort: the refusal is deterministic and
@@ -1694,6 +1738,16 @@ impl WorkspaceState {
         } else {
             PathBuf::from(cwd)
         };
+        let command_label = pipeline_stages
+            .as_ref()
+            .map(|stages| {
+                stages
+                    .iter()
+                    .map(|stage| stage.argv.join(" "))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            })
+            .unwrap_or_else(|| argv.join(" "));
 
         // E2 stop truth: live cancellation flag for this execution. Firing
         // it records intent; the task below still performs the physical stop
@@ -1716,19 +1770,43 @@ impl WorkspaceState {
                 gate.release.notified().await;
             }
 
-            let req = ExecutionRequest {
-                argv: argv.clone(),
-                cwd: exec_cwd,
-                env: vec![],
-                stdin_mode: omen_core::StdioMode::Closed,
-                stdin_payload: None,
-                timeout_ms: if timeout_ms == 0 { 60000 } else { timeout_ms },
-                inline_budget: 8192,
-                required_assurance: omen_core::RequiredAssurance::default(),
-                secrets: vec![],
+            let effective_timeout_ms = if timeout_ms == 0 { 60000 } else { timeout_ms };
+            let exec_result = if let Some(stages) = pipeline_stages {
+                let requests = stages
+                    .into_iter()
+                    .map(|stage| ExecutionRequest {
+                        argv: stage.argv,
+                        cwd: exec_cwd.clone(),
+                        env: stage.env,
+                        stdin_mode: omen_core::StdioMode::Closed,
+                        stdin_payload: None,
+                        timeout_ms: effective_timeout_ms,
+                        inline_budget: 8192,
+                        required_assurance: omen_core::RequiredAssurance::default(),
+                        secrets: vec![],
+                    })
+                    .collect();
+                this.supervisor
+                    .execute_pipeline_cancelable(requests, cancel_rx)
+                    .await
+                    .map(|pipeline| (pipeline.execution, Some(pipeline.stage_exits)))
+            } else {
+                let req = ExecutionRequest {
+                    argv: argv.clone(),
+                    cwd: exec_cwd,
+                    env: vec![],
+                    stdin_mode: omen_core::StdioMode::Closed,
+                    stdin_payload: None,
+                    timeout_ms: effective_timeout_ms,
+                    inline_budget: 8192,
+                    required_assurance: omen_core::RequiredAssurance::default(),
+                    secrets: vec![],
+                };
+                this.supervisor
+                    .execute_cancelable(req, cancel_rx)
+                    .await
+                    .map(|output| (output, None))
             };
-
-            let exec_result = this.supervisor.execute_cancelable(req, cancel_rx).await;
             // The execution is terminal: release the cancellation switch.
             {
                 let mut switches = this.cancel_switches.lock().await;
@@ -1737,8 +1815,8 @@ impl WorkspaceState {
                 index.remove(&exec_id_str);
             }
             match exec_result {
-                Ok(output) => {
-                    let cmd_str = argv.join(" ");
+                Ok((output, pipeline_stage_exits)) => {
+                    let cmd_str = command_label;
 
                     // Check CAS offload for large output
                     let (stdout_art, stderr_art) = {
@@ -1881,6 +1959,7 @@ impl WorkspaceState {
                         stdout_artifact: stdout_art,
                         stderr_artifact: stderr_art,
                         dispatch_prevented,
+                        pipeline_stage_exits,
                     };
 
                     // Cache in memory

@@ -8,14 +8,15 @@ pub mod supervisor;
 pub use backend::{
     BackendAvailability, BackendCapabilities, BackendDescriptor, BackendKind, BackendRegistry,
     ExecutionBackend, ExecutionHandle, NativeExecutionBackend, NativeExecutionHandle,
-    PtyExecutionHandle, PtyExecutionRequest, WslExecutionBackend, create_platform_backend,
-    to_wsl_path,
+    NativePipelineExecutionHandle, PipelineExecutionHandle, PtyExecutionHandle,
+    PtyExecutionRequest, WslExecutionBackend, create_platform_backend, to_wsl_path,
 };
 pub use pty::{
     DEFAULT_RING_BUFFER_CAPACITY, NativePtyHandle, RingBuffer, sanitize_terminal_escapes,
 };
 pub use supervisor::{
-    DEFAULT_INLINE_BUDGET, ExecutionOutput, ExecutionRequest, ExecutionSecret, ProcessSupervisor,
+    DEFAULT_INLINE_BUDGET, ExecutionOutput, ExecutionRequest, ExecutionSecret,
+    PipelineExecutionOutput, ProcessSupervisor,
 };
 
 /// Checks whether an OS process with the given PID is currently active.

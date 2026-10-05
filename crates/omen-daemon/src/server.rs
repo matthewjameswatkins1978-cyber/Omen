@@ -172,6 +172,7 @@ impl DaemonServer {
                 "events".to_string(),
                 "services".to_string(),
                 "execution".to_string(),
+                omen_ipc::FEATURE_SUPERVISED_PIPELINES.to_string(),
             ],
             max_frame_size: MAX_FRAME_SIZE,
         };
@@ -426,6 +427,37 @@ impl DaemonServer {
                         };
                         let res = ws.execute_broker(params).await;
                         res.map(ResponsePayload::ExecutionFinished)
+                    }
+                    None => Err(LocalIpcError::WorkspaceNotAttached(
+                        "No workspace attached for this session".into(),
+                    )),
+                }
+            }
+
+            RequestPayload::SubmitPipeline {
+                stages,
+                cwd,
+                timeout_ms,
+                consequential_request_id,
+            } => {
+                if let Some(ref request_id) = consequential_request_id
+                    && let Err(message) = validate_consequential_request_id(request_id)
+                {
+                    return IpcResponse::err(req_id, LocalIpcError::MalformedRequest(message));
+                }
+                let current = attached_workspace.read().await;
+                match &*current {
+                    Some(ws) => {
+                        let dedup_id = consequential_request_id.unwrap_or_else(|| req_id.clone());
+                        let params = crate::workspace::BrokerPipelineParams {
+                            dedup_id: &dedup_id,
+                            session_id: &session_id,
+                            stages: &stages,
+                            cwd: &cwd,
+                            timeout_ms,
+                        };
+                        let result = ws.execute_pipeline_broker(params).await;
+                        result.map(ResponsePayload::ExecutionFinished)
                     }
                     None => Err(LocalIpcError::WorkspaceNotAttached(
                         "No workspace attached for this session".into(),

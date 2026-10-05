@@ -43,6 +43,81 @@ fn gremlin_exe() -> PathBuf {
     fallback
 }
 
+fn pipeline_stage(gremlin: &std::path::Path, args: &[&str], timeout_ms: u64) -> ExecutionRequest {
+    let mut argv = vec![gremlin.to_string_lossy().to_string()];
+    argv.extend(args.iter().map(|arg| (*arg).to_string()));
+    ExecutionRequest {
+        argv,
+        cwd: std::env::current_dir().unwrap(),
+        env: Vec::new(),
+        stdin_mode: StdioMode::Closed,
+        stdin_payload: None,
+        timeout_ms,
+        inline_budget: 8192,
+        required_assurance: RequiredAssurance::default(),
+        secrets: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn native_pipeline_streams_exact_bytes_between_stages() {
+    let supervisor = ProcessSupervisor::new();
+    let gremlin = gremlin_exe();
+    let producer = pipeline_stage(&gremlin, &["--stdout", "pipeline-bytes"], 10000);
+    let consumer = pipeline_stage(&gremlin, &["--echo-stdin"], 10000);
+
+    let output = supervisor
+        .execute_pipeline(vec![producer, consumer])
+        .await
+        .unwrap();
+
+    assert_eq!(output.execution.runtime_status, RuntimeStatus::Completed);
+    assert_eq!(output.execution.process_exit.code, Some(0));
+    assert_eq!(output.stage_exits.len(), 2);
+    assert!(output.stage_exits.iter().all(|exit| exit.code == Some(0)));
+    assert_eq!(
+        output.execution.stdout_all,
+        b"READ_STDIN_BYTES:15\nSTDIN_ECHO:pipeline-bytes\n"
+    );
+    assert_eq!(output.stderr_by_stage, vec![Vec::<u8>::new(), Vec::new()]);
+}
+
+#[tokio::test]
+async fn native_pipeline_streams_more_than_pipe_capacity_without_deadlock() {
+    let supervisor = ProcessSupervisor::new();
+    let gremlin = gremlin_exe();
+    let producer = pipeline_stage(&gremlin, &["--stdout-bytes", "1048576"], 10000);
+    let consumer = pipeline_stage(&gremlin, &["--stdin-report"], 10000);
+
+    let output = supervisor
+        .execute_pipeline(vec![producer, consumer])
+        .await
+        .unwrap();
+
+    assert_eq!(output.execution.runtime_status, RuntimeStatus::Completed);
+    assert_eq!(output.execution.process_exit.code, Some(0));
+    let report: serde_json::Value = serde_json::from_slice(&output.execution.stdout_all).unwrap();
+    assert_eq!(report["bytes_read"], 1_048_576);
+    assert_eq!(report["stdin_eof"], true);
+}
+
+#[tokio::test]
+async fn native_pipeline_deadline_terminates_every_stage() {
+    let supervisor = ProcessSupervisor::new();
+    let gremlin = gremlin_exe();
+    let producer = pipeline_stage(&gremlin, &["--sleep-ms", "5000"], 200);
+    let consumer = pipeline_stage(&gremlin, &["--echo-stdin"], 200);
+
+    let output = supervisor
+        .execute_pipeline(vec![producer, consumer])
+        .await
+        .unwrap();
+
+    assert_eq!(output.execution.runtime_status, RuntimeStatus::TimedOut);
+    assert_eq!(output.stage_exits.len(), 2);
+    assert!(output.execution.duration_ms < 3000);
+}
+
 #[tokio::test]
 async fn gremlin_closed_stdin_receives_eof() {
     let supervisor = ProcessSupervisor::new();

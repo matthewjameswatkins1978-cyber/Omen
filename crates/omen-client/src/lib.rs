@@ -6,8 +6,8 @@ use uuid::Uuid;
 
 use omen_ipc::{
     ClientHello, DaemonHello, DaemonMessage, ExecutionResultSummary, ExecutionStatusRecord,
-    FactInfo, IpcEvent, IpcRequest, LocalIpcError, ManagedServiceInfo, PlatformStream,
-    RequestPayload, ResponsePayload, SharedIndexSnapshot, default_endpoint_address,
+    FactInfo, IpcEvent, IpcRequest, LocalIpcError, ManagedServiceInfo, PipelineStageRequest,
+    PlatformStream, RequestPayload, ResponsePayload, SharedIndexSnapshot, default_endpoint_address,
     read_json_frame, write_json_frame,
 };
 
@@ -29,6 +29,7 @@ pub struct OmenClient {
     is_connected: Arc<AtomicBool>,
     last_sequence: Arc<AtomicU64>,
     last_epoch: Arc<AtomicU64>,
+    supports_supervised_pipelines: bool,
 }
 
 impl OmenClient {
@@ -52,7 +53,11 @@ impl OmenClient {
         endpoint: Option<String>,
         session_id: Option<String>,
     ) -> Result<Self, LocalIpcError> {
-        let _daemon_hello = Self::perform_handshake(&mut stream).await?;
+        let daemon_hello = Self::perform_handshake(&mut stream).await?;
+        let supports_supervised_pipelines = daemon_hello
+            .supported_features
+            .iter()
+            .any(|feature| feature == omen_ipc::FEATURE_SUPERVISED_PIPELINES);
         let session_id = session_id.unwrap_or_else(|| format!("sess_{}", Uuid::new_v4()));
         let endpoint = endpoint.unwrap_or_else(|| "memory://stream".to_string());
 
@@ -162,6 +167,7 @@ impl OmenClient {
             is_connected,
             last_sequence,
             last_epoch,
+            supports_supervised_pipelines,
         })
     }
 
@@ -172,6 +178,7 @@ impl OmenClient {
                 "events".to_string(),
                 "services".to_string(),
                 "execution".to_string(),
+                omen_ipc::FEATURE_SUPERVISED_PIPELINES.to_string(),
             ],
         );
         write_json_frame(stream, &client_hello).await?;
@@ -227,6 +234,13 @@ impl OmenClient {
         request_id: impl Into<String>,
         payload: RequestPayload,
     ) -> Result<ResponsePayload, LocalIpcError> {
+        if matches!(&payload, RequestPayload::SubmitPipeline { .. })
+            && !self.supports_supervised_pipelines
+        {
+            return Err(LocalIpcError::UnsupportedFeature(
+                omen_ipc::FEATURE_SUPERVISED_PIPELINES.into(),
+            ));
+        }
         if !self.is_connected() {
             return Err(LocalIpcError::Io(
                 "Client is not connected to daemon".to_string(),
@@ -332,6 +346,28 @@ impl OmenClient {
             ResponsePayload::ExecutionFinished(summary) => Ok(summary),
             other => Err(LocalIpcError::MalformedRequest(format!(
                 "Expected ExecutionFinished, got {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn submit_pipeline(
+        &self,
+        stages: Vec<PipelineStageRequest>,
+        cwd: impl Into<String>,
+        timeout_ms: u64,
+    ) -> Result<ExecutionResultSummary, LocalIpcError> {
+        let resp = self
+            .send_request(RequestPayload::SubmitPipeline {
+                stages,
+                cwd: cwd.into(),
+                timeout_ms,
+                consequential_request_id: None,
+            })
+            .await?;
+        match resp {
+            ResponsePayload::ExecutionFinished(summary) => Ok(summary),
+            other => Err(LocalIpcError::MalformedRequest(format!(
+                "Expected ExecutionFinished for pipeline, got {other:?}"
             ))),
         }
     }

@@ -62,6 +62,11 @@ Client                                             Daemon
 ### Handshake Failure:
 If `supported_versions` contains no protocol version supported by `omend`, the daemon responds with `PROTOCOL_VERSION_UNSUPPORTED` and closes the stream. No heuristic fallback or silent downgrade is permitted.
 
+### 2.3 Feature negotiation
+Protocol versions define envelope and framing compatibility. Optional additive request capabilities are negotiated separately: clients request them in `requested_features`, and may use one only when the daemon advertises it in `supported_features`. A client must not send a capability-specific request to a daemon that did not advertise that capability. This lets older clients continue using the stable protocol while newer clients fail locally and clearly when paired with an older daemon.
+
+The `supervised_pipelines` feature advertises support for the `SubmitPipeline` request. It does not change the `omen.local-ipc/1` framing or the semantics of existing request kinds.
+
 ---
 
 ## 3. Message Envelopes

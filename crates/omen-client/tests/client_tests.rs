@@ -104,3 +104,48 @@ async fn test_client_service_not_found_error() {
         other => panic!("Expected ServiceNotFound, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn test_pipeline_request_is_not_sent_to_daemon_without_feature() {
+    let (client_stream, mut server_stream) = PlatformStream::duplex_pair(4096);
+    let legacy_daemon = tokio::spawn(async move {
+        let hello: Option<omen_ipc::ClientHello> =
+            omen_ipc::read_json_frame(&mut server_stream).await.unwrap();
+        let hello = hello.expect("client should start with a handshake");
+        assert!(
+            hello
+                .requested_features
+                .contains(&omen_ipc::FEATURE_SUPERVISED_PIPELINES.to_string())
+        );
+
+        let response = omen_ipc::DaemonHello {
+            selected_protocol_version: 1,
+            daemon_instance_id: "legacy-daemon".into(),
+            product_version: "0.9.0".into(),
+            supported_features: vec!["events".into(), "services".into(), "execution".into()],
+            max_frame_size: omen_ipc::MAX_FRAME_SIZE,
+        };
+        omen_ipc::write_json_frame(&mut server_stream, &response)
+            .await
+            .unwrap();
+
+        omen_ipc::read_json_frame::<omen_ipc::IpcRequest, _>(&mut server_stream)
+            .await
+            .unwrap()
+    });
+
+    let client = OmenClient::from_stream(client_stream, None, None)
+        .await
+        .unwrap();
+    let result = client
+        .submit_pipeline(Vec::new(), "C:/fixture", 5_000)
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(LocalIpcError::UnsupportedFeature(feature))
+            if feature == omen_ipc::FEATURE_SUPERVISED_PIPELINES
+    ));
+    drop(client);
+    legacy_daemon.abort();
+}

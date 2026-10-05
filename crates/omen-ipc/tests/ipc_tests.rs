@@ -88,6 +88,40 @@ async fn test_codec_frame_roundtrip() {
 }
 
 #[tokio::test]
+async fn test_pipeline_request_frame_roundtrip() {
+    let (mut client, mut server) = duplex(4096);
+    let request = IpcRequest::new(
+        "pipeline-001",
+        Some("session-001".into()),
+        Some("workspace-001".into()),
+        RequestPayload::SubmitPipeline {
+            stages: vec![
+                PipelineStageRequest {
+                    argv: vec!["producer".into(), "--stdout".into(), "bytes".into()],
+                    env: vec![("MODE".into(), "test".into())],
+                },
+                PipelineStageRequest {
+                    argv: vec!["consumer".into(), "--echo-stdin".into()],
+                    env: Vec::new(),
+                },
+            ],
+            cwd: "C:/fixture".into(),
+            timeout_ms: 5_000,
+            consequential_request_id: Some("action-001".into()),
+        },
+    );
+
+    write_json_frame(&mut client, &request)
+        .await
+        .expect("pipeline request should serialize");
+    let received: Option<IpcRequest> = read_json_frame(&mut server)
+        .await
+        .expect("pipeline request should deserialize");
+
+    assert_eq!(received, Some(request));
+}
+
+#[tokio::test]
 async fn test_codec_frame_too_large_rejection() {
     let (mut client, mut server) = duplex(1024);
 

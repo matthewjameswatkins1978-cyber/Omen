@@ -44,6 +44,13 @@ pub enum RequestPayload {
         #[serde(default)]
         consequential_request_id: Option<String>,
     },
+    SubmitPipeline {
+        stages: Vec<PipelineStageRequest>,
+        cwd: String,
+        timeout_ms: u64,
+        #[serde(default)]
+        consequential_request_id: Option<String>,
+    },
     QueryRequestStatus {
         consequential_request_id: String,
     },
@@ -325,6 +332,17 @@ pub struct ExecutionResultSummary {
     /// recorded before this field existed.
     #[serde(default)]
     pub dispatch_prevented: bool,
+    /// Exit evidence for each member of an interactive byte pipeline.
+    /// Empty for a single-command execution and for historical results.
+    #[serde(default)]
+    pub pipeline_stage_exits: Option<Vec<omen_core::ProcessExit>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PipelineStageRequest {
+    pub argv: Vec<String>,
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

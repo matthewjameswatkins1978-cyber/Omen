@@ -6,6 +6,9 @@ pub enum LocalIpcError {
     #[error("Protocol version unsupported: {0}")]
     ProtocolVersionUnsupported(String),
 
+    #[error("Unsupported daemon feature: {0}")]
+    UnsupportedFeature(String),
+
     #[error("Frame too large: {declared_bytes} exceeds limit of {max_bytes} bytes")]
     FrameTooLarge {
         declared_bytes: usize,

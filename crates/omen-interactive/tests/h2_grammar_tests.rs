@@ -1,4 +1,41 @@
 use omen_interactive::{GrammarScanner, InputLane, InteractiveSession, TypedReference};
+use std::path::PathBuf;
+
+fn gremlin_exe() -> PathBuf {
+    let mut executable = std::env::current_exe().expect("current test executable");
+    executable.pop();
+    if executable.ends_with("deps") {
+        executable.pop();
+    }
+    let name = if cfg!(windows) {
+        "omen-gremlin.exe"
+    } else {
+        "omen-gremlin"
+    };
+    let candidate = executable.join(name);
+    if candidate.exists() {
+        return candidate;
+    }
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_dir
+        .parent()
+        .expect("interactive crate parent")
+        .parent()
+        .expect("workspace root");
+    let status = std::process::Command::new("cargo")
+        .current_dir(workspace_root)
+        .args(["build", "--bin", "omen-gremlin"])
+        .status()
+        .expect("build deterministic Omen process fixture");
+    assert!(status.success(), "omen-gremlin fixture build failed");
+    let candidate = workspace_root.join("target").join("debug").join(name);
+    assert!(
+        candidate.exists(),
+        "omen-gremlin binary missing at {candidate:?}"
+    );
+    candidate
+}
 
 #[test]
 fn test_grammar_lane_scanning() {
@@ -129,6 +166,36 @@ fn portable_shell_boolean_chains_update_session_directory() {
     let fallback = session.dispatch_input("cd missing || cd nested").unwrap();
     assert!(fallback.is_zero());
     assert_eq!(session.cwd, nested.canonicalize().unwrap());
+}
+
+#[test]
+fn portable_shell_dispatches_byte_pipelines_through_supervision() {
+    let workspace = tempfile::tempdir().unwrap();
+    let workspace = workspace.path().canonicalize().unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let _guard = runtime.enter();
+    let mut session = InteractiveSession::new_with_client(
+        omen_core::InteractiveSessionId::generate(),
+        workspace,
+        None,
+        None,
+    )
+    .unwrap();
+
+    let gremlin = gremlin_exe();
+    let command = format!(
+        "\"{}\" --stdout pipeline-bytes | \"{}\" --echo-stdin",
+        gremlin.display(),
+        gremlin.display()
+    );
+    let exit = session.dispatch_input(&command).unwrap();
+    assert_eq!(exit.code, Some(0));
+    assert!(
+        session
+            .last_exit
+            .as_ref()
+            .is_some_and(|exit| exit.is_zero())
+    );
 }
 
 #[test]

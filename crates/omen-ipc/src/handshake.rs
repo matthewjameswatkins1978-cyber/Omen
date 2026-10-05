@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 pub const PROTOCOL_FAMILY: &str = "omen.local-ipc";
 pub const PROTOCOL_VERSION_1: u32 = 1;
 pub const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[PROTOCOL_VERSION_1];
+pub const FEATURE_SUPERVISED_PIPELINES: &str = "supervised_pipelines";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClientHello {
@@ -49,6 +50,7 @@ impl DaemonHello {
                 "services".into(),
                 "execution".into(),
                 "hot_index".into(),
+                FEATURE_SUPERVISED_PIPELINES.into(),
             ],
             max_frame_size: MAX_FRAME_SIZE,
         }

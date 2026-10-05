@@ -6,7 +6,9 @@ use omen_core::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -68,6 +70,10 @@ pub type ExecutionWaitResult = Result<(RuntimeStatus, ProcessExit, Vec<u8>, Vec<
 pub type ExecutionWaitFuture =
     std::pin::Pin<Box<dyn std::future::Future<Output = ExecutionWaitResult> + Send>>;
 
+pub type PipelineWaitFuture = Pin<Box<dyn Future<Output = PipelineWaitResult> + Send>>;
+pub type PipelineWaitResult =
+    Result<(RuntimeStatus, Vec<ProcessExit>, Vec<u8>, Vec<Vec<u8>>), CoreError>;
+
 /// Handle to a running process spawned by an ExecutionBackend.
 pub trait ExecutionHandle: Send {
     fn pid(&self) -> Option<u32>;
@@ -85,6 +91,17 @@ pub trait ExecutionHandle: Send {
         timeout: Duration,
         cancel: tokio::sync::watch::Receiver<bool>,
     ) -> ExecutionWaitFuture;
+}
+
+/// Handle to a running byte pipeline spawned by an execution backend.
+pub trait PipelineExecutionHandle: Send {
+    fn terminate_tree(&mut self) -> Result<(), CoreError>;
+    fn wait_bounded(self: Box<Self>, timeout: Duration) -> PipelineWaitFuture;
+    fn wait_cancelable(
+        self: Box<Self>,
+        timeout: Duration,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> PipelineWaitFuture;
 }
 
 /// Request to spawn a PTY interactive process.
@@ -153,6 +170,16 @@ pub trait ExecutionBackend: Send + Sync {
     }
 
     fn spawn(&self, req: &ExecutionRequest) -> Result<Box<dyn ExecutionHandle>, CoreError>;
+    fn spawn_pipeline(
+        &self,
+        _stages: &[ExecutionRequest],
+    ) -> Result<Box<dyn PipelineExecutionHandle>, CoreError> {
+        Err(CoreError::ExecutionFailedCode {
+            code: omen_core::ErrorCode::Unsupported,
+            message: "the active execution backend does not support supervised byte pipelines"
+                .into(),
+        })
+    }
     fn spawn_pty(
         &self,
         req: &PtyExecutionRequest,
@@ -169,6 +196,242 @@ pub struct NativeExecutionHandle {
     pub job_guard: Option<crate::platform::windows::JobObjectGuard>,
     #[cfg(unix)]
     pub pgid: Option<u32>,
+}
+
+/// A native pipeline is spawned stage-by-stage so each OS pipe connects
+/// directly to the next child's stdin. It is intentionally not a shell
+/// executor: Omen supplies already-resolved argv and owns all supervision.
+pub struct NativePipelineExecutionHandle {
+    requests: Vec<ExecutionRequest>,
+    stages: Vec<NativeExecutionHandle>,
+    stdout_task: Option<tokio::task::JoinHandle<Vec<u8>>>,
+    stderr_tasks: Vec<tokio::task::JoinHandle<Vec<u8>>>,
+    finished: bool,
+}
+
+impl NativePipelineExecutionHandle {
+    fn new(requests: &[ExecutionRequest]) -> Self {
+        Self {
+            requests: requests.to_vec(),
+            stages: Vec::with_capacity(requests.len()),
+            stdout_task: None,
+            stderr_tasks: Vec::with_capacity(requests.len()),
+            finished: false,
+        }
+    }
+
+    fn start(&mut self) -> Result<(), CoreError> {
+        let backend = NativeExecutionBackend::new();
+        let stage_count = self.requests.len();
+        let mut next_stdin = Some(std::process::Stdio::null());
+
+        for (index, request) in self.requests.iter().enumerate() {
+            let stdin = next_stdin.take().ok_or_else(|| {
+                CoreError::ExecutionFailed("native pipeline stdin connection was lost".into())
+            })?;
+            let stage = backend.spawn_with_stdio(request, stdin, std::process::Stdio::piped())?;
+            self.stages.push(stage);
+            let stage = self.stages.last_mut().expect("stage was just inserted");
+
+            if let Some(stderr) = stage.stderr.take() {
+                self.stderr_tasks.push(tokio::spawn(async move {
+                    let mut stderr = stderr;
+                    let mut output = Vec::new();
+                    let _ = tokio::io::AsyncReadExt::read_to_end(&mut stderr, &mut output).await;
+                    output
+                }));
+            }
+
+            if index + 1 < stage_count {
+                let stdout = stage.stdout.take().ok_or_else(|| {
+                    CoreError::ExecutionFailed(
+                        "native pipeline stage did not expose its stdout pipe".into(),
+                    )
+                })?;
+                next_stdin = Some(stdout.try_into().map_err(|error| {
+                    CoreError::ExecutionFailed(format!(
+                        "failed to connect native pipeline stage {index} to stage {}: {error}",
+                        index + 1
+                    ))
+                })?);
+            } else if let Some(mut stdout) = stage.stdout.take() {
+                self.stdout_task = Some(tokio::spawn(async move {
+                    let mut output = Vec::new();
+                    let _ = tokio::io::AsyncReadExt::read_to_end(&mut stdout, &mut output).await;
+                    output
+                }));
+            }
+        }
+
+        self.requests.clear();
+        Ok(())
+    }
+
+    async fn wait_inner(
+        mut self: Box<Self>,
+        timeout: Duration,
+        mut cancel: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> PipelineWaitResult {
+        if self.requests.is_empty() && self.stages.is_empty() {
+            return Err(CoreError::ExecutionFailed(
+                "native pipeline cannot contain zero stages".into(),
+            ));
+        }
+
+        if cancel.as_ref().is_some_and(|flag| *flag.borrow()) {
+            self.finished = true;
+            let exits = vec![
+                ProcessExit {
+                    code: None,
+                    signal: Some("CANCELLED_BEFORE_DISPATCH".into()),
+                };
+                self.requests.len()
+            ];
+            let stderr = vec![Vec::new(); self.requests.len()];
+            return Ok((RuntimeStatus::Cancelled, exits, Vec::new(), stderr));
+        }
+
+        self.start()?;
+
+        let mut waiters = tokio::task::JoinSet::new();
+        let stage_count = self.stages.len();
+        for (index, stage) in self.stages.iter_mut().enumerate() {
+            if let Some(mut child) = stage.child.take() {
+                waiters.spawn(async move { (index, child.wait().await) });
+            }
+        }
+
+        let mut exits = vec![None; stage_count];
+        let mut wait_failed = false;
+        let mut runtime_status = RuntimeStatus::Completed;
+        {
+            let wait_all = async {
+                while let Some(result) = waiters.join_next().await {
+                    match result {
+                        Ok((index, Ok(status))) => {
+                            exits[index] = Some(ProcessExit {
+                                code: status.code(),
+                                signal: None,
+                            });
+                        }
+                        Ok((index, Err(error))) => {
+                            exits[index] = Some(ProcessExit {
+                                code: None,
+                                signal: Some(error.to_string()),
+                            });
+                            wait_failed = true;
+                        }
+                        Err(_) => wait_failed = true,
+                    }
+                }
+            };
+            tokio::pin!(wait_all);
+
+            let termination_status = if let Some(flag) = cancel.as_mut() {
+                tokio::select! {
+                    _ = &mut wait_all => None,
+                    _ = tokio::time::sleep(timeout) => Some(RuntimeStatus::TimedOut),
+                    _ = flag.wait_for(|fired| *fired) => Some(RuntimeStatus::Cancelled),
+                }
+            } else {
+                tokio::select! {
+                    _ = &mut wait_all => None,
+                    _ = tokio::time::sleep(timeout) => Some(RuntimeStatus::TimedOut),
+                }
+            };
+
+            if let Some(status) = termination_status {
+                self.terminate_tree()?;
+                if tokio::time::timeout(CANCEL_TERMINATION_GRACE, &mut wait_all)
+                    .await
+                    .is_err()
+                {
+                    runtime_status = RuntimeStatus::OutcomeUnknown;
+                } else {
+                    runtime_status = status;
+                }
+            }
+        }
+
+        if wait_failed && runtime_status == RuntimeStatus::Completed {
+            runtime_status = RuntimeStatus::IoFailed;
+        }
+        let mut stdout_all = Vec::new();
+        let mut stderr_by_stage = vec![Vec::new(); stage_count];
+        let mut outputs_complete = true;
+        let output_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        if let Some(task) = self.stdout_task.as_mut() {
+            match tokio::time::timeout_at(output_deadline, &mut *task).await {
+                Ok(Ok(output)) => stdout_all = output,
+                _ => {
+                    task.abort();
+                    outputs_complete = false;
+                }
+            }
+        }
+        for (index, task) in self.stderr_tasks.iter_mut().enumerate() {
+            match tokio::time::timeout_at(output_deadline, &mut *task).await {
+                Ok(Ok(output)) => stderr_by_stage[index] = output,
+                _ => {
+                    task.abort();
+                    outputs_complete = false;
+                }
+            }
+        }
+        if !outputs_complete && runtime_status == RuntimeStatus::Completed {
+            runtime_status = RuntimeStatus::IoFailed;
+        }
+
+        let stage_exits = exits
+            .into_iter()
+            .map(|exit| {
+                exit.unwrap_or(ProcessExit {
+                    code: None,
+                    signal: Some("EXIT_UNCONFIRMED".into()),
+                })
+            })
+            .collect();
+
+        self.finished = runtime_status != RuntimeStatus::OutcomeUnknown;
+        Ok((runtime_status, stage_exits, stdout_all, stderr_by_stage))
+    }
+}
+
+impl Drop for NativePipelineExecutionHandle {
+    fn drop(&mut self) {
+        if !self.finished {
+            for stage in &mut self.stages {
+                let _ = stage.terminate_tree();
+            }
+        }
+        if let Some(task) = &self.stdout_task {
+            task.abort();
+        }
+        for task in &self.stderr_tasks {
+            task.abort();
+        }
+    }
+}
+
+impl PipelineExecutionHandle for NativePipelineExecutionHandle {
+    fn terminate_tree(&mut self) -> Result<(), CoreError> {
+        for stage in &mut self.stages {
+            stage.terminate_tree()?;
+        }
+        Ok(())
+    }
+
+    fn wait_bounded(self: Box<Self>, timeout: Duration) -> PipelineWaitFuture {
+        Box::pin(async move { self.wait_inner(timeout, None).await })
+    }
+
+    fn wait_cancelable(
+        self: Box<Self>,
+        timeout: Duration,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> PipelineWaitFuture {
+        Box::pin(async move { self.wait_inner(timeout, Some(cancel)).await })
+    }
 }
 
 impl NativeExecutionHandle {
@@ -423,6 +686,82 @@ impl NativeExecutionBackend {
     pub fn new() -> Self {
         Self
     }
+
+    fn spawn_with_stdio(
+        &self,
+        req: &ExecutionRequest,
+        stdin: std::process::Stdio,
+        stdout: std::process::Stdio,
+    ) -> Result<NativeExecutionHandle, CoreError> {
+        if req.argv.is_empty() {
+            return Err(CoreError::ExecutionFailed("Argv cannot be empty".into()));
+        }
+
+        let mut cmd = tokio::process::Command::new(&req.argv[0]);
+        cmd.args(&req.argv[1..]);
+        cmd.current_dir(&req.cwd);
+        for (key, value) in &req.env {
+            cmd.env(key, value);
+        }
+        for secret in &req.secrets {
+            if let omen_core::SecretInjectionContract::EnvironmentVariable { name } =
+                &secret.contract
+            {
+                cmd.env(name, &secret.value);
+            }
+        }
+        cmd.stdin(stdin);
+        cmd.stdout(stdout);
+        cmd.stderr(std::process::Stdio::piped());
+
+        #[cfg(unix)]
+        cmd.process_group(0);
+
+        #[cfg(windows)]
+        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
+
+        #[cfg(windows)]
+        let job_guard = crate::platform::windows::JobObjectGuard::new().map_err(|error| {
+            CoreError::ExecutionFailed(format!("Job object initialization error: {error}"))
+        })?;
+
+        let mut child = cmd.spawn().map_err(|error| {
+            CoreError::ExecutionFailed(format!(
+                "Process spawn failed for '{}': {error}",
+                req.argv[0]
+            ))
+        })?;
+        let pid = child.id();
+
+        #[cfg(windows)]
+        if let Some(pid) = pid {
+            job_guard.assign_pid(pid).map_err(|error| {
+                let _ = child.start_kill();
+                CoreError::ExecutionFailed(format!(
+                    "Failed to assign PID {pid} to Job Object: {error}"
+                ))
+            })?;
+            job_guard.resume_primary_thread(pid).map_err(|error| {
+                let _ = child.start_kill();
+                CoreError::ExecutionFailed(format!(
+                    "Failed to resume contained PID {pid} after Job Object assignment: {error}"
+                ))
+            })?;
+        }
+
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        Ok(NativeExecutionHandle {
+            pid,
+            child: Some(child),
+            stdout,
+            stderr,
+            #[cfg(windows)]
+            job_guard: Some(job_guard),
+            #[cfg(unix)]
+            pgid: pid,
+        })
+    }
 }
 
 impl Default for NativeExecutionBackend {
@@ -474,29 +813,6 @@ impl ExecutionBackend for NativeExecutionBackend {
     }
 
     fn spawn(&self, req: &ExecutionRequest) -> Result<Box<dyn ExecutionHandle>, CoreError> {
-        if req.argv.is_empty() {
-            return Err(CoreError::ExecutionFailed("Argv cannot be empty".into()));
-        }
-
-        let mut cmd = tokio::process::Command::new(&req.argv[0]);
-        if req.argv.len() > 1 {
-            cmd.args(&req.argv[1..]);
-        }
-        cmd.current_dir(&req.cwd);
-
-        for (k, v) in &req.env {
-            cmd.env(k, v);
-        }
-
-        // Secret injection into environment variables
-        for secret in &req.secrets {
-            if let omen_core::SecretInjectionContract::EnvironmentVariable { name } =
-                &secret.contract
-            {
-                cmd.env(name, &secret.value);
-            }
-        }
-
         // Stdio setup.
         //
         // Closed means the child is not expected to consume caller input.
@@ -513,57 +829,18 @@ impl ExecutionBackend for NativeExecutionBackend {
                 .secrets
                 .iter()
                 .any(|secret| matches!(secret.contract, omen_core::SecretInjectionContract::Stdin));
-        match req.stdin_mode {
-            omen_core::StdioMode::Closed if !stdin_carries_bytes => {
-                cmd.stdin(std::process::Stdio::null());
-            }
+        let stdin = match req.stdin_mode {
+            omen_core::StdioMode::Closed if !stdin_carries_bytes => std::process::Stdio::null(),
             omen_core::StdioMode::Closed | omen_core::StdioMode::Inline => {
-                cmd.stdin(std::process::Stdio::piped());
+                std::process::Stdio::piped()
             }
-            omen_core::StdioMode::Inherit => {
-                cmd.stdin(std::process::Stdio::inherit());
-            }
-            _ => {
-                cmd.stdin(std::process::Stdio::null());
-            }
-        }
-
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-
-        #[cfg(unix)]
-        cmd.process_group(0);
-
-        #[cfg(windows)]
-        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
-
-        #[cfg(windows)]
-        let job_guard = crate::platform::windows::JobObjectGuard::new().map_err(|e| {
-            CoreError::ExecutionFailed(format!("Job object initialization error: {e}"))
-        })?;
-
-        let mut child = cmd.spawn().map_err(|e| {
-            CoreError::ExecutionFailed(format!("Process spawn failed for '{}': {e}", req.argv[0]))
-        })?;
-
-        let pid = child.id();
-
-        #[cfg(windows)]
-        if let Some(p) = pid {
-            job_guard.assign_pid(p).map_err(|e| {
-                let _ = child.start_kill();
-                CoreError::ExecutionFailed(format!("Failed to assign PID {p} to Job Object: {e}"))
-            })?;
-            job_guard.resume_primary_thread(p).map_err(|e| {
-                let _ = child.start_kill();
-                CoreError::ExecutionFailed(format!(
-                    "Failed to resume contained PID {p} after Job Object assignment: {e}"
-                ))
-            })?;
-        }
+            omen_core::StdioMode::Inherit => std::process::Stdio::inherit(),
+            _ => std::process::Stdio::null(),
+        };
+        let mut handle = self.spawn_with_stdio(req, stdin, std::process::Stdio::piped())?;
 
         // Write stdin payload and stdin secrets
-        if let Some(mut stdin) = child.stdin.take() {
+        if let Some(mut stdin) = handle.child.as_mut().and_then(|child| child.stdin.take()) {
             let mut stdin_bytes = req.stdin_payload.clone().unwrap_or_default();
             for secret in &req.secrets {
                 if let omen_core::SecretInjectionContract::Stdin = &secret.contract {
@@ -582,19 +859,42 @@ impl ExecutionBackend for NativeExecutionBackend {
             }
         }
 
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
+        Ok(Box::new(handle))
+    }
 
-        Ok(Box::new(NativeExecutionHandle {
-            pid,
-            child: Some(child),
-            stdout,
-            stderr,
-            #[cfg(windows)]
-            job_guard: Some(job_guard),
-            #[cfg(unix)]
-            pgid: pid,
-        }))
+    fn spawn_pipeline(
+        &self,
+        stages: &[ExecutionRequest],
+    ) -> Result<Box<dyn PipelineExecutionHandle>, CoreError> {
+        if stages.is_empty() {
+            return Err(CoreError::ExecutionFailed(
+                "native pipeline cannot contain zero stages".into(),
+            ));
+        }
+        for (index, stage) in stages.iter().enumerate() {
+            if stage.argv.is_empty() {
+                return Err(CoreError::ExecutionFailed(format!(
+                    "native pipeline stage {index} has empty argv"
+                )));
+            }
+            if stage.stdin_payload.is_some() || !stage.secrets.is_empty() {
+                return Err(CoreError::ExecutionFailedCode {
+                    code: omen_core::ErrorCode::Unsupported,
+                    message: format!(
+                        "native pipeline stage {index} cannot use inline stdin payloads or secrets"
+                    ),
+                });
+            }
+            if !matches!(stage.stdin_mode, omen_core::StdioMode::Closed) {
+                return Err(CoreError::ExecutionFailedCode {
+                    code: omen_core::ErrorCode::Unsupported,
+                    message: format!(
+                        "native pipeline stage {index} requires closed stdin semantics"
+                    ),
+                });
+            }
+        }
+        Ok(Box::new(NativePipelineExecutionHandle::new(stages)))
     }
 
     fn spawn_pty(
@@ -727,6 +1027,34 @@ impl ExecutionBackend for WslExecutionBackend {
         translated_req.argv = wsl_argv;
 
         NativeExecutionBackend::new().spawn(&translated_req)
+    }
+
+    fn spawn_pipeline(
+        &self,
+        stages: &[ExecutionRequest],
+    ) -> Result<Box<dyn PipelineExecutionHandle>, CoreError> {
+        if !Self::is_available() {
+            return Err(CoreError::ExecutionFailed(
+                "WSL backend is unavailable on this system".into(),
+            ));
+        }
+
+        let translated = stages
+            .iter()
+            .map(|stage| {
+                let mut request = stage.clone();
+                let mut argv = vec![
+                    "wsl.exe".to_string(),
+                    "--cd".to_string(),
+                    to_wsl_path(&stage.cwd),
+                    "-e".to_string(),
+                ];
+                argv.extend(stage.argv.iter().cloned());
+                request.argv = argv;
+                request
+            })
+            .collect::<Vec<_>>();
+        NativeExecutionBackend::new().spawn_pipeline(&translated)
     }
 
     fn spawn_pty(

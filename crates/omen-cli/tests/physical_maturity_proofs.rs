@@ -3,11 +3,12 @@ use omen_core::{
     RuntimeStatus, StdioMode,
 };
 use omen_daemon::{DaemonServer, PtySessionManager};
-use omen_engine::{
-    ExecutionBackend, ExecutionRequest, ExecutionSecret, ProcessSupervisor, WslExecutionBackend,
-};
+#[cfg(windows)]
+use omen_engine::ExecutionBackend;
+use omen_engine::{ExecutionRequest, ExecutionSecret, ProcessSupervisor, WslExecutionBackend};
 use omen_knowledge::{ContentAddressedStore, Database};
 use std::path::PathBuf;
+#[cfg(windows)]
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::tempdir;
@@ -531,6 +532,7 @@ async fn test_proof_d_containment_real_path() {
 }
 
 /// PROOF E: Real Non-Native Execution Backend (WSL on Windows) Real Path
+#[cfg(windows)]
 #[tokio::test]
 async fn test_proof_e_non_native_wsl_backend_real_path() {
     if !WslExecutionBackend::is_available() {
@@ -576,6 +578,12 @@ async fn test_proof_e_non_native_wsl_backend_real_path() {
         stdout.contains("hello-from-wsl-kernel"),
         "WSL backend must return command output, got: {stdout}"
     );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn test_wsl_backend_is_unavailable_off_windows() {
+    assert!(!WslExecutionBackend::is_available());
 }
 
 /// PROOF F: Secret Injection and Output Redaction Real Path
