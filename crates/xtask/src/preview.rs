@@ -489,16 +489,7 @@ fn fixture_hashes_at(base: &Path) -> Result<std::collections::BTreeMap<String, S
     Ok(m)
 }
 fn install_root() -> PathBuf {
-    dirs_local().join("Omen")
-}
-fn dirs_local() -> PathBuf {
-    std::env::var_os(if cfg!(windows) {
-        "LOCALAPPDATA"
-    } else {
-        "HOME"
-    })
-    .map(PathBuf::from)
-    .unwrap_or_else(|| PathBuf::from("."))
+    omen_lifecycle::state::state_base_dir()
 }
 fn state_path() -> PathBuf {
     install_root().join("state").join("installed.json")
@@ -1898,6 +1889,15 @@ fn promote(root: &Path, expected: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn preview_conveyor_uses_the_canonical_lifecycle_state_base() {
+        assert_eq!(
+            install_root(),
+            omen_lifecycle::state::state_base_dir(),
+            "conveyor slots, state, and lifecycle pointers must share one root",
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn installed_executables_have_execute_permissions() {
