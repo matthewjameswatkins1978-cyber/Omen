@@ -196,6 +196,13 @@ If it is **APPROVED WITH CONDITIONS**, perform the bounded licence/provenance ch
 
 If it is **EXTERNAL / REFERENCE ONLY BY DEFAULT**, do not copy its copyleft-covered source into Omen without an explicit licensing decision.
 
+## Process supervision reuse evaluation — 5 October 2026
+
+Evaluated [`process-wrap` 10.0.1](https://docs.rs/crate/process-wrap/10.0.1), dual-licensed MIT/Apache-2.0, with a Tokio 1 frontend. Its composable wrappers cover Windows Job Objects (including suspended creation, assignment, then resume) and Unix process groups/sessions. Its `Child` wrappers provide group-aware termination. The crate MSRV is 1.87, below Omen's declared 1.98.1.
+
+Omen's native non-PTY backend already creates a Unix process group and uses a Windows Job Object with a suspended-create/assign/resume barrier. The separate PTY/ConPTY backend has its own raw platform launch and containment path. `process-wrap` is therefore a strong reuse candidate for the native backend, but is not a drop-in replacement for the PTY path. Replacing only one path without a cross-path acceptance spike risks keeping two subtly different containment implementations; replacing the PTY launch is explicitly outside this shell increment.
+
+Decision: **evaluate for reuse; do not add the dependency or copy code in this P0 interactive-job increment.** Before adopting it, run a bounded Windows/Linux spike against Omen's existing process-tree cancellation, timeout, stream-drain, descendant-containment, and exact process-identity tests; separately preserve the existing PTY/ConPTY acceptance. No process-wrap code has been copied or linked into Omen, and no third-party notice is required yet.
 ## Provenance requirements
 
 When Omen borrows or adapts code, keep provenance visible.
