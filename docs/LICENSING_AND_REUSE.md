@@ -148,6 +148,24 @@ It is deliberately stricter than asking whether Omen may execute a tool.
 
 Before reimplementing commodity shell/tool behaviour, consult this matrix.
 
+## Portable-shell parser reuse — 5 October 2026
+
+Omen's interactive crate pins [`deno_task_shell` 0.33.3](https://github.com/denoland/deno_task_shell/tree/0.33.3)
+from upstream commit `8c0d728c22512f799e9ec6974826d915507b4795` (MIT). Cargo
+disables default features, so the dependency contributes the parser and its
+`monch` parser-combinator dependency only; Omen does not enable or call Deno's
+shell executor.
+
+`omen-interactive::shell_grammar` lowers parser output into Omen-owned syntax
+nodes and explicitly rejects unsupported constructs such as subshells,
+negated pipelines, combined `|&` pipelines, and brace expansion. Omen retains
+ownership of expansion, alias resolution, execution planning, authority,
+physical process dispatch, and runtime truth. Because upstream currently
+parses `$NAME` but leaves `${NAME}` as text, the adapter normalizes valid
+braced identifiers outside single quotes before parsing. Multiple redirects
+on one command are not accepted by the upstream parser yet; the parser tests
+record that as an uncovered P0 compatibility case, not as supported syntax.
+
 If the relevant upstream is **APPROVED**, reuse should be actively considered before writing a fresh implementation.
 
 If it is **APPROVED WITH CONDITIONS**, perform the bounded licence/provenance check and reuse it when those conditions are satisfied.

@@ -14,6 +14,7 @@ pub mod resolver;
 pub mod semantic_service;
 pub mod services;
 pub mod session;
+pub mod shell_grammar;
 
 pub use actions::SemanticDispatcher;
 pub use ai_lane::{AiLaneDispatchStats, AiLaneDispatcher, AiLaneOutput};
