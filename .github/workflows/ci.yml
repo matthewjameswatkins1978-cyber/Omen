@@ -332,10 +332,10 @@ jobs:
             work/provenance.json
 
   preview-lifecycle-proof:
-    # Hosted Preview 23 -> 24 -> 23 -> 24 proof on the exact candidate
+    # Hosted Preview 23 -> 25 -> 23 -> 25 proof on the exact candidate
     # (Lucy ruling). Uses each version's own conveyor (--artifact installs,
     # slot machine, conveyor rollback); asserts exact binary identities,
-    # release records, slot preservation, sentinel user state, and the P24
+    # release records, slot preservation, sentinel user state, and the P25
     # companion binding at every transition. Companion activation is
     # on-demand and fetch-verified (see fetch tests + gate E2E); this job
     # proves no stale companion can be active across transitions, and that
@@ -365,7 +365,7 @@ jobs:
         run: |
           rustup toolchain install 1.98.1 --profile minimal
           rustup default 1.98.1
-      - name: Download Preview 24 candidate
+      - name: Download Preview 25 candidate
         uses: actions/download-artifact@v4
         with:
           name: omen-preview-candidate-windows-x86_64
@@ -379,15 +379,15 @@ jobs:
       - name: Build Preview 23 baseline package
         working-directory: omen-p23
         run: cargo run --package xtask -- preview package
-      - name: Run 23-24-23-24 lifecycle proof
+      - name: Run 23-25-23-25 lifecycle proof
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           function Xtask { param([string[]]$a) cargo run --package xtask -- @a; if ($LASTEXITCODE -ne 0) { throw "XTASK_FAILED: $($a -join ' ')" } }
           $p23zip = (Get-ChildItem -LiteralPath omen-p23/work -Filter 'omen-0.9.0-preview.23-*.zip' -File | Select-Object -First 1).FullName
           if (-not $p23zip) { throw "P23_PACKAGE_MISSING" }
-          $p24zip = (Get-ChildItem -LiteralPath work -Filter 'omen-0.9.0-preview.24-windows-x86_64.zip' -File | Select-Object -First 1).FullName
-          if (-not $p24zip) { throw "P24_PACKAGE_MISSING" }
+          $p25zip = (Get-ChildItem -LiteralPath work -Filter 'omen-0.9.0-preview.25-windows-x86_64.zip' -File | Select-Object -First 1).FullName
+          if (-not $p25zip) { throw "P25_PACKAGE_MISSING" }
           $bin = Join-Path $env:LOCALAPPDATA 'Omen\bin\omen.exe'
           function Assert-Doctor($ver, $sha, $phase) {
             $out = & $bin doctor 2>&1 | Out-String
@@ -406,12 +406,12 @@ jobs:
           Push-Location omen-p23
           try { Xtask @('preview','install','--artifact', "work/$((Split-Path -Leaf $p23zip))") } finally { Pop-Location }
           $sentinel = Join-Path $env:LOCALAPPDATA 'Omen\h2-lifecycle-sentinel.txt'
-          'user-state-must-survive-23-24-23-24' | Set-Content -NoNewline $sentinel
+          'user-state-must-survive-23-25-23-25' | Set-Content -NoNewline $sentinel
           Assert-Doctor '0.9.0-preview.23' '6987c5842b3c9afaa81ca78a83ad66bf72c361d5' 'p23-install'
-          # 23 -> 24: update with the H2 conveyor.
-          Xtask @('preview','install','--artifact', $p24zip)
-          Assert-Doctor '0.9.0-preview.24' $env:H2_SHA 'p24-update'
-          Assert-Status '0.9.0-preview.24' $env:H2_SHA 'p24-update'
+          # 23 -> 25: update with the H2 conveyor.
+          Xtask @('preview','install','--artifact', $p25zip)
+          Assert-Doctor '0.9.0-preview.25' $env:H2_SHA 'p25-update'
+          Assert-Status '0.9.0-preview.25' $env:H2_SHA 'p25-update'
           # Companion binding: release manifest pins the verified companion.
           $rel = Get-Content work/omen-release.json | ConvertFrom-Json
           $compZip = (Get-ChildItem -LiteralPath work -Filter 'omen-*-gate-companion-*.zip' -File | Select-Object -First 1).FullName
@@ -419,14 +419,14 @@ jobs:
           $compHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $compZip).Hash.ToLowerInvariant()
           if ($compHash -ne $rel.gate_companion_sha256.ToLowerInvariant()) { throw "GATE_COMPANION_DIGEST_MISMATCH" }
           if ($rel.gate_tethers_sha.ToLowerInvariant() -ne '7e29110319c554a6586865ec6c47a45498696d16') { throw "GATE_TETHERS_SHA_MISMATCH" }
-          "p24-update companion binding: PASS"
+          "p25-update companion binding: PASS"
           # No stale companion active: fetch is on-demand; a live dir must be
-          # absent or carry exactly the P24 SHAs (P23 never ships one).
+          # absent or carry exactly the P25 SHAs (P23 never ships one).
           $compLive = Join-Path $env:LOCALAPPDATA 'Omen\gate-companion'
           if (Test-Path $compLive) {
             $prov = Get-Content (Join-Path $compLive 'provenance.json') | ConvertFrom-Json
             if ($prov.gate_exe_sha256.ToLowerInvariant() -ne $rel.gate_exe_sha256.ToLowerInvariant()) { throw "STALE_COMPANION_ACTIVE" }
-            "companion live with P24 identity: PASS"
+            "companion live with P25 identity: PASS"
           } else {
             "companion live dir absent (fetch on-demand): PASS"
           }
@@ -434,18 +434,18 @@ jobs:
           $slots = (Get-ChildItem -LiteralPath (Join-Path $env:LOCALAPPDATA 'Omen\versions') -Directory).Count
           if ($slots -lt 2) { throw "SLOT_NOT_PRESERVED: $slots" }
           "slots preserved: PASS ($slots)"
-          if ((Get-Content $sentinel -Raw) -ne 'user-state-must-survive-23-24-23-24') { throw "USER_STATE_LOST" }
+          if ((Get-Content $sentinel -Raw) -ne 'user-state-must-survive-23-25-23-25') { throw "USER_STATE_LOST" }
           "user state preserved: PASS"
-          # 24 -> 23: conveyor rollback re-activates the P23 slot.
+          # 25 -> 23: conveyor rollback re-activates the P23 slot.
           Xtask @('preview','rollback')
-          Assert-Doctor '0.9.0-preview.23' '6987c5842b3c9afaa81ca78a83ad66bf72c361d5' 'p24-rollback'
-          Assert-Status '0.9.0-preview.23' '6987c5842b3c9afaa81ca78a83ad66bf72c361d5' 'p24-rollback'
-          if ((Get-Content $sentinel -Raw) -ne 'user-state-must-survive-23-24-23-24') { throw "USER_STATE_LOST_ROLLBACK" }
-          # 23 -> 24: restore via the accepted install mechanism.
-          Xtask @('preview','install','--artifact', $p24zip)
-          Assert-Doctor '0.9.0-preview.24' $env:H2_SHA 'p24-restore'
-          Assert-Status '0.9.0-preview.24' $env:H2_SHA 'p24-restore'
-          if ((Get-Content $sentinel -Raw) -ne 'user-state-must-survive-23-24-23-24') { throw "USER_STATE_LOST_RESTORE" }
+          Assert-Doctor '0.9.0-preview.23' '6987c5842b3c9afaa81ca78a83ad66bf72c361d5' 'p25-rollback'
+          Assert-Status '0.9.0-preview.23' '6987c5842b3c9afaa81ca78a83ad66bf72c361d5' 'p25-rollback'
+          if ((Get-Content $sentinel -Raw) -ne 'user-state-must-survive-23-25-23-25') { throw "USER_STATE_LOST_ROLLBACK" }
+          # 23 -> 25: restore via the accepted install mechanism.
+          Xtask @('preview','install','--artifact', $p25zip)
+          Assert-Doctor '0.9.0-preview.25' $env:H2_SHA 'p25-restore'
+          Assert-Status '0.9.0-preview.25' $env:H2_SHA 'p25-restore'
+          if ((Get-Content $sentinel -Raw) -ne 'user-state-must-survive-23-25-23-25') { throw "USER_STATE_LOST_RESTORE" }
           # Authority stays truthfully fail-closed after the full cycle: no
           # companion is fetched here, so exec must refuse (never allow).
           # Spec is semantic-only (no argv — the resolver owns physical
@@ -459,7 +459,7 @@ jobs:
           if ($LASTEXITCODE -eq 0) { throw "AUTHORITY_FABRICATED_AFTER_CYCLE :: $authOut" }
           if ($authOut -notmatch 'companion') { throw "AUTHORITY_FAILURE_NOT_TRUTHFUL :: $authOut" }
           "authority fail-closed after cycle: PASS"
-          "LIFECYCLE_23_24_23_24: PASS"
+          "LIFECYCLE_23_25_23_25: PASS"
           # The fail-closed authority probe above exits nonzero by design;
           # every assertion passed, so close the step green explicitly.
           exit 0
