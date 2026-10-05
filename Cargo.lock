@@ -1168,7 +1168,7 @@ dependencies = [
 
 [[package]]
 name = "omen-discovery"
-version = "0.9.0-preview.22"
+version = "0.9.0-preview.23"
 dependencies = [
  "chrono",
  "serde",
