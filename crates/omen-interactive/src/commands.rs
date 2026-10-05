@@ -37,6 +37,7 @@ pub const OMEN_ACTIONS: &[&str] = &[
     "history",
     "how",
     "inspect",
+    "jobs",
     "orient",
     "packages",
     "plan",

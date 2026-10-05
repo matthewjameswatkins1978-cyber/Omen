@@ -7,6 +7,12 @@ use omen_ui::{HumanSettings, TerminalCapabilities};
 use reedline::Signal;
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundJobInfo {
+    pub request_id: String,
+    pub execution_id: String,
+}
+
 pub struct InteractiveSession {
     pub session_id: InteractiveSessionId,
     pub workspace_root: PathBuf,
@@ -18,6 +24,7 @@ pub struct InteractiveSession {
     pub db: Option<Database>,
     pub comp_ctx: std::sync::Arc<std::sync::Mutex<crate::completion::CompletionContext>>,
     pub client: Option<omen_client::OmenClient>,
+    background_jobs: Vec<BackgroundJobInfo>,
     pub agent_provider: Option<std::sync::Arc<dyn omen_agent::AgentProvider>>,
     pub agent_registry: std::sync::Arc<omen_agent::ProviderRegistry>,
     pub backend_registry: std::sync::Arc<omen_engine::BackendRegistry>,
@@ -178,6 +185,7 @@ impl InteractiveSession {
             caps,
             prompt,
             last_exit: None,
+            background_jobs: Vec::new(),
             db,
             comp_ctx,
             client,
@@ -189,6 +197,10 @@ impl InteractiveSession {
         sess.prompt.apply_settings(sess.human_settings.clone());
         sess.update_prompt_state();
         Ok(sess)
+    }
+
+    pub fn tracked_background_jobs(&self) -> &[BackgroundJobInfo] {
+        &self.background_jobs
     }
 
     pub fn with_agent_provider(
@@ -265,6 +277,7 @@ impl InteractiveSession {
             }
         }
 
+        self.cancel_background_jobs_on_exit();
         Ok(())
     }
 
@@ -409,15 +422,25 @@ impl InteractiveSession {
                 Ok(exit)
             }
             crate::grammar::InputLane::SemanticAction { action, args } => {
-                let res = crate::actions::SemanticDispatcher::dispatch(
-                    &action,
-                    &args,
-                    &self.cwd,
-                    &self.session_id,
-                    self.db.as_mut(),
-                    Some(&self.agent_registry),
-                    Some(&self.backend_registry),
-                );
+                let res = if action == "jobs" {
+                    self.dispatch_background_jobs()
+                } else if action == "stop"
+                    && args
+                        .first()
+                        .is_some_and(|target| target.starts_with("exec_"))
+                {
+                    self.dispatch_background_stop(&args[0])
+                } else {
+                    crate::actions::SemanticDispatcher::dispatch(
+                        &action,
+                        &args,
+                        &self.cwd,
+                        &self.session_id,
+                        self.db.as_mut(),
+                        Some(&self.agent_registry),
+                        Some(&self.backend_registry),
+                    )
+                };
                 if let Ok(exit) = &res {
                     self.last_exit = Some(exit.clone());
                 }
@@ -673,18 +696,12 @@ impl InteractiveSession {
         &mut self,
         line: crate::shell_grammar::ShellLine,
     ) -> Result<ProcessExit, CoreError> {
-        let unsupported = |message: String| CoreError::ExecutionFailedCode {
-            code: omen_core::ErrorCode::Unsupported,
-            message,
-        };
         let mut status = ProcessExit::success(0);
 
         for item in line.items {
             if item.backgrounded {
-                return Err(unsupported(
-                    "background execution is not available in the portable shell dispatcher yet"
-                        .into(),
-                ));
+                status = self.dispatch_background_item(&item.sequence)?;
+                continue;
             }
 
             match item.sequence {
@@ -708,6 +725,239 @@ impl InteractiveSession {
         Ok(status)
     }
 
+    fn dispatch_background_item(
+        &mut self,
+        sequence: &crate::shell_grammar::ShellSequence,
+    ) -> Result<ProcessExit, CoreError> {
+        let unsupported = |message: String| CoreError::ExecutionFailedCode {
+            code: omen_core::ErrorCode::Unsupported,
+            message,
+        };
+        let crate::shell_grammar::ShellSequence::BooleanChain { first, rest } = sequence;
+        if !rest.is_empty() {
+            return Err(unsupported(
+                "background execution currently accepts a command or pipeline, not a boolean chain"
+                    .into(),
+            ));
+        }
+        if self.background_jobs.len() >= 128 {
+            return Err(unsupported(
+                "this interactive session has reached its 128 tracked background-job limit".into(),
+            ));
+        }
+        let stages = self.prepare_shell_pipeline_stages(first)?;
+        let client = self
+            .client
+            .as_ref()
+            .filter(|client| client.is_connected())
+            .ok_or_else(|| {
+                unsupported(
+                    "background execution requires a connected Omen daemon; standalone mode refuses detached work"
+                        .into(),
+                )
+            })?;
+
+        let cwd = self.cwd.to_string_lossy().to_string();
+        let submission = if stages.len() == 1 && stages[0].env.is_empty() {
+            let stage = &stages[0];
+            block_on_async(client.submit_background_execution(
+                stage.argv[0].clone(),
+                "",
+                stage.argv.iter().skip(1).cloned().collect(),
+                cwd,
+                60000,
+            ))
+        } else {
+            block_on_async(client.submit_background_pipeline(stages, cwd, 60000))
+        }
+        .map_err(|error| CoreError::Internal(format!("Background broker error: {error}")))?;
+
+        let (request_id, execution_id) = match submission {
+            omen_client::BackgroundExecutionSubmission::Accepted {
+                consequential_request_id,
+                execution_id,
+            } => {
+                println!("Started background job {execution_id}.");
+                (consequential_request_id, execution_id)
+            }
+            omen_client::BackgroundExecutionSubmission::Finished {
+                consequential_request_id,
+                summary,
+            } => {
+                println!(
+                    "Background job {} finished immediately with {:?}",
+                    summary.execution_id, summary.runtime_status
+                );
+                if !summary.stdout_preview.is_empty() {
+                    print!("{}", summary.stdout_preview);
+                }
+                if !summary.stderr_preview.is_empty() {
+                    eprint!("{}", summary.stderr_preview);
+                }
+                (consequential_request_id, summary.execution_id)
+            }
+        };
+        self.background_jobs.push(BackgroundJobInfo {
+            request_id,
+            execution_id,
+        });
+        Ok(ProcessExit::success(0))
+    }
+
+    fn prepare_shell_pipeline_stages(
+        &self,
+        pipeline: &crate::shell_grammar::ShellPipeline,
+    ) -> Result<Vec<omen_ipc::PipelineStageRequest>, CoreError> {
+        let unsupported = |message: String| CoreError::ExecutionFailedCode {
+            code: omen_core::ErrorCode::Unsupported,
+            message,
+        };
+        let mut stages = Vec::with_capacity(pipeline.commands.len());
+        for command in &pipeline.commands {
+            if !command.redirects.is_empty() {
+                return Err(unsupported(
+                    "redirection requires the supervised redirection dispatcher".into(),
+                ));
+            }
+            let mut env = Vec::with_capacity(command.environment.len());
+            for assignment in &command.environment {
+                let expanded = crate::shell_grammar::expand_word(&assignment.value, &self.cwd)
+                    .map_err(|error| {
+                        unsupported(format!("environment assignment expansion failed: {error}"))
+                    })?;
+                let value = match expanded.as_slice() {
+                    [value] => value.clone(),
+                    _ => {
+                        return Err(unsupported(format!(
+                            "environment assignment '{}' must expand to exactly one value",
+                            assignment.name
+                        )));
+                    }
+                };
+                env.push((assignment.name.clone(), value));
+            }
+
+            let mut argv = Vec::new();
+            for word in &command.words {
+                argv.extend(crate::shell_grammar::expand_word(word, &self.cwd).map_err(
+                    |error| unsupported(format!("shell word expansion failed: {error}")),
+                )?);
+            }
+            let argv = crate::commands::expand_shell_alias(&argv);
+            let argv = crate::resolver::ReferenceResolver::resolve_argv(
+                &argv,
+                &self.session_id,
+                self.db.as_ref(),
+            );
+            let Some(program) = argv.first() else {
+                return Err(unsupported(
+                    "every pipeline stage must contain an executable".into(),
+                ));
+            };
+            if program == "cd" {
+                return Err(unsupported(
+                    "the Omen cd intrinsic cannot run as a pipeline stage".into(),
+                ));
+            }
+            if ChildHandoff::classify(&argv)
+                == crate::child::ChildClassification::InteractiveHandoff
+            {
+                return Err(unsupported(
+                    "interactive terminal handoff cannot run inside a portable shell expression yet".into(),
+                ));
+            }
+            if let Some(blast) = crate::preflight::BlastPreflight::assess(&argv) {
+                println!(
+                    "[Preflight Warning: {:?}] Command '{}' will affect: {}",
+                    blast.severity, blast.command, blast.summary
+                );
+            }
+            stages.push(omen_ipc::PipelineStageRequest { argv, env });
+        }
+        Ok(stages)
+    }
+
+    fn dispatch_background_jobs(&self) -> Result<ProcessExit, CoreError> {
+        if self.background_jobs.is_empty() {
+            println!("No background jobs tracked in this interactive session.");
+            return Ok(ProcessExit::success(0));
+        }
+        let client = self
+            .client
+            .as_ref()
+            .filter(|client| client.is_connected())
+            .ok_or_else(|| CoreError::Internal("Omen daemon is not connected".into()))?;
+        for job in &self.background_jobs {
+            let status =
+                block_on_async(client.query_request_status(&job.request_id)).map_err(|error| {
+                    CoreError::Internal(format!("Job status query failed: {error}"))
+                })?;
+            println!("{} [{:?}]", job.execution_id, status.status);
+        }
+        Ok(ProcessExit::success(0))
+    }
+
+    fn dispatch_background_stop(&self, execution_id: &str) -> Result<ProcessExit, CoreError> {
+        if !self
+            .background_jobs
+            .iter()
+            .any(|job| job.execution_id == execution_id)
+        {
+            eprintln!(
+                "No background job with execution ID '{execution_id}' is tracked by this session."
+            );
+            return Ok(ProcessExit {
+                code: Some(1),
+                signal: None,
+            });
+        }
+        let client = self
+            .client
+            .as_ref()
+            .filter(|client| client.is_connected())
+            .ok_or_else(|| CoreError::Internal("Omen daemon is not connected".into()))?;
+        let record = block_on_async(client.cancel_execution(execution_id.to_string()))
+            .map_err(|error| CoreError::Internal(format!("Job cancellation failed: {error}")))?;
+        println!("{}: {:?}", record.execution_id, record.outcome);
+        let succeeded = matches!(
+            record.outcome,
+            omen_ipc::CancelOutcome::TerminationConfirmed
+                | omen_ipc::CancelOutcome::DispatchPrevented
+                | omen_ipc::CancelOutcome::AlreadyFinished { .. }
+        );
+        Ok(ProcessExit {
+            code: Some(if succeeded { 0 } else { 1 }),
+            signal: None,
+        })
+    }
+
+    fn cancel_background_jobs_on_exit(&self) {
+        let Some(client) = self.client.as_ref().filter(|client| client.is_connected()) else {
+            return;
+        };
+        for job in &self.background_jobs {
+            match block_on_async(client.query_request_status(&job.request_id)) {
+                Ok(status) if status.status == omen_ipc::ExecutionStatusCode::Running => {
+                    match block_on_async(client.cancel_execution(job.execution_id.clone())) {
+                        Ok(record) => eprintln!(
+                            "Omen exit requested stop for background job {}: {:?}",
+                            job.execution_id, record.outcome
+                        ),
+                        Err(error) => eprintln!(
+                            "Could not stop background job {} during Omen exit; it may remain running: {error}",
+                            job.execution_id
+                        ),
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => eprintln!(
+                    "Could not inspect background job {} during Omen exit; it may remain running: {error}",
+                    job.execution_id
+                ),
+            }
+        }
+    }
+
     fn dispatch_shell_pipeline(
         &mut self,
         pipeline: &crate::shell_grammar::ShellPipeline,
@@ -723,73 +973,7 @@ impl InteractiveSession {
                 .any(|command| !command.environment.is_empty());
 
         if needs_pipeline_dispatch {
-            let mut stages = Vec::with_capacity(pipeline.commands.len());
-            for command in &pipeline.commands {
-                if !command.redirects.is_empty() {
-                    return Err(unsupported(
-                        "redirection requires the supervised redirection dispatcher".into(),
-                    ));
-                }
-
-                let mut env = Vec::with_capacity(command.environment.len());
-                for assignment in &command.environment {
-                    let expanded = crate::shell_grammar::expand_word(&assignment.value, &self.cwd)
-                        .map_err(|error| {
-                            unsupported(format!("environment assignment expansion failed: {error}"))
-                        })?;
-                    let value = match expanded.as_slice() {
-                        [value] => value.clone(),
-                        _ => {
-                            return Err(unsupported(format!(
-                                "environment assignment '{}' must expand to exactly one value",
-                                assignment.name
-                            )));
-                        }
-                    };
-                    env.push((assignment.name.clone(), value));
-                }
-
-                let mut argv = Vec::new();
-                for word in &command.words {
-                    argv.extend(crate::shell_grammar::expand_word(word, &self.cwd).map_err(
-                        |error| unsupported(format!("shell word expansion failed: {error}")),
-                    )?);
-                }
-                let argv = crate::commands::expand_shell_alias(&argv);
-                let argv = crate::resolver::ReferenceResolver::resolve_argv(
-                    &argv,
-                    &self.session_id,
-                    self.db.as_ref(),
-                );
-                let Some(program) = argv.first() else {
-                    return Err(unsupported(
-                        "every pipeline stage must contain an executable".into(),
-                    ));
-                };
-
-                if program == "cd" {
-                    return Err(unsupported(
-                        "the Omen `cd` intrinsic cannot run as a pipeline stage".into(),
-                    ));
-                }
-                if ChildHandoff::classify(&argv)
-                    == crate::child::ChildClassification::InteractiveHandoff
-                {
-                    return Err(unsupported(
-                        "interactive terminal handoff cannot run inside a portable shell expression yet"
-                            .into(),
-                    ));
-                }
-                if let Some(blast) = crate::preflight::BlastPreflight::assess(&argv) {
-                    println!(
-                        "[Preflight Warning: {:?}] Command '{}' will affect: {}",
-                        blast.severity, blast.command, blast.summary
-                    );
-                }
-
-                stages.push(omen_ipc::PipelineStageRequest { argv, env });
-            }
-
+            let stages = self.prepare_shell_pipeline_stages(pipeline)?;
             return self.execute_pipeline_via_broker(stages, None);
         }
 

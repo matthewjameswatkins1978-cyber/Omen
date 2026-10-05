@@ -10,6 +10,26 @@ use omen_ipc::{EventPayload, PlatformStream};
 use omen_knowledge::{Database, canonical_workspace_db_path};
 use omen_test_fixtures::{INTEGRATION_TIMEOUT, run_with_test_timeout};
 
+fn gremlin_exe() -> std::path::PathBuf {
+    let mut path = std::env::current_exe().expect("failed to get current_exe");
+    path.pop();
+    if path.ends_with("deps") {
+        path.pop();
+    }
+    let name = if cfg!(windows) {
+        "omen-gremlin.exe"
+    } else {
+        "omen-gremlin"
+    };
+    let exe = path.join(name);
+    assert!(
+        exe.exists(),
+        "omen-gremlin fixture must be built: {}",
+        exe.display()
+    );
+    exe
+}
+
 async fn spawn_connected_session(
     daemon: &Arc<DaemonServer>,
     ws_path: &std::path::Path,
@@ -42,6 +62,37 @@ async fn spawn_connected_session(
     let session_id = InteractiveSessionId::new(session_id_str).unwrap();
     InteractiveSession::new_with_client(session_id, ws_path.to_path_buf(), Some(db), Some(client))
         .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_background_shell_refuses_standalone_and_boolean_chain_jobs() {
+    let temp = tempdir().unwrap();
+    let db_path = canonical_workspace_db_path(temp.path());
+    let db = Database::open(&db_path).unwrap();
+    let session_id = InteractiveSessionId::new("sess_shell_background_standalone").unwrap();
+    let mut session =
+        InteractiveSession::new_with_client(session_id, temp.path().to_path_buf(), Some(db), None)
+            .unwrap();
+
+    for input in ["echo first && echo second &", "echo standalone &"] {
+        let error = session
+            .dispatch_input(input)
+            .expect_err("unsupported background requests must fail closed");
+        assert!(
+            matches!(
+                error,
+                omen_core::CoreError::ExecutionFailedCode {
+                    code: omen_core::ErrorCode::Unsupported,
+                    ..
+                }
+            ),
+            "expected explicit unsupported result for {input:?}, got {error:?}"
+        );
+        assert!(
+            session.tracked_background_jobs().is_empty(),
+            "a refused background request must not be recorded as a job"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -117,6 +168,52 @@ async fn test_real_interactive_shell_routes_execution_through_daemon_once() {
                 .expect("Execution history must exist");
             assert_eq!(last.command, "cargo --version");
             assert_eq!(last.exit_code, Some(0));
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_real_interactive_shell_background_broker_jobs_and_stop() {
+    run_with_test_timeout(
+        "test_real_interactive_shell_background_broker_jobs_and_stop",
+        INTEGRATION_TIMEOUT,
+        |ctx| async move {
+            ctx.phase("START_DAEMON_AND_SESSION");
+            let temp = tempdir().unwrap();
+            let daemon = Arc::new(DaemonServer::new(Some(
+                "duplex://real_shell_background".into(),
+            )));
+            let mut session =
+                spawn_connected_session(&daemon, temp.path(), "sess_shell_background").await;
+
+            ctx.phase("SUBMIT_BACKGROUND_SHELL_COMMAND");
+            let gremlin = gremlin_exe().to_string_lossy().replace('\\', "/");
+            let command = format!("\"{gremlin}\" --sleep-ms 30000 &");
+            let accepted = session.dispatch_input(&command).unwrap();
+            assert_eq!(accepted.code, Some(0));
+
+            ctx.phase("VERIFY_BROKER_STATUS_AND_LIST_JOBS");
+            let job = session
+                .tracked_background_jobs()
+                .first()
+                .expect("interactive session must track accepted background work");
+            let request_id = job.request_id.clone();
+            let execution_id = job.execution_id.clone();
+            assert!(execution_id.starts_with("exec_"));
+            let client = session.client.as_ref().unwrap().clone();
+            let running = client.query_request_status(&request_id).await.unwrap();
+            assert_eq!(running.status, omen_ipc::ExecutionStatusCode::Running);
+            assert_eq!(running.execution_id.as_deref(), Some(execution_id.as_str()));
+            assert_eq!(session.dispatch_input(":jobs").unwrap().code, Some(0));
+
+            ctx.phase("STOP_VIA_CANONICAL_EXECUTION_CANCELLATION");
+            let stopped = session
+                .dispatch_input(&format!(":stop {execution_id}"))
+                .unwrap();
+            assert_eq!(stopped.code, Some(0));
+            let terminal = client.query_request_status(&request_id).await.unwrap();
+            assert_eq!(terminal.status, omen_ipc::ExecutionStatusCode::Cancelled);
         },
     )
     .await;

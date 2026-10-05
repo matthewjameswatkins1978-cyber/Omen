@@ -203,6 +203,7 @@ fn test_omen_actions_authority_is_shared_with_dispatcher() {
         "history",
         "how",
         "inspect",
+        "jobs",
         "orient",
         "packages",
         "plan",

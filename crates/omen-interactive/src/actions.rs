@@ -201,6 +201,12 @@ impl SemanticDispatcher {
                     signal: None,
                 })
             }
+            "jobs" => {
+                println!(
+                    "Background-job status is available in an active interactive session via :jobs."
+                );
+                Ok(ProcessExit::success(0))
+            }
             "history" => {
                 if let Some(db_ref) = db
                     && let Ok(execs) = omen_knowledge::ExecutionHistory::list_session_executions(
