@@ -426,6 +426,7 @@ impl InteractiveSession {
                 self.update_prompt_state();
                 res
             }
+            crate::grammar::InputLane::PortableShell { line } => self.dispatch_portable_shell(line),
             crate::grammar::InputLane::Executable { argv } => {
                 if argv.is_empty() {
                     return Ok(ProcessExit {
@@ -666,6 +667,114 @@ impl InteractiveSession {
                 Ok(output.process_exit)
             }
         }
+    }
+
+    fn dispatch_portable_shell(
+        &mut self,
+        line: crate::shell_grammar::ShellLine,
+    ) -> Result<ProcessExit, CoreError> {
+        let unsupported = |message: String| CoreError::ExecutionFailedCode {
+            code: omen_core::ErrorCode::Unsupported,
+            message,
+        };
+        let mut status = ProcessExit::success(0);
+
+        for item in line.items {
+            if item.backgrounded {
+                return Err(unsupported(
+                    "background execution is not available in the portable shell dispatcher yet"
+                        .into(),
+                ));
+            }
+
+            match item.sequence {
+                crate::shell_grammar::ShellSequence::BooleanChain { first, rest } => {
+                    status = self.dispatch_shell_pipeline(&first)?;
+                    for (operator, pipeline) in rest {
+                        let should_run = match operator {
+                            crate::shell_grammar::ShellBooleanOperator::And => status.is_zero(),
+                            crate::shell_grammar::ShellBooleanOperator::Or => !status.is_zero(),
+                        };
+                        if should_run {
+                            status = self.dispatch_shell_pipeline(&pipeline)?;
+                        }
+                    }
+                }
+            }
+        }
+
+        self.last_exit = Some(status.clone());
+        self.update_prompt_state();
+        Ok(status)
+    }
+
+    fn dispatch_shell_pipeline(
+        &mut self,
+        pipeline: &crate::shell_grammar::ShellPipeline,
+    ) -> Result<ProcessExit, CoreError> {
+        let unsupported = |message: String| CoreError::ExecutionFailedCode {
+            code: omen_core::ErrorCode::Unsupported,
+            message,
+        };
+        if pipeline.commands.len() != 1 {
+            return Err(unsupported(
+                "pipelines require the supervised byte-pipeline dispatcher".into(),
+            ));
+        }
+        let command = &pipeline.commands[0];
+        if !command.environment.is_empty() {
+            return Err(unsupported(
+                "per-command environment assignments are not available in this dispatcher yet"
+                    .into(),
+            ));
+        }
+        if !command.redirects.is_empty() {
+            return Err(unsupported(
+                "redirection requires the supervised redirection dispatcher".into(),
+            ));
+        }
+
+        let mut argv = Vec::new();
+        for word in &command.words {
+            argv.extend(
+                crate::shell_grammar::expand_word(word, &self.cwd).map_err(|error| {
+                    unsupported(format!("shell word expansion failed: {error}"))
+                })?,
+            );
+        }
+        let argv = crate::resolver::ReferenceResolver::resolve_argv(
+            &argv,
+            &self.session_id,
+            self.db.as_ref(),
+        );
+        let Some(program) = argv.first() else {
+            return Ok(ProcessExit::success(0));
+        };
+
+        if program == "cd" {
+            debug_assert!(crate::commands::is_shell_intrinsic("cd"));
+            let target = argv
+                .get(1)
+                .map(|value| resolve_cd_target(&self.cwd, value))
+                .unwrap_or_else(|| self.workspace_root.clone());
+            return self.navigate_to(target, "cd");
+        }
+
+        if let Some(blast) = crate::preflight::BlastPreflight::assess(&argv) {
+            println!(
+                "[Preflight Warning: {:?}] Command '{}' will affect: {}",
+                blast.severity, blast.command, blast.summary
+            );
+        }
+
+        if ChildHandoff::classify(&argv) == crate::child::ChildClassification::InteractiveHandoff {
+            return Err(unsupported(
+                "interactive terminal handoff cannot run inside a portable shell expression yet"
+                    .into(),
+            ));
+        }
+
+        self.execute_via_broker("exec", "", argv, None)
     }
 
     /// Navigates the session cwd to `target`, updating all dependent state.

@@ -5,6 +5,7 @@
 //! grammar; it never invokes the upstream shell executor.
 
 use deno_task_shell::parser as upstream;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +116,201 @@ pub fn parse(input: &str) -> Result<ShellLine, ShellParseError> {
     let parsed =
         upstream::parse(&normalized).map_err(|error| ShellParseError::Syntax(error.to_string()))?;
     lower_line(parsed)
+}
+
+impl ShellLine {
+    /// Whether this line uses semantics beyond Omen's existing argv scanner.
+    pub fn requires_portable_shell(&self) -> bool {
+        self.items.len() != 1
+            || self.items.iter().any(|item| {
+                item.backgrounded
+                    || match &item.sequence {
+                        ShellSequence::BooleanChain { first, rest } => {
+                            !rest.is_empty()
+                                || pipeline_requires_portable_shell(first)
+                                || rest
+                                    .iter()
+                                    .any(|(_, pipeline)| pipeline_requires_portable_shell(pipeline))
+                        }
+                    }
+            })
+    }
+}
+
+fn pipeline_requires_portable_shell(pipeline: &ShellPipeline) -> bool {
+    pipeline.commands.len() != 1
+        || pipeline.commands.iter().any(|command| {
+            !command.environment.is_empty()
+                || !command.redirects.is_empty()
+                || command.words.iter().any(word_requires_portable_shell)
+        })
+}
+
+fn word_requires_portable_shell(word: &ShellWord) -> bool {
+    word.parts
+        .iter()
+        .any(|part| word_part_requires_portable_shell(part, false))
+}
+
+fn word_part_requires_portable_shell(part: &ShellWordPart, quoted: bool) -> bool {
+    match part {
+        ShellWordPart::Variable(_) | ShellWordPart::CommandSubstitution(_) => true,
+        ShellWordPart::Tilde => !quoted,
+        ShellWordPart::Text(text) => {
+            !quoted && text.chars().any(|ch| matches!(ch, '*' | '?' | '['))
+        }
+        ShellWordPart::Quoted(parts) => {
+            parts.is_empty()
+                || parts
+                    .iter()
+                    .any(|part| word_part_requires_portable_shell(part, true))
+        }
+    }
+}
+
+/// Expand one Omen shell word into zero or more argv words.
+///
+/// Globs are resolved against the session cwd, sorted, and retain the literal
+/// pattern when there are no matches. Command substitution is left to the
+/// execution layer because evaluating it can dispatch consequential commands.
+pub fn expand_word(word: &ShellWord, cwd: &Path) -> Result<Vec<String>, ShellParseError> {
+    expand_word_with_lookup(word, cwd, &|name| {
+        std::env::var_os(name)
+            .map(|value| {
+                value.into_string().map_err(|_| {
+                    ShellParseError::Unsupported(format!(
+                        "environment variable {name} is not valid UTF-8"
+                    ))
+                })
+            })
+            .transpose()
+    })
+}
+
+fn expand_word_with_lookup(
+    word: &ShellWord,
+    cwd: &Path,
+    lookup: &impl Fn(&str) -> Result<Option<String>, ShellParseError>,
+) -> Result<Vec<String>, ShellParseError> {
+    let mut value = String::new();
+    let mut pathname_pattern = false;
+    append_word_parts(
+        &word.parts,
+        false,
+        lookup,
+        &mut value,
+        &mut pathname_pattern,
+    )?;
+
+    if !pathname_pattern {
+        return Ok(vec![value]);
+    }
+
+    let absolute_pattern = Path::new(&value).is_absolute();
+    let mut pattern = if absolute_pattern {
+        value.clone()
+    } else {
+        cwd.join(&value)
+            .to_str()
+            .ok_or_else(|| {
+                ShellParseError::Unsupported(
+                    "current directory is not valid UTF-8 in the current argv model".into(),
+                )
+            })?
+            .to_string()
+    };
+    // Match the common-shell default: `**` has no recursive special meaning
+    // unless a future explicit Omen option enables globstar.
+    while pattern.contains("**") {
+        pattern = pattern.replace("**", "*");
+    }
+    let paths = match glob::glob_with(
+        &pattern,
+        glob::MatchOptions {
+            case_sensitive: !cfg!(windows),
+            require_literal_separator: true,
+            require_literal_leading_dot: true,
+        },
+    ) {
+        Ok(paths) => paths,
+        Err(_) => return Ok(vec![value]),
+    };
+    let mut matches = Vec::new();
+    for path in paths {
+        matches.push(path.map_err(|error| {
+            ShellParseError::Unsupported(format!("glob traversal failed: {error}"))
+        })?);
+    }
+    if matches.is_empty() {
+        return Ok(vec![value]);
+    }
+    matches.sort_by(|left, right| left.as_os_str().cmp(right.as_os_str()));
+    matches
+        .into_iter()
+        .map(|path| {
+            let projected = if absolute_pattern {
+                path
+            } else {
+                path.strip_prefix(cwd).map(PathBuf::from).unwrap_or(path)
+            };
+            projected.into_os_string().into_string().map_err(|_| {
+                ShellParseError::Unsupported(
+                    "glob matched a path that is not representable as UTF-8 argv".into(),
+                )
+            })
+        })
+        .collect()
+}
+
+fn append_word_parts(
+    parts: &[ShellWordPart],
+    quoted: bool,
+    lookup: &impl Fn(&str) -> Result<Option<String>, ShellParseError>,
+    output: &mut String,
+    pathname_pattern: &mut bool,
+) -> Result<(), ShellParseError> {
+    for part in parts {
+        match part {
+            ShellWordPart::Text(text) => {
+                output.push_str(text);
+                if !quoted && text.chars().any(|ch| matches!(ch, '*' | '?' | '[')) {
+                    *pathname_pattern = true;
+                }
+            }
+            ShellWordPart::Variable(name) => {
+                let value = lookup(name)?.unwrap_or_default();
+                if !quoted && value.chars().any(|ch| matches!(ch, '*' | '?' | '[')) {
+                    *pathname_pattern = true;
+                }
+                output.push_str(&value);
+            }
+            ShellWordPart::Tilde if !quoted && output.is_empty() => {
+                let home = if cfg!(windows) {
+                    lookup("USERPROFILE")?.or(lookup("HOME")?)
+                } else {
+                    lookup("HOME")?
+                };
+                if let Some(home) = home {
+                    if home.chars().any(|ch| matches!(ch, '*' | '?' | '[')) {
+                        *pathname_pattern = true;
+                    }
+                    output.push_str(&home);
+                } else {
+                    output.push('~');
+                }
+            }
+            ShellWordPart::Tilde => output.push('~'),
+            ShellWordPart::CommandSubstitution(_) => {
+                return Err(ShellParseError::Unsupported(
+                    "command substitution requires the Omen execution dispatcher".into(),
+                ));
+            }
+            ShellWordPart::Quoted(parts) => {
+                append_word_parts(parts, true, lookup, output, pathname_pattern)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn normalize_braced_variables(input: &str) -> String {
@@ -519,6 +715,60 @@ mod tests {
         assert_eq!(
             normalize_braced_variables("${A} '${B}' \"${C}\" \\${D}"),
             "$A '${B}' \"$C\" \\${D}"
+        );
+    }
+
+    #[test]
+    fn expands_variables_without_expanding_single_quoted_content() {
+        let parsed =
+            parse("echo '$OMEN_SHELL_TEST' \"$OMEN_SHELL_TEST\" ${OMEN_SHELL_TEST}").unwrap();
+        let ShellSequence::BooleanChain { first, .. } = &parsed.items[0].sequence;
+        let environment = std::collections::HashMap::from([(
+            "OMEN_SHELL_TEST".to_string(),
+            "portable value".to_string(),
+        )]);
+        let lookup = |name: &str| Ok(environment.get(name).cloned());
+        let expanded = first.commands[0].words[1..]
+            .iter()
+            .map(|word| expand_word_with_lookup(word, Path::new("."), &lookup).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            expanded,
+            [
+                vec!["$OMEN_SHELL_TEST".to_string()],
+                vec!["portable value".to_string()],
+                vec!["portable value".to_string()]
+            ]
+        );
+    }
+
+    #[test]
+    fn deterministic_globbing_sorts_matches_and_respects_quoting() {
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(cwd.path().join("zeta.txt"), "").unwrap();
+        std::fs::write(cwd.path().join("alpha.txt"), "").unwrap();
+        std::fs::write(cwd.path().join(".hidden.txt"), "").unwrap();
+
+        let unquoted = parse("echo *.txt").unwrap();
+        let ShellSequence::BooleanChain { first, .. } = &unquoted.items[0].sequence;
+        assert_eq!(
+            expand_word(&first.commands[0].words[1], cwd.path()).unwrap(),
+            ["alpha.txt", "zeta.txt"]
+        );
+
+        let quoted = parse("echo '*.txt'").unwrap();
+        let ShellSequence::BooleanChain { first, .. } = &quoted.items[0].sequence;
+        assert_eq!(
+            expand_word(&first.commands[0].words[1], cwd.path()).unwrap(),
+            ["*.txt"]
+        );
+
+        let unmatched = ShellWord {
+            parts: vec![ShellWordPart::Text("missing-*.txt".into())],
+        };
+        assert_eq!(
+            expand_word(&unmatched, cwd.path()).unwrap(),
+            ["missing-*.txt"]
         );
     }
 }

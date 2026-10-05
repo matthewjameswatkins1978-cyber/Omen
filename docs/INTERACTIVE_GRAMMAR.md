@@ -18,20 +18,16 @@ cargo test auth          <-- 1. Raw Executable: Direct PATH dispatch, argv-only,
 
 ---
 
-## 2. The Three Explicit Symbolic Lanes
+## 2. The Four Explicit Symbolic Lanes
 
-Input lines are categorized lexically by `GrammarScanner` into three explicit symbolic lanes:
+Input lines are categorized by `GrammarScanner` into four explicit lanes:
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                       GrammarScanner                        │
-└──────────────┬───────────────────┬───────────────────┬──────┘
-               │                   │                   │
-               ▼                   ▼                   ▼
-      Executable Lane     Semantic Action Lane    AI Lane
-       "cargo test"            ":status"        "? why failed"
-             │                     │                   │
-    ProcessSupervisor     SemanticDispatcher   AiLaneDispatcher
+GrammarScanner
+  ├─ Executable       → existing argv process dispatch
+  ├─ Portable shell   → Omen-owned shell parser and dispatcher
+  ├─ Semantic action  → SemanticDispatcher
+  └─ AI reasoning     → AiLaneDispatcher
 ```
 
 ### Lane 1: Ordinary Executables (Prefix: None)
@@ -45,7 +41,16 @@ rg "TODO" src/
 - Standard output and error streams are captured, bounded, and spooled to SHA-256 CAS artifacts (`artifact://`).
 - Emits structured execution block and updates session history.
 
-### Lane 2: Semantic Actions (Prefix: `:`)
+### Lane 2: Portable Shell Expressions
+
+Shell expressions are interpreted by Omen's Omen-owned syntax tree and dispatcher rather than a host shell:
+```text
+echo "$HOME" && cargo test
+cd src; rg "TODO" *.rs
+```
+Ordered command lists and `&&` / `||` short-circuiting are supported. Expansion currently includes variables, tilde, and deterministic pathname globs. Every simple command goes through Omen's existing execution boundary. Unsupported syntax is refused, not passed through as argv. The supported subset and explicit refusals are listed above.
+
+### Lane 3: Semantic Actions (Prefix: `:`)
 Direct, typed operations on the Omen runtime substrate:
 ```text
 :status                  # Workspace cleanliness, dirty facts, active services
@@ -68,11 +73,19 @@ Direct, typed operations on the Omen runtime substrate:
 :restart <service>       # Restarts a managed background service
 ```
 
-Composition planning is read-only. Interactive composition execution is not
-exposed; consequential execution remains on the explicitly contract-bound CLI
-surface.
+Omen action-composition planning is read-only; this interactive shell does not
+execute action plans. The portable shell lane currently executes ordered simple
+commands separated by `;`, with `&&` / `||` short-circuiting. Each command is
+dispatched separately through Omen's existing execution boundary; shell syntax
+does not create or grant action authority.
 
-### Lane 3: Optional AI Reasoning Lane (Prefix: `?`)
+The lane supports variable and tilde expansion plus deterministic pathname
+globbing. Pipelines, redirections, command-local environment assignments,
+command substitution, background jobs, and interactive terminal handoff inside
+a shell expression are currently refused as unsupported. Unsupported shell
+syntax is never passed through as literal argv.
+
+### Lane 4: Optional AI Reasoning Lane (Prefix: `?`)
 Advisory reasoning invoked only when explicit human judgement is requested:
 ```text
 ? why did the last test fail?

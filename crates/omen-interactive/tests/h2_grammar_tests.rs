@@ -1,4 +1,4 @@
-use omen_interactive::{GrammarScanner, InputLane, TypedReference};
+use omen_interactive::{GrammarScanner, InputLane, InteractiveSession, TypedReference};
 
 #[test]
 fn test_grammar_lane_scanning() {
@@ -55,6 +55,80 @@ fn test_grammar_lane_scanning() {
             query: "why does the auth test fail on token refresh?".into()
         }
     );
+}
+
+#[test]
+fn test_portable_shell_lane_preserves_plain_argv_and_parses_compounds() {
+    assert!(matches!(
+        GrammarScanner::scan("printf 'a|b'").unwrap(),
+        InputLane::Executable { .. }
+    ));
+
+    assert!(matches!(
+        GrammarScanner::scan("echo a | cat").unwrap(),
+        InputLane::PortableShell { .. }
+    ));
+    assert_eq!(
+        GrammarScanner::scan("echo a |& cat").unwrap_err().code(),
+        omen_core::ErrorCode::Unsupported
+    );
+
+    let InputLane::PortableShell { line } = GrammarScanner::scan("a && b; c").unwrap() else {
+        panic!("compound shell expression must use the portable shell lane");
+    };
+    assert_eq!(line.items.len(), 2);
+    let omen_interactive::shell_grammar::ShellSequence::BooleanChain { first, rest } =
+        &line.items[0].sequence;
+    assert_eq!(
+        first.commands[0].words[0].parts,
+        [omen_interactive::shell_grammar::ShellWordPart::Text(
+            "a".into()
+        )]
+    );
+    assert_eq!(rest.len(), 1);
+    assert_eq!(
+        rest[0].0,
+        omen_interactive::shell_grammar::ShellBooleanOperator::And
+    );
+    let omen_interactive::shell_grammar::ShellSequence::BooleanChain { first, rest } =
+        &line.items[1].sequence;
+    assert_eq!(
+        first.commands[0].words[0].parts,
+        [omen_interactive::shell_grammar::ShellWordPart::Text(
+            "c".into()
+        )]
+    );
+    assert!(rest.is_empty());
+}
+
+#[test]
+fn portable_shell_boolean_chains_update_session_directory() {
+    let workspace = tempfile::tempdir().unwrap();
+    let nested = workspace.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let workspace = workspace.path().canonicalize().unwrap();
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let _guard = runtime.enter();
+    let mut session = InteractiveSession::new_with_client(
+        omen_core::InteractiveSessionId::generate(),
+        workspace.clone(),
+        None,
+        None,
+    )
+    .unwrap();
+
+    let semicolon = session.dispatch_input("cd nested; cd ..").unwrap();
+    assert!(semicolon.is_zero());
+    assert_eq!(session.cwd, workspace);
+
+    let skipped = session.dispatch_input("cd missing && cd nested").unwrap();
+    assert!(!skipped.is_zero());
+    assert_eq!(session.cwd, workspace);
+
+    let fallback = session.dispatch_input("cd missing || cd nested").unwrap();
+    assert!(fallback.is_zero());
+    assert_eq!(session.cwd, nested.canonicalize().unwrap());
 }
 
 #[test]

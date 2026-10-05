@@ -7,6 +7,11 @@ pub enum InputLane {
     /// Ordinary executable dispatch (e.g. `cargo test`, `git status`)
     Executable { argv: Vec<String> },
 
+    /// Portable shell syntax that must be interpreted rather than passed as argv.
+    PortableShell {
+        line: crate::shell_grammar::ShellLine,
+    },
+
     /// Omen semantic action prefixed by `:` (e.g. `:status`, `:test auth`, `:why @last`)
     SemanticAction { action: String, args: Vec<String> },
 
@@ -151,9 +156,114 @@ impl GrammarScanner {
             return Ok(InputLane::SemanticAction { action, args });
         }
 
-        // 3. Ordinary Executable Invocation: standard argv splitting
+        // 3. Omen's portable-shell parser owns lines with operators or
+        // expansion syntax. Keep the established argv scanner authoritative
+        // for a plain command so Windows quoting/path behavior remains stable.
+        let portable_input = Self::escape_argv_word_pipes(trimmed);
+        match crate::shell_grammar::parse(&portable_input) {
+            Ok(line) if line.requires_portable_shell() => {
+                return Ok(InputLane::PortableShell { line });
+            }
+            Err(error) if Self::contains_unquoted_shell_construct(trimmed) => {
+                return Err(CoreError::ExecutionFailedCode {
+                    code: omen_core::ErrorCode::Unsupported,
+                    message: error.to_string(),
+                });
+            }
+            _ => {}
+        }
+
+        // 4. Ordinary Executable Invocation: standard argv splitting
         let argv = Self::split_words(trimmed);
         Ok(InputLane::Executable { argv })
+    }
+
+    fn escape_argv_word_pipes(input: &str) -> String {
+        let characters: Vec<char> = input.chars().collect();
+        let mut output = String::with_capacity(input.len());
+        let mut quote = None;
+        let mut escaped = false;
+
+        for (index, character) in characters.iter().copied().enumerate() {
+            if escaped {
+                output.push(character);
+                escaped = false;
+                continue;
+            }
+            match quote {
+                Some('\'') => {
+                    output.push(character);
+                    if character == '\'' {
+                        quote = None;
+                    }
+                    continue;
+                }
+                Some('"') => {
+                    output.push(character);
+                    if character == '"' {
+                        quote = None;
+                    } else if character == '\\' {
+                        escaped = true;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+
+            match character {
+                '\'' | '"' => quote = Some(character),
+                '\\' => escaped = true,
+                '|' if index > 0
+                    && !characters[index - 1].is_whitespace()
+                    && characters[index - 1] != '|'
+                    && characters.get(index + 1) != Some(&'|')
+                    && characters.get(index + 1) != Some(&'&') =>
+                {
+                    output.push('\\');
+                }
+                _ => {}
+            }
+            output.push(character);
+        }
+        output
+    }
+
+    fn contains_unquoted_shell_construct(input: &str) -> bool {
+        let mut quote = None;
+        let mut escaped = false;
+        for character in input.chars() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match quote {
+                Some('\'') => {
+                    if character == '\'' {
+                        quote = None;
+                    }
+                    continue;
+                }
+                Some('"') => {
+                    if character == '"' {
+                        quote = None;
+                    } else if character == '\\' {
+                        escaped = true;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+
+            match character {
+                '\'' | '"' => quote = Some(character),
+                '\\' => escaped = true,
+                '|' | ';' | '&' | '<' | '>' | '$' | '*' | '?' | '[' | ']' | '{' | '}' | '~' => {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     /// Word splitter preserving Windows path separators, double and single quotes,
