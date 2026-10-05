@@ -1,0 +1,39 @@
+[package]
+name = "omen-compat"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+# Test-only observation boundary for IDO No. 2. Production crates must never
+# depend on this crate.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+# Existing workspace dependency newly used by omen-compat for bounded
+# cancellable child I/O only (not a new third-party crate).
+tokio = { workspace = true, features = [
+    "process",
+    "io-util",
+    "time",
+    "rt",
+    "macros",
+    "sync",
+] }
+
+[dev-dependencies]
+omen-test-fixtures = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = [
+    "process",
+    "io-util",
+    "time",
+    "rt",
+    "macros",
+    "sync",
+] }

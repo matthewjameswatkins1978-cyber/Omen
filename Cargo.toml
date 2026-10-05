@@ -20,6 +20,7 @@ members = [
     "crates/omen-authority",
     "crates/omen-test-fixtures",
     "crates/omen-semantic",
+    "crates/omen-compat",
     "crates/xtask",
 ]
 exclude = [
@@ -54,6 +55,7 @@ omen-lifecycle = { path = "crates/omen-lifecycle", version = "0.9.0-preview.7" }
 omen-authority = { path = "crates/omen-authority", version = "0.9.0-preview.7" }
 omen-test-fixtures = { path = "crates/omen-test-fixtures", version = "0.9.0-preview.7" }
 omen-semantic = { path = "crates/omen-semantic", version = "0.9.0-preview.7" }
+omen-compat = { path = "crates/omen-compat", version = "0.9.0-preview.7" }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

@@ -1,0 +1,123 @@
+# Omen Compat architecture boundary
+
+## Dependency direction
+
+```text
+compat corpus + omen-compat harness
+                 │ observes
+                 ▼
+           Omen runtime under test
+```
+
+The reverse edge is forbidden: production crates must never import
+`omen-compat`. Workspace membership is not a runtime dependency.
+
+## M0 portable machinery (implemented)
+
+The crate contains authorized measurement types and a bounded portable
+runner (`Platform`, `Capability`, `CommandSpec`, `StdinSpec`, `Deadline`,
+`ExitCause`, observations, evidence grades, invariant results, structured
+failures, replay descriptors). Platform-specific capabilities remain schema
+placeholders until their milestone.
+
+### Bounded process/I/O contract
+
+All external waits use Tokio cancellable I/O with three explicit layers:
+
+1. Scenario deadline (process wait + stdin delivery budget).
+2. Cleanup: non-waiting `start_kill()` then bounded root reap within
+   `CLEANUP_BOUND` (never `Child::kill().await`, which may wait for exit).
+3. **One shared** post-root I/O completion window (`IO_COMPLETION_GRACE`)
+   covering stdin, stdout, and stderr task completion and abort
+   acknowledgement concurrently — never a fresh full grace per task.
+
+```text
+declared_max_wall_ms
+  = deadline_ms
+  + CLEANUP_BOUND
+  + IO_COMPLETION_GRACE
+  + scheduling_tolerance
+```
+
+The implementation mechanically matches this formula. `BOUNDED_WAIT_NO_HANG`
+fails if actual elapsed exceeds that maximum.
+
+**Stream truth:** `truncated` (more bytes than retained), `eof_observed`
+(pipe EOF), and `drain_timed_out` (cancelled at grace) are distinct.
+Descendant-held pipes may leave `eof_observed=false` with
+`drain_timed_out=true`; that is not process failure.
+`DRAIN_BOTH_STREAMS_NO_DEADLOCK` means both streams were handled without
+deadlock — not that EOF was observed on both.
+
+**Root cleanup vs descendants:** timeout cleanup is `root_only=true` with
+distinct `kill_attempted` / `kill_initiated` / `root_reaped` facts. Kill
+initiation is not termination. Portable descendant containment is not claimed
+until POSIX groups / Windows job-object work.
+
+### Secret-safe durable evidence
+
+Execution may hold env values and stdin bytes transiently. Durable evidence
+uses `CommandEvidence` (counts, kinds, key names — no values), explicit
+`ReplayDescriptor::{redacted,try_exact_fixture}` with `ReplayFidelity`,
+`Observation::EnvApplied { key }` (no value), and `StreamSummary` without
+raw previews. Debug for `CommandSpec`/`EnvPolicy`/`StdinSpec` redacts values.
+
+`ReplayFidelity::Exact` is mechanically validated only by
+`try_exact_fixture` against original `CommandSpec`:
+env must be `Clear`, stdin `Closed`, cwd unset, and safe argv exactly equal
+to recorded argv. Omission of any required value yields an error — never a
+mislabelled Exact. Evidence projections use `redacted_from_evidence` only
+and cannot claim Exact (one authority; see D2-012). The safe generic
+projection remains `Redacted`.
+
+**Type seal (D2-013):** `ReplayDescriptor` fields are private; there is no
+public fidelity setter or struct-literal forge. Generic `Deserialize`
+rejects `Exact` (serialization records a claim; deserialization does not
+prove it). Redacted records still round-trip.
+
+Fixture JSON reports remain limited to controlled Compat fixtures.
+
+## D2-014 deterministic portable foundation
+
+The approved RC foundation composes the existing bounded runner rather than
+creating another process executor:
+
+- **Reference execution and replay:** `run` captures bounded process facts;
+  Exact fixture records reconstruct only the sealed argv/cwd/env/stdin shape
+  and replay through that same runner. Redacted records cannot execute.
+- **Canonical observation and differential comparison:** comparisons include
+  exit cause, timeout, harness failure, and normalized stdout/stderr. PID,
+  elapsed time, and scheduling noise are excluded. An observed mismatch is
+  divergent even when a stream is truncated; a matching incomplete capture or
+  timeout is inconclusive, never equivalent.
+- **Normalization:** only explicitly configured ordered byte rules transform
+  comparison projections. Raw observations are unchanged. Output bytes and
+  replacement count have hard bounds.
+- **Structured fuzz and shrinking:** a stable seed derives reproducible case
+  seeds; a named failure predicate stops at the first finding and emits a
+  deterministic regression record. Delta-debugging removes structured items
+  only while the same predicate holds and obeys an explicit attempt budget.
+  Generators and predicates must themselves be bounded; process-backed checks
+  use the Compat runner.
+- **Capability evidence:** reports distinguish available, unsupported,
+  unavailable, and not-tested. An available claim requires strong evidence and
+  an evidence identifier. Reports validate platform-family fit and duplicate
+  entries; they do not probe the OS or promote schema declarations into
+  implemented capability.
+
+This foundation is test infrastructure only. It does not introduce application
+adapters, PTY/ConPTY control, production changes, or authority beyond D2-014.
+## Evidence layers
+
+- Invariants state what must be true.
+- Scenarios state how a bounded case is exercised.
+- Fixtures provide the smallest useful probe.
+- Golden targets witness selected real tools after the foundation is sound.
+- CI artifacts retain large generated output without making Git the trace store.
+- Documents record design, decisions, and interpretation; they are not test
+  inputs.
+
+Compatibility results must preserve the distinction between observed Omen
+behaviour, reference behaviour, known difference, Omen defect, and unresolved
+evidence. Compat is diagnostic and evidence-producing, not an authority or an
+automatic fixer.
