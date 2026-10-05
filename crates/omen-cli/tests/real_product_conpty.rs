@@ -277,6 +277,35 @@ fn real_product_identity_recorded() {
     eprintln!("  conpty:   NO_COLOR=1 TERM=dumb 40x120");
 }
 
+#[test]
+fn doctor_reads_preview_identity_from_canonical_state_root() {
+    let state_base = tempfile::tempdir().unwrap();
+    let state_dir = state_base.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    std::fs::write(
+        state_dir.join("installed.json"),
+        serde_json::json!({
+            "active": {
+                "provenance": "ci",
+                "git_sha": "a".repeat(40),
+                "preview_version": "0.9.0-preview.25"
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(omen_exe())
+        .args(["doctor", "--json"])
+        .env("OMEN_STATE_HOME", state_base.path())
+        .output()
+        .expect("omen doctor must run");
+    assert!(output.status.success());
+    let doctor: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(doctor["installed_git_sha"], "a".repeat(40));
+    assert_eq!(doctor["provenance"], "ci");
+}
+
 // ===========================================================================
 // TAB COMPLETION (through real InteractiveSession)
 // ===========================================================================

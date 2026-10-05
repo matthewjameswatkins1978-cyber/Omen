@@ -282,13 +282,10 @@ fn describe_invocation(invocation: &omen_core::machine_contract::Invocation) -> 
 /// preview conveyor (`<install-root>/state/installed.json`). Returns the
 /// active manifest identity subset, or `None` for dev cargo builds.
 fn installed_preview_identity() -> Option<serde_json::Value> {
-    let root = std::env::var_os(if cfg!(windows) {
-        "LOCALAPPDATA"
-    } else {
-        "HOME"
-    })
-    .map(PathBuf::from)?;
-    let state = std::fs::read(root.join("Omen").join("state").join("installed.json")).ok()?;
+    let state_path = omen_knowledge::user_state_base_dir()
+        .join("state")
+        .join("installed.json");
+    let state = std::fs::read(state_path).ok()?;
     let state: serde_json::Value = serde_json::from_slice(&state).ok()?;
     let active = state.get("active")?;
     if active.is_null() {
