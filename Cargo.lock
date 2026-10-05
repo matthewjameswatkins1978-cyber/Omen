@@ -1124,6 +1124,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "omen-compat"
+version = "0.9.0-preview.25"
+dependencies = [
+ "hex",
+ "omen-test-fixtures",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "omen-core"
 version = "0.9.0-preview.25"
 dependencies = [
