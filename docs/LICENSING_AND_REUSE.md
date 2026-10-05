@@ -166,6 +166,30 @@ braced identifiers outside single quotes before parsing. Multiple redirects
 on one command are not accepted by the upstream parser yet; the parser tests
 record that as an uncovered P0 compatibility case, not as supported syntax.
 
+### Parser compatibility matrix
+
+This matrix describes parser/lowering compatibility only. It does **not** claim that every construct is already executable by Omen. Physical execution remains Omen-owned and follows the existing broker and authority boundary.
+
+| Feature | Deno parser | Omen intent | Omen action |
+|---|---|---|---|
+| Ordinary command + argv | Yes | Yes | Reuse parse tree; dispatch through Omen broker. |
+| `|`, `&&`, `||`, `;` | Yes | Yes | Lower to Omen-owned pipeline/boolean/list nodes; Omen supervises execution. |
+| Background `&` | Yes | Yes | Reuse syntax node; Omen job lifecycle and bounded supervision remain required before enabling. |
+| One stdin/stdout/stderr redirect | Yes | Yes | Lower redirect metadata; physical stream and file effects remain Omen-owned and are not delegated to Deno. |
+| Multiple redirects on one command | No (current pinned parser) | Yes | Uncovered P0 parser compatibility case; do not treat as supported. |
+| Single/double quoting | Yes | Yes | Reuse parser structure; Omen controls argv projection. |
+| `~`, `$NAME` | Yes | Yes | Lower then expand under Omen's session environment and cwd. |
+| `${NAME}` | Not directly | Yes | Normalize valid braced identifiers outside single quotes, then lower. |
+| `$(command)` | Yes | Yes | Parse nested syntax only; execution must recursively use Omen dispatch and remains disabled until implemented. |
+| Globs | Pattern is represented as word text; parser does not perform expansion | Yes | Omen performs deterministic expansion (ordering, quoting, unmatched-pattern policy). |
+| Per-command environment assignment | Yes | Yes | Lower assignment; apply through Omen's process-launch path. |
+| Visible aliases | No alias grammar (ordinary command word) | Yes | Omen owns the canonical alias table and one-level argv expansion. |
+| Brace expansion | Yes | Optional | Reject/defer; not part of Omen's frozen grammar. |
+| Subshell / negated pipeline / `|&` | Parsed by upstream in relevant cases | No | Reject during Omen lowering; never invoke Deno's executor. |
+| Functions / loops / conditionals | No Omen control-flow AST | No | Do not add programming-language semantics; require fail-closed parser/lowering tests before any grammar expansion. |
+
+The required portable grammar has substantially more than 70% reusable parser coverage. The chosen route is therefore to keep `deno_task_shell` as a pinned parser-only dependency, lower into Omen-owned nodes, and retain Omen ownership of expansion, aliases, execution planning, authority, process lifecycle, and projections. This is not adoption of Deno's shell runtime or builtin semantics.
+
 If the relevant upstream is **APPROVED**, reuse should be actively considered before writing a fresh implementation.
 
 If it is **APPROVED WITH CONDITIONS**, perform the bounded licence/provenance check and reuse it when those conditions are satisfied.
