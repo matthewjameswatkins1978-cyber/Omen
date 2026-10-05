@@ -457,6 +457,87 @@ async fn cancel_across_restart_boundary_reports_unknown() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn background_execution_is_accepted_cancellable_and_durably_tracked() {
+    let (guard, _state) = lock_env();
+    run_with_test_timeout(
+        "background_execution_is_accepted_cancellable_and_durably_tracked",
+        INTEGRATION_TIMEOUT,
+        |ctx| async move {
+            ctx.phase("SETUP_SERVER_AND_CLIENT");
+            let server = DaemonServer::new(Some("e2-background-execution".to_string()));
+            let registry = server.registry();
+            let instance_id = server.instance_id().to_string();
+            let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+            let tmp = tempdir().unwrap();
+            let workspace_path = tmp.path().to_string_lossy().into_owned();
+            let gremlin_path = gremlin_exe().to_string_lossy().into_owned();
+
+            let (client_stream, server_stream) = PlatformStream::duplex_pair(8192);
+            tokio::spawn(async move {
+                let _ = DaemonServer::handle_connection(
+                    server_stream,
+                    instance_id,
+                    registry,
+                    shutdown_rx,
+                )
+                .await;
+            });
+            let client = OmenClient::from_stream(
+                client_stream,
+                None,
+                Some("sess_e2_background".to_string()),
+            )
+            .await
+            .unwrap();
+            client.attach_workspace(&workspace_path).await.unwrap();
+
+            ctx.phase("ACCEPT_BACKGROUND_EXECUTION");
+            let submission = client
+                .submit_background_execution(
+                    "exec",
+                    gremlin_path,
+                    vec!["--sleep-ms".into(), "30000".into()],
+                    workspace_path.clone(),
+                    60000,
+                )
+                .await
+                .unwrap();
+            let (request_id, execution_id) = match submission {
+                omen_client::BackgroundExecutionSubmission::Accepted {
+                    consequential_request_id,
+                    execution_id,
+                } => (consequential_request_id, execution_id),
+                omen_client::BackgroundExecutionSubmission::Finished { summary, .. } => {
+                    panic!("long-running fixture unexpectedly finished: {summary:?}")
+                }
+            };
+
+            ctx.phase("VERIFY_RUNNING_RECEIPT");
+            let running = client.query_request_status(&request_id).await.unwrap();
+            assert_eq!(running.status, ExecutionStatusCode::Running);
+            assert_eq!(running.execution_id.as_deref(), Some(execution_id.as_str()));
+
+            ctx.phase("CANCEL_AND_VERIFY_TERMINAL_RECEIPT");
+            let cancellation = client.cancel_execution(&execution_id).await.unwrap();
+            assert!(
+                matches!(
+                    cancellation.outcome,
+                    omen_ipc::CancelOutcome::TerminationConfirmed
+                        | omen_ipc::CancelOutcome::DispatchPrevented
+                ),
+                "accepted background work must be stoppable or truthfully prevented, got {:?}: {}",
+                cancellation.outcome,
+                cancellation.detail
+            );
+            let terminal = client.query_request_status(&request_id).await.unwrap();
+            assert_eq!(terminal.status, ExecutionStatusCode::Cancelled);
+        },
+    )
+    .await;
+    unlock_env(guard);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn cancellation_requested_receipt_reconciled_on_restart() {
     let (guard, _state) = lock_env();
     run_with_test_timeout(

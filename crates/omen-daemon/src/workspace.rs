@@ -181,6 +181,18 @@ pub struct BrokerPipelineParams<'a> {
     pub timeout_ms: u64,
 }
 
+#[derive(Debug, Clone)]
+pub enum BackgroundBrokerResult {
+    Accepted { execution_id: String },
+    Finished(ExecutionResultSummary),
+}
+
+#[derive(Debug, Clone)]
+enum BackgroundBrokerState {
+    Accepted(String),
+    Finished(Result<ExecutionResultSummary, LocalIpcError>),
+}
+
 pub struct WorkspaceState {
     workspace_id: String,
     canonical_path: PathBuf,
@@ -1556,11 +1568,63 @@ impl WorkspaceState {
         }
     }
 
+    pub async fn start_background_broker(
+        self: &Arc<Self>,
+        params: BrokerExecutionParams<'_>,
+        pipeline_stages: Option<Vec<PipelineStageRequest>>,
+    ) -> Result<BackgroundBrokerResult, LocalIpcError> {
+        let (state_tx, mut state_rx) = watch::channel(None);
+        let this = Arc::clone(self);
+        let dedup_id = params.dedup_id.to_string();
+        let session_id = params.session_id.to_string();
+        let tool = params.tool.to_string();
+        let operation = params.operation.to_string();
+        let args = params.args.to_vec();
+        let cwd = params.cwd.to_string();
+        let timeout_ms = params.timeout_ms;
+
+        tokio::spawn(async move {
+            let owned_params = BrokerExecutionParams {
+                dedup_id: &dedup_id,
+                session_id: &session_id,
+                tool: &tool,
+                operation: &operation,
+                args: &args,
+                cwd: &cwd,
+                timeout_ms,
+            };
+            let result = this
+                .execute_broker_inner(owned_params, pipeline_stages, Some(state_tx.clone()))
+                .await;
+            state_tx.send_replace(Some(BackgroundBrokerState::Finished(result)));
+        });
+
+        loop {
+            let state = { state_rx.borrow_and_update().clone() };
+            if let Some(state) = state {
+                return match state {
+                    BackgroundBrokerState::Accepted(execution_id) => {
+                        Ok(BackgroundBrokerResult::Accepted { execution_id })
+                    }
+                    BackgroundBrokerState::Finished(Ok(summary)) => {
+                        Ok(BackgroundBrokerResult::Finished(summary))
+                    }
+                    BackgroundBrokerState::Finished(Err(error)) => Err(error),
+                };
+            }
+            state_rx.changed().await.map_err(|_| {
+                LocalIpcError::InternalRuntimeError(
+                    "background execution broker ended before reporting a start or result".into(),
+                )
+            })?;
+        }
+    }
+
     pub async fn execute_broker(
         self: &Arc<Self>,
         params: BrokerExecutionParams<'_>,
     ) -> Result<ExecutionResultSummary, LocalIpcError> {
-        self.execute_broker_inner(params, None).await
+        self.execute_broker_inner(params, None, None).await
     }
 
     pub async fn execute_pipeline_broker(
@@ -1576,7 +1640,7 @@ impl WorkspaceState {
             cwd: params.cwd,
             timeout_ms: params.timeout_ms,
         };
-        self.execute_broker_inner(request, Some(params.stages.to_vec()))
+        self.execute_broker_inner(request, Some(params.stages.to_vec()), None)
             .await
     }
 
@@ -1584,6 +1648,7 @@ impl WorkspaceState {
         self: &Arc<Self>,
         params: BrokerExecutionParams<'_>,
         pipeline_stages: Option<Vec<PipelineStageRequest>>,
+        background_start: Option<watch::Sender<Option<BackgroundBrokerState>>>,
     ) -> Result<ExecutionResultSummary, LocalIpcError> {
         let dedup_id = params.dedup_id;
         let session_id = params.session_id;
@@ -1759,6 +1824,8 @@ impl WorkspaceState {
             let mut index = self.cancel_index.lock().await;
             index.insert(exec_id_str.clone(), dedup_id_str.clone());
         }
+
+        let accepted_execution_id = exec_id_str.clone();
 
         let join_handle = tokio::spawn(async move {
             // Repair 2 test seam: park here — after the live cancel switch
@@ -2014,6 +2081,10 @@ impl WorkspaceState {
                 }
             }
         });
+
+        if let Some(start_tx) = background_start {
+            start_tx.send_replace(Some(BackgroundBrokerState::Accepted(accepted_execution_id)));
+        }
 
         match join_handle.await {
             Ok(res) => res,

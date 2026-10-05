@@ -173,6 +173,7 @@ impl DaemonServer {
                 "services".to_string(),
                 "execution".to_string(),
                 omen_ipc::FEATURE_SUPERVISED_PIPELINES.to_string(),
+                omen_ipc::FEATURE_BACKGROUND_EXECUTIONS.to_string(),
             ],
             max_frame_size: MAX_FRAME_SIZE,
         };
@@ -465,6 +466,74 @@ impl DaemonServer {
                 }
             }
 
+            RequestPayload::SubmitBackgroundExecution {
+                tool,
+                operation,
+                args,
+                cwd,
+                timeout_ms,
+                consequential_request_id,
+            } => {
+                if let Err(message) = validate_consequential_request_id(&consequential_request_id) {
+                    return IpcResponse::err(req_id, LocalIpcError::MalformedRequest(message));
+                }
+                let current = attached_workspace.read().await;
+                match &*current {
+                    Some(ws) => {
+                        let params = crate::workspace::BrokerExecutionParams {
+                            dedup_id: &consequential_request_id,
+                            session_id: &session_id,
+                            tool: &tool,
+                            operation: &operation,
+                            args: &args,
+                            cwd: &cwd,
+                            timeout_ms,
+                        };
+                        ws.start_background_broker(params, None)
+                            .await
+                            .map(|result| {
+                                background_broker_response(consequential_request_id, result)
+                            })
+                    }
+                    None => Err(LocalIpcError::WorkspaceNotAttached(
+                        "No workspace attached for this session".into(),
+                    )),
+                }
+            }
+
+            RequestPayload::SubmitBackgroundPipeline {
+                stages,
+                cwd,
+                timeout_ms,
+                consequential_request_id,
+            } => {
+                if let Err(message) = validate_consequential_request_id(&consequential_request_id) {
+                    return IpcResponse::err(req_id, LocalIpcError::MalformedRequest(message));
+                }
+                let current = attached_workspace.read().await;
+                match &*current {
+                    Some(ws) => {
+                        let params = crate::workspace::BrokerExecutionParams {
+                            dedup_id: &consequential_request_id,
+                            session_id: &session_id,
+                            tool: "pipeline",
+                            operation: "",
+                            args: &[],
+                            cwd: &cwd,
+                            timeout_ms,
+                        };
+                        ws.start_background_broker(params, Some(stages))
+                            .await
+                            .map(|result| {
+                                background_broker_response(consequential_request_id, result)
+                            })
+                    }
+                    None => Err(LocalIpcError::WorkspaceNotAttached(
+                        "No workspace attached for this session".into(),
+                    )),
+                }
+            }
+
             RequestPayload::QueryRequestStatus {
                 consequential_request_id,
             } => {
@@ -668,6 +737,23 @@ impl DaemonServer {
         match outcome {
             Ok(payload) => IpcResponse::ok(req_id, payload),
             Err(error) => IpcResponse::err(req_id, error),
+        }
+    }
+}
+
+fn background_broker_response(
+    consequential_request_id: String,
+    result: crate::workspace::BackgroundBrokerResult,
+) -> ResponsePayload {
+    match result {
+        crate::workspace::BackgroundBrokerResult::Accepted { execution_id } => {
+            ResponsePayload::ExecutionAccepted {
+                consequential_request_id,
+                execution_id,
+            }
+        }
+        crate::workspace::BackgroundBrokerResult::Finished(summary) => {
+            ResponsePayload::ExecutionFinished(summary)
         }
     }
 }

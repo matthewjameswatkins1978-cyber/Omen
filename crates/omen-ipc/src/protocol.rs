@@ -51,6 +51,20 @@ pub enum RequestPayload {
         #[serde(default)]
         consequential_request_id: Option<String>,
     },
+    SubmitBackgroundExecution {
+        tool: String,
+        operation: String,
+        args: Vec<String>,
+        cwd: String,
+        timeout_ms: u64,
+        consequential_request_id: String,
+    },
+    SubmitBackgroundPipeline {
+        stages: Vec<PipelineStageRequest>,
+        cwd: String,
+        timeout_ms: u64,
+        consequential_request_id: String,
+    },
     QueryRequestStatus {
         consequential_request_id: String,
     },
@@ -160,6 +174,7 @@ pub enum ResponsePayload {
     },
     Snapshot(SharedIndexSnapshot),
     ExecutionAccepted {
+        consequential_request_id: String,
         execution_id: String,
     },
     ExecutionFinished(ExecutionResultSummary),

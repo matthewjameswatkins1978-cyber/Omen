@@ -14,6 +14,47 @@ use omen_ipc::{
 type PendingRequests =
     Arc<Mutex<HashMap<String, oneshot::Sender<Result<ResponsePayload, LocalIpcError>>>>>;
 
+#[derive(Debug, Clone)]
+pub enum BackgroundExecutionSubmission {
+    Accepted {
+        consequential_request_id: String,
+        execution_id: String,
+    },
+    Finished {
+        consequential_request_id: String,
+        summary: ExecutionResultSummary,
+    },
+}
+
+fn parse_background_submission(
+    request_id: String,
+    response: ResponsePayload,
+) -> Result<BackgroundExecutionSubmission, LocalIpcError> {
+    match response {
+        ResponsePayload::ExecutionAccepted {
+            consequential_request_id,
+            execution_id,
+        } if consequential_request_id == request_id => {
+            Ok(BackgroundExecutionSubmission::Accepted {
+                consequential_request_id,
+                execution_id,
+            })
+        }
+        ResponsePayload::ExecutionAccepted { .. } => Err(LocalIpcError::MalformedRequest(
+            "background execution response carried a different request identity".into(),
+        )),
+        ResponsePayload::ExecutionFinished(summary) => {
+            Ok(BackgroundExecutionSubmission::Finished {
+                consequential_request_id: request_id,
+                summary,
+            })
+        }
+        other => Err(LocalIpcError::MalformedRequest(format!(
+            "Expected a background execution response, got {other:?}"
+        ))),
+    }
+}
+
 struct QueuedRequest {
     request: IpcRequest,
     reply_tx: oneshot::Sender<Result<ResponsePayload, LocalIpcError>>,
@@ -30,6 +71,7 @@ pub struct OmenClient {
     last_sequence: Arc<AtomicU64>,
     last_epoch: Arc<AtomicU64>,
     supports_supervised_pipelines: bool,
+    supports_background_executions: bool,
 }
 
 impl OmenClient {
@@ -58,6 +100,10 @@ impl OmenClient {
             .supported_features
             .iter()
             .any(|feature| feature == omen_ipc::FEATURE_SUPERVISED_PIPELINES);
+        let supports_background_executions = daemon_hello
+            .supported_features
+            .iter()
+            .any(|feature| feature == omen_ipc::FEATURE_BACKGROUND_EXECUTIONS);
         let session_id = session_id.unwrap_or_else(|| format!("sess_{}", Uuid::new_v4()));
         let endpoint = endpoint.unwrap_or_else(|| "memory://stream".to_string());
 
@@ -168,6 +214,7 @@ impl OmenClient {
             last_sequence,
             last_epoch,
             supports_supervised_pipelines,
+            supports_background_executions,
         })
     }
 
@@ -179,6 +226,7 @@ impl OmenClient {
                 "services".to_string(),
                 "execution".to_string(),
                 omen_ipc::FEATURE_SUPERVISED_PIPELINES.to_string(),
+                omen_ipc::FEATURE_BACKGROUND_EXECUTIONS.to_string(),
             ],
         );
         write_json_frame(stream, &client_hello).await?;
@@ -234,11 +282,23 @@ impl OmenClient {
         request_id: impl Into<String>,
         payload: RequestPayload,
     ) -> Result<ResponsePayload, LocalIpcError> {
-        if matches!(&payload, RequestPayload::SubmitPipeline { .. })
-            && !self.supports_supervised_pipelines
+        if matches!(
+            &payload,
+            RequestPayload::SubmitPipeline { .. } | RequestPayload::SubmitBackgroundPipeline { .. }
+        ) && !self.supports_supervised_pipelines
         {
             return Err(LocalIpcError::UnsupportedFeature(
                 omen_ipc::FEATURE_SUPERVISED_PIPELINES.into(),
+            ));
+        }
+        if matches!(
+            &payload,
+            RequestPayload::SubmitBackgroundExecution { .. }
+                | RequestPayload::SubmitBackgroundPipeline { .. }
+        ) && !self.supports_background_executions
+        {
+            return Err(LocalIpcError::UnsupportedFeature(
+                omen_ipc::FEATURE_BACKGROUND_EXECUTIONS.into(),
             ));
         }
         if !self.is_connected() {
@@ -348,6 +408,52 @@ impl OmenClient {
                 "Expected ExecutionFinished, got {other:?}"
             ))),
         }
+    }
+
+    pub async fn submit_background_execution(
+        &self,
+        tool: impl Into<String>,
+        operation: impl Into<String>,
+        args: Vec<String>,
+        cwd: impl Into<String>,
+        timeout_ms: u64,
+    ) -> Result<BackgroundExecutionSubmission, LocalIpcError> {
+        let consequential_request_id = format!("req_{}", Uuid::new_v4());
+        let response = self
+            .send_request_with_id(
+                consequential_request_id.clone(),
+                RequestPayload::SubmitBackgroundExecution {
+                    tool: tool.into(),
+                    operation: operation.into(),
+                    args,
+                    cwd: cwd.into(),
+                    timeout_ms,
+                    consequential_request_id: consequential_request_id.clone(),
+                },
+            )
+            .await?;
+        parse_background_submission(consequential_request_id, response)
+    }
+
+    pub async fn submit_background_pipeline(
+        &self,
+        stages: Vec<PipelineStageRequest>,
+        cwd: impl Into<String>,
+        timeout_ms: u64,
+    ) -> Result<BackgroundExecutionSubmission, LocalIpcError> {
+        let consequential_request_id = format!("req_{}", Uuid::new_v4());
+        let response = self
+            .send_request_with_id(
+                consequential_request_id.clone(),
+                RequestPayload::SubmitBackgroundPipeline {
+                    stages,
+                    cwd: cwd.into(),
+                    timeout_ms,
+                    consequential_request_id: consequential_request_id.clone(),
+                },
+            )
+            .await?;
+        parse_background_submission(consequential_request_id, response)
     }
 
     pub async fn submit_pipeline(
