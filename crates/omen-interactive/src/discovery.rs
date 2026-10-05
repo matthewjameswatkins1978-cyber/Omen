@@ -1521,9 +1521,20 @@ mod tests {
                     .iter()
                     .any(|s| matches!(s.authority, Authority::HelpHarvest { .. }))
             });
+        let offline_harvested = v2.ranked.iter().any(|c| {
+            c.value().insert == "--offline"
+                && (matches!(c.authority(), Authority::HelpHarvest { .. })
+                    || c.supporting
+                        .iter()
+                        .any(|s| matches!(s.authority, Authority::HelpHarvest { .. })))
+        });
         assert!(
-            harvest_authority,
-            "harvested evidence visible in the final ranked set"
+            harvest_authority && offline_harvested,
+            "Cargo --offline must remain visible as harvested evidence; ranked: {:?}",
+            v2.ranked
+                .iter()
+                .map(|c| c.value().insert.clone())
+                .collect::<Vec<_>>()
         );
 
         // Cache path used on the repeat request: no second dispatch.

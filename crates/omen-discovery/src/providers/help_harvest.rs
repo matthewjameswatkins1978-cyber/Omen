@@ -244,7 +244,8 @@ pub fn run_help_harvest(tool: &str) -> Result<String, ProviderError> {
         .env("PAGER", "cat")
         .env("GIT_PAGER", "cat")
         .env("MANPAGER", "cat")
-        .env("TERM", "dumb");
+        .env("TERM", "dumb")
+        .env("CARGO_TERM_COLOR", "never");
 
     let mut child = cmd.spawn().map_err(|e| {
         ProviderError::new(
