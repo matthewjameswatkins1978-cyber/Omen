@@ -359,6 +359,23 @@ fn run_hostile_lsp(mode: &str) {
                 "exit-before-ready" => {
                     std::process::exit(1);
                 }
+                "ready-pulse" => {
+                    let bodies = [
+                        r#"{"jsonrpc":"2.0","method":"experimental/serverStatus","params":{"health":"ok","quiescent":false,"message":"indexing"}}"#,
+                        r#"{"jsonrpc":"2.0","method":"experimental/serverStatus","params":{"health":"ok","quiescent":true,"message":"ready pulse"}}"#,
+                        r#"{"jsonrpc":"2.0","method":"experimental/serverStatus","params":{"health":"ok","quiescent":false,"message":"background work resumed"}}"#,
+                    ];
+                    let mut batch = Vec::new();
+                    for body in bodies {
+                        batch.extend_from_slice(
+                            format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes(),
+                        );
+                        batch.extend_from_slice(body.as_bytes());
+                    }
+                    let mut out = std::io::stdout();
+                    let _ = out.write_all(&batch);
+                    let _ = out.flush();
+                }
                 "ready-sequence" => {
                     write_response(
                         r#"{"jsonrpc":"2.0","method":"experimental/serverStatus","params":{"health":"ok","quiescent":false,"message":"indexing"}}"#,
@@ -422,7 +439,7 @@ fn run_hostile_lsp(mode: &str) {
                         std::process::exit(1);
                     }
                     "semantic-filtered" | "semantic-fallback" | "ready-sequence"
-                    | "never-quiescent" | "warning-ready" | "exit-before-ready" => {
+                    | "ready-pulse" | "never-quiescent" | "warning-ready" | "exit-before-ready" => {
                         let params = val.get("params").cloned().unwrap_or_default();
                         match method {
                             "workspace/symbol" => {

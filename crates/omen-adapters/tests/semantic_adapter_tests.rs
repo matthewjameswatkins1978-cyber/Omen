@@ -332,6 +332,26 @@ async fn rust_analyzer_all_symbol_lookup_uses_hash_fallback_without_extension() 
 }
 
 #[tokio::test]
+async fn rust_analyzer_readiness_latches_quiescent_pulse() {
+    let temp = rust_semantic_fixture();
+    let provider = RustAnalyzerProvider::with_binary_args_and_readiness_timeout(
+        temp.path().to_path_buf(),
+        gremlin_exe(),
+        vec!["--lsp-mode".into(), "ready-pulse".into()],
+        Duration::from_millis(500),
+    );
+
+    let symbols = provider.symbol_search("refresh_token", 10).await.unwrap();
+    assert_eq!(symbols.len(), 1);
+    let status = provider
+        .latest_server_status()
+        .await
+        .expect("latest status must remain observable after readiness");
+    assert_eq!(status.quiescent, Some(false));
+    assert_eq!(status.message.as_deref(), Some("background work resumed"));
+}
+
+#[tokio::test]
 async fn rust_analyzer_readiness_waits_for_quiescent_status() {
     let temp = rust_semantic_fixture();
     let provider = RustAnalyzerProvider::with_binary_args_and_readiness_timeout(

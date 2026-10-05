@@ -343,7 +343,7 @@ pub struct SessionToken;
         let symbols = run_phase(
             "test_proof_c",
             "lsp_function_symbol_search",
-            Duration::from_secs(25),
+            Duration::from_secs(45),
             ra_provider.symbol_search("refresh_token", 10),
         )
         .await

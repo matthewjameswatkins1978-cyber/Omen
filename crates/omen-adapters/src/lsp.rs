@@ -16,9 +16,10 @@ use tokio::process::{Child, Command};
 use tokio::sync::{oneshot, watch};
 
 pub const DEFAULT_LSP_TIMEOUT: Duration = Duration::from_millis(5000);
-/// Cold rust-analyzer startup can exceed the ordinary request budget on a
-/// clean Windows process. Keep readiness finite, but leave enough headroom
-/// for initialization before semantic requests are attempted.
+/// Initialization can exceed the ordinary request budget on a clean Windows
+/// process. Keep it separately bounded so startup can finish before readiness
+/// and semantic requests use their shorter request deadlines.
+pub const DEFAULT_LSP_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_LSP_READINESS_TIMEOUT: Duration = Duration::from_secs(25);
 pub const DEFAULT_MAX_LSP_MESSAGE_BYTES: usize = 16 * 1024 * 1024; // 16 MiB hard-cap
 
@@ -47,6 +48,17 @@ fn parse_server_status(params: &Value) -> LspServerStatus {
     }
 }
 
+fn record_server_status(
+    latest_status: &watch::Sender<Option<LspServerStatus>>,
+    readiness: &watch::Sender<bool>,
+    status: LspServerStatus,
+) {
+    if status.quiescent == Some(true) {
+        readiness.send_replace(true);
+    }
+    latest_status.send_replace(Some(status));
+}
+
 fn format_readiness_evidence(
     status: Option<&LspServerStatus>,
     deadline: Duration,
@@ -66,6 +78,49 @@ fn format_readiness_evidence(
         "provider=rust-analyzer phase=readiness.wait health={health} quiescent={quiescent} message={message:?} deadline_ms={} reason={reason}",
         deadline.as_millis()
     )
+}
+
+async fn wait_for_server_readiness(
+    readiness: &mut watch::Receiver<bool>,
+    latest_status: &watch::Receiver<Option<LspServerStatus>>,
+    deadline: Duration,
+) -> Result<(), CoreError> {
+    let deadline_at = tokio::time::Instant::now() + deadline;
+    loop {
+        if *readiness.borrow() {
+            return Ok(());
+        }
+
+        let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            let status = latest_status.borrow().clone();
+            return Err(CoreError::ExecutionFailed(format_readiness_evidence(
+                status.as_ref(),
+                deadline,
+                "deadline_exceeded",
+            )));
+        }
+
+        match tokio::time::timeout(remaining, readiness.changed()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                let status = latest_status.borrow().clone();
+                return Err(CoreError::ExecutionFailed(format_readiness_evidence(
+                    status.as_ref(),
+                    deadline,
+                    "server_status_channel_closed",
+                )));
+            }
+            Err(_) => {
+                let status = latest_status.borrow().clone();
+                return Err(CoreError::ExecutionFailed(format_readiness_evidence(
+                    status.as_ref(),
+                    deadline,
+                    "deadline_exceeded",
+                )));
+            }
+        }
+    }
 }
 
 fn initialize_supports_workspace_symbol_scope_kind_filtering(result: &Value) -> bool {
@@ -137,6 +192,7 @@ pub struct LspClient {
     generation: SemanticGeneration,
     workspace_symbol_scope_kind_filtering: bool,
     server_status: watch::Receiver<Option<LspServerStatus>>,
+    server_ready: watch::Receiver<bool>,
     known_rust_files: HashMap<String, String>,
 }
 
@@ -177,6 +233,7 @@ impl LspClient {
         let root_clone = workspace_root.clone();
         let prov_id_clone = provider_id.clone();
         let (server_status_tx, server_status_rx) = watch::channel(None);
+        let (server_ready_tx, server_ready_rx) = watch::channel(false);
 
         // Background reader reading Content-Length framed JSON-RPC messages
         let reader_task = tokio::spawn(async move {
@@ -248,7 +305,11 @@ impl LspClient {
                             } else if method == "experimental/serverStatus"
                                 && let Some(params) = val.get("params")
                             {
-                                let _ = server_status_tx.send(Some(parse_server_status(params)));
+                                record_server_status(
+                                    &server_status_tx,
+                                    &server_ready_tx,
+                                    parse_server_status(params),
+                                );
                             }
                         }
                     }
@@ -268,6 +329,7 @@ impl LspClient {
             generation: SemanticGeneration::new(1, 1),
             workspace_symbol_scope_kind_filtering: false,
             server_status: server_status_rx,
+            server_ready: server_ready_rx,
             known_rust_files: HashMap::new(),
         })
     }
@@ -439,48 +501,7 @@ impl LspClient {
     }
 
     async fn wait_for_readiness(&mut self, deadline: Duration) -> Result<(), CoreError> {
-        let deadline_at = tokio::time::Instant::now() + deadline;
-        loop {
-            if self
-                .server_status
-                .borrow()
-                .as_ref()
-                .and_then(|status| status.quiescent)
-                == Some(true)
-            {
-                return Ok(());
-            }
-
-            let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                let status = self.latest_server_status();
-                return Err(CoreError::ExecutionFailed(format_readiness_evidence(
-                    status.as_ref(),
-                    deadline,
-                    "deadline_exceeded",
-                )));
-            }
-
-            match tokio::time::timeout(remaining, self.server_status.changed()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) => {
-                    let status = self.latest_server_status();
-                    return Err(CoreError::ExecutionFailed(format_readiness_evidence(
-                        status.as_ref(),
-                        deadline,
-                        "server_status_channel_closed",
-                    )));
-                }
-                Err(_) => {
-                    let status = self.latest_server_status();
-                    return Err(CoreError::ExecutionFailed(format_readiness_evidence(
-                        status.as_ref(),
-                        deadline,
-                        "deadline_exceeded",
-                    )));
-                }
-            }
-        }
+        wait_for_server_readiness(&mut self.server_ready, &self.server_status, deadline).await
     }
 
     async fn workspace_symbol_with_params(
@@ -1116,7 +1137,10 @@ impl RustAnalyzerProvider {
             )
             .await?;
             client
-                .initialize_with_readiness_timeout(DEFAULT_LSP_TIMEOUT, self.readiness_timeout)
+                .initialize_with_readiness_timeout(
+                    DEFAULT_LSP_INITIALIZE_TIMEOUT,
+                    self.readiness_timeout,
+                )
                 .await?;
             *guard = Some(client);
         }
@@ -1349,6 +1373,47 @@ impl SemanticProvider for RustAnalyzerProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initialization_has_more_cold_start_budget_than_semantic_requests() {
+        assert_eq!(DEFAULT_LSP_INITIALIZE_TIMEOUT, Duration::from_secs(10));
+        assert!(DEFAULT_LSP_INITIALIZE_TIMEOUT > DEFAULT_LSP_TIMEOUT);
+        assert_eq!(DEFAULT_LSP_TIMEOUT, Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn readiness_latches_quiescence_across_coalesced_status_updates() {
+        let (latest_status_tx, latest_status_rx) = watch::channel(None);
+        let (readiness_tx, mut readiness_rx) = watch::channel(false);
+
+        for (quiescent, message) in [
+            (Some(false), "indexing"),
+            (Some(true), "ready pulse"),
+            (Some(false), "background work resumed"),
+        ] {
+            record_server_status(
+                &latest_status_tx,
+                &readiness_tx,
+                LspServerStatus {
+                    health: Some("ok".into()),
+                    quiescent,
+                    message: Some(message.into()),
+                },
+            );
+        }
+
+        wait_for_server_readiness(
+            &mut readiness_rx,
+            &latest_status_rx,
+            Duration::from_millis(50),
+        )
+        .await
+        .expect("a transient quiescent status must latch readiness");
+
+        let latest = latest_status_rx.borrow().clone().unwrap();
+        assert_eq!(latest.quiescent, Some(false));
+        assert_eq!(latest.message.as_deref(), Some("background work resumed"));
+    }
 
     #[test]
     fn detects_rust_analyzer_workspace_symbol_filtering_capability() {

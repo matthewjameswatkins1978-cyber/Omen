@@ -10,7 +10,7 @@ pub const DEFAULT_SEMANTIC_TIMEOUT: Duration = Duration::from_millis(3000);
 /// Live providers may need to start a process, initialize, become ready, and
 /// then answer the request. This must cover the rust-analyzer readiness and
 /// request bounds without making indexed/structural providers slower.
-pub const DEFAULT_LIVE_SEMANTIC_TIMEOUT: Duration = Duration::from_millis(40000);
+pub const DEFAULT_LIVE_SEMANTIC_TIMEOUT: Duration = Duration::from_millis(45000);
 pub const DEFAULT_RESULT_LIMIT: usize = 50;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1036,7 +1036,7 @@ mod tests {
 
     #[test]
     fn live_provider_default_budget_covers_readiness_and_request_bounds() {
-        assert!(DEFAULT_LIVE_SEMANTIC_TIMEOUT >= Duration::from_secs(15 + 5));
+        assert!(DEFAULT_LIVE_SEMANTIC_TIMEOUT >= Duration::from_secs(40));
         assert!(DEFAULT_LIVE_SEMANTIC_TIMEOUT <= Duration::from_secs(45));
     }
 
