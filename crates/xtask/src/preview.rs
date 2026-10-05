@@ -166,6 +166,12 @@ impl Manifest {
 struct InstallState {
     active_slot: Option<String>,
     previous_slot: Option<String>,
+    /// Final archive-byte identity for the active slot; separate from payload identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_package_sha256: Option<String>,
+    /// Final archive-byte identity for the previous slot, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_package_sha256: Option<String>,
     active: Option<Manifest>,
     last_proof: Option<Proof>,
     ci_green: bool,
@@ -1236,7 +1242,9 @@ fn install(_root: &Path, artifact: Option<PathBuf>) -> Result<(), String> {
     }
     let mut s = read_state();
     s.previous_slot = s.active_slot.take();
+    s.previous_package_sha256 = s.active_package_sha256.take();
     s.active_slot = Some(slot.clone());
+    s.active_package_sha256 = Some(actual_package_sha256.clone());
     s.active = Some(manifest.clone());
     s.ci_green = false;
     write_state(&s)?;
@@ -1644,6 +1652,25 @@ fn walk_zip(dir: &Path) -> Option<PathBuf> {
     }
     None
 }
+fn rollback_install_record(
+    manifest: &Manifest,
+    slot: &str,
+    package_sha256: Option<String>,
+    channel: omen_lifecycle::install::Channel,
+) -> Result<omen_lifecycle::install::InstallRecord, String> {
+    let mut record = omen_lifecycle::install::InstallRecord::new(
+        omen_lifecycle::install::Ownership::Omen,
+        channel,
+        &manifest.preview_version,
+        &manifest.git_sha,
+    );
+    record.active_slot = Some(slot.to_string());
+    record.package_sha256 = package_sha256;
+    record.payload_sha256 = Some(manifest.payload_identity()?.to_string());
+    record.binary_sha256 = Some(manifest.binary_sha256.clone());
+    Ok(record)
+}
+
 fn rollback(_root: &Path) -> Result<(), String> {
     let mut s = read_state();
     let prev = s
@@ -1665,10 +1692,32 @@ fn rollback(_root: &Path) -> Result<(), String> {
         ));
     }
     fs::copy(&candidate, active_binary()).map_err(|e| fail("OMEN_INSTALL_BUSY", e))?;
-    s.active_slot = Some(prev);
+
+    // Restore the exact archive identity recorded when this slot was installed.
+    // Legacy conveyor state may not have it; in that case keep package identity unknown
+    // rather than substituting the embedded payload digest.
+    let restored_package_sha256 = s.previous_package_sha256.take();
+    s.active_slot = Some(prev.clone());
     s.previous_slot = None;
-    s.active = Some(manifest);
+    s.active_package_sha256 = restored_package_sha256.clone();
+    s.active = Some(manifest.clone());
     write_state(&s)?;
+
+    // Keep the shared lifecycle record and active pointer aligned with the
+    // executable now restored by this conveyor operation.
+    let base = omen_lifecycle::state::state_base_dir();
+    let existing_record = omen_lifecycle::install::load_install_record(&base)
+        .map_err(|e| fail("OMEN_INSTALL_RECORD_FAILED", e))?;
+    let channel = existing_record
+        .as_ref()
+        .map(|record| record.channel.clone())
+        .unwrap_or(omen_lifecycle::install::Channel::Preview);
+    let record = rollback_install_record(&manifest, &prev, restored_package_sha256, channel)?;
+    omen_lifecycle::install::save_install_record(&base, &record)
+        .map_err(|e| fail("OMEN_INSTALL_RECORD_FAILED", e))?;
+    omen_lifecycle::update::write_active_pointer(&base, &prev)
+        .map_err(|e| fail("OMEN_INSTALL_RECORD_FAILED", e))?;
+
     println!("ROLLBACK: {}", s.active_slot.unwrap());
     Ok(())
 }
@@ -2086,6 +2135,32 @@ mod tests {
         // Legacy verification is content-agnostic for fixtures (exact v1
         // semantics): binary bytes must match, legacy field must match.
         verify_package_contents(&m, &binary, None, &std::collections::BTreeMap::new()).unwrap();
+
+        let legacy_state: InstallState = serde_json::from_value(serde_json::json!({
+            "active_slot": "legacy-slot",
+            "previous_slot": null,
+            "active": null,
+            "last_proof": null,
+            "ci_green": false
+        }))
+        .unwrap();
+        assert_eq!(legacy_state.active_package_sha256, None);
+        assert_eq!(legacy_state.previous_package_sha256, None);
+
+        let record = rollback_install_record(
+            &m,
+            "legacy-slot",
+            Some("ACTUAL-ARCHIVE-SHA".to_string()),
+            omen_lifecycle::install::Channel::Preview,
+        )
+        .unwrap();
+        assert_eq!(record.active_slot.as_deref(), Some("legacy-slot"));
+        assert_eq!(record.package_sha256.as_deref(), Some("ACTUAL-ARCHIVE-SHA"));
+        assert_eq!(
+            record.payload_sha256.as_deref(),
+            Some(legacy_field.as_str())
+        );
+        assert_eq!(record.binary_sha256.as_deref(), Some(bin_hash.as_str()));
     }
 
     // 11. Legacy v1 `package_sha256` is payload identity, NOT archive
