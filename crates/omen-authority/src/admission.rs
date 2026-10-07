@@ -261,6 +261,37 @@ impl<T: GateTransport> AdmitExecute<T> {
         }
     }
 
+    /// Atomic `commit_bundle` on `tethers.authority/2`: admits a bounded
+    /// ordered set of PREPAREd members together or not at all. Never a
+    /// loop over single `commit`: the Gate rechecks every member against
+    /// fresh authority inside its own durable transaction, and only a
+    /// ledger-committed bundle yields dispatchable members. Any refusal
+    /// (deny, replay, composition, count) surfaces as
+    /// [`BundleCommitOutcome::Refused`] with zero dispatch.
+    pub fn commit_bundle(
+        &mut self,
+        prepared_ids: &[String],
+        approvals: &std::collections::HashMap<String, String>,
+    ) -> Result<BundleCommitOutcome, AuthorityError> {
+        let mut payload = json!({"prepared_ids": prepared_ids});
+        if !approvals.is_empty() {
+            payload["approvals"] = json!(approvals);
+        }
+        match self
+            .transport
+            .roundtrip_v2(crate::protocol::OP_COMMIT_BUNDLE, payload)
+        {
+            Ok(raw) => {
+                let dispatch = crate::protocol::BundleDispatchRecord::parse(&raw)?;
+                Ok(BundleCommitOutcome::Admitted { dispatch })
+            }
+            Err(RoundtripError::Refused { code, message, .. }) => {
+                Ok(BundleCommitOutcome::Refused { code, message })
+            }
+            Err(RoundtripError::Transport(e)) => Err(e),
+        }
+    }
+
     /// Bounded durable-reconciliation read (reconnect/recovery surface).
     pub fn status(&mut self) -> Result<crate::protocol::DurableView, AuthorityError> {
         let raw = self.roundtrip_ok("status", json!({}))?;
@@ -276,6 +307,19 @@ impl<T: GateTransport> AdmitExecute<T> {
             Err(RoundtripError::Transport(e)) => Err(e),
         }
     }
+}
+
+/// Atomic bundle commit outcome: all members admitted together, or
+/// a machine-coded refusal with zero dispatch.
+#[derive(Debug, Clone)]
+pub enum BundleCommitOutcome {
+    Admitted {
+        dispatch: crate::protocol::BundleDispatchRecord,
+    },
+    Refused {
+        code: String,
+        message: String,
+    },
 }
 
 fn parse_prepare(raw: &Value, intent: &AuthorityIntent) -> Result<PrepareResult, AuthorityError> {

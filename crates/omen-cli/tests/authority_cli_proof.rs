@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const TETHERS_SHA: &str = "7e29110319c554a6586865ec6c47a45498696d16";
+const TETHERS_SHA: &str = "95136e2f029676a0e0e374aff2433e5dda3d554a";
 
 const CORE_TETHER: &str = r#"tether "J14 complete local scenario"
 

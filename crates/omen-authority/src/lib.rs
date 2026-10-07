@@ -20,6 +20,7 @@
 
 pub mod admission;
 pub mod binding;
+pub mod bundle_pipe;
 pub mod contract;
 pub mod digest;
 pub mod dispatch;
@@ -35,10 +36,17 @@ pub mod run;
 pub mod transport;
 
 pub use admission::{
-    AdmitExecute, ApprovalDecision, ApprovalOutcome, AuthorityIntent, CommitOutcome, PrepareOutcome,
+    AdmitExecute, ApprovalDecision, ApprovalOutcome, AuthorityIntent, BundleCommitOutcome,
+    CommitOutcome, PrepareOutcome,
 };
 pub use binding::{
     ExecutionBinding, FixtureProvision, VerifiedExecutionBinding, resolve_execution,
+};
+pub use bundle_pipe::{
+    AuthorisedBundle, AuthorisedPipeReport, PipeRedirect, PipeStage, StageAttempt, VerifiedBundle,
+    VerifiedBundleMember, authorise_and_spawn_pipe, authorise_pipe, compose_identity,
+    empty_approvals, mark_unstarted_members, member_outcome_payload, spawn_authorised,
+    verify_bundle_dispatch,
 };
 pub use contract::{AuthorityProjection, AuthorityState, HumanOutcome};
 pub use digest::{canonical_digest, verify_argument_digest};
@@ -49,10 +57,15 @@ pub use fetch::{FetchedCompanion, fetch_companion};
 pub use gate::{GateProcess, GateSpawnConfig};
 pub use identity::{ExpectedGate, TETHERS_SOURCE_SHA};
 pub use managed::{CompanionPaths, GateCompanion, resolve_companion};
-pub use outcome::{OutcomeJournal, OutcomeRecord, PendingOutcome};
+pub use outcome::{
+    OutcomeDelivered, OutcomeJournal, OutcomeRecord, PendingOutcome, bundle_member_outcome_payload,
+    deliver_outcome_v2,
+};
 pub use protocol::{
-    AUTHORITY_PROTOCOL, ApprovalInfo, CommitResult, DispatchRecord, OutcomeClassification,
-    OutcomeResult, PrepareResult, TETHERS_PRODUCT_VERSION,
+    AUTHORITY_PROTOCOL, AUTHORITY_PROTOCOL_V2, ApprovalInfo, BUNDLE_DISPATCH_SCHEMA,
+    BundleDispatchRecord, BundleMemberRecord, CommitResult, DispatchRecord, OP_COMMIT_BUNDLE,
+    OUTCOME_NOT_ATTEMPTED, OutcomeClassification, OutcomeResult, PrepareResult,
+    TETHERS_PRODUCT_VERSION,
 };
 pub use run::{AskPolicy, RunReport, parse_ask_policy, report_json, run_once};
 pub use transport::{GateTransport, RoundtripError};

@@ -8,7 +8,7 @@ the Windows live-authority item from the 1.0 convergence gate.
 ## Canonical Tethers identity
 
 - Repository: `matthewjameswatkins1978-cyber/tethers-lang`
-- Pinned source SHA: `7e29110319c554a6586865ec6c47a45498696d16`
+- Pinned source SHA: `95136e2f029676a0e0e374aff2433e5dda3d554a`
   (R2 external authority gate; SHA-guarded in Omen CI on every run)
 - Gate binary: `tethers-reference-host` (`tethers-0.1/host-rust`), release
 - Engine: `tethers_mcp_main` (`tethers-0.1/engine-ocaml`, dune-built)

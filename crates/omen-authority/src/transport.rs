@@ -17,6 +17,14 @@ pub trait GateTransport: Send {
     /// Send one operation frame and return the parsed `result` value, or
     /// the Gate error body on `status: error`.
     fn roundtrip(&mut self, operation: &str, payload: Value) -> Result<Value, RoundtripError>;
+    /// Schema-bound default: plain /1 `roundtrip`. The managed
+    /// [`crate::gate::GateProcess`] overrides this with the /2 frame
+    /// schema for bundle operations; scripted fakes keep /1 behaviour
+    /// unless they opt into /2 explicitly.
+    fn roundtrip_v2(&mut self, operation: &str, payload: Value) -> Result<Value, RoundtripError> {
+        self.roundtrip(operation, payload)
+    }
+
     /// Best-effort orderly session end. Failure is diagnostic only.
     fn shutdown(&mut self);
 }

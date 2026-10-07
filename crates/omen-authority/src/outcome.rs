@@ -169,6 +169,69 @@ pub fn deliver_outcome<T: GateTransport>(
     }
 }
 
+/// Build the /2 OUTCOME payload for one bundle member. Unlike the /1
+/// path (where `attempted == false` sends nothing), /2 accepts the
+/// bounded `not_attempted` terminal outcome for members of a
+/// ledger-committed bundle: classification `not_attempted` with
+/// attempted=false and neither result nor error (the Gate enforces the
+/// exact shape; anything else refuses). Attempted members behave like
+/// the /1 payload.
+pub fn bundle_member_outcome_payload(
+    execution_id: &str,
+    classification: &str,
+    attempted: bool,
+    result: Option<Value>,
+    error: Option<String>,
+) -> Value {
+    let mut payload = json!({
+        "execution_id": execution_id,
+        "classification": classification,
+        "attempted": attempted,
+    });
+    if let Some(r) = result {
+        payload["result"] = r;
+    }
+    if let Some(e) = error {
+        payload["error"] = Value::String(e);
+    }
+    payload
+}
+
+/// Deliver a bundle-member OUTCOME on `tethers.authority/2` with the
+/// same idempotent retry discipline as [`deliver_outcome`]: the retry
+/// carries the SAME classification for the SAME execution (never a
+/// re-execution).
+pub fn deliver_outcome_v2<T: GateTransport>(
+    transport: &mut T,
+    payload: &Value,
+) -> Result<OutcomeDelivered, AuthorityError> {
+    match transport.roundtrip_v2("outcome", payload.clone()) {
+        Ok(raw) => {
+            let parsed = OutcomeResult::parse(&raw)?;
+            Ok(OutcomeDelivered::Recorded(parsed))
+        }
+        Err(RoundtripError::Refused { code, message, .. }) => {
+            Ok(OutcomeDelivered::Refused { code, message })
+        }
+        Err(RoundtripError::Transport(_)) => {
+            // Response possibly lost AFTER the Gate recorded: retry once
+            // with identical classification (idempotent repeat path).
+            match transport.roundtrip_v2("outcome", payload.clone()) {
+                Ok(raw) => {
+                    let parsed = OutcomeResult::parse(&raw)?;
+                    Ok(OutcomeDelivered::Recorded(parsed))
+                }
+                Err(RoundtripError::Refused { code, message, .. }) => {
+                    Ok(OutcomeDelivered::Refused { code, message })
+                }
+                Err(RoundtripError::Transport(e)) => Err(AuthorityError::OutcomeIncomplete(
+                    format!("outcome.delivery.lost: {e:?}; retry delivery, never re-execute"),
+                )),
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum OutcomeDelivered {
     Recorded(OutcomeResult),

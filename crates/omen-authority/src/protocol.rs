@@ -11,7 +11,7 @@ use serde_json::Value;
 /// Exact frozen protocol identity. Any other schema value refuses.
 pub const AUTHORITY_PROTOCOL: &str = "tethers.authority/1";
 /// Expected compatible Tethers product version (independent axis).
-pub const TETHERS_PRODUCT_VERSION: &str = "0.8.0";
+pub const TETHERS_PRODUCT_VERSION: &str = "0.8.1";
 /// Dispatch record schema returned by a successful `commit`.
 pub const DISPATCH_SCHEMA: &str = "tethers.dispatch/1";
 /// Maximum accepted response frame size (mirrors the Gate bound).
@@ -30,6 +30,15 @@ impl RequestFrame {
     pub fn new(request_id: String, operation: &str, payload: Value) -> Self {
         Self {
             schema: AUTHORITY_PROTOCOL.to_string(),
+            request_id,
+            operation: operation.to_string(),
+            payload,
+        }
+    }
+
+    pub fn new_in(schema: &str, request_id: String, operation: &str, payload: Value) -> Self {
+        Self {
+            schema: schema.to_string(),
             request_id,
             operation: operation.to_string(),
             payload,
@@ -69,6 +78,12 @@ pub struct GateErrorBody {
 
 impl ResponseFrame {
     pub fn parse(line: &str) -> Result<Self, crate::AuthorityError> {
+        Self::parse_in(line, AUTHORITY_PROTOCOL)
+    }
+
+    /// Schema-explicit parse: the frame schema must equal `expected`.
+    /// Used for /2 bundle frames; /1 behaviour is unchanged.
+    pub fn parse_in(line: &str, expected: &str) -> Result<Self, crate::AuthorityError> {
         if line.len() > MAX_FRAME_BYTES {
             return Err(crate::AuthorityError::Receive(
                 "frame.oversized: response exceeds 1 MiB".to_string(),
@@ -81,7 +96,7 @@ impl ResponseFrame {
         let frame: ResponseFrame = serde_json::from_str(line).map_err(|e| {
             crate::AuthorityError::Receive(format!("frame.invalid_json: {e} :: {snippet}"))
         })?;
-        if frame.schema != AUTHORITY_PROTOCOL {
+        if frame.schema != expected {
             return Err(crate::AuthorityError::Receive(format!(
                 "frame.unsupported_schema: {}",
                 frame.schema
@@ -346,5 +361,110 @@ impl DurableView {
         self.terminal_outcomes
             .iter()
             .any(|v| v.get("execution_id").and_then(|id| id.as_str()) == Some(execution_id))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `tethers.authority/2` — atomic host-execution bundles (Tethers 0.8.1+).
+//
+// Additive over /1: every /1 operation behaves identically on /2; /2 adds
+// `commit_bundle` and the bundle-bound `not_attempted` outcome. Omen's /1
+// paths above are untouched. A bundle is a bounded ordered set of PREPAREd
+// ordinary Actions admitted atomically: either every member becomes
+// dispatchable together (ledger-committed), or none does.
+// ---------------------------------------------------------------------------
+
+/// Exact /2 protocol identity. Sent as the frame schema for bundle
+/// operations; /2 responses must echo it.
+pub const AUTHORITY_PROTOCOL_V2: &str = "tethers.authority/2";
+/// `commit_bundle` operation name (recognised only on /2 frames; the
+/// Gate refuses it on /1 as an unknown operation — frozen protocol).
+pub const OP_COMMIT_BUNDLE: &str = "commit_bundle";
+/// Dispatch record schema returned by a successful `commit_bundle`.
+pub const BUNDLE_DISPATCH_SCHEMA: &str = "tethers.bundle_dispatch/2";
+/// Bundle-bound terminal outcome: a committed member never attempted
+/// (partial physical start). Refused on /1; accepted on /2 only for
+/// members of a ledger-committed bundle with attempted=false and
+/// neither result nor error.
+pub const OUTCOME_NOT_ATTEMPTED: &str = "not_attempted";
+
+/// One member of a `tethers.bundle_dispatch/2` record.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BundleMemberRecord {
+    pub execution_id: String,
+    pub evaluation_id: String,
+    pub action_id: String,
+    pub event_id: String,
+    pub capability: CapabilityRef,
+    pub argument_digest: String,
+    pub manifest_digest: String,
+    pub provider_identity: String,
+    pub prepared_id: String,
+    pub approval_consumed: bool,
+}
+
+/// Typed `tethers.bundle_dispatch/2` commit_bundle result.
+#[derive(Debug, Clone)]
+pub struct BundleDispatchRecord {
+    pub bundle_id: String,
+    pub composition_digest: String,
+    pub members: Vec<BundleMemberRecord>,
+    pub authority_protocol: String,
+    pub authorizes_physical_execution_by_tethers: bool,
+    pub host_must_report_outcome: bool,
+    pub provider_invocations: u64,
+    pub raw: Value,
+}
+
+impl BundleDispatchRecord {
+    pub fn parse(raw: &Value) -> Result<Self, crate::AuthorityError> {
+        let fail = |detail: String| {
+            crate::AuthorityError::Validate(format!("bundle.dispatch.parse.failed: {detail}"))
+        };
+        let obj = raw
+            .as_object()
+            .ok_or_else(|| fail("result not an object".to_string()))?;
+        let get_str = |k: &str| {
+            obj.get(k)
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .ok_or_else(|| fail(format!("missing {k}")))
+        };
+        let schema = get_str("schema")?;
+        if schema != BUNDLE_DISPATCH_SCHEMA {
+            return Err(fail(format!("schema_mismatch: {schema}")));
+        }
+        let members_raw = obj
+            .get("members")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| fail("missing members".to_string()))?;
+        let mut members = Vec::with_capacity(members_raw.len());
+        for m in members_raw {
+            members.push(
+                serde_json::from_value(m.clone())
+                    .map_err(|e| fail(format!("member malformed: {e}")))?,
+            );
+        }
+        Ok(Self {
+            bundle_id: get_str("bundle_id")?,
+            composition_digest: get_str("composition_digest")?,
+            members,
+            authority_protocol: get_str("authority_protocol")?,
+            authorizes_physical_execution_by_tethers: obj
+                .get("authorizes_physical_execution_by_tethers")
+                .and_then(|v| v.as_bool())
+                .ok_or_else(|| {
+                    fail("missing authorizes_physical_execution_by_tethers".to_string())
+                })?,
+            host_must_report_outcome: obj
+                .get("host_must_report_outcome")
+                .and_then(|v| v.as_bool())
+                .ok_or_else(|| fail("missing host_must_report_outcome".to_string()))?,
+            provider_invocations: obj
+                .get("provider_invocations")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            raw: raw.clone(),
+        })
     }
 }

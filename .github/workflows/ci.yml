@@ -228,9 +228,9 @@ jobs:
           $dst = Join-Path $env:RUNNER_TEMP 'tethers-pkg-src'
           if (Test-Path $dst) { Remove-Item -Recurse -Force $dst }
           git clone https://github.com/matthewjameswatkins1978-cyber/tethers-lang $dst
-          git -C $dst checkout 7e29110319c554a6586865ec6c47a45498696d16
+          git -C $dst checkout 95136e2f029676a0e0e374aff2433e5dda3d554a
           $sha = (git -C $dst rev-parse HEAD).Trim().ToLowerInvariant()
-          if ($sha -ne '7e29110319c554a6586865ec6c47a45498696d16') { throw "TETHERS_SHA_GUARD_FAILED: $sha" }
+          if ($sha -ne '95136e2f029676a0e0e374aff2433e5dda3d554a') { throw "TETHERS_SHA_GUARD_FAILED: $sha" }
           if (git -C $dst status --porcelain --untracked-files=no) { throw "TETHERS_DIRTY: fresh clone must be clean" }
           "TETHERS_PKG_SRC=$dst" >> $env:GITHUB_ENV
           "TETHERS_SHA_GUARD: PASS ($sha)"
@@ -251,7 +251,7 @@ jobs:
           ls -la _build/default/bin/tethers_mcp_main* || true
       - name: Provision canonical Gate companion
         shell: pwsh
-        run: cargo run --package xtask -- preview provision-gate --tethers-dir "${{ env.TETHERS_PKG_SRC }}" --expect-sha 7e29110319c554a6586865ec6c47a45498696d16 --out work/gate-companion
+        run: cargo run --package xtask -- preview provision-gate --tethers-dir "${{ env.TETHERS_PKG_SRC }}" --expect-sha 95136e2f029676a0e0e374aff2433e5dda3d554a --out work/gate-companion
       - name: Build exact Windows candidate
         run: cargo run --package xtask -- preview package --ci-run-id ${{ github.run_id }} --gate-companion work/gate-companion
       - name: Emit exact-SHA provenance
@@ -278,7 +278,7 @@ jobs:
           foreach ($f in @('gate_companion_asset','gate_companion_sha256','gate_exe_sha256','gate_tethers_sha')) {
             if (-not $rel.PSObject.Properties[$f].Value) { throw "GATE_COMPANION_UNBOUND: release manifest lacks $f" }
           }
-          if ($rel.gate_tethers_sha.ToLowerInvariant() -ne '7e29110319c554a6586865ec6c47a45498696d16') { throw "GATE_TETHERS_SHA_MISMATCH: $($rel.gate_tethers_sha)" }
+          if ($rel.gate_tethers_sha.ToLowerInvariant() -ne '95136e2f029676a0e0e374aff2433e5dda3d554a') { throw "GATE_TETHERS_SHA_MISMATCH: $($rel.gate_tethers_sha)" }
           $compHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $compZip).Hash.ToLowerInvariant()
           if ($compHash -ne $rel.gate_companion_sha256.ToLowerInvariant()) { throw "GATE_COMPANION_DIGEST_MISMATCH: $compHash != $($rel.gate_companion_sha256)" }
           if ((Split-Path -Leaf $compZip) -ne $rel.gate_companion_asset) { throw "GATE_COMPANION_ASSET_MISMATCH" }
@@ -418,8 +418,8 @@ jobs:
           if (-not $compZip) { throw "GATE_COMPANION_MISSING" }
           $compHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $compZip).Hash.ToLowerInvariant()
           if ($compHash -ne $rel.gate_companion_sha256.ToLowerInvariant()) { throw "GATE_COMPANION_DIGEST_MISMATCH" }
-          if ($rel.gate_tethers_sha.ToLowerInvariant() -ne '7e29110319c554a6586865ec6c47a45498696d16') { throw "GATE_TETHERS_SHA_MISMATCH" }
-          "p25-update companion binding: PASS"
+          if ($rel.gate_tethers_sha.ToLowerInvariant() -ne '95136e2f029676a0e0e374aff2433e5dda3d554a') { throw "GATE_TETHERS_SHA_MISMATCH" }
+          "p25-update companion binding: PASS (pin 95136e2f029676a0e0e374aff2433e5dda3d554a)"
           # No stale companion active: fetch is on-demand; a live dir must be
           # absent or carry exactly the P25 SHAs (P23 never ships one).
           $compLive = Join-Path $env:LOCALAPPDATA 'Omen\gate-companion'
@@ -503,14 +503,14 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: matthewjameswatkins1978-cyber/tethers-lang
-          ref: 7e29110319c554a6586865ec6c47a45498696d16
+          ref: 95136e2f029676a0e0e374aff2433e5dda3d554a
           path: tethers-canonical
 
       - name: Verify canonical Tethers SHA
         shell: pwsh
         run: |
           $sha = (git -C tethers-canonical rev-parse HEAD).Trim().ToLowerInvariant()
-          if ($sha -ne '7e29110319c554a6586865ec6c47a45498696d16') {
+          if ($sha -ne '95136e2f029676a0e0e374aff2433e5dda3d554a') {
             throw "TETHERS_SHA_GUARD_FAILED: $sha"
           }
           "OMEN_H2_TETHERS_SHA=$sha" >> $env:GITHUB_ENV

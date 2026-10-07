@@ -11,14 +11,14 @@ use crate::protocol::{AUTHORITY_PROTOCOL, HelloResult, TETHERS_PRODUCT_VERSION};
 /// Canonical Tethers source SHA the managed companion is built from.
 /// Single source of truth for the pin: CI checks out exactly this, the
 /// E2E asserts the checkout matches, and release provenance records it.
-pub const TETHERS_SOURCE_SHA: &str = "7e29110319c554a6586865ec6c47a45498696d16";
+pub const TETHERS_SOURCE_SHA: &str = "95136e2f029676a0e0e374aff2433e5dda3d554a";
 
 /// Pinned Gate identity (release provenance; handshake expectations).
 #[derive(Debug, Clone)]
 pub struct ExpectedGate {
     /// Exact authority protocol (`tethers.authority/1`).
     pub protocol: String,
-    /// Exact compatible product version (`0.8.0`).
+    /// Exact compatible product version (`0.8.1`).
     pub product_version: String,
     /// Canonical Tethers source SHA the companion was built from.
     pub tethers_source_sha: String,
@@ -44,6 +44,16 @@ impl ExpectedGate {
                 "shutdown".to_string(),
             ],
         }
+    }
+
+    /// Pinned /2 identity for bundle operations: the frame protocol is
+    /// `tethers.authority/2` and the feature set additionally requires
+    /// `commit_bundle`. Verified against a /2 `hello`.
+    pub fn pinned_v2(tethers_source_sha: String, gate_exe_sha256: Option<String>) -> Self {
+        let mut base = Self::pinned(tethers_source_sha, gate_exe_sha256);
+        base.protocol = crate::protocol::AUTHORITY_PROTOCOL_V2.to_string();
+        base.features.push("commit_bundle".to_string());
+        base
     }
 
     /// Verify a `hello` result against the pin. Any deviation refuses:

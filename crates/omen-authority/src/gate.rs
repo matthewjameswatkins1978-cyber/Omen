@@ -13,7 +13,9 @@
 //! child; orderly end uses [`GateProcess::shutdown`].
 
 use crate::AuthorityError;
-use crate::protocol::{AUTHORITY_PROTOCOL, HelloResult, MAX_FRAME_BYTES, RequestFrame};
+use crate::protocol::{
+    AUTHORITY_PROTOCOL, AUTHORITY_PROTOCOL_V2, HelloResult, MAX_FRAME_BYTES, RequestFrame,
+};
 use crate::transport::{GateTransport, RoundtripError};
 use serde_json::Value;
 use std::io::Read;
@@ -165,10 +167,14 @@ impl GateProcess {
     }
 
     /// `hello` handshake with the startup bound. Must be called first.
-    pub fn hello(&mut self, startup_timeout: Duration) -> Result<HelloResult, AuthorityError> {
+    pub fn hello_in(
+        &mut self,
+        schema: &str,
+        startup_timeout: Duration,
+    ) -> Result<HelloResult, AuthorityError> {
         let saved = self.request_timeout;
         self.request_timeout = startup_timeout;
-        let out = self.roundtrip_checked("hello", Value::Object(Default::default()));
+        let out = self.roundtrip_checked_in(schema, "hello", Value::Object(Default::default()));
         self.request_timeout = saved;
         let (_, raw) = out.map_err(|e| match e {
             RoundtripError::Transport(err) => err,
@@ -180,11 +186,36 @@ impl GateProcess {
             .map_err(|e| AuthorityError::Initialize(format!("gate.hello.malformed: {e}")))
     }
 
+    /// /2 hello: proves the pinned companion speaks
+    /// `tethers.authority/2` (features include `commit_bundle`).
+    pub fn hello_v2(&mut self, startup_timeout: Duration) -> Result<HelloResult, AuthorityError> {
+        self.hello_in(AUTHORITY_PROTOCOL_V2, startup_timeout)
+    }
+
+    /// `hello` handshake with the startup bound. Must be called first.
+    pub fn hello(&mut self, startup_timeout: Duration) -> Result<HelloResult, AuthorityError> {
+        self.hello_in(AUTHORITY_PROTOCOL, startup_timeout)
+    }
+
     /// Response `request_id` echo check: responses that do not echo the
     /// request identity kill the session. (The Gate echoes `request_id`;
     /// `interpret` validates framing — the echo binding lives here.)
     pub fn roundtrip_checked(
         &mut self,
+        operation: &str,
+        payload: Value,
+    ) -> Result<(String, Value), RoundtripError> {
+        self.roundtrip_checked_in(AUTHORITY_PROTOCOL, operation, payload)
+    }
+
+    /// Schema-explicit variant: sends `schema` as the frame schema and
+    /// requires the response to echo it. /2 bundle operations use
+    /// [`crate::protocol::AUTHORITY_PROTOCOL_V2`]; anything else kills
+    /// the session — a Gate that answers /2 work with /1 frames (or the
+    /// reverse) is not the pinned companion.
+    pub fn roundtrip_checked_in(
+        &mut self,
+        schema: &str,
         operation: &str,
         payload: Value,
     ) -> Result<(String, Value), RoundtripError> {
@@ -194,7 +225,7 @@ impl GateProcess {
             )));
         }
         let request_id = self.next_request_id();
-        let frame = RequestFrame::new(request_id.clone(), operation, payload);
+        let frame = RequestFrame::new_in(schema, request_id.clone(), operation, payload);
         let line = frame.to_line().map_err(RoundtripError::Transport)?;
         if let Some(stdin) = self.stdin.as_mut() {
             if let Err(e) = stdin.write_all(line.as_bytes()).and_then(|_| stdin.flush()) {
@@ -237,8 +268,8 @@ impl GateProcess {
                 ))));
             }
         };
-        let parsed =
-            crate::protocol::ResponseFrame::parse(&raw_line).map_err(RoundtripError::Transport)?;
+        let parsed = crate::protocol::ResponseFrame::parse_in(&raw_line, schema)
+            .map_err(RoundtripError::Transport)?;
         if parsed.request_id != request_id {
             self.kill_now();
             return Err(RoundtripError::Transport(AuthorityError::Receive(format!(
@@ -246,7 +277,7 @@ impl GateProcess {
                 parsed.request_id
             ))));
         }
-        if parsed.schema != AUTHORITY_PROTOCOL {
+        if parsed.schema != schema {
             self.kill_now();
             return Err(RoundtripError::Transport(AuthorityError::Receive(
                 "frame.unsupported_schema from gate".to_string(),
@@ -311,6 +342,13 @@ impl GateTransport for GateProcess {
 
     fn roundtrip(&mut self, operation: &str, payload: Value) -> Result<Value, RoundtripError> {
         self.roundtrip_checked(operation, payload).map(|(_, v)| v)
+    }
+
+    /// /2 bundle path: frames carry the /2 schema and /2 responses must
+    /// echo it. Used by `commit_bundle` and bundle-member `outcome`.
+    fn roundtrip_v2(&mut self, operation: &str, payload: Value) -> Result<Value, RoundtripError> {
+        self.roundtrip_checked_in(AUTHORITY_PROTOCOL_V2, operation, payload)
+            .map(|(_, v)| v)
     }
 
     fn shutdown(&mut self) {

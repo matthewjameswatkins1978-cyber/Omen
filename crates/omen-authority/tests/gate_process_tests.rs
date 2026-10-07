@@ -292,7 +292,7 @@ fn g11b_hello_identity_pins() {
     let base = || HelloResult {
         protocol: "tethers.authority/1".to_string(),
         protocol_versions: vec!["tethers.authority/1".to_string()],
-        product_version: "0.8.0".to_string(),
+        product_version: "0.8.1".to_string(),
         git_sha: None,
         features: vec![
             "prepare".to_string(),
@@ -319,6 +319,18 @@ fn g11b_hello_identity_pins() {
     let mut bad = base();
     bad.authority_granted = true;
     assert!(pin.verify_hello(&bad).is_err());
+    // /2 pin: verifies a /2 hello carrying commit_bundle; refuses a /1
+    // hello (missing feature) and a wrong product.
+    let pin2 = ExpectedGate::pinned_v2("abc123".to_string(), None);
+    let mut hello2 = base();
+    hello2.protocol = "tethers.authority/2".to_string();
+    hello2.protocol_versions = vec![
+        "tethers.authority/1".to_string(),
+        "tethers.authority/2".to_string(),
+    ];
+    hello2.features.push("commit_bundle".to_string());
+    assert!(pin2.verify_hello(&hello2).is_ok());
+    assert!(pin.verify_hello(&hello2).is_err());
 }
 
 // 12. Malformed NDJSON: handshake refuses; zero spawn.
