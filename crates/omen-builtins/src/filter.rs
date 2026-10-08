@@ -320,9 +320,10 @@ pub fn wc(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
         out.extend(
             format_counts(show_lines, show_words, show_bytes, lines, words, bytes).as_bytes(),
         );
-        if named {
+        // Stdin chunks (`-`) print bare counts like GNU; only files are named.
+        if named && let Some(n) = name {
             out.push(b' ');
-            out.extend(name.clone().unwrap_or_default().as_bytes());
+            out.extend(n.as_bytes());
         }
         out.push(b'\n');
     }
@@ -1321,7 +1322,12 @@ pub fn grep(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
                     continue;
                 }
                 if show_names {
-                    selected.extend(name.clone().unwrap_or_default().as_bytes());
+                    // Explicit `-` operands label like GNU: `(standard input)`.
+                    selected.extend(
+                        name.clone()
+                            .unwrap_or_else(|| "(standard input)".to_string())
+                            .as_bytes(),
+                    );
                     selected.push(b':');
                 }
                 if numbered {
@@ -1332,7 +1338,11 @@ pub fn grep(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
         }
         if counted && !quiet {
             if show_names {
-                out.extend(name.clone().unwrap_or_default().as_bytes());
+                out.extend(
+                    name.clone()
+                        .unwrap_or_else(|| "(standard input)".to_string())
+                        .as_bytes(),
+                );
                 out.push(b':');
             }
             out.extend(format!("{count}\n").as_bytes());
@@ -1448,6 +1458,24 @@ mod tests {
             String::from_utf8_lossy(&out.stdout),
             "      2      3     16\n"
         );
+        // Explicit `-` prints bare counts even alongside named files.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("f.txt"), b"x\n").expect("write");
+        let file_ctx = BuiltinContext {
+            cwd: dir.path().to_path_buf(),
+            env: Vec::new(),
+            stdin: b"y\n".to_vec(),
+        };
+        let out = wc(&s(&["-", "f.txt"]), &file_ctx);
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            text.lines()
+                .next()
+                .expect("stdin line")
+                .ends_with("1      1      2"),
+            "{text:?}"
+        );
+        assert!(text.contains("f.txt"));
     }
 
     #[test]
