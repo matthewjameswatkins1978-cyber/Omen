@@ -379,9 +379,7 @@ pub fn estimate(resolved: &ResolvedOp) -> EffectEstimate {
             for source in sources {
                 let src = absolutize(&resolved.cwd, source);
                 walk_operand(&src, *recursive, &mut estimate, &mut push);
-                if sources.len() > 1 || dest_is_dir {
-                    let _ = dest_is_dir;
-                } else {
+                if sources.len() == 1 && !dest_is_dir {
                     note_overwrite(&mut estimate, dest_path.clone());
                 }
             }
