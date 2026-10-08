@@ -29,6 +29,42 @@ impl BuiltinsProvider {
     pub fn new(knowledge: Arc<OmenKnowledge>) -> Self {
         Self { knowledge }
     }
+
+    /// Static flags for one builtin at option position.
+    fn discover_options(&self, ctx: &ProviderContext, command: &str) -> ProviderOutcome {
+        let span = ctx.replacement_span;
+        let mut candidates = Vec::new();
+        for (i, flag) in (self.knowledge.builtin_options)(command).iter().enumerate() {
+            candidates.push(
+                DiscoveredCandidate::new(
+                    SemanticKey::new(
+                        Kind::Option,
+                        *flag,
+                        SemanticNamespace::Tool {
+                            tool: command.to_string(),
+                        },
+                    ),
+                    ProvenanceKey::new(
+                        "builtins",
+                        AuthorityClass::Static,
+                        EvidenceIdentity::Static,
+                    ),
+                    *flag,
+                    Authority::Static,
+                    span,
+                )
+                .with_description(Description::short(format!("{command} option")))
+                .with_order_policy(OrderPolicy::Semantic(i as u32))
+                .with_safety(SafetyAnnotation::SafeReadOnly),
+            );
+        }
+        if candidates.is_empty() {
+            return ProviderOutcome::Declined {
+                reason: DeclineReason::NoMatch,
+            };
+        }
+        ProviderOutcome::Answered { candidates }
+    }
 }
 
 impl DiscoveryProvider for BuiltinsProvider {
@@ -37,12 +73,19 @@ impl DiscoveryProvider for BuiltinsProvider {
     }
 
     fn supported_kinds(&self) -> &'static [Kind] {
-        &[Kind::Intrinsic]
+        &[Kind::Intrinsic, Kind::Option]
     }
 
     fn triggers(&self, ctx: &ProviderContext) -> TriggerDecision {
         match &ctx.command_position {
             CommandPosition::CommandName if !ctx.query().starts_with(':') => TriggerDecision::Apply,
+            // Option position, but only when the command in scope is one of
+            // ours — external tools keep their own spec/harvest sources.
+            CommandPosition::OptionName { command, .. }
+                if self.knowledge.shell_builtins.contains(&command.as_str()) =>
+            {
+                TriggerDecision::Apply
+            }
             _ => TriggerDecision::Skip,
         }
     }
@@ -64,6 +107,10 @@ impl DiscoveryProvider for BuiltinsProvider {
     }
 
     fn discover(&mut self, ctx: &ProviderContext, _budget: &DiscoveryBudget) -> ProviderOutcome {
+        // Option position serves one command's static flags.
+        if let CommandPosition::OptionName { command, .. } = &ctx.command_position {
+            return self.discover_options(ctx, command);
+        }
         let span = ctx.replacement_span;
         let mut candidates = Vec::new();
         for (i, name) in self.knowledge.shell_builtins.iter().enumerate() {
@@ -111,6 +158,10 @@ mod tests {
             builtin_help: |name| match name {
                 "ls" => Some(("ls [-a] [-l] [path ...]", "listing")),
                 _ => None,
+            },
+            builtin_options: |name| match name {
+                "ls" => &["-a", "-l"],
+                _ => &[],
             },
             tool_subcommands: |_| &[],
             is_drive_designator: |_| None,
@@ -179,5 +230,30 @@ mod tests {
             option_value_of: None,
         };
         assert_eq!(p.triggers(&colon), TriggerDecision::Skip);
+    }
+
+    #[test]
+    fn option_position_serves_builtin_flags_only() {
+        use crate::budget::DiscoveryDepth;
+        fn opt_ctx(command: &str, q: &str) -> ProviderContext {
+            let mut ctx = cmd_ctx(q);
+            ctx.command_position = CommandPosition::OptionName {
+                command: command.to_string(),
+                chain: vec![],
+            };
+            ctx.depth = DiscoveryDepth::Normal;
+            ctx
+        }
+        let mut p = BuiltinsProvider::new(knowledge());
+        assert_eq!(p.triggers(&opt_ctx("ls", "--")), TriggerDecision::Apply);
+        let out = p.discover(&opt_ctx("ls", "--"), &DiscoveryBudget::inline_only());
+        let names: Vec<String> = out
+            .candidates()
+            .iter()
+            .map(|c| c.value.insert.clone())
+            .collect();
+        assert_eq!(names, vec!["-a", "-l"]);
+        // External commands keep their own sources: skipped here.
+        assert_eq!(p.triggers(&opt_ctx("cargo", "--")), TriggerDecision::Skip);
     }
 }

@@ -152,6 +152,42 @@ pub fn run_if_builtin(
     Some(Ok(output))
 }
 
+/// Static option words per builtin, for completion. A test below asserts
+/// every registry name resolves here (optionless builtins resolve to an
+/// explicit empty table); unknown names yield `&[]`. Mirrors the parsers;
+/// `--` ends option parsing everywhere.
+pub fn builtin_options(name: &str) -> &'static [&'static str] {
+    match name {
+        "cat" => &["-n", "--"],
+        "clear" => &[],
+        "cut" => &["-b", "-c", "-f", "-d", "-s", "-n", "--"],
+        "dir" => &["-a", "-l", "-0", "-1", "-d", "--"],
+        "du" => &["-s", "-a", "-b", "-k", "-m", "--"],
+        "echo" => &["-n", "-e", "-E", "--"],
+        "find" => &["-maxdepth", "-mindepth", "-type", "-name", "--"],
+        "grep" => &[
+            "-i", "-v", "-c", "-n", "-q", "-x", "-F", "-H", "-h", "-e", "--",
+        ],
+        "head" => &["-n", "--"],
+        "help" => &[],
+        "ls" => &["-a", "-l", "-0", "-1", "-d", "--"],
+        "pwd" => &["-L", "-P"],
+        "printf" => &[],
+        "readlink" => &["-f", "--"],
+        "realpath" => &["-m", "--"],
+        "sort" => &["-r", "-n", "-u", "-f", "--"],
+        "stat" => &["-L", "--"],
+        "tail" => &["-n", "--"],
+        "tr" => &["-c", "-d", "-s", "-t", "--"],
+        "tree" => &["-a", "-d", "-L", "--"],
+        "uniq" => &["-c", "-d", "-u", "-i", "--"],
+        "wc" => &["-l", "-w", "-c", "--"],
+        "where" => &["-a", "--"],
+        "which" => &["-a", "--"],
+        _ => &[],
+    }
+}
+
 /// Usage and notes per builtin: the single authority behind `help`.
 ///
 /// Completion derives the name list from [`BUILTIN_NAMES`]; human detail
@@ -427,5 +463,21 @@ mod consistency_tests {
         // Empty pipeline is not a pipeline.
         let empty: Vec<PipelineStage> = Vec::new();
         assert!(run_pipeline(&empty, &ctx).is_none());
+    }
+
+    /// Every registry name resolves to its own option table (optionless
+    /// builtins resolve explicitly empty); unknown names yield `&[]`.
+    #[test]
+    fn every_builtin_has_an_option_table() {
+        for name in BUILTIN_NAMES {
+            let options = builtin_options(name);
+            if matches!(*name, "clear" | "help" | "printf") {
+                assert!(options.is_empty(), "{name} takes no options");
+            } else {
+                assert!(!options.is_empty(), "{name} is missing its option table");
+            }
+        }
+        assert!(builtin_options("cargo").is_empty());
+        assert!(builtin_options("").is_empty());
     }
 }
