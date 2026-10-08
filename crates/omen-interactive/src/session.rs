@@ -29,7 +29,32 @@ pub struct InteractiveSession {
     pub agent_registry: std::sync::Arc<omen_agent::ProviderRegistry>,
     pub backend_registry: std::sync::Arc<omen_engine::BackendRegistry>,
     pub human_settings: HumanSettings,
+    standalone_jobs: Vec<StandaloneJob>,
+    next_standalone_job: u64,
 }
+
+/// Lifecycle of one standalone (daemonless) background job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StandaloneJobState {
+    Running,
+    Finished { code: Option<i32>, runtime: String },
+}
+
+/// A background job owned by this session process: one OS thread driving
+/// a cancelable supervised execution. Cancellation kills the process tree
+/// (Job Objects on Windows, process-group KILL on Unix) via the engine.
+/// Finished jobs stay listed until the session ends; at most 32 are
+/// tracked (further background spawns refuse with a clear error).
+pub struct StandaloneJob {
+    pub id: String,
+    pub label: String,
+    pub state: std::sync::Arc<std::sync::Mutex<StandaloneJobState>>,
+    cancel: tokio::sync::watch::Sender<bool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Cap on tracked standalone jobs: threads are heavier than daemon records.
+const MAX_STANDALONE_JOBS: usize = 32;
 
 pub fn block_on_async<F>(future: F) -> F::Output
 where
@@ -193,6 +218,8 @@ impl InteractiveSession {
             agent_registry,
             backend_registry,
             human_settings: HumanSettings::default(),
+            standalone_jobs: Vec::new(),
+            next_standalone_job: 1,
         };
         sess.prompt.apply_settings(sess.human_settings.clone());
         sess.update_prompt_state();
@@ -752,16 +779,21 @@ impl InteractiveSession {
             ));
         }
         let stages = self.prepare_shell_pipeline_stages(first, false)?;
+        // Standalone (daemonless) sessions run background jobs locally on
+        // cancelable supervised execution; connected sessions use the
+        // shared daemon broker below.
+        if self
+            .client
+            .as_ref()
+            .is_none_or(|client| !client.is_connected())
+        {
+            return self.spawn_standalone_background(stages);
+        }
         let client = self
             .client
             .as_ref()
             .filter(|client| client.is_connected())
-            .ok_or_else(|| {
-                unsupported(
-                    "background execution requires a connected Omen daemon; standalone mode refuses detached work"
-                        .into(),
-                )
-            })?;
+            .ok_or_else(|| unsupported("Omen daemon is not connected".into()))?;
 
         let cwd = self.cwd.to_string_lossy().to_string();
         let submission = if stages.len() == 1 && stages[0].env.is_empty() {
@@ -887,9 +919,170 @@ impl InteractiveSession {
         Ok(stages)
     }
 
+    /// Spawns prepared stages as a standalone background job: one OS thread
+    /// driving cancelable supervised execution. Prints `Started background
+    /// job <id>.` and returns exit 0; the job's own outcome lands in its
+    /// tracked state (see `:jobs`). Reuses the exact spawn semantics as
+    /// foreground execution, minus the wait.
+    fn spawn_standalone_background(
+        &mut self,
+        stages: Vec<omen_ipc::PipelineStageRequest>,
+    ) -> Result<ProcessExit, CoreError> {
+        if self.standalone_jobs.len() >= MAX_STANDALONE_JOBS {
+            return Err(CoreError::ExecutionFailed(format!(
+                "this interactive session has reached its {MAX_STANDALONE_JOBS} tracked standalone-job limit"
+            )));
+        }
+        let id = format!("job-{}", self.next_standalone_job);
+        self.next_standalone_job += 1;
+        let label = stages
+            .iter()
+            .map(|stage| stage.argv.join(" "))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let exec_cwd = self.cwd.clone();
+        let backend = self.backend_registry.active();
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let state = std::sync::Arc::new(std::sync::Mutex::new(StandaloneJobState::Running));
+        let thread_state = state.clone();
+        let thread = std::thread::spawn(move || {
+            let supervisor = omen_engine::ProcessSupervisor::with_backend(backend);
+            let outcome = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| {
+                    omen_core::CoreError::Internal(format!("background runtime failed: {error}"))
+                })
+                .and_then(|runtime| {
+                    runtime.block_on(async {
+                        if stages.len() == 1 {
+                            let request = omen_engine::ExecutionRequest {
+                                argv: stages[0].argv.clone(),
+                                cwd: exec_cwd,
+                                env: stages[0].env.clone(),
+                                stdin_mode: omen_core::StdioMode::Closed,
+                                stdin_payload: None,
+                                timeout_ms: 60000,
+                                inline_budget: 65536,
+                                required_assurance: omen_core::RequiredAssurance::default(),
+                                secrets: vec![],
+                            };
+                            supervisor
+                                .execute_cancelable(request, cancel_rx)
+                                .await
+                                .map(|output| (output.process_exit.code, output.runtime_status))
+                        } else {
+                            let requests = stages
+                                .iter()
+                                .map(|stage| omen_engine::ExecutionRequest {
+                                    argv: stage.argv.clone(),
+                                    cwd: exec_cwd.clone(),
+                                    env: stage.env.clone(),
+                                    stdin_mode: omen_core::StdioMode::Closed,
+                                    stdin_payload: None,
+                                    timeout_ms: 60000,
+                                    inline_budget: 65536,
+                                    required_assurance: omen_core::RequiredAssurance::default(),
+                                    secrets: vec![],
+                                })
+                                .collect();
+                            supervisor
+                                .execute_pipeline_cancelable(requests, cancel_rx)
+                                .await
+                                .map(|output| {
+                                    (
+                                        output.execution.process_exit.code,
+                                        output.execution.runtime_status,
+                                    )
+                                })
+                        }
+                    })
+                });
+            let finished = match outcome {
+                Ok((code, runtime)) => StandaloneJobState::Finished {
+                    code,
+                    runtime: format!("{runtime:?}"),
+                },
+                Err(error) => StandaloneJobState::Finished {
+                    code: None,
+                    runtime: format!("SpawnFailed: {error:?}"),
+                },
+            };
+            if let Ok(mut guard) = thread_state.lock() {
+                *guard = finished;
+            }
+        });
+        println!("Started background job {id}.");
+        self.standalone_jobs.push(StandaloneJob {
+            id,
+            label,
+            state,
+            cancel: cancel_tx,
+            thread: Some(thread),
+        });
+        Ok(ProcessExit::success(0))
+    }
+
+    fn standalone_job_state(&self, id: &str) -> Option<StandaloneJobState> {
+        self.standalone_jobs
+            .iter()
+            .find(|job| job.id == id)
+            .and_then(|job| job.state.lock().ok().map(|guard| guard.clone()))
+    }
+
+    /// Stops a standalone job: fires cancellation (tree kill via the
+    /// engine), joins the driver thread, and reports the observed state.
+    fn stop_standalone_job(&mut self, id: &str) -> Result<ProcessExit, CoreError> {
+        let position = self
+            .standalone_jobs
+            .iter()
+            .position(|job| job.id == id)
+            .ok_or_else(|| {
+                CoreError::ExecutionFailed(format!(
+                    "No background job with ID '{id}' is tracked by this session."
+                ))
+            })?;
+        self.standalone_jobs[position]
+            .cancel
+            .send(true)
+            .map_err(|_| CoreError::Internal(format!("job {id}: cancellation channel closed")))?;
+        // The engine bounds its termination grace period, so the driver
+        // thread always ends; a join failure means the thread panicked.
+        if let Some(thread) = self.standalone_jobs[position].thread.take()
+            && thread.join().is_err()
+        {
+            eprintln!("Background job {id}: driver thread panicked.");
+            return Ok(ProcessExit {
+                code: Some(1),
+                signal: None,
+            });
+        }
+        let state = self
+            .standalone_job_state(id)
+            .unwrap_or(StandaloneJobState::Running);
+        println!("{id}: {state:?}");
+        let stopped = !matches!(state, StandaloneJobState::Running);
+        Ok(ProcessExit {
+            code: Some(if stopped { 0 } else { 1 }),
+            signal: None,
+        })
+    }
+
     fn dispatch_background_jobs(&self) -> Result<ProcessExit, CoreError> {
-        if self.background_jobs.is_empty() {
+        for job in &self.standalone_jobs {
+            let state = job
+                .state
+                .lock()
+                .map(|guard| format!("{:?}", *guard))
+                .unwrap_or_else(|_| "Unknown".to_string());
+            println!("{} [{}] {}", job.id, state, job.label);
+        }
+        if self.background_jobs.is_empty() && self.standalone_jobs.is_empty() {
             println!("No background jobs tracked in this interactive session.");
+            return Ok(ProcessExit::success(0));
+        }
+        if self.background_jobs.is_empty() {
+            // Standalone jobs are already listed above; nothing brokered.
             return Ok(ProcessExit::success(0));
         }
         let client = self
@@ -907,7 +1100,12 @@ impl InteractiveSession {
         Ok(ProcessExit::success(0))
     }
 
-    fn dispatch_background_stop(&self, execution_id: &str) -> Result<ProcessExit, CoreError> {
+    fn dispatch_background_stop(&mut self, execution_id: &str) -> Result<ProcessExit, CoreError> {
+        // Standalone jobs (`job-N`) stop locally; daemon jobs (`exec_…`)
+        // stop through the broker below.
+        if execution_id.starts_with("job-") {
+            return self.stop_standalone_job(execution_id);
+        }
         if !self
             .background_jobs
             .iter()
@@ -941,7 +1139,23 @@ impl InteractiveSession {
         })
     }
 
-    fn cancel_background_jobs_on_exit(&self) {
+    fn cancel_background_jobs_on_exit(&mut self) {
+        // Standalone jobs: fire every cancel flag, then join every driver.
+        // Still-running jobs are tree-killed by the engine first, whose
+        // termination grace period bounds this wait.
+        for job in &self.standalone_jobs {
+            let _ = job.cancel.send(true);
+        }
+        for job in &mut self.standalone_jobs {
+            if let Some(thread) = job.thread.take()
+                && thread.join().is_err()
+            {
+                eprintln!(
+                    "Background job {}: driver thread panicked during exit.",
+                    job.id
+                );
+            }
+        }
         let Some(client) = self.client.as_ref().filter(|client| client.is_connected()) else {
             return;
         };
@@ -1804,5 +2018,98 @@ mod builtin_pipeline_dispatch_tests {
             !dir.path().join("out.txt").exists(),
             "refused write created a file"
         );
+    }
+
+    /// Portable long-runner for background-cancel tests (platform truth:
+    /// `sleep` on Unix, `ping`-as-timer on Windows).
+    #[cfg(windows)]
+    fn sleeper_argv() -> Vec<String> {
+        vec![
+            "cmd".to_string(),
+            "/c".to_string(),
+            "ping -n 30 127.0.0.1 > nul".to_string(),
+        ]
+    }
+    #[cfg(not(windows))]
+    fn sleeper_argv() -> Vec<String> {
+        vec!["sleep".to_string(), "30".to_string()]
+    }
+
+    /// Polls a job state until the deadline; panics with the last state.
+    fn await_state(
+        session: &InteractiveSession,
+        id: &str,
+        done: impl Fn(&StandaloneJobState) -> bool,
+        label: &str,
+    ) -> StandaloneJobState {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let state = session
+                .standalone_job_state(id)
+                .unwrap_or(StandaloneJobState::Running);
+            if done(&state) {
+                return state;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("{label}: timed out in state {state:?}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// `cmd &` tracks a standalone job without a daemon; a fast command
+    /// finishes and `:jobs` reports it.
+    #[test]
+    fn standalone_background_fast_command_finishes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = standalone_session(dir.path().to_path_buf());
+        let exit = session
+            .dispatch_input("hostname &")
+            .expect("background dispatches");
+        assert_eq!(exit.code, Some(0));
+        let state = await_state(
+            &session,
+            "job-1",
+            |s| !matches!(s, StandaloneJobState::Running),
+            "hostname job",
+        );
+        assert!(
+            matches!(state, StandaloneJobState::Finished { code: Some(0), .. }),
+            "hostname finishes zero, got {state:?}"
+        );
+        let exit = session.dispatch_input(":jobs").expect(":jobs dispatches");
+        assert_eq!(exit.code, Some(0));
+    }
+
+    /// Stopping a running standalone job tree-kills it and reports a
+    /// non-running state (never a manufactured success).
+    #[test]
+    fn standalone_background_cancel_kills_sleeper() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = standalone_session(dir.path().to_path_buf());
+        let argv = sleeper_argv();
+        let stages = vec![omen_ipc::PipelineStageRequest {
+            argv,
+            env: Vec::new(),
+        }];
+        let exit = session
+            .spawn_standalone_background(stages)
+            .expect("sleeper spawns");
+        assert_eq!(exit.code, Some(0));
+        // Give the driver thread a moment to reach spawn; then stop.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let exit = session
+            .stop_standalone_job("job-1")
+            .expect("stop dispatches");
+        assert_eq!(exit.code, Some(0));
+        let state = session
+            .standalone_job_state("job-1")
+            .expect("job still tracked");
+        assert!(
+            !matches!(state, StandaloneJobState::Running),
+            "cancelled sleeper left Running: {state:?}"
+        );
+        // Unknown ids refuse with a clear error, not a panic.
+        assert!(session.stop_standalone_job("job-99").is_err());
     }
 }
