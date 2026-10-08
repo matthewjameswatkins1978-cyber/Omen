@@ -10,6 +10,7 @@
 //! |---|---|---|
 //! | [`omen_actions::OmenActionProvider`] | 0 MemoryOnly | `OmenFact` |
 //! | [`intrinsics::IntrinsicsProvider`] | 0 MemoryOnly | `Static` |
+//! | [`builtins::BuiltinsProvider`] | 0 MemoryOnly | `Static` |
 //! | [`references::ReferenceProvider`] | 0 MemoryOnly | `Static` |
 //! | [`hot_index::HotIndexProvider`] | 0 MemoryOnly | `OmenFact` / `Environment` |
 //! | [`subcommands::SubcommandProvider`] | 0 MemoryOnly | `Static` |
@@ -29,6 +30,7 @@
 //! inert structured data and strictly bounded deterministic help harvest feed
 //! candidates.
 
+pub mod builtins;
 pub mod drive;
 pub mod filesystem_paths;
 pub mod help_harvest;
@@ -41,6 +43,7 @@ pub mod references;
 pub mod subcommands;
 pub mod tool_spec;
 
+pub use builtins::BuiltinsProvider;
 pub use filesystem_paths::FilesystemPathProvider;
 pub use help_harvest::{
     HarvestedOption, HelpHarvestCache, HelpHarvestProvider, ToolIdentity, parse_help_options,
