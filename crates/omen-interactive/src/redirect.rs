@@ -133,7 +133,6 @@ pub fn resolve_command_redirects(
                         parent.display()
                     )));
                 }
-                let _ = op;
                 output = Some(PendingWrite {
                     overwrites: path.exists(),
                     path,
