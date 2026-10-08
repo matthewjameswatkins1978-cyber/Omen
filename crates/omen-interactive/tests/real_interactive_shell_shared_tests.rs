@@ -65,7 +65,7 @@ async fn spawn_connected_session(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_background_shell_refuses_standalone_and_boolean_chain_jobs() {
+async fn test_background_shell_refuses_boolean_chain_jobs() {
     let temp = tempdir().unwrap();
     let db_path = canonical_workspace_db_path(temp.path());
     let db = Database::open(&db_path).unwrap();
@@ -74,24 +74,67 @@ async fn test_background_shell_refuses_standalone_and_boolean_chain_jobs() {
         InteractiveSession::new_with_client(session_id, temp.path().to_path_buf(), Some(db), None)
             .unwrap();
 
-    for input in ["echo first && echo second &", "echo standalone &"] {
-        let error = session
-            .dispatch_input(input)
-            .expect_err("unsupported background requests must fail closed");
-        assert!(
-            matches!(
-                error,
-                omen_core::CoreError::ExecutionFailedCode {
-                    code: omen_core::ErrorCode::Unsupported,
-                    ..
-                }
-            ),
-            "expected explicit unsupported result for {input:?}, got {error:?}"
-        );
-        assert!(
-            session.tracked_background_jobs().is_empty(),
-            "a refused background request must not be recorded as a job"
-        );
+    // Boolean-chain background has no job semantics: still refused.
+    let error = session
+        .dispatch_input("echo first && echo second &")
+        .expect_err("boolean-chain background must fail closed");
+    assert!(
+        matches!(
+            error,
+            omen_core::CoreError::ExecutionFailedCode {
+                code: omen_core::ErrorCode::Unsupported,
+                ..
+            }
+        ),
+        "expected explicit unsupported result, got {error:?}"
+    );
+    assert!(
+        session.tracked_background_jobs().is_empty() && session.standalone_jobs().is_empty(),
+        "a refused background request must not be recorded as a job"
+    );
+}
+
+/// Standalone (daemonless) background now WORKS (P4): `hostname &` tracks
+/// a `job-N` that finishes on its own. This supersedes the old
+/// refuse-standalone contract — the refusal above is what remains refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_background_shell_supports_standalone_jobs() {
+    let temp = tempdir().unwrap();
+    let db_path = canonical_workspace_db_path(temp.path());
+    let db = Database::open(&db_path).unwrap();
+    let session_id = InteractiveSessionId::new("sess_shell_background_standalone_ok").unwrap();
+    let mut session =
+        InteractiveSession::new_with_client(session_id, temp.path().to_path_buf(), Some(db), None)
+            .unwrap();
+
+    let exit = session
+        .dispatch_input("hostname &")
+        .expect("standalone background spawns");
+    assert_eq!(exit.code, Some(0));
+    assert!(
+        session.tracked_background_jobs().is_empty(),
+        "standalone jobs never enter the daemon job list"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let jobs = session.standalone_jobs();
+        assert_eq!(jobs.len(), 1, "exactly one standalone job tracked");
+        assert_eq!(jobs[0].id, "job-1");
+        if !matches!(jobs[0].state, omen_interactive::StandaloneJobState::Running) {
+            assert!(
+                matches!(
+                    jobs[0].state,
+                    omen_interactive::StandaloneJobState::Finished { code: Some(0), .. }
+                ),
+                "hostname finishes zero, got {:?}",
+                jobs[0].state
+            );
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("hostname job still running after 30s: {:?}", jobs[0].state);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
 

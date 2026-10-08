@@ -30,7 +30,7 @@ pub use preflight::{BlastPreflight, BlastRadiusReport, BlastSeverity, PasteGuard
 pub use prompt_adapter::OmenPrompt;
 pub use resolver::ReferenceResolver;
 pub use services::{ManagedService, ServiceRegistry, ServiceState};
-pub use session::InteractiveSession;
+pub use session::{BackgroundJobInfo, InteractiveSession, StandaloneJobInfo, StandaloneJobState};
 
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
