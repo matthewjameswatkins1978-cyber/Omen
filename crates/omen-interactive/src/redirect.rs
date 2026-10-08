@@ -34,8 +34,9 @@ pub struct PendingWrite {
 /// What one command's redirects resolved to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedRedirects {
-    /// Stdin bytes from the last `< file` (empty when none).
-    pub stdin: Vec<u8>,
+    /// Stdin bytes from the last `< file` (`None` when no input redirect;
+    /// `Some(empty)` for an empty file — presence matters, not length).
+    pub stdin: Option<Vec<u8>>,
     /// Stdout file write (refused-closed at apply time until P2 admission).
     pub output: Option<PendingWrite>,
 }
@@ -97,7 +98,7 @@ pub fn resolve_command_redirects(
     command: &ShellCommand,
     cwd: &Path,
 ) -> Result<ResolvedRedirects, CoreError> {
-    let mut stdin = Vec::new();
+    let mut stdin: Option<Vec<u8>> = None;
     let mut output: Option<PendingWrite> = None;
     for redirect in &command.redirects {
         if redirect.fd.is_some() {
@@ -108,12 +109,12 @@ pub fn resolve_command_redirects(
         match (&redirect.operation, &redirect.target) {
             (ShellRedirectOperation::Input, ShellRedirectTarget::Word(word)) => {
                 let path = expand_target(word, cwd, "input redirect")?;
-                stdin = std::fs::read(&path).map_err(|error| {
+                stdin = Some(std::fs::read(&path).map_err(|error| {
                     CoreError::ExecutionFailed(format!(
                         "input redirect: {}: {error}",
                         path.display()
                     ))
-                })?;
+                })?);
             }
             (
                 ShellRedirectOperation::Overwrite | ShellRedirectOperation::Append,
@@ -168,19 +169,19 @@ pub fn apply_output_write(_pending: &PendingWrite, _bytes: &[u8]) -> Result<(), 
 pub fn resolve_pipeline_redirects(
     pipeline: &crate::shell_grammar::ShellPipeline,
     cwd: &Path,
-) -> Result<(Vec<u8>, Option<PendingWrite>), CoreError> {
-    let mut stdin = Vec::new();
+) -> Result<(Option<Vec<u8>>, Option<PendingWrite>), CoreError> {
+    let mut stdin: Option<Vec<u8>> = None;
     let mut output: Option<PendingWrite> = None;
     for (index, command) in pipeline.commands.iter().enumerate() {
         let resolved = resolve_command_redirects(command, cwd)?;
-        if !resolved.stdin.is_empty() {
+        if let Some(bytes) = resolved.stdin {
             if index != 0 {
                 return Err(unsupported(
                     "input redirects (<) are honored on the first pipeline stage only in P3"
                         .to_string(),
                 ));
             }
-            stdin = resolved.stdin;
+            stdin = Some(bytes);
         }
         if resolved.output.is_some() {
             output = resolved.output;
@@ -214,8 +215,19 @@ mod tests {
         std::fs::write(dir.path().join("in.txt"), b"a\0b\n").expect("write");
         let command = parse_command("cat < in.txt");
         let resolved = resolve_command_redirects(&command, dir.path()).expect("resolves");
-        assert_eq!(resolved.stdin, b"a\0b\n");
+        assert_eq!(resolved.stdin, Some(b"a\0b\n".to_vec()));
         assert!(resolved.output.is_none());
+    }
+
+    #[test]
+    fn empty_input_file_feeds_empty_not_chain() {
+        // Presence matters: `< empty` must feed empty bytes, not fall
+        // through to chain/terminal stdin.
+        let dir = ctx();
+        std::fs::write(dir.path().join("empty.txt"), b"").expect("write");
+        let command = parse_command("cat < empty.txt");
+        let resolved = resolve_command_redirects(&command, dir.path()).expect("resolves");
+        assert_eq!(resolved.stdin, Some(Vec::new()));
     }
 
     #[test]

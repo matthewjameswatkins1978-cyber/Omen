@@ -999,7 +999,9 @@ impl InteractiveSession {
             let stages = self.prepare_shell_pipeline_stages(pipeline, true)?;
             // All-builtin pipelines run in-process: zero spawns, byte-exact
             // chaining. Mixed pipelines fall through to the broker.
-            if let Some(result) = self.try_dispatch_builtin_pipeline(&stages, chain_stdin) {
+            if let Some(result) =
+                self.try_dispatch_builtin_pipeline(&stages, chain_stdin.unwrap_or_default())
+            {
                 return result;
             }
             // External stages with redirects still need the supervised
@@ -1074,12 +1076,14 @@ impl InteractiveSession {
 
         // In-process read-only builtins (P1): same rule as the executable
         // lane — no child spawn, no daemon broker.
-        if let Some(result) = self.try_dispatch_builtin(&argv, resolved.stdin.clone(), extra_env) {
+        if let Some(result) =
+            self.try_dispatch_builtin(&argv, resolved.stdin.clone().unwrap_or_default(), extra_env)
+        {
             return result;
         }
         // External commands cannot consume a resolved input redirect yet:
         // the broker path carries no stdin payload in P3.
-        if !resolved.stdin.is_empty() {
+        if resolved.stdin.is_some() {
             return Err(CoreError::ExecutionFailedCode {
                 code: omen_core::ErrorCode::Unsupported,
                 message: "redirection requires the supervised redirection dispatcher".into(),
