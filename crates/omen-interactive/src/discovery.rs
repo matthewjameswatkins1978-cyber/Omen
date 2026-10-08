@@ -933,8 +933,20 @@ mod tests {
         }
     }
 
-    /// Builtin file operands complete from the filesystem like any other
-    /// command — `cat al` offers `alpha.txt` (generic ExecArg provider).
+    /// Visible git aliases complete as intrinsics (single source: the
+    /// SHELL_INTRINSICS authority, not a second list).
+    #[test]
+    fn command_name_position_offers_visible_aliases() {
+        let cache = path_cache(&[]);
+        let r = run_discovery_serialized(&req("g", 1, ".", &cache));
+        let inserts: Vec<&str> = r.ranked.iter().map(|x| x.value().insert.as_str()).collect();
+        for alias in ["g", "gd", "gs"] {
+            assert!(
+                inserts.contains(&alias),
+                "alias {alias} surfaced: {inserts:?}"
+            );
+        }
+    }
     #[test]
     fn exec_arg_position_offers_files_for_builtins() {
         let dir = tempfile::tempdir().expect("tempdir");
