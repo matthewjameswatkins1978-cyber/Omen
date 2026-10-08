@@ -476,9 +476,9 @@ impl InteractiveSession {
                 let res = if action == "jobs" {
                     self.dispatch_background_jobs()
                 } else if action == "stop"
-                    && args
-                        .first()
-                        .is_some_and(|target| target.starts_with("exec_"))
+                    && args.first().is_some_and(|target| {
+                        target.starts_with("exec_") || target.starts_with("job-")
+                    })
                 {
                     self.dispatch_background_stop(&args[0])
                 } else {
@@ -536,6 +536,45 @@ impl InteractiveSession {
                     };
 
                     return self.navigate_to(target_path, "cd");
+                }
+
+                // Session words without a colon: bare `history` reads the
+                // same display as `:history`; bare `jobs` lists session
+                // jobs; bare `stop <id>` stops one. Exact shapes only —
+                // anything else falls through to external execution.
+                if resolved_argv == ["history".to_string()] || resolved_argv == ["jobs".to_string()]
+                {
+                    let action = &resolved_argv[0];
+                    let res = if action == "jobs" {
+                        self.dispatch_background_jobs()
+                    } else {
+                        crate::actions::SemanticDispatcher::dispatch(
+                            action,
+                            &[],
+                            &self.cwd,
+                            &self.session_id,
+                            self.db.as_mut(),
+                            Some(&self.agent_registry),
+                            Some(&self.backend_registry),
+                        )
+                    };
+                    if let Ok(exit) = &res {
+                        self.last_exit = Some(exit.clone());
+                    }
+                    self.update_prompt_state();
+                    return res;
+                }
+                if resolved_argv.len() == 2
+                    && resolved_argv[0] == "stop"
+                    && (resolved_argv[1].starts_with("exec_")
+                        || resolved_argv[1].starts_with("job-"))
+                {
+                    let res = self.dispatch_background_stop(&resolved_argv[1]);
+                    if let Ok(exit) = &res {
+                        self.last_exit = Some(exit.clone());
+                    }
+                    self.update_prompt_state();
+                    return res;
                 }
 
                 // In-process read-only builtins (P1): no child spawn, no
@@ -1057,15 +1096,13 @@ impl InteractiveSession {
     /// Stops a standalone job: fires cancellation (tree kill via the
     /// engine), joins the driver thread, and reports the observed state.
     fn stop_standalone_job(&mut self, id: &str) -> Result<ProcessExit, CoreError> {
-        let position = self
-            .standalone_jobs
-            .iter()
-            .position(|job| job.id == id)
-            .ok_or_else(|| {
-                CoreError::ExecutionFailed(format!(
-                    "No background job with ID '{id}' is tracked by this session."
-                ))
-            })?;
+        let Some(position) = self.standalone_jobs.iter().position(|job| job.id == id) else {
+            eprintln!("No background job with ID '{id}' is tracked by this session.");
+            return Ok(ProcessExit {
+                code: Some(1),
+                signal: None,
+            });
+        };
         self.standalone_jobs[position]
             .cancel
             .send(true)
@@ -2013,6 +2050,27 @@ mod builtin_pipeline_dispatch_tests {
         assert!(format!("{error:?}").contains("nosuchbin_xyz_omen"));
     }
 
+    /// Bare session words (no colon) reach the same displays: `history`
+    /// reads session history, `jobs` lists (empty) jobs, `stop` on an
+    /// unknown id refuses cleanly.
+    #[test]
+    fn bare_session_words_dispatch_without_colon() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = standalone_session(dir.path().to_path_buf());
+        let exit = session
+            .dispatch_input("history")
+            .expect("history dispatches");
+        assert_eq!(exit.code, Some(0));
+        let exit = session.dispatch_input("jobs").expect("jobs dispatches");
+        assert_eq!(exit.code, Some(0));
+        let exit = session.dispatch_input(":jobs").expect(":jobs dispatches");
+        assert_eq!(exit.code, Some(0));
+        let exit = session
+            .dispatch_input("stop job-99")
+            .expect("stop dispatches");
+        assert_eq!(exit.code, Some(1));
+    }
+
     /// `< file` feeds a builtin chain from bytes on disk.
     #[test]
     fn input_redirect_feeds_builtin_pipeline() {
@@ -2133,7 +2191,10 @@ mod builtin_pipeline_dispatch_tests {
             !matches!(state, StandaloneJobState::Running),
             "cancelled sleeper left Running: {state:?}"
         );
-        // Unknown ids refuse with a clear error, not a panic.
-        assert!(session.stop_standalone_job("job-99").is_err());
+        // Unknown ids refuse with exit 1, not a panic or Err.
+        let exit = session
+            .stop_standalone_job("job-99")
+            .expect("stop dispatches");
+        assert_eq!(exit.code, Some(1));
     }
 }
