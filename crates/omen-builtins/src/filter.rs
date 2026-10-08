@@ -1119,11 +1119,10 @@ pub fn tr(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
         );
     }
     let squeeze_set: Vec<bool> = if squeeze {
-        let source = if !set2.is_empty() && !delete {
-            &set2
-        } else {
-            &set1
-        };
+        // Squeeze applies to SET2 when present (GNU: -s squeezes the
+        // translated set; under -d there is no translation, so SET2
+        // itself), else to SET1.
+        let source = if !set2.is_empty() { &set2 } else { &set1 };
         let mut present = [false; 256];
         for byte in source {
             present[*byte as usize] = true;
@@ -1562,6 +1561,9 @@ mod tests {
         // Complement of everything-but-newline deletes letters, keeps newline.
         let out = tr(&s(&["-c", "-d", "\\n"]), &ctx_with(b"ab\ncd\n"));
         assert_eq!(out.stdout, b"\n\n");
+        // -d -s: delete SET1, squeeze SET2 (GNU).
+        let out = tr(&s(&["-d", "-s", "a", "b"]), &ctx_with(b"aaabbb\n"));
+        assert_eq!(out.stdout, b"b\n");
         // Files refused: stdin only.
         assert_eq!(tr(&s(&["a", "b", "file"]), &ctx_with(b"")).code, 1);
         assert_eq!(tr(&s(&["a"]), &ctx_with(b"x")).code, 1);
