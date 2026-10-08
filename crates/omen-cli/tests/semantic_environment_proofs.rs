@@ -311,7 +311,10 @@ async fn test_proof_c_real_lsp_symbol_definition_and_references() {
         return;
     }
 
-    run_with_watchdog("test_proof_c", Duration::from_secs(75), async {
+    // Cold-start budget derivation: the first phase pays worst-case server
+    // readiness (2x25s grace) plus search work; later phases run warm.
+    // Watchdog covers all three phases plus fixture overhead.
+    run_with_watchdog("test_proof_c", Duration::from_secs(180), async {
         let temp_dir = tempfile::tempdir().unwrap();
         let src_dir = temp_dir.path().join("src");
         std::fs::create_dir_all(&src_dir).unwrap();
@@ -343,7 +346,7 @@ pub struct SessionToken;
         let symbols = run_phase(
             "test_proof_c",
             "lsp_function_symbol_search",
-            Duration::from_secs(45),
+            Duration::from_secs(100),
             ra_provider.symbol_search("refresh_token", 10),
         )
         .await

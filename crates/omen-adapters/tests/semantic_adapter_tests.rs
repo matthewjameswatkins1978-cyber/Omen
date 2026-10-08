@@ -376,6 +376,7 @@ async fn rust_analyzer_readiness_timeout_is_explicit_and_not_not_found() {
         Duration::from_millis(100),
     );
 
+    let t0 = std::time::Instant::now();
     let error = provider
         .symbol_search("refresh_token", 10)
         .await
@@ -385,7 +386,9 @@ async fn rust_analyzer_readiness_timeout_is_explicit_and_not_not_found() {
     assert!(text.contains("phase=readiness.wait"));
     assert!(text.contains("health=ok"));
     assert!(text.contains("quiescent=false"));
-    assert!(text.contains("deadline_ms=100"));
+    // One cold-start extension only: total budget is 2x, never unbounded.
+    assert!(text.contains("deadline_ms=200"));
+    assert!(t0.elapsed() < Duration::from_secs(2), "single extension");
 }
 
 #[tokio::test]
