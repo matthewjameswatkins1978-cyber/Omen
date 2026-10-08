@@ -489,7 +489,7 @@ impl InteractiveSession {
 
                 // In-process read-only builtins (P1): no child spawn, no
                 // daemon broker. Read-only inspection/formatting only.
-                if let Some(result) = self.try_dispatch_builtin(&resolved_argv) {
+                if let Some(result) = self.try_dispatch_builtin(&resolved_argv, Vec::new()) {
                     return result;
                 }
 
@@ -751,7 +751,7 @@ impl InteractiveSession {
                 "this interactive session has reached its 128 tracked background-job limit".into(),
             ));
         }
-        let stages = self.prepare_shell_pipeline_stages(first)?;
+        let stages = self.prepare_shell_pipeline_stages(first, false)?;
         let client = self
             .client
             .as_ref()
@@ -813,6 +813,7 @@ impl InteractiveSession {
     fn prepare_shell_pipeline_stages(
         &self,
         pipeline: &crate::shell_grammar::ShellPipeline,
+        strip_redirects: bool,
     ) -> Result<Vec<omen_ipc::PipelineStageRequest>, CoreError> {
         let unsupported = |message: String| CoreError::ExecutionFailedCode {
             code: omen_core::ErrorCode::Unsupported,
@@ -820,7 +821,10 @@ impl InteractiveSession {
         };
         let mut stages = Vec::with_capacity(pipeline.commands.len());
         for command in &pipeline.commands {
-            if !command.redirects.is_empty() {
+            // Redirects are pre-resolved by the caller when `strip_redirects`
+            // is set (in-process builtin path); the broker/background paths
+            // keep the refusal.
+            if !strip_redirects && !command.redirects.is_empty() {
                 return Err(unsupported(
                     "redirection requires the supervised redirection dispatcher".into(),
                 ));
@@ -979,20 +983,43 @@ impl InteractiveSession {
                 .any(|command| !command.environment.is_empty());
 
         if needs_pipeline_dispatch {
-            let stages = self.prepare_shell_pipeline_stages(pipeline)?;
+            // Redirects resolve before anything executes: input feeds the
+            // chain, output is validated then refused-closed (P2) with
+            // zero effects.
+            let (chain_stdin, pending_output) =
+                crate::redirect::resolve_pipeline_redirects(pipeline, &self.cwd)?;
+            if let Some(pending) = &pending_output {
+                return crate::redirect::apply_output_write(pending, &[]).map(|()| ProcessExit {
+                    code: Some(0),
+                    signal: None,
+                });
+            }
+            let stages = self.prepare_shell_pipeline_stages(pipeline, true)?;
             // All-builtin pipelines run in-process: zero spawns, byte-exact
             // chaining. Mixed pipelines fall through to the broker.
-            if let Some(result) = self.try_dispatch_builtin_pipeline(&stages) {
+            if let Some(result) = self.try_dispatch_builtin_pipeline(&stages, chain_stdin) {
                 return result;
+            }
+            // External stages with redirects still need the supervised
+            // redirection dispatcher: preserve the refusal.
+            if pipeline.commands.iter().any(|c| !c.redirects.is_empty()) {
+                return Err(CoreError::ExecutionFailedCode {
+                    code: omen_core::ErrorCode::Unsupported,
+                    message: "redirection requires the supervised redirection dispatcher".into(),
+                });
             }
             return self.execute_pipeline_via_broker(stages, None);
         }
 
         let command = &pipeline.commands[0];
-        if !command.redirects.is_empty() {
-            return Err(unsupported(
-                "redirection requires the supervised redirection dispatcher".into(),
-            ));
+        // Single-command redirects resolve before execution; output writes
+        // refuse closed (P2) with zero effects.
+        let resolved = crate::redirect::resolve_command_redirects(command, &self.cwd)?;
+        if let Some(pending) = &resolved.output {
+            return crate::redirect::apply_output_write(pending, &[]).map(|()| ProcessExit {
+                code: Some(0),
+                signal: None,
+            });
         }
 
         let mut argv = Vec::new();
@@ -1024,8 +1051,16 @@ impl InteractiveSession {
 
         // In-process read-only builtins (P1): same rule as the executable
         // lane — no child spawn, no daemon broker.
-        if let Some(result) = self.try_dispatch_builtin(&argv) {
+        if let Some(result) = self.try_dispatch_builtin(&argv, resolved.stdin.clone()) {
             return result;
+        }
+        // External commands cannot consume a resolved input redirect yet:
+        // the broker path carries no stdin payload in P3.
+        if !resolved.stdin.is_empty() {
+            return Err(CoreError::ExecutionFailedCode {
+                code: omen_core::ErrorCode::Unsupported,
+                message: "redirection requires the supervised redirection dispatcher".into(),
+            });
         }
 
         if let Some(blast) = crate::preflight::BlastPreflight::assess(&argv) {
@@ -1177,11 +1212,15 @@ impl InteractiveSession {
     /// and never go through the daemon broker: they are pure functions of
     /// `(argv, cwd, env, stdin)` in the same trust class as the `:action`
     /// dispatcher. Session-affecting words (`cd`) stay with the caller.
-    fn try_dispatch_builtin(&mut self, argv: &[String]) -> Option<Result<ProcessExit, CoreError>> {
+    fn try_dispatch_builtin(
+        &mut self,
+        argv: &[String],
+        stdin: Vec<u8>,
+    ) -> Option<Result<ProcessExit, CoreError>> {
         let ctx = omen_builtins::BuiltinContext {
             cwd: self.cwd.clone(),
             env: std::env::vars().collect(),
-            stdin: Vec::new(),
+            stdin,
         };
         let output = match omen_builtins::run_if_builtin(argv, &ctx)? {
             Ok(output) => output,
@@ -1216,6 +1255,7 @@ impl InteractiveSession {
     fn try_dispatch_builtin_pipeline(
         &mut self,
         stages: &[omen_ipc::PipelineStageRequest],
+        stdin: Vec<u8>,
     ) -> Option<Result<ProcessExit, CoreError>> {
         let inputs: Vec<omen_builtins::PipelineStage> = stages
             .iter()
@@ -1227,7 +1267,7 @@ impl InteractiveSession {
         let ctx = omen_builtins::BuiltinContext {
             cwd: self.cwd.clone(),
             env: std::env::vars().collect(),
-            stdin: Vec::new(),
+            stdin,
         };
         let outputs = omen_builtins::run_pipeline(&inputs, &ctx)?;
         use std::io::Write as _;
@@ -1733,5 +1773,36 @@ mod builtin_pipeline_dispatch_tests {
             .dispatch_input("nosuchbin_xyz_omen")
             .expect_err("missing executable must refuse");
         assert!(format!("{error:?}").contains("nosuchbin_xyz_omen"));
+    }
+
+    /// `< file` feeds a builtin chain from bytes on disk.
+    #[test]
+    fn input_redirect_feeds_builtin_pipeline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("in.txt"), b"b\na\nb\n").expect("write");
+        let mut session = standalone_session(dir.path().to_path_buf());
+        let exit = session
+            .dispatch_input("sort < in.txt | uniq -c")
+            .expect("pipeline dispatches");
+        assert_eq!(exit.code, Some(0));
+    }
+
+    /// `> file` refuses closed BEFORE running: no file appears, even
+    /// though the command itself is a harmless builtin.
+    #[test]
+    fn output_redirect_refuses_closed_with_zero_effects() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = standalone_session(dir.path().to_path_buf());
+        let error = session
+            .dispatch_input("echo hi > out.txt")
+            .expect_err("output redirect must refuse");
+        assert!(
+            format!("{error:?}").contains("admitted filesystem authority"),
+            "refusal names the missing authority"
+        );
+        assert!(
+            !dir.path().join("out.txt").exists(),
+            "refused write created a file"
+        );
     }
 }

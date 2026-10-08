@@ -10,6 +10,7 @@ pub mod grammar;
 pub mod interaction;
 pub mod preflight;
 pub mod prompt_adapter;
+pub mod redirect;
 pub mod resolver;
 pub mod semantic_service;
 pub mod services;
