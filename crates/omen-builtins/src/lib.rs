@@ -295,6 +295,10 @@ pub struct PipelineStage {
 /// reads `ctx.stdin`, each later stage reads the previous stage's stdout.
 /// No child process is spawned and no broker is involved — sound only
 /// because every builtin here is read-only (see crate docs).
+///
+/// Memory note: stages are buffered whole in memory (no streaming
+/// backpressure like kernel pipes). Correct for shell-sized data; a future
+/// streaming executor can replace the chain without changing the contract.
 pub fn run_pipeline(
     stages: &[PipelineStage],
     ctx: &BuiltinContext,

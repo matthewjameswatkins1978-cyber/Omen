@@ -1689,4 +1689,49 @@ mod builtin_pipeline_dispatch_tests {
             .expect("pipeline dispatches");
         assert_eq!(exit.code, Some(0));
     }
+
+    /// Binary bytes (NUL, invalid UTF-8, lone CR) survive a three-stage
+    /// in-process chain byte-exactly.
+    #[test]
+    fn builtin_pipeline_preserves_binary_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("bin.dat"),
+            [0x41, 0x00, 0xFF, 0x0A, 0x42, 0x0D, 0x0A, 0x43],
+        )
+        .expect("write");
+        let mut session = standalone_session(dir.path().to_path_buf());
+        // First line is `A NUL 0xFF \\n` = 4 bytes.
+        let exit = session
+            .dispatch_input("cat bin.dat | head -n 1 | wc -c")
+            .expect("pipeline dispatches");
+        assert_eq!(exit.code, Some(0));
+    }
+
+    /// A missing stage executable fails closed with a spawn error — never
+    /// a hang, never a silent success.
+    #[test]
+    fn missing_pipeline_executable_fails_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = standalone_session(dir.path().to_path_buf());
+        let error = session
+            .dispatch_input("nosuchbin_xyz_omen | wc -l")
+            .expect_err("missing executable must refuse");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("nosuchbin_xyz_omen"),
+            "refusal names the missing binary, got {message}"
+        );
+    }
+
+    /// A missing single command fails closed the same way.
+    #[test]
+    fn missing_single_executable_fails_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = standalone_session(dir.path().to_path_buf());
+        let error = session
+            .dispatch_input("nosuchbin_xyz_omen")
+            .expect_err("missing executable must refuse");
+        assert!(format!("{error:?}").contains("nosuchbin_xyz_omen"));
+    }
 }
