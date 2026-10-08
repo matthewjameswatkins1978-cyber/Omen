@@ -40,6 +40,7 @@ rg "TODO" src/
 - Spawns process using argv-only execution with closed stdin by default.
 - Standard output and error streams are captured, bounded, and spooled to SHA-256 CAS artifacts (`artifact://`).
 - Emits structured execution block and updates session history.
+- Bare `history`, `jobs`, and `stop <id>` reach the session displays without a colon; `cd` navigates.
 
 ### Lane 2: Portable Shell Expressions
 
@@ -47,8 +48,11 @@ Shell expressions are interpreted by Omen's Omen-owned syntax tree and dispatche
 ```text
 echo "$HOME" && cargo test
 cd src; rg "TODO" *.rs
+ls | grep rs | wc -l
+sort < in.txt | uniq -c
+server &
 ```
-Ordered command lists and `&&` / `||` short-circuiting are supported. Expansion currently includes variables, tilde, and deterministic pathname globs. Every simple command goes through Omen's existing execution boundary. Unsupported syntax is refused, not passed through as argv. The supported subset and explicit refusals are listed above.
+Ordered command lists and `&&` / `||` short-circuiting are supported. Expansion currently includes variables, tilde, and deterministic pathname globs. Twenty-five read-only builtins (`ls`, `cat`, `grep`, `sort`, …) run in-process with byte-preserving stdout and typed truth; all-builtin pipelines chain with zero spawns. `< file` feeds bytes; `> file` / `>> file` validate then refuse closed until the P2 filesystem authority lands. A trailing `&` starts a standalone background job (`:jobs` lists, `:stop job-N` stops). Every simple command goes through Omen's existing execution boundary. Unsupported syntax is refused, not passed through as argv. The supported subset and explicit refusals are listed above.
 
 ### Lane 3: Semantic Actions (Prefix: `:`)
 Direct, typed operations on the Omen runtime substrate:
@@ -85,9 +89,12 @@ and the visible one-level argv aliases listed by `:aliases` (for example,
 `g` expands to `git`). Pipeline stages and ordinary commands use Omen's
 existing execution broker; shell syntax does not create or grant authority.
 
-Redirections, command substitution, background jobs, and interactive terminal
-handoff inside a shell expression are still refused as unsupported. Unsupported
-shell syntax is never passed through as literal argv.
+Command substitution and interactive terminal handoff inside a shell
+expression are still refused as unsupported. fd-duplicating redirects
+(`2>`, `>&fd`), output-file writes (validated, refused-closed pending
+P2 authority), and boolean-chain background (`a && b &`) are refused
+with explicit errors. Unsupported shell syntax is never passed through
+as literal argv.
 
 ### Lane 4: Optional AI Reasoning Lane (Prefix: `?`)
 Advisory reasoning invoked only when explicit human judgement is requested:
