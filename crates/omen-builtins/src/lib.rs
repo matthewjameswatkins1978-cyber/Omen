@@ -105,8 +105,8 @@ impl BuiltinOutput {
 /// asserts the table and the dispatcher agree in both directions.
 pub const BUILTIN_NAMES: &[&str] = &[
     "cat", "clear", "cut", "dir", "du", "echo", "find", "grep", "head", "help", "ls", "pwd",
-    "printf", "readlink", "realpath", "sort", "stat", "tail", "tr", "tree", "uniq", "wc", "where",
-    "which",
+    "printf", "readlink", "realpath", "sort", "stat", "tail", "tee", "tr", "tree", "uniq", "wc",
+    "where", "which",
 ];
 
 /// Returns `true` when `name` is implemented by this crate.
@@ -135,6 +135,7 @@ pub fn run_if_builtin(
         "clear" => terminal::clear(args),
         "head" => filter::head(args, ctx),
         "tail" => filter::tail(args, ctx),
+        "tee" => filter::tee(args, ctx),
         "wc" => filter::wc(args, ctx),
         "sort" => filter::sort(args, ctx),
         "uniq" => filter::uniq(args, ctx),
@@ -178,6 +179,7 @@ pub fn builtin_options(name: &str) -> &'static [&'static str] {
         "sort" => &["-r", "-n", "-u", "-f", "--"],
         "stat" => &["-L", "--"],
         "tail" => &["-n", "--"],
+        "tee" => &["-a", "--"],
         "tr" => &["-c", "-d", "-s", "-t", "--"],
         "tree" => &["-a", "-d", "-L", "--"],
         "uniq" => &["-c", "-d", "-u", "-i", "--"],
@@ -259,6 +261,10 @@ pub fn help_for(name: &str) -> Option<(&'static str, &'static str)> {
         "tail" => (
             "tail [-n N] [file ...]",
             "Last N lines (default 10). -n +N prints from line N.",
+        ),
+        "tee" => (
+            "tee [-a]",
+            "Copies stdin to stdout. File operands refuse closed (P2 authority pending).",
         ),
         "tr" => (
             "tr [-c] [-d] [-s] SET1 [SET2]",
