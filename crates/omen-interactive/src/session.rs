@@ -1829,6 +1829,28 @@ mod builtin_pipeline_dispatch_tests {
         assert!(format!("{error:?}").contains("nosuchbin_xyz_omen"));
     }
 
+    /// `&&` / `||` short-circuit on builtin exits through the real
+    /// dispatch path: failing grep takes the `||` leg, passing grep
+    /// takes the `&&` leg, and a failed `&&` chain reports the failure.
+    #[test]
+    fn boolean_chains_short_circuit_on_builtin_exits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.txt"), b"a\n").expect("write");
+        let mut session = standalone_session(dir.path().to_path_buf());
+        let exit = session
+            .dispatch_input("grep zzz a.txt || echo fallback")
+            .expect("or-chain dispatches");
+        assert_eq!(exit.code, Some(0));
+        let exit = session
+            .dispatch_input("grep a a.txt && echo found")
+            .expect("and-chain dispatches");
+        assert_eq!(exit.code, Some(0));
+        let exit = session
+            .dispatch_input("grep zzz a.txt && echo skipped")
+            .expect("failing and-chain dispatches");
+        assert_eq!(exit.code, Some(1));
+    }
+
     /// Per-command environment reaches builtins: `PATH=<dir> which mytool`
     /// finds a tool visible only through the assignment (platform truth:
     /// executable bit on Unix, PATHEXT probe on Windows).
