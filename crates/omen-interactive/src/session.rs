@@ -489,7 +489,9 @@ impl InteractiveSession {
 
                 // In-process read-only builtins (P1): no child spawn, no
                 // daemon broker. Read-only inspection/formatting only.
-                if let Some(result) = self.try_dispatch_builtin(&resolved_argv) {
+                if let Some(result) =
+                    self.try_dispatch_builtin(&resolved_argv, Vec::new(), Vec::new())
+                {
                     return result;
                 }
 
@@ -751,7 +753,7 @@ impl InteractiveSession {
                 "this interactive session has reached its 128 tracked background-job limit".into(),
             ));
         }
-        let stages = self.prepare_shell_pipeline_stages(first)?;
+        let stages = self.prepare_shell_pipeline_stages(first, false)?;
         let client = self
             .client
             .as_ref()
@@ -813,6 +815,7 @@ impl InteractiveSession {
     fn prepare_shell_pipeline_stages(
         &self,
         pipeline: &crate::shell_grammar::ShellPipeline,
+        strip_redirects: bool,
     ) -> Result<Vec<omen_ipc::PipelineStageRequest>, CoreError> {
         let unsupported = |message: String| CoreError::ExecutionFailedCode {
             code: omen_core::ErrorCode::Unsupported,
@@ -820,7 +823,10 @@ impl InteractiveSession {
         };
         let mut stages = Vec::with_capacity(pipeline.commands.len());
         for command in &pipeline.commands {
-            if !command.redirects.is_empty() {
+            // Redirects are pre-resolved by the caller when `strip_redirects`
+            // is set (in-process builtin path); the broker/background paths
+            // keep the refusal.
+            if !strip_redirects && !command.redirects.is_empty() {
                 return Err(unsupported(
                     "redirection requires the supervised redirection dispatcher".into(),
                 ));
@@ -979,15 +985,45 @@ impl InteractiveSession {
                 .any(|command| !command.environment.is_empty());
 
         if needs_pipeline_dispatch {
-            let stages = self.prepare_shell_pipeline_stages(pipeline)?;
+            // Redirects resolve before anything executes: input feeds the
+            // chain, output is validated then refused-closed (P2) with
+            // zero effects.
+            let (chain_stdin, pending_output) =
+                crate::redirect::resolve_pipeline_redirects(pipeline, &self.cwd)?;
+            if let Some(pending) = &pending_output {
+                return crate::redirect::apply_output_write(pending, &[]).map(|()| ProcessExit {
+                    code: Some(0),
+                    signal: None,
+                });
+            }
+            let stages = self.prepare_shell_pipeline_stages(pipeline, true)?;
+            // All-builtin pipelines run in-process: zero spawns, byte-exact
+            // chaining. Mixed pipelines fall through to the broker.
+            if let Some(result) =
+                self.try_dispatch_builtin_pipeline(&stages, chain_stdin.unwrap_or_default())
+            {
+                return result;
+            }
+            // External stages with redirects still need the supervised
+            // redirection dispatcher: preserve the refusal.
+            if pipeline.commands.iter().any(|c| !c.redirects.is_empty()) {
+                return Err(CoreError::ExecutionFailedCode {
+                    code: omen_core::ErrorCode::Unsupported,
+                    message: "redirection requires the supervised redirection dispatcher".into(),
+                });
+            }
             return self.execute_pipeline_via_broker(stages, None);
         }
 
         let command = &pipeline.commands[0];
-        if !command.redirects.is_empty() {
-            return Err(unsupported(
-                "redirection requires the supervised redirection dispatcher".into(),
-            ));
+        // Single-command redirects resolve before execution; output writes
+        // refuse closed (P2) with zero effects.
+        let resolved = crate::redirect::resolve_command_redirects(command, &self.cwd)?;
+        if let Some(pending) = &resolved.output {
+            return crate::redirect::apply_output_write(pending, &[]).map(|()| ProcessExit {
+                code: Some(0),
+                signal: None,
+            });
         }
 
         let mut argv = Vec::new();
@@ -997,6 +1033,27 @@ impl InteractiveSession {
                     unsupported(format!("shell word expansion failed: {error}"))
                 })?,
             );
+        }
+        // Per-command environment (`FOO=1 cmd`): expanded exactly like the
+        // pipeline stages. Builtins receive it below; external singles
+        // cannot carry it yet (broker stdin/env payload is P4+ work) — the
+        // assignments are validated here so a malformed one fails closed
+        // instead of silently vanishing.
+        let mut extra_env = Vec::with_capacity(command.environment.len());
+        for assignment in &command.environment {
+            let expanded = crate::shell_grammar::expand_word(&assignment.value, &self.cwd)
+                .map_err(|error| {
+                    unsupported(format!("environment assignment expansion failed: {error}"))
+                })?;
+            match expanded.as_slice() {
+                [value] => extra_env.push((assignment.name.clone(), value.clone())),
+                _ => {
+                    return Err(unsupported(format!(
+                        "environment assignment '{}' must expand to exactly one value",
+                        assignment.name
+                    )));
+                }
+            }
         }
         let argv = crate::commands::expand_shell_alias(&argv);
         let argv = crate::resolver::ReferenceResolver::resolve_argv(
@@ -1019,8 +1076,18 @@ impl InteractiveSession {
 
         // In-process read-only builtins (P1): same rule as the executable
         // lane — no child spawn, no daemon broker.
-        if let Some(result) = self.try_dispatch_builtin(&argv) {
+        if let Some(result) =
+            self.try_dispatch_builtin(&argv, resolved.stdin.clone().unwrap_or_default(), extra_env)
+        {
             return result;
+        }
+        // External commands cannot consume a resolved input redirect yet:
+        // the broker path carries no stdin payload in P3.
+        if resolved.stdin.is_some() {
+            return Err(CoreError::ExecutionFailedCode {
+                code: omen_core::ErrorCode::Unsupported,
+                message: "redirection requires the supervised redirection dispatcher".into(),
+            });
         }
 
         if let Some(blast) = crate::preflight::BlastPreflight::assess(&argv) {
@@ -1172,11 +1239,24 @@ impl InteractiveSession {
     /// and never go through the daemon broker: they are pure functions of
     /// `(argv, cwd, env, stdin)` in the same trust class as the `:action`
     /// dispatcher. Session-affecting words (`cd`) stay with the caller.
-    fn try_dispatch_builtin(&mut self, argv: &[String]) -> Option<Result<ProcessExit, CoreError>> {
+    fn try_dispatch_builtin(
+        &mut self,
+        argv: &[String],
+        stdin: Vec<u8>,
+        env_overrides: Vec<(String, String)>,
+    ) -> Option<Result<ProcessExit, CoreError>> {
+        let mut env: Vec<(String, String)> = std::env::vars().collect();
+        for (key, value) in &env_overrides {
+            if let Some(slot) = env.iter_mut().find(|(k, _)| k == key) {
+                slot.1 = value.clone();
+            } else {
+                env.push((key.clone(), value.clone()));
+            }
+        }
         let ctx = omen_builtins::BuiltinContext {
             cwd: self.cwd.clone(),
-            env: std::env::vars().collect(),
-            stdin: Vec::new(),
+            env,
+            stdin,
         };
         let output = match omen_builtins::run_if_builtin(argv, &ctx)? {
             Ok(output) => output,
@@ -1196,6 +1276,63 @@ impl InteractiveSession {
         }
         let exit = ProcessExit {
             code: Some(output.code),
+            signal: None,
+        };
+        self.last_exit = Some(exit.clone());
+        self.update_prompt_state();
+        Some(Ok(exit))
+    }
+
+    /// Runs an all-builtin pipeline in-process (zero spawns, no broker).
+    ///
+    /// Returns `None` when any stage is external. Every stage runs; each
+    /// stderr passes through in order, only the last stdout reaches the
+    /// terminal, and the reported exit is the last stage's.
+    fn try_dispatch_builtin_pipeline(
+        &mut self,
+        stages: &[omen_ipc::PipelineStageRequest],
+        stdin: Vec<u8>,
+    ) -> Option<Result<ProcessExit, CoreError>> {
+        let inputs: Vec<omen_builtins::PipelineStage> = stages
+            .iter()
+            .map(|stage| omen_builtins::PipelineStage {
+                argv: stage.argv.clone(),
+                env_overrides: stage.env.clone(),
+            })
+            .collect();
+        let ctx = omen_builtins::BuiltinContext {
+            cwd: self.cwd.clone(),
+            env: std::env::vars().collect(),
+            stdin,
+        };
+        let outputs = omen_builtins::run_pipeline(&inputs, &ctx)?;
+        use std::io::Write as _;
+        let mut code = 0;
+        let mut last_stdout: Vec<u8> = Vec::new();
+        for output in outputs {
+            let output = match output {
+                Ok(output) => output,
+                Err(error) => {
+                    return Some(Err(CoreError::Internal(format!(
+                        "builtin pipeline internal failure: {error}"
+                    ))));
+                }
+            };
+            // Every stage runs (POSIX pipelines do not short-circuit);
+            // each stderr passes through in order, only the last stdout
+            // reaches the terminal, and the exit is the last stage's.
+            code = output.code;
+            if !output.stderr.is_empty() {
+                let _ = std::io::stderr().write_all(&output.stderr);
+            }
+            last_stdout = output.stdout;
+        }
+        if !last_stdout.is_empty() {
+            let _ = std::io::stdout().write_all(&last_stdout);
+            let _ = std::io::stdout().flush();
+        }
+        let exit = ProcessExit {
+            code: Some(code),
             signal: None,
         };
         self.last_exit = Some(exit.clone());
@@ -1592,6 +1729,218 @@ fn resolve_cd_target(cwd: &Path, target: &str) -> PathBuf {
     if let Some(drive) = crate::commands::is_drive_designator(target) {
         return PathBuf::from(format!("{drive}:\\"));
     }
+    // Leading `~` expands against the home directory (HOME, or
+    // USERPROFILE on Windows); anything else falls through below.
+    if let Some(rest) = target.strip_prefix('~')
+        && (rest.is_empty() || rest.starts_with('/') || rest.starts_with('\\'))
+        && let Some(home) = home_dir()
+    {
+        return home.join(rest.trim_start_matches(['/', '\\']));
+    }
     let p = PathBuf::from(target);
     if p.is_absolute() { p } else { cwd.join(p) }
+}
+
+/// Session home directory for `~` expansion. No silent fallback: `None`
+/// leaves the operand untouched so resolution fails visibly downstream.
+fn home_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let candidates = ["USERPROFILE", "HOME"];
+    #[cfg(not(windows))]
+    let candidates = ["HOME"];
+    candidates
+        .iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .next()
+}
+
+#[cfg(test)]
+mod builtin_pipeline_dispatch_tests {
+    use super::*;
+
+    fn standalone_session(cwd: PathBuf) -> InteractiveSession {
+        let id = omen_core::InteractiveSessionId::generate();
+        InteractiveSession::new_with_client(id, cwd, None, None).expect("session builds headless")
+    }
+
+    /// An all-builtin pipeline dispatches in-process: exit zero, no spawn.
+    /// (`printf | grep | wc` exercises three chained stages.)
+    #[test]
+    fn all_builtin_pipeline_runs_in_process() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = standalone_session(dir.path().to_path_buf());
+        let exit = session
+            .dispatch_input("printf 'a\\nb\\n' | grep b | wc -l")
+            .expect("pipeline dispatches");
+        assert_eq!(exit.code, Some(0));
+        assert!(session.last_exit.is_some_and(|e| e.is_zero()));
+    }
+
+    /// A failing builtin stage still runs the chain and reports the last
+    /// stage's exit (POSIX: every stage runs).
+    #[test]
+    fn builtin_pipeline_reports_last_stage_exit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = standalone_session(dir.path().to_path_buf());
+        // `grep zzz` matches nothing (exit 1); `wc -c` still runs (exit 0).
+        let exit = session
+            .dispatch_input("printf 'a\\n' | grep zzz | wc -c")
+            .expect("pipeline dispatches");
+        assert_eq!(exit.code, Some(0));
+    }
+
+    /// Binary bytes (NUL, invalid UTF-8, lone CR) survive a three-stage
+    /// in-process chain byte-exactly.
+    #[test]
+    fn builtin_pipeline_preserves_binary_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("bin.dat"),
+            [0x41, 0x00, 0xFF, 0x0A, 0x42, 0x0D, 0x0A, 0x43],
+        )
+        .expect("write");
+        let mut session = standalone_session(dir.path().to_path_buf());
+        // First line is `A NUL 0xFF \\n` = 4 bytes.
+        let exit = session
+            .dispatch_input("cat bin.dat | head -n 1 | wc -c")
+            .expect("pipeline dispatches");
+        assert_eq!(exit.code, Some(0));
+    }
+
+    /// A missing stage executable fails closed with a spawn error — never
+    /// a hang, never a silent success.
+    #[test]
+    fn missing_pipeline_executable_fails_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = standalone_session(dir.path().to_path_buf());
+        let error = session
+            .dispatch_input("nosuchbin_xyz_omen | wc -l")
+            .expect_err("missing executable must refuse");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("nosuchbin_xyz_omen"),
+            "refusal names the missing binary, got {message}"
+        );
+    }
+
+    /// A missing single command fails closed the same way.
+    #[test]
+    fn missing_single_executable_fails_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = standalone_session(dir.path().to_path_buf());
+        let error = session
+            .dispatch_input("nosuchbin_xyz_omen")
+            .expect_err("missing executable must refuse");
+        assert!(format!("{error:?}").contains("nosuchbin_xyz_omen"));
+    }
+
+    /// `&&` / `||` short-circuit on builtin exits through the real
+    /// dispatch path: failing grep takes the `||` leg, passing grep
+    /// takes the `&&` leg, and a failed `&&` chain reports the failure.
+    #[test]
+    fn boolean_chains_short_circuit_on_builtin_exits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.txt"), b"a\n").expect("write");
+        let mut session = standalone_session(dir.path().to_path_buf());
+        let exit = session
+            .dispatch_input("grep zzz a.txt || echo fallback")
+            .expect("or-chain dispatches");
+        assert_eq!(exit.code, Some(0));
+        let exit = session
+            .dispatch_input("grep a a.txt && echo found")
+            .expect("and-chain dispatches");
+        assert_eq!(exit.code, Some(0));
+        let exit = session
+            .dispatch_input("grep zzz a.txt && echo skipped")
+            .expect("failing and-chain dispatches");
+        assert_eq!(exit.code, Some(1));
+    }
+
+    /// Per-command environment reaches builtins: `PATH=<dir> which mytool`
+    /// finds a tool visible only through the assignment (platform truth:
+    /// executable bit on Unix, PATHEXT probe on Windows).
+    #[test]
+    fn per_command_env_reaches_builtin_lookup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        #[cfg(windows)]
+        std::fs::write(dir.path().join("mytool.cmd"), b"@echo off\n").expect("write");
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let tool = dir.path().join("mytool");
+            std::fs::write(&tool, b"#!/bin/sh\n").expect("write");
+            std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        let mut session = standalone_session(dir.path().to_path_buf());
+        let path_value = dir.path().to_string_lossy().into_owned();
+        let exit = session
+            .dispatch_input(&format!("PATH={path_value} which mytool"))
+            .expect("assignment dispatches");
+        assert_eq!(exit.code, Some(0));
+    }
+
+    /// Deterministic globbing flows through builtin dispatch: `ls *.rs`
+    /// lists matches sorted, while quoted patterns stay literal.
+    #[test]
+    fn glob_expansion_reaches_builtins_sorted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("b.rs"), b"b").expect("write");
+        std::fs::write(dir.path().join("a.rs"), b"a").expect("write");
+        std::fs::write(dir.path().join("c.txt"), b"c").expect("write");
+        let mut session = standalone_session(dir.path().to_path_buf());
+        let exit = session.dispatch_input("ls *.rs").expect("glob dispatches");
+        assert_eq!(exit.code, Some(0));
+        // Quoted glob stays literal: no file named `*.rs` exists.
+        let exit = session
+            .dispatch_input("ls '*.rs'")
+            .expect("quoted dispatches");
+        assert_eq!(exit.code, Some(1));
+    }
+
+    /// `cd ~` reaches the home directory (HOME / USERPROFILE); skipped
+    /// when the test environment names no home.
+    #[test]
+    fn cd_tilde_reaches_home() {
+        let Some(home) = super::home_dir() else {
+            eprintln!("SKIP cd_tilde: no home directory in this environment");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = standalone_session(dir.path().to_path_buf());
+        let exit = session.dispatch_input("cd ~").expect("cd dispatches");
+        assert_eq!(exit.code, Some(0));
+        assert_eq!(session.cwd, home.canonicalize().unwrap_or(home));
+    }
+
+    /// `< file` feeds a builtin chain from bytes on disk.
+    #[test]
+    fn input_redirect_feeds_builtin_pipeline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("in.txt"), b"b\na\nb\n").expect("write");
+        let mut session = standalone_session(dir.path().to_path_buf());
+        let exit = session
+            .dispatch_input("sort < in.txt | uniq -c")
+            .expect("pipeline dispatches");
+        assert_eq!(exit.code, Some(0));
+    }
+
+    /// `> file` refuses closed BEFORE running: no file appears, even
+    /// though the command itself is a harmless builtin.
+    #[test]
+    fn output_redirect_refuses_closed_with_zero_effects() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = standalone_session(dir.path().to_path_buf());
+        let error = session
+            .dispatch_input("echo hi > out.txt")
+            .expect_err("output redirect must refuse");
+        assert!(
+            format!("{error:?}").contains("admitted filesystem authority"),
+            "refusal names the missing authority"
+        );
+        assert!(
+            !dir.path().join("out.txt").exists(),
+            "refused write created a file"
+        );
+    }
 }

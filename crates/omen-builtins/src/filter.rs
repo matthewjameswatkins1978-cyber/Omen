@@ -320,9 +320,10 @@ pub fn wc(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
         out.extend(
             format_counts(show_lines, show_words, show_bytes, lines, words, bytes).as_bytes(),
         );
-        if named {
+        // Stdin chunks (`-`) print bare counts like GNU; only files are named.
+        if named && let Some(n) = name {
             out.push(b' ');
-            out.extend(name.clone().unwrap_or_default().as_bytes());
+            out.extend(n.as_bytes());
         }
         out.push(b'\n');
     }
@@ -381,6 +382,8 @@ fn format_counts(show_l: bool, show_w: bool, show_c: bool, l: u64, w: u64, c: u6
 /// `-n` compares by leading numeric value, `-f` folds ASCII case for the
 /// comparison only, `-r` reverses, `-u` keeps the first of each equal run.
 /// Keys (`-k`), field separators (`-t`) and check mode (`-c`) are refused.
+/// Numeric keys are leading decimal floats (no hex); non-numeric lines
+/// count as zero.
 pub fn sort(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
     let mut reverse = false;
     let mut numeric = false;
@@ -586,6 +589,56 @@ fn same_line(a: &[u8], b: &[u8], ignore_case: bool) -> bool {
     } else {
         a == b
     }
+}
+
+/// `tee [-a] [file ...]`: copies stdin to stdout byte-exactly.
+///
+/// The no-operand form (pure passthrough) runs live. FILE operands are
+/// REFUSED with exit 1: writing files is a consequential mutation needing
+/// the admitted Tethers host-filesystem capability (P2 owner decision
+/// pending — same posture as `>` redirects and `omen-mutation`). The
+/// refusal names the missing authority instead of silently dropping data.
+/// `-a` is accepted (it only matters for file writes) so pipelines do not
+/// need flag surgery when the capability lands.
+pub fn tee(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
+    let mut operands: &[String] = &[];
+    for (index, arg) in args.iter().enumerate() {
+        match arg.as_str() {
+            "-a" | "--append" => {
+                if index + 1 == args.len() {
+                    operands = &[];
+                }
+            }
+            "--" => {
+                operands = &args[index + 1..];
+                break;
+            }
+            _ if arg.starts_with('-') && arg != "-" => {
+                return BuiltinOutput::failed(
+                    format!("tee: unsupported option {arg:?} (only -a)"),
+                    json!({"builtin": "tee", "error": "unsupported_option"}),
+                );
+            }
+            _ => {
+                operands = &args[index..];
+                break;
+            }
+        }
+    }
+    if !operands.is_empty() {
+        return BuiltinOutput::failed(
+            "tee: writing files needs admitted filesystem authority: \
+             no Tethers host-execution filesystem capability is admitted yet \
+             (P2 owner decision pending)"
+                .to_string(),
+            json!({"builtin": "tee", "error": "refused_closed", "files": operands.len()}),
+        );
+    }
+    let bytes = ctx.stdin.len();
+    BuiltinOutput::ok(
+        ctx.stdin.clone(),
+        json!({"builtin": "tee", "mode": "passthrough", "bytes": bytes}),
+    )
 }
 
 /// A 1-based inclusive byte range from a `cut` list item.
@@ -1069,11 +1122,10 @@ pub fn tr(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
         );
     }
     let squeeze_set: Vec<bool> = if squeeze {
-        let source = if !set2.is_empty() && !delete {
-            &set2
-        } else {
-            &set1
-        };
+        // Squeeze applies to SET2 when present (GNU: -s squeezes the
+        // translated set; under -d there is no translation, so SET2
+        // itself), else to SET1.
+        let source = if !set2.is_empty() { &set2 } else { &set1 };
         let mut present = [false; 256];
         for byte in source {
             present[*byte as usize] = true;
@@ -1270,7 +1322,12 @@ pub fn grep(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
                     continue;
                 }
                 if show_names {
-                    selected.extend(name.clone().unwrap_or_default().as_bytes());
+                    // Explicit `-` operands label like GNU: `(standard input)`.
+                    selected.extend(
+                        name.clone()
+                            .unwrap_or_else(|| "(standard input)".to_string())
+                            .as_bytes(),
+                    );
                     selected.push(b':');
                 }
                 if numbered {
@@ -1281,7 +1338,11 @@ pub fn grep(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
         }
         if counted && !quiet {
             if show_names {
-                out.extend(name.clone().unwrap_or_default().as_bytes());
+                out.extend(
+                    name.clone()
+                        .unwrap_or_else(|| "(standard input)".to_string())
+                        .as_bytes(),
+                );
                 out.push(b':');
             }
             out.extend(format!("{count}\n").as_bytes());
@@ -1397,6 +1458,24 @@ mod tests {
             String::from_utf8_lossy(&out.stdout),
             "      2      3     16\n"
         );
+        // Explicit `-` prints bare counts even alongside named files.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("f.txt"), b"x\n").expect("write");
+        let file_ctx = BuiltinContext {
+            cwd: dir.path().to_path_buf(),
+            env: Vec::new(),
+            stdin: b"y\n".to_vec(),
+        };
+        let out = wc(&s(&["-", "f.txt"]), &file_ctx);
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            text.lines()
+                .next()
+                .expect("stdin line")
+                .ends_with("1      1      2"),
+            "{text:?}"
+        );
+        assert!(text.contains("f.txt"));
     }
 
     #[test]
@@ -1414,6 +1493,10 @@ mod tests {
         assert_eq!(out.stdout, b"2\n10\n30\n");
         let out = sort(&s(&["-r"]), &ctx_with(b"b\na\n"));
         assert_eq!(out.stdout, b"b\na\n");
+        // Decimal leading floats; non-numeric lines count as zero and
+        // sort before positives (stable among themselves).
+        let out = sort(&s(&["-n"]), &ctx_with(b"10\nabc\n2\n"));
+        assert_eq!(out.stdout, b"abc\n2\n10\n");
     }
 
     #[test]
@@ -1461,6 +1544,22 @@ mod tests {
     }
 
     #[test]
+    fn tee_passes_bytes_and_refuses_files() {
+        let out = tee(&s(&[]), &ctx_with(b"a\0b\n"));
+        assert_eq!(out.code, 0);
+        assert_eq!(out.stdout, b"a\0b\n");
+        assert_eq!(out.truth["mode"], serde_json::json!("passthrough"));
+        let out = tee(&s(&["-a"]), &ctx_with(b"x"));
+        assert_eq!(out.stdout, b"x");
+        // File operands refuse closed: no write, no stdout leak.
+        let out = tee(&s(&["out.txt"]), &ctx_with(b"data"));
+        assert_eq!(out.code, 1);
+        assert!(out.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("admitted filesystem authority"));
+        assert_eq!(tee(&s(&["-i"]), &ctx_with(b"")).code, 1);
+    }
+
+    #[test]
     fn cut_bytes_fields_and_merged_ranges() {
         let ctx = ctx_with(b"abcdef\n");
         let out = cut(&s(&["-b", "1,3"]), &ctx);
@@ -1496,6 +1595,9 @@ mod tests {
         // Complement of everything-but-newline deletes letters, keeps newline.
         let out = tr(&s(&["-c", "-d", "\\n"]), &ctx_with(b"ab\ncd\n"));
         assert_eq!(out.stdout, b"\n\n");
+        // -d -s: delete SET1, squeeze SET2 (GNU).
+        let out = tr(&s(&["-d", "-s", "a", "b"]), &ctx_with(b"aaabbb\n"));
+        assert_eq!(out.stdout, b"b\n");
         // Files refused: stdin only.
         assert_eq!(tr(&s(&["a", "b", "file"]), &ctx_with(b"")).code, 1);
         assert_eq!(tr(&s(&["a"]), &ctx_with(b"x")).code, 1);

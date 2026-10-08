@@ -105,8 +105,8 @@ impl BuiltinOutput {
 /// asserts the table and the dispatcher agree in both directions.
 pub const BUILTIN_NAMES: &[&str] = &[
     "cat", "clear", "cut", "dir", "du", "echo", "find", "grep", "head", "help", "ls", "pwd",
-    "printf", "readlink", "realpath", "sort", "stat", "tail", "tr", "tree", "uniq", "wc", "where",
-    "which",
+    "printf", "readlink", "realpath", "sort", "stat", "tail", "tee", "tr", "tree", "uniq", "wc",
+    "where", "which",
 ];
 
 /// Returns `true` when `name` is implemented by this crate.
@@ -135,6 +135,7 @@ pub fn run_if_builtin(
         "clear" => terminal::clear(args),
         "head" => filter::head(args, ctx),
         "tail" => filter::tail(args, ctx),
+        "tee" => filter::tee(args, ctx),
         "wc" => filter::wc(args, ctx),
         "sort" => filter::sort(args, ctx),
         "uniq" => filter::uniq(args, ctx),
@@ -150,6 +151,43 @@ pub fn run_if_builtin(
         _ => return None,
     };
     Some(Ok(output))
+}
+
+/// Static option words per builtin, for completion. A test below asserts
+/// every registry name resolves here (optionless builtins resolve to an
+/// explicit empty table); unknown names yield `&[]`. Mirrors the parsers;
+/// `--` ends option parsing everywhere.
+pub fn builtin_options(name: &str) -> &'static [&'static str] {
+    match name {
+        "cat" => &["-n", "--"],
+        "clear" => &[],
+        "cut" => &["-b", "-c", "-f", "-d", "-s", "-n", "--"],
+        "dir" => &["-a", "-l", "-0", "-1", "-d", "--"],
+        "du" => &["-s", "-a", "-b", "-k", "-m", "--"],
+        "echo" => &["-n", "-e", "-E", "--"],
+        "find" => &["-maxdepth", "-mindepth", "-type", "-name", "--"],
+        "grep" => &[
+            "-i", "-v", "-c", "-n", "-q", "-x", "-F", "-H", "-h", "-e", "--",
+        ],
+        "head" => &["-n", "--"],
+        "help" => &[],
+        "ls" => &["-a", "-l", "-0", "-1", "-d", "--"],
+        "pwd" => &["-L", "-P"],
+        "printf" => &[],
+        "readlink" => &["-f", "--"],
+        "realpath" => &["-m", "--"],
+        "sort" => &["-r", "-n", "-u", "-f", "--"],
+        "stat" => &["-L", "--"],
+        "tail" => &["-n", "--"],
+        "tee" => &["-a", "--"],
+        "tr" => &["-c", "-d", "-s", "-t", "--"],
+        "tree" => &["-a", "-d", "-L", "--"],
+        "uniq" => &["-c", "-d", "-u", "-i", "--"],
+        "wc" => &["-l", "-w", "-c", "--"],
+        "where" => &["-a", "--"],
+        "which" => &["-a", "--"],
+        _ => &[],
+    }
 }
 
 /// Usage and notes per builtin: the single authority behind `help`.
@@ -224,6 +262,10 @@ pub fn help_for(name: &str) -> Option<(&'static str, &'static str)> {
             "tail [-n N] [file ...]",
             "Last N lines (default 10). -n +N prints from line N.",
         ),
+        "tee" => (
+            "tee [-a]",
+            "Copies stdin to stdout. File operands refuse closed (P2 authority pending).",
+        ),
         "tr" => (
             "tr [-c] [-d] [-s] SET1 [SET2]",
             "Byte translation over stdin only. Ranges, escapes and [:upper:] classes.",
@@ -279,6 +321,68 @@ pub fn help(args: &[String]) -> BuiltinOutput {
         serde_json::json!({"builtin": "help", "topics": BUILTIN_NAMES}),
     )
 }
+/// One in-process pipeline stage: argv plus environment overrides.
+#[derive(Debug, Clone)]
+pub struct PipelineStage {
+    pub argv: Vec<String>,
+    /// Stage-scoped `NAME=value` pairs shadowing the base environment
+    /// (notably `PATH` for `which`); the base still comes from `ctx`.
+    pub env_overrides: Vec<(String, String)>,
+}
+
+/// Runs a whole pipeline in-process when EVERY stage head names a builtin.
+///
+/// Returns `None` when any stage is external (the caller falls through to
+/// process spawn). Otherwise chains stdout→stdin byte-exactly: stage 0
+/// reads `ctx.stdin`, each later stage reads the previous stage's stdout.
+/// No child process is spawned and no broker is involved — sound only
+/// because every builtin here is read-only (see crate docs).
+///
+/// Memory note: stages are buffered whole in memory (no streaming
+/// backpressure like kernel pipes). Correct for shell-sized data; a future
+/// streaming executor can replace the chain without changing the contract.
+pub fn run_pipeline(
+    stages: &[PipelineStage],
+    ctx: &BuiltinContext,
+) -> Option<Vec<Result<BuiltinOutput, BuiltinError>>> {
+    if stages.is_empty() {
+        return None;
+    }
+    for stage in stages {
+        let (name, _) = stage.argv.split_first()?;
+        if !is_builtin(name) {
+            return None;
+        }
+    }
+    let mut stdin = ctx.stdin.clone();
+    let mut outputs = Vec::with_capacity(stages.len());
+    for stage in stages {
+        let mut env = ctx.env.clone();
+        for (key, value) in &stage.env_overrides {
+            if let Some(slot) = env.iter_mut().find(|(k, _)| k == key) {
+                slot.1 = value.clone();
+            } else {
+                env.push((key.clone(), value.clone()));
+            }
+        }
+        let stage_ctx = BuiltinContext {
+            cwd: ctx.cwd.clone(),
+            env,
+            stdin,
+        };
+        let output = match run_if_builtin(&stage.argv, &stage_ctx) {
+            Some(Ok(output)) => output,
+            Some(Err(error)) => {
+                outputs.push(Err(error));
+                return Some(outputs);
+            }
+            None => unreachable!("gated by is_builtin above"),
+        };
+        stdin = output.stdout.clone();
+        outputs.push(Ok(output));
+    }
+    Some(outputs)
+}
 /// Internal builtin failure (not an operand error; those are exit codes).
 #[derive(Debug, thiserror::Error)]
 pub enum BuiltinError {
@@ -325,5 +429,45 @@ mod consistency_tests {
                 "builtin '{name}' shadows a session intrinsic"
             );
         }
+    }
+
+    /// In-process pipelines chain stdout→stdin byte-exactly and refuse
+    /// mixed builtin/external stages (those need real process spawn).
+    #[test]
+    fn pipeline_chains_bytes_and_gates_mixed_stages() {
+        let ctx = BuiltinContext {
+            cwd: std::path::PathBuf::from("."),
+            env: Vec::new(),
+            stdin: b"b\na\nb\n".to_vec(),
+        };
+        let stages = vec![
+            PipelineStage {
+                argv: vec!["sort".to_string()],
+                env_overrides: Vec::new(),
+            },
+            PipelineStage {
+                argv: vec!["uniq".to_string(), "-c".to_string()],
+                env_overrides: Vec::new(),
+            },
+        ];
+        let outputs = run_pipeline(&stages, &ctx).expect("all-builtin pipeline runs");
+        assert_eq!(outputs.len(), 2);
+        let last = outputs[1].as_ref().expect("uniq succeeds");
+        assert_eq!(last.stdout, b"      1 a\n      2 b\n");
+        // Mixed stages fall through to external execution.
+        let mixed = vec![
+            PipelineStage {
+                argv: vec!["ls".to_string()],
+                env_overrides: Vec::new(),
+            },
+            PipelineStage {
+                argv: vec!["rg".to_string(), "rs".to_string()],
+                env_overrides: Vec::new(),
+            },
+        ];
+        assert!(run_pipeline(&mixed, &ctx).is_none());
+        // Empty pipeline is not a pipeline.
+        let empty: Vec<PipelineStage> = Vec::new();
+        assert!(run_pipeline(&empty, &ctx).is_none());
     }
 }
