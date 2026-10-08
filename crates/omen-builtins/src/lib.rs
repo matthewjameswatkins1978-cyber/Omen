@@ -190,6 +190,19 @@ pub fn builtin_options(name: &str) -> &'static [&'static str] {
     }
 }
 
+/// Session-owned words documented by `help` (not builtins; see `help_for`).
+/// Single authority for the session-word side of completion and help tests.
+pub const SESSION_WORDS: &[&str] = &["cd", "history", "jobs", "stop", "exit", "quit"];
+
+/// Every `help` topic: registry builtins plus session words.
+pub fn help_topics() -> Vec<&'static str> {
+    BUILTIN_NAMES
+        .iter()
+        .copied()
+        .chain(SESSION_WORDS.iter().copied())
+        .collect()
+}
+///
 /// Usage and notes per builtin: the single authority behind `help`.
 ///
 /// Completion derives the name list from [`BUILTIN_NAMES`]; human detail
@@ -519,5 +532,17 @@ mod consistency_tests {
             );
         }
         assert!(help_for("cargo").is_none());
+    }
+
+    /// `help_topics` is exactly the registry plus the session words, and
+    /// every topic resolves to help text.
+    #[test]
+    fn help_topics_cover_builtins_and_session_words() {
+        let topics = help_topics();
+        assert_eq!(topics.len(), BUILTIN_NAMES.len() + SESSION_WORDS.len());
+        for name in BUILTIN_NAMES.iter().chain(SESSION_WORDS.iter()) {
+            assert!(topics.contains(name), "topic missing: {name}");
+            assert!(help_for(name).is_some(), "topic without text: {name}");
+        }
     }
 }
