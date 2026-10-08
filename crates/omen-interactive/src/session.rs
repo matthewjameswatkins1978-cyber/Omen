@@ -37,7 +37,12 @@ pub struct InteractiveSession {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StandaloneJobState {
     Running,
-    Finished { code: Option<i32>, runtime: String },
+    Finished {
+        code: Option<i32>,
+        runtime: String,
+        /// Bounded lossy preview of captured stdout (2KB); empty when none.
+        preview: String,
+    },
 }
 
 /// A background job owned by this session process: one OS thread driving
@@ -1033,7 +1038,13 @@ impl InteractiveSession {
                             supervisor
                                 .execute_cancelable(request, cancel_rx)
                                 .await
-                                .map(|output| (output.process_exit.code, output.runtime_status))
+                                .map(|output| {
+                                    (
+                                        output.process_exit.code,
+                                        output.runtime_status,
+                                        bounded_preview(&output.stdout_all),
+                                    )
+                                })
                         } else {
                             let requests = stages
                                 .iter()
@@ -1056,19 +1067,22 @@ impl InteractiveSession {
                                     (
                                         output.execution.process_exit.code,
                                         output.execution.runtime_status,
+                                        bounded_preview(&output.execution.stdout_all),
                                     )
                                 })
                         }
                     })
                 });
             let finished = match outcome {
-                Ok((code, runtime)) => StandaloneJobState::Finished {
+                Ok((code, runtime, preview)) => StandaloneJobState::Finished {
                     code,
                     runtime: format!("{runtime:?}"),
+                    preview,
                 },
                 Err(error) => StandaloneJobState::Finished {
                     code: None,
                     runtime: format!("SpawnFailed: {error:?}"),
+                    preview: String::new(),
                 },
             };
             if let Ok(mut guard) = thread_state.lock() {
@@ -1131,12 +1145,22 @@ impl InteractiveSession {
 
     fn dispatch_background_jobs(&self) -> Result<ProcessExit, CoreError> {
         for job in &self.standalone_jobs {
-            let state = job
+            let (state_text, preview) = job
                 .state
                 .lock()
-                .map(|guard| format!("{:?}", *guard))
-                .unwrap_or_else(|_| "Unknown".to_string());
-            println!("{} [{}] {}", job.id, state, job.label);
+                .map(|guard| match &*guard {
+                    StandaloneJobState::Running => ("Running".to_string(), String::new()),
+                    StandaloneJobState::Finished {
+                        code,
+                        runtime,
+                        preview,
+                    } => (format!("Finished{code:?} {runtime}"), preview.clone()),
+                })
+                .unwrap_or_else(|_| ("Unknown".to_string(), String::new()));
+            println!("{} [{}] {}", job.id, state_text, job.label);
+            for line in preview.lines().take(5) {
+                println!("    {line}");
+            }
         }
         if self.background_jobs.is_empty() && self.standalone_jobs.is_empty() {
             println!("No background jobs tracked in this interactive session.");
@@ -1952,6 +1976,17 @@ impl InteractiveSession {
     }
 }
 
+/// Bounded lossy preview of captured job output for `:jobs` display.
+fn bounded_preview(bytes: &[u8]) -> String {
+    const LIMIT: usize = 2048;
+    let text = String::from_utf8_lossy(bytes);
+    if text.len() <= LIMIT {
+        text.into_owned()
+    } else {
+        format!("{}…[truncated]", &text[..LIMIT])
+    }
+}
+
 /// Resolves a `cd` target argument to an absolute path.
 ///
 /// Handles bare Windows drive designators (`D:`) as navigation grammar.
@@ -2159,6 +2194,12 @@ mod builtin_pipeline_dispatch_tests {
             matches!(state, StandaloneJobState::Finished { code: Some(0), .. }),
             "hostname finishes zero, got {state:?}"
         );
+        if let StandaloneJobState::Finished { preview, .. } = state {
+            assert!(
+                !preview.trim().is_empty(),
+                "finished job keeps an output preview"
+            );
+        }
         let exit = session.dispatch_input(":jobs").expect(":jobs dispatches");
         assert_eq!(exit.code, Some(0));
     }
