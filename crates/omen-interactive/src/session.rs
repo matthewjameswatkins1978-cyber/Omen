@@ -1015,7 +1015,63 @@ impl InteractiveSession {
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let state = std::sync::Arc::new(std::sync::Mutex::new(StandaloneJobState::Running));
         let thread_state = state.clone();
+        // All-builtin background runs in-process (same rule as foreground:
+        // zero spawns). Otherwise the broker/executor path spawns real
+        // processes — which would fail for Omen-only names like `uniq`.
+        let in_process: Option<Vec<omen_builtins::PipelineStage>> = stages
+            .iter()
+            .map(|stage| {
+                if omen_builtins::is_builtin(stage.argv.first().map(String::as_str).unwrap_or("")) {
+                    Some(omen_builtins::PipelineStage {
+                        argv: stage.argv.clone(),
+                        env_overrides: stage.env.clone(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let base_env: Vec<(String, String)> = std::env::vars().collect();
         let thread = std::thread::spawn(move || {
+            // In-process fast path: pure chain, still honors a pre-fired
+            // cancel flag (zero effects either way for read-only stages).
+            if let Some(inputs) = in_process {
+                if *cancel_rx.borrow() {
+                    *thread_state.lock().expect("job state") = StandaloneJobState::Finished {
+                        code: None,
+                        runtime: "Cancelled".to_string(),
+                        preview: String::new(),
+                    };
+                    return;
+                }
+                let ctx = omen_builtins::BuiltinContext {
+                    cwd: exec_cwd,
+                    env: base_env,
+                    stdin: Vec::new(),
+                };
+                let mut code = Some(0);
+                let mut preview = String::new();
+                if let Some(outputs) = omen_builtins::run_pipeline(&inputs, &ctx) {
+                    for output in &outputs {
+                        match output {
+                            Ok(out) => {
+                                code = Some(out.code);
+                                preview = bounded_preview(&out.stdout);
+                            }
+                            Err(error) => {
+                                code = None;
+                                preview = format!("builtin pipeline internal failure: {error}");
+                            }
+                        }
+                    }
+                }
+                *thread_state.lock().expect("job state") = StandaloneJobState::Finished {
+                    code,
+                    runtime: "Completed(InProcess)".to_string(),
+                    preview,
+                };
+                return;
+            }
             let supervisor = omen_engine::ProcessSupervisor::with_backend(backend);
             let outcome = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -2340,6 +2396,35 @@ mod builtin_pipeline_dispatch_tests {
         }
         let exit = session.dispatch_input(":jobs").expect(":jobs dispatches");
         assert_eq!(exit.code, Some(0));
+    }
+
+    /// Backgrounded all-builtin pipelines run in-process (same rule as
+    /// foreground): `printf | sort &` finishes with the chained output as
+    /// its preview instead of failing to spawn external `sort`/`uniq`.
+    #[test]
+    fn standalone_background_builtin_pipeline_runs_in_process() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = standalone_session(dir.path().to_path_buf());
+        let exit = session
+            .dispatch_input("printf 'b\\na\\n' | sort &")
+            .expect("background pipeline dispatches");
+        assert_eq!(exit.code, Some(0));
+        let state = await_state(
+            &session,
+            "job-1",
+            |s| !matches!(s, StandaloneJobState::Running),
+            "builtin pipeline job",
+        );
+        match state {
+            StandaloneJobState::Finished {
+                code: Some(0),
+                preview,
+                ..
+            } => {
+                assert_eq!(preview, "a\nb\n");
+            }
+            other => panic!("builtin pipeline must finish zero in-process: {other:?}"),
+        }
     }
 
     /// Stopping a running standalone job tree-kills it and reports a
