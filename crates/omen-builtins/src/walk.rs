@@ -39,7 +39,11 @@ fn display_bytes(path: &Path, cwd: &Path) -> Vec<u8> {
 
 fn resolve_operand(cwd: &Path, operand: &str) -> PathBuf {
     let path = PathBuf::from(operand);
-    if path.is_absolute() { path } else { cwd.join(path) }
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
 }
 
 fn finish(out: Vec<u8>, truth: serde_json::Value, failures: Vec<String>) -> BuiltinOutput {
@@ -123,7 +127,9 @@ pub fn find(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
             }
             _ if arg.starts_with('-') && arg != "-" => {
                 return BuiltinOutput::failed(
-                    format!("find: unsupported primary {arg:?} (only -maxdepth, -mindepth, -type, -name)"),
+                    format!(
+                        "find: unsupported primary {arg:?} (only -maxdepth, -mindepth, -type, -name)"
+                    ),
                     json!({"builtin": "find", "error": "unsupported_option"}),
                 );
             }
@@ -153,7 +159,10 @@ pub fn find(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
     for operand in &operands {
         let root = resolve_operand(&ctx.cwd, operand);
         if std::fs::symlink_metadata(&root).is_err() {
-            failures.push(format!("find: {}: no such file or directory", root.display()));
+            failures.push(format!(
+                "find: {}: no such file or directory",
+                root.display()
+            ));
             continue;
         }
         let mut walker = walkdir::WalkDir::new(&root)
@@ -273,7 +282,10 @@ pub fn du(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
         // never the dir entry's own platform length) is ready post-order.
         let mut dir_sizes: HashMap<PathBuf, u64> = HashMap::new();
         let mut failed = false;
-        for entry in walkdir::WalkDir::new(&root).sort_by_file_name().contents_first(true) {
+        for entry in walkdir::WalkDir::new(&root)
+            .sort_by_file_name()
+            .contents_first(true)
+        {
             let entry = match entry {
                 Ok(e) => e,
                 Err(error) => {
@@ -308,7 +320,8 @@ pub fn du(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
                 } else {
                     entry.metadata().map(|m| m.len()).unwrap_or(0)
                 };
-                let shown = String::from_utf8_lossy(&display_bytes(entry.path(), &ctx.cwd)).into_owned();
+                let shown =
+                    String::from_utf8_lossy(&display_bytes(entry.path(), &ctx.cwd)).into_owned();
                 out.extend(format!("{}\t{}\n", scale(size, unit), shown).as_bytes());
             }
         } else {
@@ -324,7 +337,11 @@ pub fn du(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
 }
 
 fn scale(bytes: u64, unit: u64) -> u64 {
-    if unit <= 1 { bytes } else { bytes.div_ceil(unit) }
+    if unit <= 1 {
+        bytes
+    } else {
+        bytes.div_ceil(unit)
+    }
 }
 
 /// `tree [-a] [-d] [-L LEVEL] [path ...]`.
@@ -381,11 +398,26 @@ pub fn tree(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
     for operand in &operands {
         let root = resolve_operand(&ctx.cwd, operand);
         if std::fs::symlink_metadata(&root).is_err() {
-            failures.push(format!("tree: {}: no such file or directory", root.display()));
+            failures.push(format!(
+                "tree: {}: no such file or directory",
+                root.display()
+            ));
             continue;
         }
         out.extend(format!("{operand}\n").as_bytes());
-        render_tree_children(&root, "", 1, max_level, all, dirs_only, &mut out, &mut dirs, &mut files, &mut entries_json, &mut failures);
+        render_tree_children(
+            &root,
+            "",
+            1,
+            max_level,
+            all,
+            dirs_only,
+            &mut out,
+            &mut dirs,
+            &mut files,
+            &mut entries_json,
+            &mut failures,
+        );
         dirs += 1;
     }
     out.extend(format!("\n{dirs} directories, {files} files\n").as_bytes());
@@ -425,14 +457,18 @@ fn render_tree_children(
         }
     };
     children.sort_by(|a, b| {
-        a.file_name().map(|n| n.as_encoded_bytes().to_vec()).cmp(&b.file_name().map(|n| n.as_encoded_bytes().to_vec()))
+        a.file_name()
+            .map(|n| n.as_encoded_bytes().to_vec())
+            .cmp(&b.file_name().map(|n| n.as_encoded_bytes().to_vec()))
     });
     if dirs_only {
         children.retain(|p| p.is_dir() && !p.is_symlink());
     }
     if !show_all {
         children.retain(|p| {
-            p.file_name().map(|n| !n.to_string_lossy().starts_with('.')).unwrap_or(true)
+            p.file_name()
+                .map(|n| !n.to_string_lossy().starts_with('.'))
+                .unwrap_or(true)
         });
     }
     let total = children.len();
@@ -453,9 +489,7 @@ fn render_tree_children(
         if is_dir && !is_link {
             out.push(b'/');
         }
-        if is_link
-            && let Ok(target) = std::fs::read_link(child)
-        {
+        if is_link && let Ok(target) = std::fs::read_link(child) {
             out.extend(b" -> ");
             out.extend(target.to_string_lossy().as_bytes());
         }
@@ -471,7 +505,19 @@ fn render_tree_children(
         if is_dir && !is_link {
             *dirs += 1;
             let child_prefix = format!("{prefix}{extension}");
-            render_tree_children(child, &child_prefix, level + 1, max_level, show_all, dirs_only, out, dirs, files, entries_json, failures);
+            render_tree_children(
+                child,
+                &child_prefix,
+                level + 1,
+                max_level,
+                show_all,
+                dirs_only,
+                out,
+                dirs,
+                files,
+                entries_json,
+                failures,
+            );
         } else {
             *files += 1;
         }
@@ -483,7 +529,11 @@ mod tests {
     use super::*;
 
     fn ctx_for(dir: &Path) -> BuiltinContext {
-        BuiltinContext { cwd: dir.to_path_buf(), env: Vec::new(), stdin: Vec::new() }
+        BuiltinContext {
+            cwd: dir.to_path_buf(),
+            env: Vec::new(),
+            stdin: Vec::new(),
+        }
     }
 
     fn s(args: &[&str]) -> Vec<String> {

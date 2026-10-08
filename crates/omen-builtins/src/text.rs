@@ -252,7 +252,10 @@ fn parse_int_operand(operand: &str) -> Result<i64, String> {
         return Ok(0);
     }
     // Accept leading `0x`/`0o`/`0b` and float truncation like POSIX shells do.
-    if let Some(hex) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+    if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
         return i64::from_str_radix(hex, 16)
             .map_err(|_| format!("expected an integer, got {operand:?}"));
     }
@@ -273,7 +276,9 @@ fn parse_uint_operand(operand: &str) -> Result<u64, String> {
 /// pre-rendered integer body. Only the common subset is honored; anything
 /// else passes the body through unchanged.
 fn apply_width(spec: &str, body: &str) -> String {
-    let inner = spec.trim_start_matches('%').trim_end_matches(|ch: char| ch.is_ascii_alphabetic());
+    let inner = spec
+        .trim_start_matches('%')
+        .trim_end_matches(|ch: char| ch.is_ascii_alphabetic());
     let (left, width) = match inner.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, inner),
@@ -299,12 +304,23 @@ fn apply_width(spec: &str, body: &str) -> String {
 }
 
 fn render_float(spec: &str, conversion: char, value: f64) -> String {
-    let inner = spec.trim_start_matches('%').trim_end_matches(|ch: char| ch.is_ascii_alphabetic());
-    let inner = inner.strip_prefix('-').or_else(|| inner.strip_prefix(' ')).unwrap_or(inner);
+    let inner = spec
+        .trim_start_matches('%')
+        .trim_end_matches(|ch: char| ch.is_ascii_alphabetic());
+    let inner = inner
+        .strip_prefix('-')
+        .or_else(|| inner.strip_prefix(' '))
+        .unwrap_or(inner);
     let precision: usize = inner
         .split('.')
         .nth(1)
-        .and_then(|part| part.chars().take_while(|ch| ch.is_ascii_digit()).collect::<String>().parse().ok())
+        .and_then(|part| {
+            part.chars()
+                .take_while(|ch| ch.is_ascii_digit())
+                .collect::<String>()
+                .parse()
+                .ok()
+        })
         .unwrap_or(6);
     match conversion {
         'f' | 'F' => format!("{value:.precision$}"),

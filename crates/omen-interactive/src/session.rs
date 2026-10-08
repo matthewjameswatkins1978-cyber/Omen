@@ -1172,10 +1172,7 @@ impl InteractiveSession {
     /// and never go through the daemon broker: they are pure functions of
     /// `(argv, cwd, env, stdin)` in the same trust class as the `:action`
     /// dispatcher. Session-affecting words (`cd`) stay with the caller.
-    fn try_dispatch_builtin(
-        &mut self,
-        argv: &[String],
-    ) -> Option<Result<ProcessExit, CoreError>> {
+    fn try_dispatch_builtin(&mut self, argv: &[String]) -> Option<Result<ProcessExit, CoreError>> {
         let ctx = omen_builtins::BuiltinContext {
             cwd: self.cwd.clone(),
             env: std::env::vars().collect(),

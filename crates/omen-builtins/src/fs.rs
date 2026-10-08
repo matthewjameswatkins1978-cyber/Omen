@@ -30,7 +30,10 @@ pub fn pwd(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
     };
     let mut out = dir.to_string_lossy().into_owned().into_bytes();
     out.push(b'\n');
-    BuiltinOutput::ok(out, json!({"builtin": "pwd", "cwd": dir.to_string_lossy(), "physical": physical}))
+    BuiltinOutput::ok(
+        out,
+        json!({"builtin": "pwd", "cwd": dir.to_string_lossy(), "physical": physical}),
+    )
 }
 
 /// `cat [-n] [file ...]`: concatenates files (or stdin) to stdout, byte for
@@ -172,7 +175,9 @@ pub fn which(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
             absent.push(format!("which: no {name} in PATH"));
         } else {
             let display: Vec<String> = if all {
-                hits.iter().map(|path| path.to_string_lossy().into_owned()).collect()
+                hits.iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect()
             } else {
                 vec![hits[0].to_string_lossy().into_owned()]
             };

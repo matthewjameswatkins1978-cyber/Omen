@@ -21,7 +21,10 @@ fn main() {
     };
     match omen_builtins::run_if_builtin(&argv, &ctx) {
         None => {
-            eprintln!("run: not a builtin: {}", argv.first().map(String::as_str).unwrap_or(""));
+            eprintln!(
+                "run: not a builtin: {}",
+                argv.first().map(String::as_str).unwrap_or("")
+            );
             std::process::exit(127);
         }
         Some(Err(error)) => {

@@ -78,13 +78,16 @@ fn raw_name(path: &Path) -> (Vec<u8>, String, bool) {
 }
 
 fn unix_secs(time: std::io::Result<std::time::SystemTime>) -> Option<i64> {
-    time.ok()?.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs() as i64)
+    time.ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs() as i64)
 }
 
 /// Stats `path` itself (never follows a final symlink).
 fn stat_entry(path: &Path) -> Result<FileEntry, String> {
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
     let file_type = metadata.file_type();
     let kind = if file_type.is_symlink() {
         FileKind::Symlink
@@ -97,7 +100,9 @@ fn stat_entry(path: &Path) -> Result<FileEntry, String> {
     };
     let (name_bytes, name_lossy, name_is_lossy) = raw_name(path);
     let symlink_target = if kind == FileKind::Symlink {
-        std::fs::read_link(path).ok().map(|t| t.as_os_str().as_encoded_bytes().to_vec())
+        std::fs::read_link(path)
+            .ok()
+            .map(|t| t.as_os_str().as_encoded_bytes().to_vec())
     } else {
         None
     };
@@ -129,7 +134,11 @@ fn entry_json(entry: &FileEntry) -> serde_json::Value {
 
 fn resolve_operand(cwd: &Path, operand: &str) -> PathBuf {
     let path = PathBuf::from(operand);
-    if path.is_absolute() { path } else { cwd.join(path) }
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
 }
 
 /// `ls [-a] [-l] [-0|-1] [-d] [path ...]` (alias `dir`).
@@ -179,7 +188,11 @@ pub fn ls(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
             json!({"builtin": "ls", "error": "usage"}),
         );
     }
-    let operands: Vec<String> = if operands.is_empty() { vec![".".to_string()] } else { operands.to_vec() };
+    let operands: Vec<String> = if operands.is_empty() {
+        vec![".".to_string()]
+    } else {
+        operands.to_vec()
+    };
     let show_headers = operands.len() > 1;
     let mut out = Vec::new();
     let mut entries_json = Vec::new();
@@ -258,7 +271,13 @@ pub fn ls(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
             }
         }
     }
-    let projection = if long { "long" } else if nul { "names-nul" } else { "names-nl" };
+    let projection = if long {
+        "long"
+    } else if nul {
+        "names-nul"
+    } else {
+        "names-nl"
+    };
     let truth = json!({"builtin": "ls", "projection": projection, "lossless": lossless && !long,
                        "entries": entries_json, "listed": listed, "failures": failures.len()});
     if failures.is_empty() {
@@ -353,7 +372,14 @@ pub fn stat(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
         };
         entries_json.push(entry_json(&entry));
         out.extend(format!("  File: {}\n", entry.path.display()).as_bytes());
-        out.extend(format!("  Size: {}\tType: {}\n", entry.len, entry.file_type.as_str()).as_bytes());
+        out.extend(
+            format!(
+                "  Size: {}\tType: {}\n",
+                entry.len,
+                entry.file_type.as_str()
+            )
+            .as_bytes(),
+        );
         out.extend(format!("Readonly: {}\n", entry.readonly).as_bytes());
         match entry.modified_unix {
             Some(secs) => out.extend(format!("Modified: {secs}\n").as_bytes()),
@@ -382,7 +408,11 @@ mod tests {
     use crate::BuiltinContext;
 
     fn ctx_for(dir: &Path) -> BuiltinContext {
-        BuiltinContext { cwd: dir.to_path_buf(), env: Vec::new(), stdin: Vec::new() }
+        BuiltinContext {
+            cwd: dir.to_path_buf(),
+            env: Vec::new(),
+            stdin: Vec::new(),
+        }
     }
 
     fn s(args: &[&str]) -> Vec<String> {
@@ -436,7 +466,9 @@ mod tests {
     fn ls_newline_name_declares_lossy_nl() {
         use std::os::unix::ffi::OsStrExt;
         let dir = fixture();
-        let tricky = dir.path().join(std::ffi::OsStr::from_bytes(b"with\nnewline"));
+        let tricky = dir
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"with\nnewline"));
         std::fs::write(&tricky, b"x").expect("write");
         let out = ls(&s(&["-0"]), &ctx_for(dir.path()));
         assert_eq!(out.code, 0);

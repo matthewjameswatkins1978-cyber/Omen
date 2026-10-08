@@ -25,9 +25,9 @@
 mod filter;
 mod fs;
 mod listing;
-mod walk;
 mod terminal;
 mod text;
+mod walk;
 
 use std::path::PathBuf;
 
@@ -104,9 +104,9 @@ impl BuiltinOutput {
 /// Authority: the `match` arms in [`run_if_builtin`]. A consistency test
 /// asserts the table and the dispatcher agree in both directions.
 pub const BUILTIN_NAMES: &[&str] = &[
-    "cat", "clear", "cut", "dir", "du", "echo", "find", "grep", "head", "help", "ls",
-    "pwd", "printf", "readlink", "realpath", "sort", "stat", "tail", "tr", "tree", "uniq",
-    "wc", "where", "which",
+    "cat", "clear", "cut", "dir", "du", "echo", "find", "grep", "head", "help", "ls", "pwd",
+    "printf", "readlink", "realpath", "sort", "stat", "tail", "tr", "tree", "uniq", "wc", "where",
+    "which",
 ];
 
 /// Returns `true` when `name` is implemented by this crate.
@@ -158,30 +158,93 @@ pub fn run_if_builtin(
 /// lives here, not in a second documentation copy.
 pub fn help_for(name: &str) -> Option<(&'static str, &'static str)> {
     Some(match name {
-        "cat" => ("cat [-n] [file ...]", "Concatenates files (or stdin) byte for byte. -n numbers lines."),
-        "clear" => ("clear", "Emits the home-and-erase ANSI sequence. Takes no operands."),
-        "cut" => ("cut -b LIST | -c LIST | -f LIST [-d DELIM] [-s] [file ...]", "Positions are BYTES (lossy over multibyte text). Only one of -b/-c/-f."),
+        "cat" => (
+            "cat [-n] [file ...]",
+            "Concatenates files (or stdin) byte for byte. -n numbers lines.",
+        ),
+        "clear" => (
+            "clear",
+            "Emits the home-and-erase ANSI sequence. Takes no operands.",
+        ),
+        "cut" => (
+            "cut -b LIST | -c LIST | -f LIST [-d DELIM] [-s] [file ...]",
+            "Positions are BYTES (lossy over multibyte text). Only one of -b/-c/-f.",
+        ),
         "dir" => ("dir [options] [path ...]", "Alias of ls."),
-        "du" => ("du [-s] [-a] [-b|-k|-m] [path ...]", "Apparent sizes, never disk blocks. Default unit is bytes."),
-        "echo" => ("echo [-n] [-e|-E] [word ...]", "Writes words joined by spaces. -n drops the newline."),
-        "find" => ("find [path ...] [-maxdepth N] [-mindepth N] [-type f|d|l] [-name PATTERN]", "Visits everything (no ignore files); never follows symlinked dirs. -name is glob over the lossy name."),
-        "grep" => ("grep [-i] [-v] [-c] [-n] [-q] [-x] [-e PATTERN] PATTERN [file ...]", "LITERAL substring match only (no regex; use rg). Exits 0 match, 1 none, 2 error."),
-        "head" => ("head [-n N] [file ...]", "First N lines (default 10). Negative N drops the last |N| lines."),
+        "du" => (
+            "du [-s] [-a] [-b|-k|-m] [path ...]",
+            "Apparent sizes, never disk blocks. Default unit is bytes.",
+        ),
+        "echo" => (
+            "echo [-n] [-e|-E] [word ...]",
+            "Writes words joined by spaces. -n drops the newline.",
+        ),
+        "find" => (
+            "find [path ...] [-maxdepth N] [-mindepth N] [-type f|d|l] [-name PATTERN]",
+            "Visits everything (no ignore files); never follows symlinked dirs. -name is glob over the lossy name.",
+        ),
+        "grep" => (
+            "grep [-i] [-v] [-c] [-n] [-q] [-x] [-e PATTERN] PATTERN [file ...]",
+            "LITERAL substring match only (no regex; use rg). Exits 0 match, 1 none, 2 error.",
+        ),
+        "head" => (
+            "head [-n N] [file ...]",
+            "First N lines (default 10). Negative N drops the last |N| lines.",
+        ),
         "help" => ("help [builtin]", "Lists builtins, or details one."),
-        "ls" => ("ls [-a] [-l] [-0|-1] [-d] [path ...]", "Byte-sorted listing. -0 (NUL) is lossless; newline-delimited names are lossy."),
-        "pwd" => ("pwd [-L|-P]", "Prints the session directory. -P resolves symlinks."),
-        "printf" => ("printf format [arg ...]", "POSIX printf subset (%s %d %u %o %x %X %c %b %f %e %g %%)."),
-        "readlink" => ("readlink [-f] path ...", "Prints raw link targets; -f canonicalizes."),
-        "realpath" => ("realpath [-m] path ...", "Canonical absolute paths. -m tolerates missing tails."),
-        "sort" => ("sort [-r] [-n] [-u] [-f] [file ...]", "Stable line sort. -n is leading-number, -f folds ASCII case for comparison."),
-        "stat" => ("stat [-L] path ...", "Typed metadata (size/type/readonly/mtime). -L follows symlinks."),
-        "tail" => ("tail [-n N] [file ...]", "Last N lines (default 10). -n +N prints from line N."),
-        "tr" => ("tr [-c] [-d] [-s] SET1 [SET2]", "Byte translation over stdin only. Ranges, escapes and [:upper:] classes."),
-        "tree" => ("tree [-a] [-d] [-L LEVEL] [path ...]", "Renders directory drawing. Display only (always lossy projection)."),
-        "uniq" => ("uniq [-c] [-d] [-u] [-i] [file ...]", "Adjacent duplicate suppression. -i folds ASCII case."),
-        "wc" => ("wc [-lwc] [file ...]", "Lines, words, bytes. -m is refused (chars lie over non-UTF-8)."),
+        "ls" => (
+            "ls [-a] [-l] [-0|-1] [-d] [path ...]",
+            "Byte-sorted listing. -0 (NUL) is lossless; newline-delimited names are lossy.",
+        ),
+        "pwd" => (
+            "pwd [-L|-P]",
+            "Prints the session directory. -P resolves symlinks.",
+        ),
+        "printf" => (
+            "printf format [arg ...]",
+            "POSIX printf subset (%s %d %u %o %x %X %c %b %f %e %g %%).",
+        ),
+        "readlink" => (
+            "readlink [-f] path ...",
+            "Prints raw link targets; -f canonicalizes.",
+        ),
+        "realpath" => (
+            "realpath [-m] path ...",
+            "Canonical absolute paths. -m tolerates missing tails.",
+        ),
+        "sort" => (
+            "sort [-r] [-n] [-u] [-f] [file ...]",
+            "Stable line sort. -n is leading-number, -f folds ASCII case for comparison.",
+        ),
+        "stat" => (
+            "stat [-L] path ...",
+            "Typed metadata (size/type/readonly/mtime). -L follows symlinks.",
+        ),
+        "tail" => (
+            "tail [-n N] [file ...]",
+            "Last N lines (default 10). -n +N prints from line N.",
+        ),
+        "tr" => (
+            "tr [-c] [-d] [-s] SET1 [SET2]",
+            "Byte translation over stdin only. Ranges, escapes and [:upper:] classes.",
+        ),
+        "tree" => (
+            "tree [-a] [-d] [-L LEVEL] [path ...]",
+            "Renders directory drawing. Display only (always lossy projection).",
+        ),
+        "uniq" => (
+            "uniq [-c] [-d] [-u] [-i] [file ...]",
+            "Adjacent duplicate suppression. -i folds ASCII case.",
+        ),
+        "wc" => (
+            "wc [-lwc] [file ...]",
+            "Lines, words, bytes. -m is refused (chars lie over non-UTF-8).",
+        ),
         "where" => ("where [-a] name ...", "Alias of which."),
-        "which" => ("which [-a] name ...", "Locates executables on PATH. -a prints every hit."),
+        "which" => (
+            "which [-a] name ...",
+            "Locates executables on PATH. -a prints every hit.",
+        ),
         _ => return None,
     })
 }
@@ -211,7 +274,10 @@ pub fn help(args: &[String]) -> BuiltinOutput {
         let usage = help_for(name).map(|(u, _)| u).unwrap_or("?");
         out.push_str(&format!("  {usage}\n"));
     }
-    BuiltinOutput::ok(out.into_bytes(), serde_json::json!({"builtin": "help", "topics": BUILTIN_NAMES}))
+    BuiltinOutput::ok(
+        out.into_bytes(),
+        serde_json::json!({"builtin": "help", "topics": BUILTIN_NAMES}),
+    )
 }
 /// Internal builtin failure (not an operand error; those are exit codes).
 #[derive(Debug, thiserror::Error)]

@@ -33,7 +33,11 @@ fn gather(operands: &[String], ctx: &BuiltinContext, builtin: &str) -> Gathered 
             continue;
         }
         let path = PathBuf::from(operand);
-        let path = if path.is_absolute() { path } else { ctx.cwd.join(path) };
+        let path = if path.is_absolute() {
+            path
+        } else {
+            ctx.cwd.join(path)
+        };
         match std::fs::read(&path) {
             Ok(data) => chunks.push((Some(operand.clone()), data)),
             Err(error) => failures.push(format!("{builtin}: {}: {error}", path.display())),
@@ -69,7 +73,12 @@ fn fail2(message: &str, mut truth: serde_json::Value) -> BuiltinOutput {
     result
 }
 
-fn finish(_builtin: &str, out: Vec<u8>, truth: serde_json::Value, failures: Vec<String>) -> BuiltinOutput {
+fn finish(
+    _builtin: &str,
+    out: Vec<u8>,
+    truth: serde_json::Value,
+    failures: Vec<String>,
+) -> BuiltinOutput {
     if failures.is_empty() {
         BuiltinOutput::ok(out, truth)
     } else {
@@ -88,7 +97,11 @@ fn parse_count(text: &str, builtin: &str) -> Result<i64, String> {
 
 /// Shared `-n`/`-N`/`--lines=` flag parsing for `head` and `tail`.
 /// Returns `(signed_count_or_default, operands)`.
-fn parse_n_flag(args: &[String], builtin: &str, default: i64) -> Result<(i64, Vec<String>), String> {
+fn parse_n_flag(
+    args: &[String],
+    builtin: &str,
+    default: i64,
+) -> Result<(i64, Vec<String>), String> {
     let mut count = default;
     let mut operands = Vec::new();
     let mut index = 0;
@@ -100,13 +113,18 @@ fn parse_n_flag(args: &[String], builtin: &str, default: i64) -> Result<(i64, Ve
         }
         if arg == "-n" || arg == "--lines" {
             index += 1;
-            let value = args.get(index).ok_or_else(|| format!("{builtin}: -n needs a count"))?;
+            let value = args
+                .get(index)
+                .ok_or_else(|| format!("{builtin}: -n needs a count"))?;
             count = parse_count(value, builtin)?;
         } else if let Some(value) = arg.strip_prefix("--lines=") {
             count = parse_count(value, builtin)?;
         } else if let Some(value) = arg.strip_prefix("-n") {
             count = parse_count(value, builtin)?;
-        } else if arg.len() > 1 && arg.starts_with('-') && arg[1..].chars().all(|c| c.is_ascii_digit()) {
+        } else if arg.len() > 1
+            && arg.starts_with('-')
+            && arg[1..].chars().all(|c| c.is_ascii_digit())
+        {
             // Old-style `-N`.
             count = parse_count(&arg[1..], builtin)?;
         } else if arg.starts_with('-') && arg != "-" {
@@ -191,11 +209,23 @@ pub fn tail(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
     }
     let selected: Vec<Vec<u8>> = if count >= 0 {
         let want = count as usize;
-        all.into_iter().rev().take(want).collect::<Vec<_>>().into_iter().rev().collect()
+        all.into_iter()
+            .rev()
+            .take(want)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
     } else {
         // `tail -n -N`: last N lines, same as plain N.
         let want = (-count) as usize;
-        all.into_iter().rev().take(want).collect::<Vec<_>>().into_iter().rev().collect()
+        all.into_iter()
+            .rev()
+            .take(want)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
     };
     let lines = selected.len();
     let mut out = Vec::new();
@@ -287,7 +317,9 @@ pub fn wc(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
         total_words += words;
         total_bytes += bytes;
         files += 1;
-        out.extend(format_counts(show_lines, show_words, show_bytes, lines, words, bytes).as_bytes());
+        out.extend(
+            format_counts(show_lines, show_words, show_bytes, lines, words, bytes).as_bytes(),
+        );
         if named {
             out.push(b' ');
             out.extend(name.clone().unwrap_or_default().as_bytes());
@@ -295,7 +327,17 @@ pub fn wc(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
         out.push(b'\n');
     }
     if gathered.chunks.len() > 1 {
-        out.extend(format_counts(show_lines, show_words, show_bytes, total_lines, total_words, total_bytes).as_bytes());
+        out.extend(
+            format_counts(
+                show_lines,
+                show_words,
+                show_bytes,
+                total_lines,
+                total_words,
+                total_bytes,
+            )
+            .as_bytes(),
+        );
         out.extend(b" total\n");
     }
     finish(
@@ -386,7 +428,9 @@ pub fn sort(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
     if unique {
         let mut kept: Vec<Vec<u8>> = Vec::with_capacity(lines.len());
         for line in lines {
-            let equal = kept.last().is_some_and(|last: &Vec<u8>| keys_equal(last, &line, numeric, fold));
+            let equal = kept
+                .last()
+                .is_some_and(|last: &Vec<u8>| keys_equal(last, &line, numeric, fold));
             if !equal {
                 kept.push(line);
             }
@@ -512,7 +556,9 @@ pub fn uniq(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
     let mut index = 0;
     while index < lines.len() {
         let mut run = 1;
-        while index + run < lines.len() && same_line(&lines[index], &lines[index + run], ignore_case) {
+        while index + run < lines.len()
+            && same_line(&lines[index], &lines[index + run], ignore_case)
+        {
             run += 1;
         }
         groups += 1;
@@ -558,29 +604,39 @@ fn parse_cut_list(list: &str) -> Result<Vec<ByteRange>, String> {
         }
         let (lo, hi) = match item.split_once('-') {
             None => {
-                let n: usize = item.parse().map_err(|_| format!("cut: invalid position {item:?}"))?;
+                let n: usize = item
+                    .parse()
+                    .map_err(|_| format!("cut: invalid position {item:?}"))?;
                 if n == 0 {
                     return Err("cut: positions start at 1".to_string());
                 }
                 (n - 1, n)
             }
             Some(("", hi)) => {
-                let m: usize = hi.parse().map_err(|_| format!("cut: invalid position {item:?}"))?;
+                let m: usize = hi
+                    .parse()
+                    .map_err(|_| format!("cut: invalid position {item:?}"))?;
                 if m == 0 {
                     return Err("cut: positions start at 1".to_string());
                 }
                 (0, m)
             }
             Some((lo, "")) => {
-                let n: usize = lo.parse().map_err(|_| format!("cut: invalid position {item:?}"))?;
+                let n: usize = lo
+                    .parse()
+                    .map_err(|_| format!("cut: invalid position {item:?}"))?;
                 if n == 0 {
                     return Err("cut: positions start at 1".to_string());
                 }
                 (n - 1, usize::MAX)
             }
             Some((lo, hi)) => {
-                let n: usize = lo.parse().map_err(|_| format!("cut: invalid position {item:?}"))?;
-                let m: usize = hi.parse().map_err(|_| format!("cut: invalid position {item:?}"))?;
+                let n: usize = lo
+                    .parse()
+                    .map_err(|_| format!("cut: invalid position {item:?}"))?;
+                let m: usize = hi
+                    .parse()
+                    .map_err(|_| format!("cut: invalid position {item:?}"))?;
                 if n == 0 || m == 0 {
                     return Err("cut: positions start at 1".to_string());
                 }
@@ -645,11 +701,16 @@ pub fn cut(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
         }
         if arg == "-d" {
             index += 1;
-            let value = args.get(index).ok_or_else(|| "cut: -d needs a delimiter".to_string());
+            let value = args
+                .get(index)
+                .ok_or_else(|| "cut: -d needs a delimiter".to_string());
             let value = match value {
                 Ok(v) => v,
                 Err(message) => {
-                    return BuiltinOutput::failed(message, json!({"builtin": "cut", "error": "usage"}));
+                    return BuiltinOutput::failed(
+                        message,
+                        json!({"builtin": "cut", "error": "usage"}),
+                    );
                 }
             };
             if value.is_empty() {
@@ -678,7 +739,11 @@ pub fn cut(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
                     json!({"builtin": "cut", "error": "usage"}),
                 );
             }
-            mode = Some(if arg == "-f" { Mode::Fields } else { Mode::Bytes });
+            mode = Some(if arg == "-f" {
+                Mode::Fields
+            } else {
+                Mode::Bytes
+            });
             index += 1;
             let value = args.get(index).cloned().unwrap_or_default();
             if value.is_empty() {
@@ -688,7 +753,9 @@ pub fn cut(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
                 );
             }
             list = Some(value);
-        } else if arg.len() > 2 && arg.starts_with('-') && arg.as_bytes()[1] != b'-'
+        } else if arg.len() > 2
+            && arg.starts_with('-')
+            && arg.as_bytes()[1] != b'-'
             && "bcf".contains(arg.as_bytes()[1] as char)
         {
             // Joined form: `-f1,3`, `-d,`, `-b2-`.
@@ -711,7 +778,11 @@ pub fn cut(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
                             json!({"builtin": "cut", "error": "usage"}),
                         );
                     }
-                    mode = Some(if flag == 'f' { Mode::Fields } else { Mode::Bytes });
+                    mode = Some(if flag == 'f' {
+                        Mode::Fields
+                    } else {
+                        Mode::Bytes
+                    });
                     if rest.is_empty() {
                         return BuiltinOutput::failed(
                             format!("cut: -{flag} needs a list"),
@@ -736,14 +807,17 @@ pub fn cut(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
         Some(m) => m,
         None => {
             return BuiltinOutput::failed(
-                "cut: usage: cut -b LIST | -c LIST | -f LIST [-d DELIM] [-s] [file ...]".to_string(),
+                "cut: usage: cut -b LIST | -c LIST | -f LIST [-d DELIM] [-s] [file ...]"
+                    .to_string(),
                 json!({"builtin": "cut", "error": "usage"}),
             );
         }
     };
     let ranges = match parse_cut_list(&list.unwrap_or_default()) {
         Ok(r) => merge_ranges(r),
-        Err(message) => return BuiltinOutput::failed(message, json!({"builtin": "cut", "error": "usage"})),
+        Err(message) => {
+            return BuiltinOutput::failed(message, json!({"builtin": "cut", "error": "usage"}));
+        }
     };
     let gathered = gather(operands, ctx, "cut");
     let mut out = Vec::new();
@@ -767,7 +841,11 @@ pub fn cut(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
                 let mut first = true;
                 // Ranges index fields 1-based the same way they index bytes.
                 for range in &ranges {
-                    for field in fields.iter().take(range.end.min(fields.len())).skip(range.start) {
+                    for field in fields
+                        .iter()
+                        .take(range.end.min(fields.len()))
+                        .skip(range.start)
+                    {
                         if !first {
                             out.push(delim);
                         }
@@ -809,9 +887,15 @@ fn expand_tr_set(set: &str) -> Result<Vec<u8>, String> {
     const CLASSES: &[(&str, &[u8])] = &[
         ("[:upper:]", b"ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
         ("[:lower:]", b"abcdefghijklmnopqrstuvwxyz"),
-        ("[:alpha:]", b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"),
+        (
+            "[:alpha:]",
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+        ),
         ("[:digit:]", b"0123456789"),
-        ("[:alnum:]", b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"),
+        (
+            "[:alnum:]",
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
+        ),
         ("[:space:]", b" \t\n\r\x0B\x0C"),
     ];
     while index < bytes.len() {
@@ -938,7 +1022,9 @@ pub fn tr(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
     }
     let mut set1 = match expand_tr_set(&sets[0]) {
         Ok(s) => s,
-        Err(message) => return BuiltinOutput::failed(message, json!({"builtin": "tr", "error": "usage"})),
+        Err(message) => {
+            return BuiltinOutput::failed(message, json!({"builtin": "tr", "error": "usage"}));
+        }
     };
     if complement {
         let present = {
@@ -948,12 +1034,17 @@ pub fn tr(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
             }
             table
         };
-        set1 = (0u16..=255).filter(|b| !present[*b as usize]).map(|b| b as u8).collect();
+        set1 = (0u16..=255)
+            .filter(|b| !present[*b as usize])
+            .map(|b| b as u8)
+            .collect();
     }
     let set2: Vec<u8> = match sets.get(1) {
         Some(text) => match expand_tr_set(text) {
             Ok(s) => s,
-            Err(message) => return BuiltinOutput::failed(message, json!({"builtin": "tr", "error": "usage"})),
+            Err(message) => {
+                return BuiltinOutput::failed(message, json!({"builtin": "tr", "error": "usage"}));
+            }
         },
         None => Vec::new(),
     };
@@ -978,7 +1069,11 @@ pub fn tr(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
         );
     }
     let squeeze_set: Vec<bool> = if squeeze {
-        let source = if !set2.is_empty() && !delete { &set2 } else { &set1 };
+        let source = if !set2.is_empty() && !delete {
+            &set2
+        } else {
+            &set1
+        };
         let mut present = [false; 256];
         for byte in source {
             present[*byte as usize] = true;
@@ -1078,7 +1173,9 @@ pub fn grep(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
             }
             if !only_flags {
                 return fail2(
-                    &format!("grep: unsupported option {arg:?} (only -i -v -c -n -q -x -F -H -h -e; -E/-G regex is refused, use rg)"),
+                    &format!(
+                        "grep: unsupported option {arg:?} (only -i -v -c -n -q -x -F -H -h -e; -E/-G regex is refused, use rg)"
+                    ),
                     json!({"builtin": "grep", "error": "unsupported_option"}),
                 );
             }
@@ -1116,7 +1213,11 @@ pub fn grep(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
                     _ => unreachable!(),
                 }
             }
-        } else if arg == "-E" || arg == "--extended-regexp" || arg == "-G" || arg == "--basic-regexp" {
+        } else if arg == "-E"
+            || arg == "--extended-regexp"
+            || arg == "-G"
+            || arg == "--basic-regexp"
+        {
             return fail2(
                 "grep: regex matching is not implemented (literal only); use rg for patterns",
                 json!({"builtin": "grep", "error": "regex_refused"}),
@@ -1158,7 +1259,9 @@ pub fn grep(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
         for line in split_lines(data) {
             line_number += 1;
             let body = line.strip_suffix(b"\n").unwrap_or(&line);
-            let hit = patterns.iter().any(|p| line_matches(body, p, ignore_case, whole_line));
+            let hit = patterns
+                .iter()
+                .any(|p| line_matches(body, p, ignore_case, whole_line));
             let selected_line = if invert { !hit } else { hit };
             if selected_line {
                 count += 1;
@@ -1232,7 +1335,8 @@ fn line_matches(line: &[u8], pattern: &[u8], ignore_case: bool, whole_line: bool
     if !ignore_case {
         return line.windows(pattern.len()).any(|w| w == pattern);
     }
-    line.windows(pattern.len()).any(|w| w.eq_ignore_ascii_case(pattern))
+    line.windows(pattern.len())
+        .any(|w| w.eq_ignore_ascii_case(pattern))
 }
 
 #[cfg(test)]
@@ -1289,7 +1393,10 @@ mod tests {
         let ctx = ctx_with(b"hello world\nfoo\n");
         let out = wc(&s(&[]), &ctx);
         assert_eq!(out.code, 0);
-        assert_eq!(String::from_utf8_lossy(&out.stdout), "      2      3     16\n");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "      2      3     16\n"
+        );
     }
 
     #[test]
@@ -1366,7 +1473,10 @@ mod tests {
         let ctx = ctx_with(b"a:b:c\nplain\n");
         let out = cut(&s(&["-f", "2", "-d", ":"]), &ctx);
         assert_eq!(out.stdout, b"b\nplain\n");
-        let out = cut(&s(&["-f", "2", "-d", ":", "-s"]), &ctx_with(b"a:b:c\nplain\n"));
+        let out = cut(
+            &s(&["-f", "2", "-d", ":", "-s"]),
+            &ctx_with(b"a:b:c\nplain\n"),
+        );
         assert_eq!(out.stdout, b"b\n");
         // Only one mode; bad ranges fail.
         assert_eq!(cut(&s(&["-b", "1", "-f", "1"]), &ctx).code, 1);
