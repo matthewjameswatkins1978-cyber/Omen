@@ -1690,6 +1690,8 @@ impl InteractiveSession {
         self.update_prompt_state();
         Some(Ok(exit))
     }
+
+    /// Navigates the session cwd to `target`, updating all dependent state.
     ///
     /// Used by `cd`, bare drive designators (`D:`), and any future navigation
     /// grammar.  Exactly one place owns the navigation side-effects.
