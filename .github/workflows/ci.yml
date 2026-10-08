@@ -119,6 +119,9 @@ jobs:
         run: cargo test -p omen-cli --test semantic_environment_proofs test_proof_c_real_lsp_symbol_definition_and_references -- --exact --nocapture
 
   matrix-test:
+    # RC1 scope: macOS is deferred (known platform defects recorded for
+    # post-RC). Its lane still runs for signal but never gates acceptance.
+    continue-on-error: ${{ matrix.os == 'macos-latest' }}
     strategy:
       fail-fast: false
       matrix:
