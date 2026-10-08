@@ -330,7 +330,39 @@ mod tests {
     fn superseded_jobs_do_not_leak_pending_state() {
         // Regression: latest-query-wins used to drop queued jobs without
         // refunding their outstanding count, leaving poll() Pending forever.
+        // Deterministic: a gate job occupies the single shared worker while
+        // five rapid dispatches queue behind it, so supersede applies to
+        // queued (not already-running) work on every platform and load.
+        use std::sync::atomic::{AtomicBool, Ordering};
         let s = Scheduler::spawn();
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let s_flag = started.clone();
+        let g = release.clone();
+        assert!(s.dispatch(
+            ProviderId::new("gate"),
+            CostTier::BlockingLocal,
+            1000,
+            DiscoveryBudget::allowing_subprocess(),
+            Box::new(move |_| {
+                s_flag.store(true, Ordering::SeqCst);
+                let (m, cv) = &*g;
+                let mut open = lock(m);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !*open && Instant::now() < deadline {
+                    open = cv
+                        .wait_timeout(open, Duration::from_millis(50))
+                        .map(|(guard, _)| guard)
+                        .unwrap_or_else(|e| e.into_inner().0);
+                }
+                declined()
+            }),
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !started.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "gate job must start");
+            std::thread::sleep(Duration::from_millis(2));
+        }
         for i in 0..5 {
             assert!(s.dispatch(
                 ProviderId::new("fs"),
@@ -340,6 +372,12 @@ mod tests {
                 Box::new(|_| declined()),
             ));
         }
+        let (m, cv) = &*release;
+        *lock(m) = true;
+        cv.notify_one();
+        // Serial worker: gate result first, then the surviving latest job.
+        let gate = await_ready(&s);
+        assert_eq!(gate.operation_id, 1000, "gate drains first");
         let r = await_ready(&s);
         assert_eq!(r.operation_id, 4, "only the latest job runs");
         await_idle(&s);
