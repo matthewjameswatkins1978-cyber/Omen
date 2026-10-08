@@ -2033,8 +2033,30 @@ fn resolve_cd_target(cwd: &Path, target: &str) -> PathBuf {
     if let Some(drive) = crate::commands::is_drive_designator(target) {
         return PathBuf::from(format!("{drive}:\\"));
     }
+    // Leading `~` expands against the home directory (HOME, or
+    // USERPROFILE on Windows); anything else falls through below.
+    if let Some(rest) = target.strip_prefix('~')
+        && (rest.is_empty() || rest.starts_with('/') || rest.starts_with('\\'))
+        && let Some(home) = home_dir()
+    {
+        return home.join(rest.trim_start_matches(['/', '\\']));
+    }
     let p = PathBuf::from(target);
     if p.is_absolute() { p } else { cwd.join(p) }
+}
+
+/// Session home directory for `~` expansion. No silent fallback: `None`
+/// leaves the operand untouched so resolution fails visibly downstream.
+fn home_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let candidates = ["USERPROFILE", "HOME"];
+    #[cfg(not(windows))]
+    let candidates = ["HOME"];
+    candidates
+        .iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .next()
 }
 
 #[cfg(test)]
@@ -2177,6 +2199,21 @@ mod builtin_pipeline_dispatch_tests {
             .dispatch_input("ls '*.rs'")
             .expect("quoted dispatches");
         assert_eq!(exit.code, Some(1));
+    }
+
+    /// `cd ~` reaches the home directory (HOME / USERPROFILE); skipped
+    /// when the test environment names no home.
+    #[test]
+    fn cd_tilde_reaches_home() {
+        let Some(home) = super::home_dir() else {
+            eprintln!("SKIP cd_tilde: no home directory in this environment");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = standalone_session(dir.path().to_path_buf());
+        let exit = session.dispatch_input("cd ~").expect("cd dispatches");
+        assert_eq!(exit.code, Some(0));
+        assert_eq!(session.cwd, home.canonicalize().unwrap_or(home));
     }
 
     /// `< file` feeds a builtin chain from bytes on disk.
