@@ -53,6 +53,14 @@ pub struct StandaloneJob {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
+/// Public snapshot of one standalone job (for `:jobs` rendering and tests).
+#[derive(Debug, Clone)]
+pub struct StandaloneJobInfo {
+    pub id: String,
+    pub label: String,
+    pub state: StandaloneJobState,
+}
+
 /// Cap on tracked standalone jobs: threads are heavier than daemon records.
 const MAX_STANDALONE_JOBS: usize = 32;
 
@@ -228,6 +236,22 @@ impl InteractiveSession {
 
     pub fn tracked_background_jobs(&self) -> &[BackgroundJobInfo] {
         &self.background_jobs
+    }
+
+    /// Snapshot of standalone (daemonless) background jobs and states.
+    pub fn standalone_jobs(&self) -> Vec<StandaloneJobInfo> {
+        self.standalone_jobs
+            .iter()
+            .map(|job| StandaloneJobInfo {
+                id: job.id.clone(),
+                label: job.label.clone(),
+                state: job
+                    .state
+                    .lock()
+                    .map(|guard| guard.clone())
+                    .unwrap_or(StandaloneJobState::Running),
+            })
+            .collect()
     }
 
     pub fn with_agent_provider(
