@@ -123,6 +123,8 @@ mod tests {
             actions: &[],
             action_subcommands: |_| &[],
             shell_intrinsics: &[],
+            shell_builtins: &[],
+            builtin_help: |_| None,
             tool_subcommands: |_| &[],
             is_drive_designator: |_| None,
             typed_handles: &["@last", "@failed"],

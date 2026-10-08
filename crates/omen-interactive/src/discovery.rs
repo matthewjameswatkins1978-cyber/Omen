@@ -43,9 +43,10 @@ use omen_discovery::context::{
 use omen_discovery::outcome::{DeclineReason, PartialReason, ProviderError};
 use omen_discovery::provider::{DiscoveryProvider, ProviderId};
 use omen_discovery::providers::{
-    FilesystemPathProvider, HelpHarvestCache, HelpHarvestProvider, HotIndexProvider,
-    HotIndexSnapshot, IntrinsicsProvider, OmenActionProvider, OmenKnowledge, PathCommandCache,
-    PathCommandsProvider, ReferenceProvider, SubcommandProvider, ToolIdentity, ToolSpecProvider,
+    BuiltinsProvider, FilesystemPathProvider, HelpHarvestCache, HelpHarvestProvider,
+    HotIndexProvider, HotIndexSnapshot, IntrinsicsProvider, OmenActionProvider, OmenKnowledge,
+    PathCommandCache, PathCommandsProvider, ReferenceProvider, SubcommandProvider, ToolIdentity,
+    ToolSpecProvider,
 };
 use omen_discovery::registry::{DiscoveryResult, ProviderRegistry};
 use omen_discovery::scheduler::{Scheduler, WorkResult, WorkStatus};
@@ -67,13 +68,15 @@ fn global_harvest_cache() -> &'static HelpHarvestCache {
     CACHE.get_or_init(HelpHarvestCache::new)
 }
 
-/// Builds the canonical Omen knowledge from `crate::commands` (single source
-/// of truth; no second handwritten action list).
+/// Builds the canonical Omen knowledge from `crate::commands` and the
+/// builtin registry (single source of truth; no second handwritten lists).
 pub fn omen_knowledge() -> Arc<OmenKnowledge> {
     Arc::new(OmenKnowledge {
         actions: commands::OMEN_ACTIONS,
         action_subcommands: commands::omen_action_subcommands,
         shell_intrinsics: commands::SHELL_INTRINSICS,
+        shell_builtins: omen_builtins::BUILTIN_NAMES,
+        builtin_help: omen_builtins::help_for,
         tool_subcommands: commands::tool_subcommands,
         is_drive_designator: commands::is_drive_designator,
         typed_handles: crate::grammar::TypedReference::STATIC_HANDLES,
@@ -371,6 +374,7 @@ impl DiscoveryRuntime {
 
         registry.register(Box::new(OmenActionProvider::new(knowledge.clone())));
         registry.register(Box::new(IntrinsicsProvider::new(knowledge.clone())));
+        registry.register(Box::new(BuiltinsProvider::new(knowledge.clone())));
         registry.register(Box::new(ReferenceProvider::new(knowledge.clone())));
         registry.register(Box::new(HotIndexProvider::new(hot.clone())));
         registry.register(Box::new(SubcommandProvider::new(knowledge.clone())));
@@ -866,6 +870,40 @@ mod tests {
         assert!(
             kinds.contains(&Kind::Command),
             "PATH command surfaced: {kinds:?}"
+        );
+    }
+
+    /// Builtin names complete at command position from the registry (with
+    /// usage descriptions), through the real provider set — no PATH needed.
+    #[test]
+    fn command_name_position_offers_registry_builtins() {
+        let cache = path_cache(&[]);
+        let r = run_discovery_serialized(&req("sor", 3, ".", &cache));
+        let inserts: Vec<&str> = r.ranked.iter().map(|x| x.value().insert.as_str()).collect();
+        assert!(
+            inserts.contains(&"sort"),
+            "builtin sort surfaced: {inserts:?}"
+        );
+        let sort = r
+            .ranked
+            .iter()
+            .find(|x| x.value().insert == "sort")
+            .expect("sort");
+        assert_eq!(
+            sort.authority(),
+            &omen_discovery::authority::Authority::Static,
+            "builtin completion is Static authority"
+        );
+        let description = sort
+            .matched
+            .discovered
+            .description
+            .as_ref()
+            .map(|d| d.short.clone())
+            .unwrap_or_default();
+        assert!(
+            description.contains("sort"),
+            "usage description attached: {description:?}"
         );
     }
 

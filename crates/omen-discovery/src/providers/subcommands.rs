@@ -118,6 +118,8 @@ mod tests {
             actions: &[],
             action_subcommands: |_| &[],
             shell_intrinsics: &["cd"],
+            shell_builtins: &[],
+            builtin_help: |_| None,
             tool_subcommands: |t| match t {
                 "cargo" => &["build", "test"],
                 _ => &[],
