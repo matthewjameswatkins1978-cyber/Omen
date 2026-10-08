@@ -43,9 +43,10 @@ use omen_discovery::context::{
 use omen_discovery::outcome::{DeclineReason, PartialReason, ProviderError};
 use omen_discovery::provider::{DiscoveryProvider, ProviderId};
 use omen_discovery::providers::{
-    FilesystemPathProvider, HelpHarvestCache, HelpHarvestProvider, HotIndexProvider,
-    HotIndexSnapshot, IntrinsicsProvider, OmenActionProvider, OmenKnowledge, PathCommandCache,
-    PathCommandsProvider, ReferenceProvider, SubcommandProvider, ToolIdentity, ToolSpecProvider,
+    BuiltinsProvider, FilesystemPathProvider, HelpHarvestCache, HelpHarvestProvider,
+    HotIndexProvider, HotIndexSnapshot, IntrinsicsProvider, OmenActionProvider, OmenKnowledge,
+    PathCommandCache, PathCommandsProvider, ReferenceProvider, SubcommandProvider, ToolIdentity,
+    ToolSpecProvider,
 };
 use omen_discovery::registry::{DiscoveryResult, ProviderRegistry};
 use omen_discovery::scheduler::{Scheduler, WorkResult, WorkStatus};
@@ -67,13 +68,17 @@ fn global_harvest_cache() -> &'static HelpHarvestCache {
     CACHE.get_or_init(HelpHarvestCache::new)
 }
 
-/// Builds the canonical Omen knowledge from `crate::commands` (single source
-/// of truth; no second handwritten action list).
+/// Builds the canonical Omen knowledge from `crate::commands` and the
+/// builtin registry (single source of truth; no second handwritten lists).
 pub fn omen_knowledge() -> Arc<OmenKnowledge> {
     Arc::new(OmenKnowledge {
         actions: commands::OMEN_ACTIONS,
         action_subcommands: commands::omen_action_subcommands,
         shell_intrinsics: commands::SHELL_INTRINSICS,
+        shell_builtins: omen_builtins::BUILTIN_NAMES,
+        builtin_help: omen_builtins::help_for,
+        builtin_options: omen_builtins::builtin_options,
+        help_topics: omen_builtins::help_topics,
         tool_subcommands: commands::tool_subcommands,
         is_drive_designator: commands::is_drive_designator,
         typed_handles: crate::grammar::TypedReference::STATIC_HANDLES,
@@ -371,6 +376,7 @@ impl DiscoveryRuntime {
 
         registry.register(Box::new(OmenActionProvider::new(knowledge.clone())));
         registry.register(Box::new(IntrinsicsProvider::new(knowledge.clone())));
+        registry.register(Box::new(BuiltinsProvider::new(knowledge.clone())));
         registry.register(Box::new(ReferenceProvider::new(knowledge.clone())));
         registry.register(Box::new(HotIndexProvider::new(hot.clone())));
         registry.register(Box::new(SubcommandProvider::new(knowledge.clone())));
@@ -869,6 +875,40 @@ mod tests {
         );
     }
 
+    /// Builtin names complete at command position from the registry (with
+    /// usage descriptions), through the real provider set — no PATH needed.
+    #[test]
+    fn command_name_position_offers_registry_builtins() {
+        let cache = path_cache(&[]);
+        let r = run_discovery_serialized(&req("sor", 3, ".", &cache));
+        let inserts: Vec<&str> = r.ranked.iter().map(|x| x.value().insert.as_str()).collect();
+        assert!(
+            inserts.contains(&"sort"),
+            "builtin sort surfaced: {inserts:?}"
+        );
+        let sort = r
+            .ranked
+            .iter()
+            .find(|x| x.value().insert == "sort")
+            .expect("sort");
+        assert_eq!(
+            sort.authority(),
+            &omen_discovery::authority::Authority::Static,
+            "builtin completion is Static authority"
+        );
+        let description = sort
+            .matched
+            .discovered
+            .description
+            .as_ref()
+            .map(|d| d.short.clone())
+            .unwrap_or_default();
+        assert!(
+            description.contains("sort"),
+            "usage description attached: {description:?}"
+        );
+    }
+
     #[test]
     fn option_name_position_uses_tool_context() {
         let cache = path_cache(&["git"]);
@@ -877,6 +917,76 @@ mod tests {
         for c in &r.ranked {
             assert!(c.value().insert.starts_with("--"), "{:?}", c.value());
         }
+    }
+
+    /// Builtin flags complete at option position from the static table —
+    /// `sort -` offers the registry's own flags through the real runtime.
+    #[test]
+    fn option_name_position_offers_builtin_flags() {
+        let cache = path_cache(&[]);
+        let r = run_discovery_serialized(&req("sort -", 6, ".", &cache));
+        let inserts: Vec<&str> = r.ranked.iter().map(|x| x.value().insert.as_str()).collect();
+        for flag in ["-r", "-n", "-u", "-f", "--"] {
+            assert!(
+                inserts.contains(&flag),
+                "builtin flag {flag} surfaced: {inserts:?}"
+            );
+        }
+    }
+
+    /// Visible git aliases complete as intrinsics (single source: the
+    /// SHELL_INTRINSICS authority, not a second list).
+    #[test]
+    fn command_name_position_offers_visible_aliases() {
+        let cache = path_cache(&[]);
+        let r = run_discovery_serialized(&req("g", 1, ".", &cache));
+        let inserts: Vec<&str> = r.ranked.iter().map(|x| x.value().insert.as_str()).collect();
+        for alias in ["g", "gd", "gs"] {
+            assert!(
+                inserts.contains(&alias),
+                "alias {alias} surfaced: {inserts:?}"
+            );
+        }
+    }
+    #[test]
+    fn exec_arg_position_offers_files_for_builtins() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("alpha.txt"), b"a").expect("write");
+        std::fs::write(dir.path().join("alpine.txt"), b"b").expect("write");
+        std::fs::write(dir.path().join("other.txt"), b"c").expect("write");
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let cache = path_cache(&[]);
+        let r = run_discovery_serialized(&req("cat al", 6, &cwd, &cache));
+        let inserts: Vec<String> = r.ranked.iter().map(|x| x.value().insert.clone()).collect();
+        assert!(
+            inserts.iter().any(|s| s.contains("alpha.txt")),
+            "file candidate surfaced: {inserts:?}"
+        );
+        assert!(
+            inserts.iter().any(|s| s.contains("alpine.txt")),
+            "second file candidate surfaced: {inserts:?}"
+        );
+    }
+
+    /// `help <topic>` completes topics (builtins and session words)
+    /// through the real runtime.
+    #[test]
+    fn exec_arg_position_offers_help_topics() {
+        let cache = path_cache(&[]);
+        let r = run_discovery_serialized(&req("help s", 6, ".", &cache));
+        let inserts: Vec<&str> = r.ranked.iter().map(|x| x.value().insert.as_str()).collect();
+        for topic in ["sort", "stat", "stop"] {
+            assert!(
+                inserts.contains(&topic),
+                "help topic {topic} surfaced: {inserts:?}"
+            );
+        }
+        let r = run_discovery_serialized(&req("help cd", 7, ".", &cache));
+        let inserts: Vec<&str> = r.ranked.iter().map(|x| x.value().insert.as_str()).collect();
+        assert!(
+            inserts.contains(&"cd"),
+            "session-word topic surfaced: {inserts:?}"
+        );
     }
 
     #[test]

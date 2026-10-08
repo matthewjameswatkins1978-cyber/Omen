@@ -190,6 +190,19 @@ pub fn builtin_options(name: &str) -> &'static [&'static str] {
     }
 }
 
+/// Session-owned words documented by `help` (not builtins; see `help_for`).
+/// Single authority for the session-word side of completion and help tests.
+pub const SESSION_WORDS: &[&str] = &["cd", "history", "jobs", "stop", "exit", "quit"];
+
+/// Every `help` topic: registry builtins plus session words.
+pub fn help_topics() -> Vec<&'static str> {
+    BUILTIN_NAMES
+        .iter()
+        .copied()
+        .chain(SESSION_WORDS.iter().copied())
+        .collect()
+}
+///
 /// Usage and notes per builtin: the single authority behind `help`.
 ///
 /// Completion derives the name list from [`BUILTIN_NAMES`]; human detail
@@ -287,6 +300,22 @@ pub fn help_for(name: &str) -> Option<(&'static str, &'static str)> {
             "which [-a] name ...",
             "Locates executables on PATH. -a prints every hit.",
         ),
+        // Session-owned words (not builtins): documented here so `help`
+        // stays the single surface; each says who owns it.
+        "cd" => (
+            "cd [dir]",
+            "Session navigation (session-owned, not a builtin).",
+        ),
+        "history" => (
+            "history",
+            "Session execution history display (session-owned).",
+        ),
+        "jobs" => ("jobs", "Lists session background jobs (session-owned)."),
+        "stop" => (
+            "stop <job-id>",
+            "Stops a session background job (session-owned).",
+        ),
+        "exit" | "quit" => ("exit", "Leaves the shell (session-owned)."),
         _ => return None,
     })
 }
@@ -469,5 +498,51 @@ mod consistency_tests {
         // Empty pipeline is not a pipeline.
         let empty: Vec<PipelineStage> = Vec::new();
         assert!(run_pipeline(&empty, &ctx).is_none());
+    }
+
+    /// Every registry name resolves to its own option table (optionless
+    /// builtins resolve explicitly empty); unknown names yield `&[]`.
+    #[test]
+    fn every_builtin_has_an_option_table() {
+        for name in BUILTIN_NAMES {
+            let options = builtin_options(name);
+            if matches!(*name, "clear" | "help" | "printf") {
+                assert!(options.is_empty(), "{name} takes no options");
+            } else {
+                assert!(!options.is_empty(), "{name} is missing its option table");
+            }
+        }
+        assert!(builtin_options("cargo").is_empty());
+        assert!(builtin_options("").is_empty());
+    }
+
+    /// `help` covers every builtin plus the session-owned words (marked
+    /// as such); anything else is an unknown topic.
+    #[test]
+    fn help_covers_builtins_and_session_words() {
+        for name in BUILTIN_NAMES {
+            assert!(help_for(name).is_some(), "help is missing builtin '{name}'");
+        }
+        for name in ["cd", "history", "jobs", "stop", "exit", "quit"] {
+            let (usage, notes) = help_for(name).expect("session word documented");
+            assert!(!usage.is_empty());
+            assert!(
+                notes.contains("session-owned"),
+                "{name} must say who owns it"
+            );
+        }
+        assert!(help_for("cargo").is_none());
+    }
+
+    /// `help_topics` is exactly the registry plus the session words, and
+    /// every topic resolves to help text.
+    #[test]
+    fn help_topics_cover_builtins_and_session_words() {
+        let topics = help_topics();
+        assert_eq!(topics.len(), BUILTIN_NAMES.len() + SESSION_WORDS.len());
+        for name in BUILTIN_NAMES.iter().chain(SESSION_WORDS.iter()) {
+            assert!(topics.contains(name), "topic missing: {name}");
+            assert!(help_for(name).is_some(), "topic without text: {name}");
+        }
     }
 }
