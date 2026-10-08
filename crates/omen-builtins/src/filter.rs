@@ -588,6 +588,56 @@ fn same_line(a: &[u8], b: &[u8], ignore_case: bool) -> bool {
     }
 }
 
+/// `tee [-a] [file ...]`: copies stdin to stdout byte-exactly.
+///
+/// The no-operand form (pure passthrough) runs live. FILE operands are
+/// REFUSED with exit 1: writing files is a consequential mutation needing
+/// the admitted Tethers host-filesystem capability (P2 owner decision
+/// pending — same posture as `>` redirects and `omen-mutation`). The
+/// refusal names the missing authority instead of silently dropping data.
+/// `-a` is accepted (it only matters for file writes) so pipelines do not
+/// need flag surgery when the capability lands.
+pub fn tee(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
+    let mut operands: &[String] = &[];
+    for (index, arg) in args.iter().enumerate() {
+        match arg.as_str() {
+            "-a" | "--append" => {
+                if index + 1 == args.len() {
+                    operands = &[];
+                }
+            }
+            "--" => {
+                operands = &args[index + 1..];
+                break;
+            }
+            _ if arg.starts_with('-') && arg != "-" => {
+                return BuiltinOutput::failed(
+                    format!("tee: unsupported option {arg:?} (only -a)"),
+                    json!({"builtin": "tee", "error": "unsupported_option"}),
+                );
+            }
+            _ => {
+                operands = &args[index..];
+                break;
+            }
+        }
+    }
+    if !operands.is_empty() {
+        return BuiltinOutput::failed(
+            "tee: writing files needs admitted filesystem authority: \
+             no Tethers host-execution filesystem capability is admitted yet \
+             (P2 owner decision pending)"
+                .to_string(),
+            json!({"builtin": "tee", "error": "refused_closed", "files": operands.len()}),
+        );
+    }
+    let bytes = ctx.stdin.len();
+    BuiltinOutput::ok(
+        ctx.stdin.clone(),
+        json!({"builtin": "tee", "mode": "passthrough", "bytes": bytes}),
+    )
+}
+
 /// A 1-based inclusive byte range from a `cut` list item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct ByteRange {
@@ -1458,6 +1508,22 @@ mod tests {
         assert_eq!(sort(&s(&["-k"]), &ctx).code, 1);
         assert_eq!(uniq(&s(&["-s"]), &ctx).code, 1);
         assert_eq!(wc(&s(&["-L"]), &ctx).code, 1);
+    }
+
+    #[test]
+    fn tee_passes_bytes_and_refuses_files() {
+        let out = tee(&s(&[]), &ctx_with(b"a\0b\n"));
+        assert_eq!(out.code, 0);
+        assert_eq!(out.stdout, b"a\0b\n");
+        assert_eq!(out.truth["mode"], serde_json::json!("passthrough"));
+        let out = tee(&s(&["-a"]), &ctx_with(b"x"));
+        assert_eq!(out.stdout, b"x");
+        // File operands refuse closed: no write, no stdout leak.
+        let out = tee(&s(&["out.txt"]), &ctx_with(b"data"));
+        assert_eq!(out.code, 1);
+        assert!(out.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("admitted filesystem authority"));
+        assert_eq!(tee(&s(&["-i"]), &ctx_with(b"")).code, 1);
     }
 
     #[test]
