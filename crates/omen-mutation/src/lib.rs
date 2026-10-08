@@ -477,7 +477,10 @@ fn walk_operand(
                 break;
             }
         };
-        if entry.file_type().is_symlink() && entry.file_type().is_dir() {
+        if entry.file_type().is_symlink() {
+            // Never followed (walkdir is not in follow mode): recorded so
+            // the estimate names every link the operation will reproduce
+            // or refuse rather than traverse.
             estimate.symlinked_dirs.push(entry.path().to_path_buf());
         }
         if estimate.affected.len() >= ESTIMATE_ENTRY_CAP {
@@ -1074,6 +1077,31 @@ mod tests {
             },
         );
         assert_eq!(severity, Severity::High);
+    }
+
+    /// Symlinked dirs are recorded, never descended (unix-gated: link
+    /// creation needs privilege on Windows; the documented rule holds on
+    /// both).
+    #[cfg(unix)]
+    #[test]
+    fn estimate_records_symlinked_dirs_without_following() {
+        use std::os::unix::fs::symlink;
+        let dir = fixture();
+        symlink(dir.path().join("sub"), dir.path().join("linked-sub")).expect("symlink");
+        let op = parse(&s(&["cp", "-r", "linked-sub", "copy"])).expect("parses");
+        let est = estimate(&resolve(op, dir.path()));
+        assert!(
+            est.symlinked_dirs.iter().any(|p| p.ends_with("linked-sub")),
+            "link recorded: {:?}",
+            est.symlinked_dirs
+        );
+        // The link target's contents are NOT enumerated through the link.
+        assert!(
+            !est.affected
+                .iter()
+                .any(|a| a.path.to_string_lossy().contains("linked-sub/b.txt")),
+            "must not descend through the link"
+        );
     }
 
     #[test]
