@@ -458,6 +458,11 @@ fn walk_operand(
     };
     if metadata.file_type().is_symlink() {
         push(estimate, path.to_path_buf());
+        // A link to a directory is recorded (never descended): one
+        // metadata call classifies the target without traversing it.
+        if std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false) {
+            estimate.symlinked_dirs.push(path.to_path_buf());
+        }
         return;
     }
     if !metadata.is_dir() {
@@ -478,10 +483,12 @@ fn walk_operand(
             }
         };
         if entry.file_type().is_symlink() {
-            // Never followed (walkdir is not in follow mode): recorded so
-            // the estimate names every link the operation will reproduce
-            // or refuse rather than traverse.
-            estimate.symlinked_dirs.push(entry.path().to_path_buf());
+            // Never followed (walkdir is not in follow mode): dir links are
+            // recorded so the estimate names every link the operation will
+            // reproduce or refuse rather than traverse.
+            if entry.path().is_dir() {
+                estimate.symlinked_dirs.push(entry.path().to_path_buf());
+            }
         }
         if estimate.affected.len() >= ESTIMATE_ENTRY_CAP {
             estimate.truncated = true;
