@@ -78,6 +78,7 @@ pub fn omen_knowledge() -> Arc<OmenKnowledge> {
         shell_builtins: omen_builtins::BUILTIN_NAMES,
         builtin_help: omen_builtins::help_for,
         builtin_options: omen_builtins::builtin_options,
+        help_topics: omen_builtins::help_topics,
         tool_subcommands: commands::tool_subcommands,
         is_drive_designator: commands::is_drive_designator,
         typed_handles: crate::grammar::TypedReference::STATIC_HANDLES,
@@ -964,6 +965,27 @@ mod tests {
         assert!(
             inserts.iter().any(|s| s.contains("alpine.txt")),
             "second file candidate surfaced: {inserts:?}"
+        );
+    }
+
+    /// `help <topic>` completes topics (builtins and session words)
+    /// through the real runtime.
+    #[test]
+    fn exec_arg_position_offers_help_topics() {
+        let cache = path_cache(&[]);
+        let r = run_discovery_serialized(&req("help s", 6, ".", &cache));
+        let inserts: Vec<&str> = r.ranked.iter().map(|x| x.value().insert.as_str()).collect();
+        for topic in ["sort", "stat", "stop"] {
+            assert!(
+                inserts.contains(&topic),
+                "help topic {topic} surfaced: {inserts:?}"
+            );
+        }
+        let r = run_discovery_serialized(&req("help cd", 7, ".", &cache));
+        let inserts: Vec<&str> = r.ranked.iter().map(|x| x.value().insert.as_str()).collect();
+        assert!(
+            inserts.contains(&"cd"),
+            "session-word topic surfaced: {inserts:?}"
         );
     }
 

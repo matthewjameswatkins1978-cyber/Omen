@@ -126,6 +126,7 @@ mod tests {
             shell_builtins: &[],
             builtin_help: |_| None,
             builtin_options: |_| &[],
+            help_topics: Vec::new,
             tool_subcommands: |_| &[],
             is_drive_designator: |_| None,
             typed_handles: &["@last", "@failed"],

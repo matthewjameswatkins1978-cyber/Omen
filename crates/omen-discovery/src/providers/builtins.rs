@@ -65,6 +65,36 @@ impl BuiltinsProvider {
         }
         ProviderOutcome::Answered { candidates }
     }
+
+    /// `help <topic>` candidates from the help authority.
+    fn discover_help_topics(&self, ctx: &ProviderContext) -> ProviderOutcome {
+        let span = ctx.replacement_span;
+        let mut candidates = Vec::new();
+        for (i, topic) in (self.knowledge.help_topics)().iter().enumerate() {
+            candidates.push(
+                DiscoveredCandidate::new(
+                    SemanticKey::new(Kind::Intrinsic, *topic, SemanticNamespace::Global),
+                    ProvenanceKey::new(
+                        "builtins",
+                        AuthorityClass::Static,
+                        EvidenceIdentity::Static,
+                    ),
+                    *topic,
+                    Authority::Static,
+                    span,
+                )
+                .with_description(Description::short("help topic"))
+                .with_order_policy(OrderPolicy::Semantic(i as u32))
+                .with_safety(SafetyAnnotation::SafeReadOnly),
+            );
+        }
+        if candidates.is_empty() {
+            return ProviderOutcome::Declined {
+                reason: DeclineReason::NoMatch,
+            };
+        }
+        ProviderOutcome::Answered { candidates }
+    }
 }
 
 impl DiscoveryProvider for BuiltinsProvider {
@@ -86,6 +116,8 @@ impl DiscoveryProvider for BuiltinsProvider {
             {
                 TriggerDecision::Apply
             }
+            // `help <topic>`: topics are builtin (and session-word) names.
+            CommandPosition::ExecArg { command, .. } if command == "help" => TriggerDecision::Apply,
             _ => TriggerDecision::Skip,
         }
     }
@@ -107,6 +139,12 @@ impl DiscoveryProvider for BuiltinsProvider {
     }
 
     fn discover(&mut self, ctx: &ProviderContext, _budget: &DiscoveryBudget) -> ProviderOutcome {
+        // `help <topic>`: topics come from the help authority.
+        if let CommandPosition::ExecArg { command, .. } = &ctx.command_position
+            && command == "help"
+        {
+            return self.discover_help_topics(ctx);
+        }
         // Option position serves one command's static flags.
         if let CommandPosition::OptionName { command, .. } = &ctx.command_position {
             return self.discover_options(ctx, command);
@@ -163,6 +201,7 @@ mod tests {
                 "ls" => &["-a", "-l"],
                 _ => &[],
             },
+            help_topics: || vec!["ls", "grep", "sort", "cd"],
             tool_subcommands: |_| &[],
             is_drive_designator: |_| None,
             typed_handles: &[],
@@ -255,5 +294,33 @@ mod tests {
         assert_eq!(names, vec!["-a", "-l"]);
         // External commands keep their own sources: skipped here.
         assert_eq!(p.triggers(&opt_ctx("cargo", "--")), TriggerDecision::Skip);
+    }
+
+    #[test]
+    fn help_exec_arg_serves_topics() {
+        let mut ctx = cmd_ctx("");
+        ctx.command_position = CommandPosition::ExecArg {
+            command: "help".to_string(),
+            chain: vec![],
+            option_value_of: None,
+        };
+        let p = BuiltinsProvider::new(knowledge());
+        assert_eq!(p.triggers(&ctx), TriggerDecision::Apply);
+        let mut p = p;
+        let out = p.discover(&ctx, &DiscoveryBudget::inline_only());
+        let names: Vec<String> = out
+            .candidates()
+            .iter()
+            .map(|c| c.value.insert.clone())
+            .collect();
+        assert_eq!(names, vec!["ls", "grep", "sort", "cd"]);
+        // Other commands' args are not topics.
+        let mut other = cmd_ctx("");
+        other.command_position = CommandPosition::ExecArg {
+            command: "cat".to_string(),
+            chain: vec![],
+            option_value_of: None,
+        };
+        assert_eq!(p.triggers(&other), TriggerDecision::Skip);
     }
 }
