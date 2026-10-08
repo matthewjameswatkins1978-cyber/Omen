@@ -20,6 +20,7 @@ omen-ui = { workspace = true }
 omen-ipc = { workspace = true }
 omen-client = { workspace = true }
 omen-agent = { workspace = true }
+omen-builtins = { workspace = true }
 reedline = { workspace = true }
 crossterm = { workspace = true }
 nu-ansi-term = { workspace = true }
