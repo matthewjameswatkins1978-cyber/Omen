@@ -381,6 +381,8 @@ fn format_counts(show_l: bool, show_w: bool, show_c: bool, l: u64, w: u64, c: u6
 /// `-n` compares by leading numeric value, `-f` folds ASCII case for the
 /// comparison only, `-r` reverses, `-u` keeps the first of each equal run.
 /// Keys (`-k`), field separators (`-t`) and check mode (`-c`) are refused.
+/// Numeric keys are leading decimal floats (no hex); non-numeric lines
+/// count as zero.
 pub fn sort(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
     let mut reverse = false;
     let mut numeric = false;
@@ -1463,6 +1465,10 @@ mod tests {
         assert_eq!(out.stdout, b"2\n10\n30\n");
         let out = sort(&s(&["-r"]), &ctx_with(b"b\na\n"));
         assert_eq!(out.stdout, b"b\na\n");
+        // Decimal leading floats; non-numeric lines count as zero and
+        // sort before positives (stable among themselves).
+        let out = sort(&s(&["-n"]), &ctx_with(b"10\nabc\n2\n"));
+        assert_eq!(out.stdout, b"abc\n2\n10\n");
     }
 
     #[test]
