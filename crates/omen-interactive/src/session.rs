@@ -489,7 +489,9 @@ impl InteractiveSession {
 
                 // In-process read-only builtins (P1): no child spawn, no
                 // daemon broker. Read-only inspection/formatting only.
-                if let Some(result) = self.try_dispatch_builtin(&resolved_argv, Vec::new()) {
+                if let Some(result) =
+                    self.try_dispatch_builtin(&resolved_argv, Vec::new(), Vec::new())
+                {
                     return result;
                 }
 
@@ -1030,6 +1032,27 @@ impl InteractiveSession {
                 })?,
             );
         }
+        // Per-command environment (`FOO=1 cmd`): expanded exactly like the
+        // pipeline stages. Builtins receive it below; external singles
+        // cannot carry it yet (broker stdin/env payload is P4+ work) — the
+        // assignments are validated here so a malformed one fails closed
+        // instead of silently vanishing.
+        let mut extra_env = Vec::with_capacity(command.environment.len());
+        for assignment in &command.environment {
+            let expanded = crate::shell_grammar::expand_word(&assignment.value, &self.cwd)
+                .map_err(|error| {
+                    unsupported(format!("environment assignment expansion failed: {error}"))
+                })?;
+            match expanded.as_slice() {
+                [value] => extra_env.push((assignment.name.clone(), value.clone())),
+                _ => {
+                    return Err(unsupported(format!(
+                        "environment assignment '{}' must expand to exactly one value",
+                        assignment.name
+                    )));
+                }
+            }
+        }
         let argv = crate::commands::expand_shell_alias(&argv);
         let argv = crate::resolver::ReferenceResolver::resolve_argv(
             &argv,
@@ -1051,7 +1074,7 @@ impl InteractiveSession {
 
         // In-process read-only builtins (P1): same rule as the executable
         // lane — no child spawn, no daemon broker.
-        if let Some(result) = self.try_dispatch_builtin(&argv, resolved.stdin.clone()) {
+        if let Some(result) = self.try_dispatch_builtin(&argv, resolved.stdin.clone(), extra_env) {
             return result;
         }
         // External commands cannot consume a resolved input redirect yet:
@@ -1216,10 +1239,19 @@ impl InteractiveSession {
         &mut self,
         argv: &[String],
         stdin: Vec<u8>,
+        env_overrides: Vec<(String, String)>,
     ) -> Option<Result<ProcessExit, CoreError>> {
+        let mut env: Vec<(String, String)> = std::env::vars().collect();
+        for (key, value) in &env_overrides {
+            if let Some(slot) = env.iter_mut().find(|(k, _)| k == key) {
+                slot.1 = value.clone();
+            } else {
+                env.push((key.clone(), value.clone()));
+            }
+        }
         let ctx = omen_builtins::BuiltinContext {
             cwd: self.cwd.clone(),
-            env: std::env::vars().collect(),
+            env,
             stdin,
         };
         let output = match omen_builtins::run_if_builtin(argv, &ctx)? {
@@ -1773,6 +1805,29 @@ mod builtin_pipeline_dispatch_tests {
             .dispatch_input("nosuchbin_xyz_omen")
             .expect_err("missing executable must refuse");
         assert!(format!("{error:?}").contains("nosuchbin_xyz_omen"));
+    }
+
+    /// Per-command environment reaches builtins: `PATH=<dir> which mytool`
+    /// finds a tool visible only through the assignment (platform truth:
+    /// executable bit on Unix, PATHEXT probe on Windows).
+    #[test]
+    fn per_command_env_reaches_builtin_lookup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        #[cfg(windows)]
+        std::fs::write(dir.path().join("mytool.cmd"), b"@echo off\n").expect("write");
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let tool = dir.path().join("mytool");
+            std::fs::write(&tool, b"#!/bin/sh\n").expect("write");
+            std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        let mut session = standalone_session(dir.path().to_path_buf());
+        let path_value = dir.path().to_string_lossy().into_owned();
+        let exit = session
+            .dispatch_input(&format!("PATH={path_value} which mytool"))
+            .expect("assignment dispatches");
+        assert_eq!(exit.code, Some(0));
     }
 
     /// `< file` feeds a builtin chain from bytes on disk.
