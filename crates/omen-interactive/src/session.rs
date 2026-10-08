@@ -487,6 +487,12 @@ impl InteractiveSession {
                     return self.navigate_to(target_path, "cd");
                 }
 
+                // In-process read-only builtins (P1): no child spawn, no
+                // daemon broker. Read-only inspection/formatting only.
+                if let Some(result) = self.try_dispatch_builtin(&resolved_argv) {
+                    return result;
+                }
+
                 // Blast-Radius Preflight assessment
                 if let Some(blast) = crate::preflight::BlastPreflight::assess(&resolved_argv) {
                     println!(
@@ -1011,6 +1017,12 @@ impl InteractiveSession {
             return self.navigate_to(target, "cd");
         }
 
+        // In-process read-only builtins (P1): same rule as the executable
+        // lane — no child spawn, no daemon broker.
+        if let Some(result) = self.try_dispatch_builtin(&argv) {
+            return result;
+        }
+
         if let Some(blast) = crate::preflight::BlastPreflight::assess(&argv) {
             println!(
                 "[Preflight Warning: {:?}] Command '{}' will affect: {}",
@@ -1151,6 +1163,44 @@ impl InteractiveSession {
         self.last_exit = Some(exit.clone());
         self.update_prompt_state();
         Ok(exit)
+    }
+
+    /// Runs `argv` as an in-process read-only builtin when it names one.
+    ///
+    /// Returns `None` when the command is not a builtin (the caller falls
+    /// through to external execution). Builtins never spawn a child process
+    /// and never go through the daemon broker: they are pure functions of
+    /// `(argv, cwd, env, stdin)` in the same trust class as the `:action`
+    /// dispatcher. Session-affecting words (`cd`) stay with the caller.
+    fn try_dispatch_builtin(&mut self, argv: &[String]) -> Option<Result<ProcessExit, CoreError>> {
+        let ctx = omen_builtins::BuiltinContext {
+            cwd: self.cwd.clone(),
+            env: std::env::vars().collect(),
+            stdin: Vec::new(),
+        };
+        let output = match omen_builtins::run_if_builtin(argv, &ctx)? {
+            Ok(output) => output,
+            Err(error) => {
+                return Some(Err(CoreError::Internal(format!(
+                    "builtin internal failure: {error}"
+                ))));
+            }
+        };
+        use std::io::Write as _;
+        if !output.stdout.is_empty() {
+            let _ = std::io::stdout().write_all(&output.stdout);
+            let _ = std::io::stdout().flush();
+        }
+        if !output.stderr.is_empty() {
+            let _ = std::io::stderr().write_all(&output.stderr);
+        }
+        let exit = ProcessExit {
+            code: Some(output.code),
+            signal: None,
+        };
+        self.last_exit = Some(exit.clone());
+        self.update_prompt_state();
+        Some(Ok(exit))
     }
 
     /// Navigates the session cwd to `target`, updating all dependent state.

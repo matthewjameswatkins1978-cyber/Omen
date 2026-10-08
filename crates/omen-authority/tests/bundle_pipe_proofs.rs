@@ -780,7 +780,6 @@ async fn pipe_unstarted_members_not_attempted_accepted() {
     let mut driver = AdmitExecute::new(gate);
     let authorised = authorise_pipe(&mut driver, stages.clone(), None).expect("authorise works");
     // Local spawn failure: the consumer executable vanishes after COMMIT.
-    let stages = stages;
     std::fs::remove_file(&stages[1].exe).unwrap();
     let missing = omen_authority::AuthorisedBundle {
         bundle: authorised.bundle.clone(),

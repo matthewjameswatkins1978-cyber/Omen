@@ -20,6 +20,7 @@ members = [
     "crates/omen-authority",
     "crates/omen-test-fixtures",
     "crates/omen-semantic",
+    "crates/omen-builtins",
     "crates/omen-compat",
     "crates/xtask",
 ]
@@ -55,6 +56,7 @@ omen-lifecycle = { path = "crates/omen-lifecycle", version = "0.9.0-preview.7" }
 omen-authority = { path = "crates/omen-authority", version = "0.9.0-preview.7" }
 omen-test-fixtures = { path = "crates/omen-test-fixtures", version = "0.9.0-preview.7" }
 omen-semantic = { path = "crates/omen-semantic", version = "0.9.0-preview.7" }
+omen-builtins = { path = "crates/omen-builtins", version = "0.9.0-preview.7" }
 omen-compat = { path = "crates/omen-compat", version = "0.9.0-preview.7" }
 
 serde = { version = "1.0", features = ["derive"] }
@@ -63,6 +65,7 @@ schemars = { version = "0.8", features = ["derive"] }
 thiserror = "2.0"
 deno_task_shell = { version = "=0.33.3", default-features = false }
 glob = "0.3"
+walkdir = "2"
 sha2 = "0.10"
 hex = "0.4"
 serde_json_canonicalizer = "0.3"
