@@ -85,7 +85,11 @@ async fn wait_for_server_readiness(
     latest_status: &watch::Receiver<Option<LspServerStatus>>,
     deadline: Duration,
 ) -> Result<(), CoreError> {
-    let deadline_at = tokio::time::Instant::now() + deadline;
+    // Cold-start grace: a live-but-indexing server (quiescent == false)
+    // earns exactly one equal-length extension. A silent, errored, or
+    // closed server fails fast on the first budget — no unbounded waits.
+    let mut extended = false;
+    let mut deadline_at = tokio::time::Instant::now() + deadline;
     loop {
         if *readiness.borrow() {
             return Ok(());
@@ -94,9 +98,16 @@ async fn wait_for_server_readiness(
         let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             let status = latest_status.borrow().clone();
+            let busy = status.as_ref().and_then(|s| s.quiescent) == Some(false);
+            if busy && !extended {
+                extended = true;
+                deadline_at = tokio::time::Instant::now() + deadline;
+                continue;
+            }
+            let waited = if extended { deadline * 2 } else { deadline };
             return Err(CoreError::ExecutionFailed(format_readiness_evidence(
                 status.as_ref(),
-                deadline,
+                waited,
                 "deadline_exceeded",
             )));
         }
@@ -107,18 +118,13 @@ async fn wait_for_server_readiness(
                 let status = latest_status.borrow().clone();
                 return Err(CoreError::ExecutionFailed(format_readiness_evidence(
                     status.as_ref(),
-                    deadline,
+                    if extended { deadline * 2 } else { deadline },
                     "server_status_channel_closed",
                 )));
             }
-            Err(_) => {
-                let status = latest_status.borrow().clone();
-                return Err(CoreError::ExecutionFailed(format_readiness_evidence(
-                    status.as_ref(),
-                    deadline,
-                    "deadline_exceeded",
-                )));
-            }
+            // No status change inside the remaining budget: re-enter the
+            // loop so expiry (and the one cold-start extension) applies.
+            Err(_) => continue,
         }
     }
 }
@@ -1413,6 +1419,61 @@ mod tests {
         let latest = latest_status_rx.borrow().clone().unwrap();
         assert_eq!(latest.quiescent, Some(false));
         assert_eq!(latest.message.as_deref(), Some("background work resumed"));
+    }
+
+    #[tokio::test]
+    async fn busy_server_earns_one_extension_then_succeeds() {
+        // Cold-start grace: quiescent==false at first-budget expiry earns
+        // one equal extension; readiness inside the extension succeeds.
+        let (latest_status_tx, latest_status_rx) = watch::channel(None);
+        let (readiness_tx, mut readiness_rx) = watch::channel(false);
+        record_server_status(
+            &latest_status_tx,
+            &readiness_tx,
+            LspServerStatus {
+                health: Some("ok".into()),
+                quiescent: Some(false),
+                message: Some("indexing".into()),
+            },
+        );
+        let tx = latest_status_tx.clone();
+        let rtx = readiness_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            record_server_status(
+                &tx,
+                &rtx,
+                LspServerStatus {
+                    health: Some("ok".into()),
+                    quiescent: Some(true),
+                    message: Some("ready".into()),
+                },
+            );
+        });
+        wait_for_server_readiness(
+            &mut readiness_rx,
+            &latest_status_rx,
+            Duration::from_millis(50),
+        )
+        .await
+        .expect("busy server must earn one extension and succeed");
+    }
+
+    #[tokio::test]
+    async fn silent_server_fails_fast_without_extension() {
+        // No status at all: fail on the first budget, never extended.
+        let (_tx, latest_status_rx) = watch::channel(None);
+        let (_rtx, mut readiness_rx) = watch::channel(false);
+        let t0 = tokio::time::Instant::now();
+        let err = wait_for_server_readiness(
+            &mut readiness_rx,
+            &latest_status_rx,
+            Duration::from_millis(50),
+        )
+        .await
+        .expect_err("silent server must fail");
+        assert!(t0.elapsed() < Duration::from_millis(95), "no extension");
+        assert!(err.to_string().contains("deadline_ms=50"));
     }
 
     #[test]
