@@ -165,8 +165,27 @@ pub fn probe_candidate_with_budget(
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
         }
-        cmd.spawn()
-            .map_err(|e| LifecycleError::Health(format!("candidate would not spawn: {e}")))?
+        // Bounded ETXTBSY tolerance: a just-materialized fixture can race
+        // the exec page cache on loaded CI runners (observed twice on
+        // hosted Ubuntu, never locally). ETXTBSY is definitionally
+        // transient: retry 3x at 50ms, then fail exactly as before. Any
+        // other spawn error fails immediately; persistent ETXTBSY still
+        // fails after the bound.
+        let mut attempt = 0;
+        loop {
+            match cmd.spawn() {
+                Ok(child) => break child,
+                Err(e) if e.raw_os_error() == Some(26) && attempt < 3 => {
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => {
+                    return Err(LifecycleError::Health(format!(
+                        "candidate would not spawn: {e}"
+                    )));
+                }
+            }
+        }
     };
 
     let start = Instant::now();
