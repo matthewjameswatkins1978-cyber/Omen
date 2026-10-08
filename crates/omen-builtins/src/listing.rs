@@ -217,7 +217,15 @@ pub fn ls(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
                     continue;
                 }
             };
-            for child in read_dir.flatten() {
+            for child in read_dir {
+                // Unreadable entries are diagnostics, never silent drops.
+                let child = match child {
+                    Ok(child) => child,
+                    Err(error) => {
+                        failures.push(format!("ls: {}: {error}", path.display()));
+                        continue;
+                    }
+                };
                 match stat_entry(&child.path()) {
                     Ok(e) => batch.push(e),
                     Err(message) => failures.push(format!("ls: {message}")),
