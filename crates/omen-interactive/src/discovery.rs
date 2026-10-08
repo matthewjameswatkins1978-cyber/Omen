@@ -933,6 +933,28 @@ mod tests {
         }
     }
 
+    /// Builtin file operands complete from the filesystem like any other
+    /// command — `cat al` offers `alpha.txt` (generic ExecArg provider).
+    #[test]
+    fn exec_arg_position_offers_files_for_builtins() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("alpha.txt"), b"a").expect("write");
+        std::fs::write(dir.path().join("alpine.txt"), b"b").expect("write");
+        std::fs::write(dir.path().join("other.txt"), b"c").expect("write");
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let cache = path_cache(&[]);
+        let r = run_discovery_serialized(&req("cat al", 6, &cwd, &cache));
+        let inserts: Vec<String> = r.ranked.iter().map(|x| x.value().insert.clone()).collect();
+        assert!(
+            inserts.iter().any(|s| s.contains("alpha.txt")),
+            "file candidate surfaced: {inserts:?}"
+        );
+        assert!(
+            inserts.iter().any(|s| s.contains("alpine.txt")),
+            "second file candidate surfaced: {inserts:?}"
+        );
+    }
+
     #[test]
     fn zero_candidate_is_clean_decline() {
         let cache = path_cache(&[]);
