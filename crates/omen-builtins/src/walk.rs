@@ -405,6 +405,30 @@ pub fn tree(args: &[String], ctx: &BuiltinContext) -> BuiltinOutput {
             continue;
         }
         out.extend(format!("{operand}\n").as_bytes());
+        // A file operand renders as itself (GNU); only directories are
+        // descended and counted as such.
+        let root_type = std::fs::symlink_metadata(&root).map(|m| m.file_type());
+        let root_is_dir = root_type.as_ref().is_ok_and(|t| t.is_dir());
+        if !root_is_dir {
+            let display = root
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| operand.clone());
+            out.extend(display.as_bytes());
+            let kind = if root_type.as_ref().is_ok_and(|t| t.is_symlink()) {
+                if let Ok(target) = std::fs::read_link(&root) {
+                    out.extend(b" -> ");
+                    out.extend(target.to_string_lossy().as_bytes());
+                }
+                "symlink"
+            } else {
+                "file"
+            };
+            out.push(b'\n');
+            files += 1;
+            entries_json.push(json!({"path": root.to_string_lossy(), "type": kind, "depth": 0}));
+            continue;
+        }
         render_tree_children(
             &root,
             "",
@@ -614,6 +638,14 @@ mod tests {
         let text = String::from_utf8_lossy(&out.stdout);
         assert!(!text.contains("inner.txt"));
         assert!(text.contains("1 directories, 1 files") || text.contains("directories"));
+        // A file operand renders as itself (no phantom directory count).
+        let out = tree(&s(&["top.txt"]), &ctx_for(dir.path()));
+        assert_eq!(out.code, 0);
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            text.contains("top.txt") && text.contains("0 directories, 1 files"),
+            "{text:?}"
+        );
     }
 
     #[test]
