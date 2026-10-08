@@ -287,6 +287,22 @@ pub fn help_for(name: &str) -> Option<(&'static str, &'static str)> {
             "which [-a] name ...",
             "Locates executables on PATH. -a prints every hit.",
         ),
+        // Session-owned words (not builtins): documented here so `help`
+        // stays the single surface; each says who owns it.
+        "cd" => (
+            "cd [dir]",
+            "Session navigation (session-owned, not a builtin).",
+        ),
+        "history" => (
+            "history",
+            "Session execution history display (session-owned).",
+        ),
+        "jobs" => ("jobs", "Lists session background jobs (session-owned)."),
+        "stop" => (
+            "stop <job-id>",
+            "Stops a session background job (session-owned).",
+        ),
+        "exit" | "quit" => ("exit", "Leaves the shell (session-owned)."),
         _ => return None,
     })
 }
@@ -485,5 +501,23 @@ mod consistency_tests {
         }
         assert!(builtin_options("cargo").is_empty());
         assert!(builtin_options("").is_empty());
+    }
+
+    /// `help` covers every builtin plus the session-owned words (marked
+    /// as such); anything else is an unknown topic.
+    #[test]
+    fn help_covers_builtins_and_session_words() {
+        for name in BUILTIN_NAMES {
+            assert!(help_for(name).is_some(), "help is missing builtin '{name}'");
+        }
+        for name in ["cd", "history", "jobs", "stop", "exit", "quit"] {
+            let (usage, notes) = help_for(name).expect("session word documented");
+            assert!(!usage.is_empty());
+            assert!(
+                notes.contains("session-owned"),
+                "{name} must say who owns it"
+            );
+        }
+        assert!(help_for("cargo").is_none());
     }
 }
