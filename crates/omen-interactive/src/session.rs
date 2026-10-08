@@ -2161,6 +2161,24 @@ mod builtin_pipeline_dispatch_tests {
         assert_eq!(exit.code, Some(0));
     }
 
+    /// Deterministic globbing flows through builtin dispatch: `ls *.rs`
+    /// lists matches sorted, while quoted patterns stay literal.
+    #[test]
+    fn glob_expansion_reaches_builtins_sorted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("b.rs"), b"b").expect("write");
+        std::fs::write(dir.path().join("a.rs"), b"a").expect("write");
+        std::fs::write(dir.path().join("c.txt"), b"c").expect("write");
+        let mut session = standalone_session(dir.path().to_path_buf());
+        let exit = session.dispatch_input("ls *.rs").expect("glob dispatches");
+        assert_eq!(exit.code, Some(0));
+        // Quoted glob stays literal: no file named `*.rs` exists.
+        let exit = session
+            .dispatch_input("ls '*.rs'")
+            .expect("quoted dispatches");
+        assert_eq!(exit.code, Some(1));
+    }
+
     /// `< file` feeds a builtin chain from bytes on disk.
     #[test]
     fn input_redirect_feeds_builtin_pipeline() {
