@@ -980,6 +980,11 @@ impl InteractiveSession {
 
         if needs_pipeline_dispatch {
             let stages = self.prepare_shell_pipeline_stages(pipeline)?;
+            // All-builtin pipelines run in-process: zero spawns, byte-exact
+            // chaining. Mixed pipelines fall through to the broker.
+            if let Some(result) = self.try_dispatch_builtin_pipeline(&stages) {
+                return result;
+            }
             return self.execute_pipeline_via_broker(stages, None);
         }
 
@@ -1203,7 +1208,61 @@ impl InteractiveSession {
         Some(Ok(exit))
     }
 
-    /// Navigates the session cwd to `target`, updating all dependent state.
+    /// Runs an all-builtin pipeline in-process (zero spawns, no broker).
+    ///
+    /// Returns `None` when any stage is external. Every stage runs; each
+    /// stderr passes through in order, only the last stdout reaches the
+    /// terminal, and the reported exit is the last stage's.
+    fn try_dispatch_builtin_pipeline(
+        &mut self,
+        stages: &[omen_ipc::PipelineStageRequest],
+    ) -> Option<Result<ProcessExit, CoreError>> {
+        let inputs: Vec<omen_builtins::PipelineStage> = stages
+            .iter()
+            .map(|stage| omen_builtins::PipelineStage {
+                argv: stage.argv.clone(),
+                env_overrides: stage.env.clone(),
+            })
+            .collect();
+        let ctx = omen_builtins::BuiltinContext {
+            cwd: self.cwd.clone(),
+            env: std::env::vars().collect(),
+            stdin: Vec::new(),
+        };
+        let outputs = omen_builtins::run_pipeline(&inputs, &ctx)?;
+        use std::io::Write as _;
+        let mut code = 0;
+        let mut last_stdout: Vec<u8> = Vec::new();
+        for output in outputs {
+            let output = match output {
+                Ok(output) => output,
+                Err(error) => {
+                    return Some(Err(CoreError::Internal(format!(
+                        "builtin pipeline internal failure: {error}"
+                    ))));
+                }
+            };
+            // Every stage runs (POSIX pipelines do not short-circuit);
+            // each stderr passes through in order, only the last stdout
+            // reaches the terminal, and the exit is the last stage's.
+            code = output.code;
+            if !output.stderr.is_empty() {
+                let _ = std::io::stderr().write_all(&output.stderr);
+            }
+            last_stdout = output.stdout;
+        }
+        if !last_stdout.is_empty() {
+            let _ = std::io::stdout().write_all(&last_stdout);
+            let _ = std::io::stdout().flush();
+        }
+        let exit = ProcessExit {
+            code: Some(code),
+            signal: None,
+        };
+        self.last_exit = Some(exit.clone());
+        self.update_prompt_state();
+        Some(Ok(exit))
+    }
     ///
     /// Used by `cd`, bare drive designators (`D:`), and any future navigation
     /// grammar.  Exactly one place owns the navigation side-effects.
@@ -1594,4 +1653,40 @@ fn resolve_cd_target(cwd: &Path, target: &str) -> PathBuf {
     }
     let p = PathBuf::from(target);
     if p.is_absolute() { p } else { cwd.join(p) }
+}
+
+#[cfg(test)]
+mod builtin_pipeline_dispatch_tests {
+    use super::*;
+
+    fn standalone_session(cwd: PathBuf) -> InteractiveSession {
+        let id = omen_core::InteractiveSessionId::generate();
+        InteractiveSession::new_with_client(id, cwd, None, None).expect("session builds headless")
+    }
+
+    /// An all-builtin pipeline dispatches in-process: exit zero, no spawn.
+    /// (`printf | grep | wc` exercises three chained stages.)
+    #[test]
+    fn all_builtin_pipeline_runs_in_process() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = standalone_session(dir.path().to_path_buf());
+        let exit = session
+            .dispatch_input("printf 'a\\nb\\n' | grep b | wc -l")
+            .expect("pipeline dispatches");
+        assert_eq!(exit.code, Some(0));
+        assert!(session.last_exit.is_some_and(|e| e.is_zero()));
+    }
+
+    /// A failing builtin stage still runs the chain and reports the last
+    /// stage's exit (POSIX: every stage runs).
+    #[test]
+    fn builtin_pipeline_reports_last_stage_exit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = standalone_session(dir.path().to_path_buf());
+        // `grep zzz` matches nothing (exit 1); `wc -c` still runs (exit 0).
+        let exit = session
+            .dispatch_input("printf 'a\\n' | grep zzz | wc -c")
+            .expect("pipeline dispatches");
+        assert_eq!(exit.code, Some(0));
+    }
 }

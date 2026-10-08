@@ -279,6 +279,64 @@ pub fn help(args: &[String]) -> BuiltinOutput {
         serde_json::json!({"builtin": "help", "topics": BUILTIN_NAMES}),
     )
 }
+/// One in-process pipeline stage: argv plus environment overrides.
+#[derive(Debug, Clone)]
+pub struct PipelineStage {
+    pub argv: Vec<String>,
+    /// Stage-scoped `NAME=value` pairs shadowing the base environment
+    /// (notably `PATH` for `which`); the base still comes from `ctx`.
+    pub env_overrides: Vec<(String, String)>,
+}
+
+/// Runs a whole pipeline in-process when EVERY stage head names a builtin.
+///
+/// Returns `None` when any stage is external (the caller falls through to
+/// process spawn). Otherwise chains stdout→stdin byte-exactly: stage 0
+/// reads `ctx.stdin`, each later stage reads the previous stage's stdout.
+/// No child process is spawned and no broker is involved — sound only
+/// because every builtin here is read-only (see crate docs).
+pub fn run_pipeline(
+    stages: &[PipelineStage],
+    ctx: &BuiltinContext,
+) -> Option<Vec<Result<BuiltinOutput, BuiltinError>>> {
+    if stages.is_empty() {
+        return None;
+    }
+    for stage in stages {
+        let (name, _) = stage.argv.split_first()?;
+        if !is_builtin(name) {
+            return None;
+        }
+    }
+    let mut stdin = ctx.stdin.clone();
+    let mut outputs = Vec::with_capacity(stages.len());
+    for stage in stages {
+        let mut env = ctx.env.clone();
+        for (key, value) in &stage.env_overrides {
+            if let Some(slot) = env.iter_mut().find(|(k, _)| k == key) {
+                slot.1 = value.clone();
+            } else {
+                env.push((key.clone(), value.clone()));
+            }
+        }
+        let stage_ctx = BuiltinContext {
+            cwd: ctx.cwd.clone(),
+            env,
+            stdin,
+        };
+        let output = match run_if_builtin(&stage.argv, &stage_ctx) {
+            Some(Ok(output)) => output,
+            Some(Err(error)) => {
+                outputs.push(Err(error));
+                return Some(outputs);
+            }
+            None => unreachable!("gated by is_builtin above"),
+        };
+        stdin = output.stdout.clone();
+        outputs.push(Ok(output));
+    }
+    Some(outputs)
+}
 /// Internal builtin failure (not an operand error; those are exit codes).
 #[derive(Debug, thiserror::Error)]
 pub enum BuiltinError {
@@ -325,5 +383,45 @@ mod consistency_tests {
                 "builtin '{name}' shadows a session intrinsic"
             );
         }
+    }
+
+    /// In-process pipelines chain stdout→stdin byte-exactly and refuse
+    /// mixed builtin/external stages (those need real process spawn).
+    #[test]
+    fn pipeline_chains_bytes_and_gates_mixed_stages() {
+        let ctx = BuiltinContext {
+            cwd: std::path::PathBuf::from("."),
+            env: Vec::new(),
+            stdin: b"b\na\nb\n".to_vec(),
+        };
+        let stages = vec![
+            PipelineStage {
+                argv: vec!["sort".to_string()],
+                env_overrides: Vec::new(),
+            },
+            PipelineStage {
+                argv: vec!["uniq".to_string(), "-c".to_string()],
+                env_overrides: Vec::new(),
+            },
+        ];
+        let outputs = run_pipeline(&stages, &ctx).expect("all-builtin pipeline runs");
+        assert_eq!(outputs.len(), 2);
+        let last = outputs[1].as_ref().expect("uniq succeeds");
+        assert_eq!(last.stdout, b"      1 a\n      2 b\n");
+        // Mixed stages fall through to external execution.
+        let mixed = vec![
+            PipelineStage {
+                argv: vec!["ls".to_string()],
+                env_overrides: Vec::new(),
+            },
+            PipelineStage {
+                argv: vec!["rg".to_string(), "rs".to_string()],
+                env_overrides: Vec::new(),
+            },
+        ];
+        assert!(run_pipeline(&mixed, &ctx).is_none());
+        // Empty pipeline is not a pipeline.
+        let empty: Vec<PipelineStage> = Vec::new();
+        assert!(run_pipeline(&empty, &ctx).is_none());
     }
 }
