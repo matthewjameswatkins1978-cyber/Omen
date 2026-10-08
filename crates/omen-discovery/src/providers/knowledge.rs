@@ -18,6 +18,8 @@ pub struct OmenKnowledge {
     pub shell_builtins: &'static [&'static str],
     /// One-line usage per builtin, for completion descriptions.
     pub builtin_help: fn(&str) -> Option<(&'static str, &'static str)>,
+    /// Static option words per builtin, for option-name completion.
+    pub builtin_options: fn(&str) -> &'static [&'static str],
     /// Static subcommand syntax for well-known external tools.
     pub tool_subcommands: fn(&str) -> &'static [&'static str],
     /// Bare Windows drive designator detection (`D:`).
@@ -39,6 +41,7 @@ impl OmenKnowledge {
             shell_intrinsics: &[],
             shell_builtins: &[],
             builtin_help: |_| None,
+            builtin_options: |_| &[],
             tool_subcommands: |_| &[],
             is_drive_designator: |_| None,
             typed_handles: &[],

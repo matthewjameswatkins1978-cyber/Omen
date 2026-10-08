@@ -125,6 +125,7 @@ mod tests {
             shell_intrinsics: &[],
             shell_builtins: &[],
             builtin_help: |_| None,
+            builtin_options: |_| &[],
             tool_subcommands: |_| &[],
             is_drive_designator: |_| None,
             typed_handles: &["@last", "@failed"],

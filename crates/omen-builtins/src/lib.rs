@@ -470,4 +470,20 @@ mod consistency_tests {
         let empty: Vec<PipelineStage> = Vec::new();
         assert!(run_pipeline(&empty, &ctx).is_none());
     }
+
+    /// Every registry name resolves to its own option table (optionless
+    /// builtins resolve explicitly empty); unknown names yield `&[]`.
+    #[test]
+    fn every_builtin_has_an_option_table() {
+        for name in BUILTIN_NAMES {
+            let options = builtin_options(name);
+            if matches!(*name, "clear" | "help" | "printf") {
+                assert!(options.is_empty(), "{name} takes no options");
+            } else {
+                assert!(!options.is_empty(), "{name} is missing its option table");
+            }
+        }
+        assert!(builtin_options("cargo").is_empty());
+        assert!(builtin_options("").is_empty());
+    }
 }

@@ -77,6 +77,7 @@ pub fn omen_knowledge() -> Arc<OmenKnowledge> {
         shell_intrinsics: commands::SHELL_INTRINSICS,
         shell_builtins: omen_builtins::BUILTIN_NAMES,
         builtin_help: omen_builtins::help_for,
+        builtin_options: omen_builtins::builtin_options,
         tool_subcommands: commands::tool_subcommands,
         is_drive_designator: commands::is_drive_designator,
         typed_handles: crate::grammar::TypedReference::STATIC_HANDLES,
@@ -914,6 +915,21 @@ mod tests {
         assert!(!r.ranked.is_empty());
         for c in &r.ranked {
             assert!(c.value().insert.starts_with("--"), "{:?}", c.value());
+        }
+    }
+
+    /// Builtin flags complete at option position from the static table —
+    /// `sort -` offers the registry's own flags through the real runtime.
+    #[test]
+    fn option_name_position_offers_builtin_flags() {
+        let cache = path_cache(&[]);
+        let r = run_discovery_serialized(&req("sort -", 6, ".", &cache));
+        let inserts: Vec<&str> = r.ranked.iter().map(|x| x.value().insert.as_str()).collect();
+        for flag in ["-r", "-n", "-u", "-f", "--"] {
+            assert!(
+                inserts.contains(&flag),
+                "builtin flag {flag} surfaced: {inserts:?}"
+            );
         }
     }
 

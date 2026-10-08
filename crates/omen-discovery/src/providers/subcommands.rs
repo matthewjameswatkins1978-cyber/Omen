@@ -120,6 +120,7 @@ mod tests {
             shell_intrinsics: &["cd"],
             shell_builtins: &[],
             builtin_help: |_| None,
+            builtin_options: |_| &[],
             tool_subcommands: |t| match t {
                 "cargo" => &["build", "test"],
                 _ => &[],
