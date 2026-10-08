@@ -1363,6 +1363,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "omen-mutation"
+version = "0.9.0-preview.25"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "walkdir",
+]
+
+[[package]]
 name = "omen-schema"
 version = "0.9.0-preview.25"
 dependencies = [
