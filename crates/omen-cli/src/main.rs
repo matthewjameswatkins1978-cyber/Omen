@@ -475,6 +475,11 @@ enum FactSubcommands {
     },
     /// Inspect fact provenance and dependency history
     Why { uri: String },
+    /// List active facts (resource URIs discoverable for get/why)
+    List {
+        #[arg(long, default_value = "50")]
+        limit: usize,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -1404,6 +1409,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         );
                     }
                     println!("History Count: {}", prov.history.len());
+                }
+            }
+            FactSubcommands::List { limit } => {
+                let db = Database::open(&db_path)?;
+                let facts = FactRegistry::list_active_facts(&db, limit)?;
+                if json_mode {
+                    println!("{}", serde_json::to_string_pretty(&facts)?);
+                } else if facts.is_empty() {
+                    println!("No active facts recorded for this workspace.");
+                } else {
+                    for f in &facts {
+                        println!("{}  {:?}  {}", f.resource_uri, f.validity, f.value);
+                    }
                 }
             }
         },
