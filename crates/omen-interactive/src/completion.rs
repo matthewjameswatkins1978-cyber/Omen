@@ -235,6 +235,15 @@ impl HotSemanticIndex {
         if fresh && !force {
             return;
         }
+        if !force && !self.path_commands.is_empty() && self.path_scanned_at.is_none() {
+            // Explicitly seeded commands (tests, out-of-band injection via
+            // direct staging): a scan would clobber deliberate content, so
+            // adopt the seed as fresh instead. Genuine scans always set
+            // `path_scanned_at` themselves, so this arm never suppresses
+            // real refreshes.
+            self.path_scanned_at = Some(Instant::now());
+            return;
+        }
         let scanned = commands::list_path_commands(
             bounds::MAX_PATH_DIRS,
             bounds::MAX_PATH_ENTRIES_PER_DIR,
