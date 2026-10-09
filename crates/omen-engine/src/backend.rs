@@ -942,15 +942,24 @@ pub fn to_wsl_path(path: &Path) -> String {
 /// Windows Subsystem for Linux (WSL) execution backend.
 pub struct WslExecutionBackend;
 
+/// Process-wide cache of the WSL availability probe: spawning wsl.exe
+/// costs up to 6s cold and BackendRegistry::new() runs per session.
+/// WSL install state does not change meaningfully within one process.
+static WSL_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
 impl WslExecutionBackend {
     pub fn new() -> Self {
         Self
     }
 
     pub fn is_available() -> bool {
+        *WSL_AVAILABLE.get_or_init(Self::probe_available)
+    }
+
+    fn probe_available() -> bool {
         #[cfg(windows)]
         {
-            // Probe wsl.exe -e true with a hard 1500ms deadline, killing child on timeout to prevent hanging.
+            // Probe wsl.exe -e true with a hard 6000ms deadline, killing child on timeout to prevent hanging.
             let mut child = match std::process::Command::new("wsl.exe")
                 .arg("-e")
                 .arg("true")
