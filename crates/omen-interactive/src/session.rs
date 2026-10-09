@@ -33,6 +33,27 @@ pub struct InteractiveSession {
     next_standalone_job: u64,
 }
 
+/// Render bytes for the HUMAN terminal: control characters that could
+/// drive the terminal (ESC sequences, carriage returns, DEL, C1) become
+/// `?`, while newline/tab structure and all printable Unicode survive.
+///
+/// Process bytes are NEVER sanitized in flight — pipes, redirects, and
+/// captures keep exact bytes. This applies ONLY at terminal display
+/// sites, so a hostile filename containing ESC cannot clear the screen
+/// or forge prompt text when listed.
+pub fn sanitize_for_terminal(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .chars()
+        .map(|c| {
+            if c == '\n' || c == '\t' || !c.is_control() {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
 /// Lifecycle of one standalone (daemonless) background job.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StandaloneJobState {
@@ -679,10 +700,16 @@ impl InteractiveSession {
                             );
 
                             if !summary.stdout_preview.is_empty() {
-                                print!("{}", summary.stdout_preview);
+                                print!(
+                                    "{}",
+                                    sanitize_for_terminal(summary.stdout_preview.as_bytes())
+                                );
                             }
                             if !summary.stderr_preview.is_empty() {
-                                eprint!("{}", summary.stderr_preview);
+                                eprint!(
+                                    "{}",
+                                    sanitize_for_terminal(summary.stderr_preview.as_bytes())
+                                );
                             }
 
                             let exit = ProcessExit {
@@ -784,8 +811,8 @@ impl InteractiveSession {
                 }
 
                 // Print stdout / stderr to user
-                print!("{}", String::from_utf8_lossy(&output.stdout_all));
-                eprint!("{}", String::from_utf8_lossy(&output.stderr_all));
+                print!("{}", sanitize_for_terminal(&output.stdout_all));
+                eprint!("{}", sanitize_for_terminal(&output.stderr_all));
 
                 self.last_exit = Some(output.process_exit.clone());
                 self.update_prompt_state();
@@ -897,10 +924,16 @@ impl InteractiveSession {
                     summary.execution_id, summary.runtime_status
                 );
                 if !summary.stdout_preview.is_empty() {
-                    print!("{}", summary.stdout_preview);
+                    print!(
+                        "{}",
+                        sanitize_for_terminal(summary.stdout_preview.as_bytes())
+                    );
                 }
                 if !summary.stderr_preview.is_empty() {
-                    eprint!("{}", summary.stderr_preview);
+                    eprint!(
+                        "{}",
+                        sanitize_for_terminal(summary.stderr_preview.as_bytes())
+                    );
                 }
                 (consequential_request_id, summary.execution_id)
             }
@@ -1178,7 +1211,20 @@ impl InteractiveSession {
         self.standalone_jobs[position]
             .cancel
             .send(true)
-            .map_err(|_| CoreError::Internal(format!("job {id}: cancellation channel closed")))?;
+            .or_else(|_| {
+                // Benign race: the driver finished (and dropped its
+                // receiver) between lookup and send. Report the observed
+                // state instead of erroring on a completed job.
+                match self.standalone_job_state(id) {
+                    Some(StandaloneJobState::Running) | None => Err(CoreError::Internal(format!(
+                        "job {id}: cancellation channel closed"
+                    ))),
+                    Some(_) => {
+                        println!("{id}: already finished");
+                        Ok(())
+                    }
+                }
+            })?;
         // The engine bounds its termination grace period, so the driver
         // thread always ends; a join failure means the thread panicked.
         if let Some(thread) = self.standalone_jobs[position].thread.take()
@@ -1193,7 +1239,10 @@ impl InteractiveSession {
         let state = self
             .standalone_job_state(id)
             .unwrap_or(StandaloneJobState::Running);
-        println!("{id}: {state:?}");
+        println!(
+            "{}",
+            sanitize_for_terminal(format!("{id}: {state:?}").as_bytes())
+        );
         let stopped = !matches!(state, StandaloneJobState::Running);
         Ok(ProcessExit {
             code: Some(if stopped { 0 } else { 1 }),
@@ -1215,9 +1264,14 @@ impl InteractiveSession {
                     } => (format!("Finished{code:?} {runtime}"), preview.clone()),
                 })
                 .unwrap_or_else(|_| ("Unknown".to_string(), String::new()));
-            println!("{} [{}] {}", job.id, state_text, job.label);
+            println!(
+                "{} [{}] {}",
+                job.id,
+                state_text,
+                sanitize_for_terminal(job.label.as_bytes())
+            );
             for line in preview.lines().take(5) {
-                println!("    {line}");
+                println!("    {}", sanitize_for_terminal(line.as_bytes()));
             }
         }
         if self.background_jobs.is_empty() && self.standalone_jobs.is_empty() {
@@ -1493,10 +1547,16 @@ impl InteractiveSession {
                 )
             );
             if !summary.stdout_preview.is_empty() {
-                print!("{}", summary.stdout_preview);
+                print!(
+                    "{}",
+                    sanitize_for_terminal(summary.stdout_preview.as_bytes())
+                );
             }
             if !summary.stderr_preview.is_empty() {
-                eprint!("{}", summary.stderr_preview);
+                eprint!(
+                    "{}",
+                    sanitize_for_terminal(summary.stderr_preview.as_bytes())
+                );
             }
             let exit = ProcessExit {
                 code: summary.exit_code,
@@ -1579,8 +1639,8 @@ impl InteractiveSession {
             let _ = omen_knowledge::ExecutionHistory::record_execution(db, &record, &[], &[], &[]);
         }
 
-        print!("{}", String::from_utf8_lossy(&output.execution.stdout_all));
-        eprint!("{}", String::from_utf8_lossy(&output.execution.stderr_all));
+        print!("{}", sanitize_for_terminal(&output.execution.stdout_all));
+        eprint!("{}", sanitize_for_terminal(&output.execution.stderr_all));
         let exit = output.execution.process_exit;
         self.last_exit = Some(exit.clone());
         self.update_prompt_state();
@@ -1950,10 +2010,16 @@ impl InteractiveSession {
             );
 
             if !summary_res.stdout_preview.is_empty() {
-                print!("{}", summary_res.stdout_preview);
+                print!(
+                    "{}",
+                    sanitize_for_terminal(summary_res.stdout_preview.as_bytes())
+                );
             }
             if !summary_res.stderr_preview.is_empty() {
-                eprint!("{}", summary_res.stderr_preview);
+                eprint!(
+                    "{}",
+                    sanitize_for_terminal(summary_res.stderr_preview.as_bytes())
+                );
             }
 
             let exit = ProcessExit {
@@ -2061,8 +2127,8 @@ impl InteractiveSession {
             );
         }
 
-        print!("{}", String::from_utf8_lossy(&output.stdout_all));
-        eprint!("{}", String::from_utf8_lossy(&output.stderr_all));
+        print!("{}", sanitize_for_terminal(&output.stdout_all));
+        eprint!("{}", sanitize_for_terminal(&output.stderr_all));
 
         self.last_exit = Some(output.process_exit.clone());
         self.update_prompt_state();
@@ -2188,6 +2254,52 @@ mod builtin_pipeline_dispatch_tests {
             message.contains("nosuchbin_xyz_omen"),
             "refusal names the missing binary, got {message}"
         );
+    }
+
+    /// A missing single command fails closed the same way.
+    #[test]
+    fn terminal_sanitizer_neutralizes_escape_injection() {
+        // ESC, CR, DEL, C1 become `?`; newline/tab/Unicode survive.
+        assert_eq!(
+            sanitize_for_terminal(b"\x1b[2J\x1b[Hclean\n"),
+            "?[2J?[Hclean\n"
+        );
+        assert_eq!(
+            sanitize_for_terminal("a\rb\u{7f}c\u{85}d".as_bytes()),
+            "a?b?c?d"
+        );
+        assert_eq!(
+            sanitize_for_terminal("tab\there\né\u{301}\n".as_bytes()),
+            "tab\there\né\u{301}\n"
+        );
+        // Invalid UTF-8 degrades to U+FFFD (terminal-inert), never panics.
+        assert!(sanitize_for_terminal(b"\xff\xfen").contains('\u{FFFD}'));
+    }
+
+    /// Stopping an already-finished job reports completion, not an
+    /// internal error (the driver may drop its cancel receiver first).
+    #[test]
+    fn stop_finished_job_reports_already_finished() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = standalone_session(dir.path().to_path_buf());
+        let exit = session
+            .dispatch_input("echo done-bg &")
+            .expect("bg dispatches");
+        assert_eq!(exit.code, Some(0));
+        // Bounded wait for the in-process job to finish.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while session
+            .standalone_jobs()
+            .iter()
+            .any(|j| matches!(j.state, crate::session::StandaloneJobState::Running))
+        {
+            assert!(std::time::Instant::now() < deadline, "job must finish");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let exit = session
+            .dispatch_input("stop job-1")
+            .expect("stop dispatches");
+        assert_eq!(exit.code, Some(0), "finished stop reports success");
     }
 
     /// A missing single command fails closed the same way.
