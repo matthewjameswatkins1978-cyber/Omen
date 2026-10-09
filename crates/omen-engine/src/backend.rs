@@ -716,6 +716,25 @@ impl NativeExecutionBackend {
 
         #[cfg(unix)]
         cmd.process_group(0);
+        // Linux orphan backstop: if the Omen session dies abruptly
+        // (SIGKILL: no Drop, no cancel path), the child must not
+        // outlive it as an orphan. PR_SET_PDEATHSIG delivers SIGKILL
+        // on parent death; the getppid recheck closes the fork/prctl
+        // race (parent already reaped to init). Windows is covered by
+        // KILL_ON_JOB_CLOSE job objects instead. Other Unix keeps
+        // process-group semantics without pdeathsig (documented gap).
+        #[cfg(target_os = "linux")]
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() == 1 {
+                    return Err(std::io::Error::other("parent died before pdeathsig armed"));
+                }
+                Ok(())
+            });
+        }
 
         #[cfg(windows)]
         cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
@@ -1213,5 +1232,29 @@ mod tests {
 
         let active = registry.active();
         assert_eq!(active.id(), BackendId::native());
+    }
+
+    /// Linux orphan backstop: a child spawned through the native backend
+    /// (with PR_SET_PDEATHSIG armed pre-exec) must start and exit
+    /// normally. This exercises the pre_exec path; the kill-on-parent-
+    /// death itself is a kernel guarantee, not something a test can
+    /// observe without orphaning a real process.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_spawn_with_pdeathsig_exits_cleanly() {
+        use crate::supervisor::ExecutionRequest;
+        let backend = NativeExecutionBackend;
+        let req = ExecutionRequest::simple(
+            vec!["/bin/true".to_string()],
+            std::path::PathBuf::from("/tmp"),
+        );
+        let handle = backend
+            .spawn(&req)
+            .expect("spawn with pdeathsig must succeed");
+        let (status, exit, _, _) = handle
+            .wait_bounded(std::time::Duration::from_secs(10))
+            .await
+            .expect("wait must succeed");
+        assert_eq!(exit.code, Some(0), "true exits 0, status={status:?}");
     }
 }
