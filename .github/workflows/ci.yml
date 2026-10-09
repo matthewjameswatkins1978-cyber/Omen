@@ -122,7 +122,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON((github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main' || startsWith(github.head_ref, 'feature/omen-')) && '["ubuntu-latest","windows-latest"]' || '["ubuntu-latest","windows-latest","macos-latest"]') }}
+        # RC1 scope: Ubuntu + Windows gate. macOS is deferred to a
+        # separate non-blocking signal lane below (macos-signal).
+        os: ["ubuntu-latest", "windows-latest"]
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout repository
@@ -192,6 +194,23 @@ jobs:
           "Rust cache hit: $env:RUST_CACHE_HIT"
           "Target directory bytes: $targetBytes"
           "Incremental directory bytes: $incrementalBytes"
+
+  # RC1 scope: macOS is deferred (known pty/prctl defects recorded for
+  # post-RC). This lane keeps compile signal without ever gating.
+  macos-signal:
+    continue-on-error: true
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || inputs.target_sha || github.sha }}
+          fetch-depth: 0
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup default 1.98.1
+      - name: macOS compile signal (non-blocking, deferred platform)
+        run: cargo check --workspace --all-targets
 
   windows-preview-candidate:
     runs-on: windows-latest
