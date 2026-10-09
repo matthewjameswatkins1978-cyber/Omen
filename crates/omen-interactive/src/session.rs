@@ -1211,7 +1211,20 @@ impl InteractiveSession {
         self.standalone_jobs[position]
             .cancel
             .send(true)
-            .map_err(|_| CoreError::Internal(format!("job {id}: cancellation channel closed")))?;
+            .or_else(|_| {
+                // Benign race: the driver finished (and dropped its
+                // receiver) between lookup and send. Report the observed
+                // state instead of erroring on a completed job.
+                match self.standalone_job_state(id) {
+                    Some(StandaloneJobState::Running) | None => Err(CoreError::Internal(format!(
+                        "job {id}: cancellation channel closed"
+                    ))),
+                    Some(_) => {
+                        println!("{id}: already finished");
+                        Ok(())
+                    }
+                }
+            })?;
         // The engine bounds its termination grace period, so the driver
         // thread always ends; a join failure means the thread panicked.
         if let Some(thread) = self.standalone_jobs[position].thread.take()
@@ -1226,7 +1239,10 @@ impl InteractiveSession {
         let state = self
             .standalone_job_state(id)
             .unwrap_or(StandaloneJobState::Running);
-        println!("{id}: {state:?}");
+        println!(
+            "{}",
+            sanitize_for_terminal(format!("{id}: {state:?}").as_bytes())
+        );
         let stopped = !matches!(state, StandaloneJobState::Running);
         Ok(ProcessExit {
             code: Some(if stopped { 0 } else { 1 }),
@@ -1248,9 +1264,14 @@ impl InteractiveSession {
                     } => (format!("Finished{code:?} {runtime}"), preview.clone()),
                 })
                 .unwrap_or_else(|_| ("Unknown".to_string(), String::new()));
-            println!("{} [{}] {}", job.id, state_text, job.label);
+            println!(
+                "{} [{}] {}",
+                job.id,
+                state_text,
+                sanitize_for_terminal(job.label.as_bytes())
+            );
             for line in preview.lines().take(5) {
-                println!("    {line}");
+                println!("    {}", sanitize_for_terminal(line.as_bytes()));
             }
         }
         if self.background_jobs.is_empty() && self.standalone_jobs.is_empty() {
@@ -2253,6 +2274,32 @@ mod builtin_pipeline_dispatch_tests {
         );
         // Invalid UTF-8 degrades to U+FFFD (terminal-inert), never panics.
         assert!(sanitize_for_terminal(b"\xff\xfen").contains('\u{FFFD}'));
+    }
+
+    /// Stopping an already-finished job reports completion, not an
+    /// internal error (the driver may drop its cancel receiver first).
+    #[test]
+    fn stop_finished_job_reports_already_finished() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = standalone_session(dir.path().to_path_buf());
+        let exit = session
+            .dispatch_input("echo done-bg &")
+            .expect("bg dispatches");
+        assert_eq!(exit.code, Some(0));
+        // Bounded wait for the in-process job to finish.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while session
+            .standalone_jobs()
+            .iter()
+            .any(|j| matches!(j.state, crate::session::StandaloneJobState::Running))
+        {
+            assert!(std::time::Instant::now() < deadline, "job must finish");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let exit = session
+            .dispatch_input("stop job-1")
+            .expect("stop dispatches");
+        assert_eq!(exit.code, Some(0), "finished stop reports success");
     }
 
     /// A missing single command fails closed the same way.
