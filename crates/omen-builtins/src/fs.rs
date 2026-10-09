@@ -1,7 +1,7 @@
 //! Read-only filesystem builtins: `pwd`, `cat`, `which`/`where`,
 //! `realpath`, `readlink`.
 
-use super::{BuiltinContext, BuiltinOutput};
+use super::{BuiltinContext, BuiltinOutput, resolve_operand};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
@@ -473,14 +473,5 @@ fn normalize_lexical(path: &Path) -> PathBuf {
         PathBuf::from(".")
     } else {
         out
-    }
-}
-
-fn resolve_operand(cwd: &Path, operand: &str) -> PathBuf {
-    let path = PathBuf::from(operand);
-    if path.is_absolute() {
-        path
-    } else {
-        cwd.join(path)
     }
 }
