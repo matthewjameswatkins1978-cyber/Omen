@@ -29,7 +29,7 @@ mod terminal;
 mod text;
 mod walk;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub use listing::{FileEntry, FileKind};
 
@@ -108,6 +108,19 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "printf", "readlink", "realpath", "sort", "stat", "tail", "tee", "tr", "tree", "uniq", "wc",
     "where", "which",
 ];
+
+/// Resolves a command operand against the session cwd: absolute paths
+/// (including Windows drive/UNC forms via the standard library) pass
+/// through; anything else joins onto `cwd`. Single canonical site —
+/// per-module copies diverged silently in the past.
+pub(crate) fn resolve_operand(cwd: &Path, operand: &str) -> PathBuf {
+    let path = PathBuf::from(operand);
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
 
 /// Returns `true` when `name` is implemented by this crate.
 pub fn is_builtin(name: &str) -> bool {

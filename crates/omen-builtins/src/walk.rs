@@ -13,7 +13,7 @@
 //! - `tree` drawing characters are display rendering (`projection:
 //!   "rendered-tree"`, always lossy when names are not plain UTF-8).
 
-use super::{BuiltinContext, BuiltinOutput};
+use super::{BuiltinContext, BuiltinOutput, resolve_operand};
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -34,15 +34,6 @@ fn display_bytes(path: &Path, cwd: &Path) -> Vec<u8> {
     match path.strip_prefix(cwd) {
         Ok(relative) if !relative.as_os_str().is_empty() => raw_bytes(relative),
         _ => raw_bytes(path),
-    }
-}
-
-fn resolve_operand(cwd: &Path, operand: &str) -> PathBuf {
-    let path = PathBuf::from(operand);
-    if path.is_absolute() {
-        path
-    } else {
-        cwd.join(path)
     }
 }
 

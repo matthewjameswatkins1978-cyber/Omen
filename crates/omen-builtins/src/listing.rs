@@ -13,7 +13,7 @@
 //! (those need per-platform truth work), no `-R` recursion (`find` will own
 //! traversal), long format shows mtime as unix seconds.
 
-use super::{BuiltinContext, BuiltinOutput};
+use super::{BuiltinContext, BuiltinOutput, resolve_operand};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
@@ -130,15 +130,6 @@ fn entry_json(entry: &FileEntry) -> serde_json::Value {
         "modified_unix": entry.modified_unix,
         "symlink_target_lossy": entry.symlink_target.as_ref().map(|t| String::from_utf8_lossy(t).into_owned()),
     })
-}
-
-fn resolve_operand(cwd: &Path, operand: &str) -> PathBuf {
-    let path = PathBuf::from(operand);
-    if path.is_absolute() {
-        path
-    } else {
-        cwd.join(path)
-    }
 }
 
 /// `ls [-a] [-l] [-0|-1] [-d] [path ...]` (alias `dir`).
