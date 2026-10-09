@@ -138,6 +138,12 @@ pub fn invocation_for(capability_id: &str) -> Invocation {
         "composition.plan" => {
             Invocation::new(Some("action plan"), Some("omen_action_plan"), Some(":plan"))
         }
+        // Shell composition is syntax, not a verb: no CLI/MCP/REPL
+        // spelling exists. Agents compose at the prompt; routing is None
+        // on all surfaces by design (see the summaries).
+        "shell.pipeline" | "shell.redirect" | "shell.job" | "shell.builtin" => {
+            Invocation::new(None, None, None)
+        }
         _ => Invocation::new(None, None, None),
     }
 }
@@ -446,7 +452,7 @@ pub fn contract() -> MachineContract {
                 json!({"path":{"type":"string","minLength":1},"content":{"type":"string"}}),
                 &["path", "content"],
             ),
-            output_schema: result,
+            output_schema: result.clone(),
             effect_class: EffectClass::Mutate,
             network_effect: NetworkEffect::None,
             reversibility: Reversibility::Reversible,
@@ -474,6 +480,82 @@ pub fn contract() -> MachineContract {
             bounds: "bounded action and plan size".into(),
             timeout: "bounded local parse and validation".into(),
             examples: vec![json!({"action_id":"inspect-auth"})],
+        },
+        CapabilityDefinition {
+            id: "shell.pipeline".into(),
+            invocation: invocation_for("shell.pipeline"),
+            group: "composition".into(),
+            summary: "Compose commands with `|` (plus `&&` / `||`): bytes flow unchanged between stages; all-builtin chains run in-process, external stages spawn real tools.".into(),
+            input_schema: object_schema(
+                json!({"pipeline":{"type":"string","minLength":1}}),
+                &["pipeline"],
+            ),
+            output_schema: result.clone(),
+            effect_class: EffectClass::SpawnProcess,
+            network_effect: NetworkEffect::None,
+            reversibility: Reversibility::NotApplicable,
+            idempotent: false,
+            authority: "none for read-only chains; external stages under current execution contracts".into(),
+            bounds: "bounded stages;pipelines bind tighter than `&&`/`||`".into(),
+            timeout: "bounded by stage timeouts".into(),
+            examples: vec![json!({"pipeline":"cat server.log | grep ERROR | sort -u"})],
+        },
+        CapabilityDefinition {
+            id: "shell.redirect".into(),
+            invocation: invocation_for("shell.redirect"),
+            group: "composition".into(),
+            summary: "`<` feeds a file as input. `>` / `>>` refuse closed until host-filesystem authority is admitted (no half-writes, ever).".into(),
+            input_schema: object_schema(
+                json!({"redirect":{"type":"string","minLength":1}}),
+                &["redirect"],
+            ),
+            output_schema: result.clone(),
+            effect_class: EffectClass::Compute,
+            network_effect: NetworkEffect::None,
+            reversibility: Reversibility::NotApplicable,
+            idempotent: true,
+            authority: "input reads: none; output writes: Tethers admission (pending)".into(),
+            bounds: "input from first stage only; output validated last-wins".into(),
+            timeout: "bounded local resolution".into(),
+            examples: vec![json!({"redirect":"sort -u < names.txt"})],
+        },
+        CapabilityDefinition {
+            id: "shell.job".into(),
+            invocation: invocation_for("shell.job"),
+            group: "execution".into(),
+            summary: "Run work in the background with `&`; list with `jobs`, stop with `stop <id>`; finished jobs keep a bounded output preview.".into(),
+            input_schema: object_schema(
+                json!({"command":{"type":"string","minLength":1}}),
+                &["command"],
+            ),
+            output_schema: result.clone(),
+            effect_class: EffectClass::SpawnProcess,
+            network_effect: NetworkEffect::None,
+            reversibility: Reversibility::NotApplicable,
+            idempotent: false,
+            authority: "none for read-only builtin jobs; external jobs under current execution contracts".into(),
+            bounds: "at most 32 tracked jobs per session; tree-kill on stop".into(),
+            timeout: "bounded stop grace plus bounded observation".into(),
+            examples: vec![json!({"command":"python -m http.server &"})],
+        },
+        CapabilityDefinition {
+            id: "shell.builtin".into(),
+            invocation: invocation_for("shell.builtin"),
+            group: "composition".into(),
+            summary: "Read-only native commands (cat/grep/sort/ls/find/which/…): same trust class as reads; `help <name>` documents each; unknown options fail loudly.".into(),
+            input_schema: object_schema(
+                json!({"command":{"type":"string","minLength":1}}),
+                &["command"],
+            ),
+            output_schema: result.clone(),
+            effect_class: EffectClass::Read,
+            network_effect: NetworkEffect::None,
+            reversibility: Reversibility::NotApplicable,
+            idempotent: true,
+            authority: "none".into(),
+            bounds: "declared lossy/lossless projections per command".into(),
+            timeout: "bounded local execution".into(),
+            examples: vec![json!({"command":"ls --help"})],
         },
     ];
     let mut recipe_definitions = vec![
