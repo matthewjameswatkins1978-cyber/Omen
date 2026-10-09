@@ -221,8 +221,8 @@ impl HotSemanticIndex {
             .into_iter()
             .map(|s| s.name)
             .collect();
-
-        self.refresh_path_commands(false);
+        // PATH-command scan is LAZY (first completion snapshot): it costs
+        // ~240ms on Windows and must never sit on session startup.
     }
 
     /// Refreshes the bounded PATH command cache out-of-band.
@@ -233,6 +233,15 @@ impl HotSemanticIndex {
             .path_scanned_at
             .is_some_and(|t| t.elapsed() < bounds::PATH_CACHE_TTL);
         if fresh && !force {
+            return;
+        }
+        if !force && !self.path_commands.is_empty() && self.path_scanned_at.is_none() {
+            // Explicitly seeded commands (tests, out-of-band injection via
+            // direct staging): a scan would clobber deliberate content, so
+            // adopt the seed as fresh instead. Genuine scans always set
+            // `path_scanned_at` themselves, so this arm never suppresses
+            // real refreshes.
+            self.path_scanned_at = Some(Instant::now());
             return;
         }
         let scanned = commands::list_path_commands(
@@ -772,8 +781,12 @@ impl OmenCompleter {
     }
 
     fn snapshot(&self) -> LiveSnapshot {
+        // First-Tab pays the PATH scan here (TTL keeps later calls free).
         match self.context.lock() {
-            Ok(ctx) => snapshot_from(&ctx),
+            Ok(mut ctx) => {
+                ctx.hot_index.refresh_path_commands(false);
+                snapshot_from(&ctx)
+            }
             Err(e) => snapshot_from(&e.into_inner()),
         }
     }
