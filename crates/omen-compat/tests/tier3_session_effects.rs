@@ -115,3 +115,33 @@ fn empty_input_file_feeds_empty() {
     assert_eq!(run(&mut s, "cat < e.txt"), 0);
     assert!(PathBuf::from("e.txt").is_relative());
 }
+
+#[test]
+fn mixed_external_to_builtin_pipe_parity() {
+    // Mixed routing: any-external pipelines execute through the engine
+    // with real OS pipes (all-builtin chains stay in-process). Requires
+    // git on PATH (true on dev machines and CI runners).
+    // `git --version | sort`: external producer, builtin consumer.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session_for(dir.path());
+    assert_eq!(run(&mut s, "git --version | sort"), 0);
+    #[cfg(windows)]
+    let (ocode, _) = {
+        let out = Command::new("cmd")
+            .args(["/c", "git --version | sort"])
+            .current_dir(dir.path())
+            .output()
+            .expect("oracle spawns");
+        (out.status.code().unwrap_or(-1), out.stdout)
+    };
+    #[cfg(not(windows))]
+    let (ocode, _) = {
+        let out = Command::new("sh")
+            .args(["-c", "git --version | sort"])
+            .current_dir(dir.path())
+            .output()
+            .expect("oracle spawns");
+        (out.status.code().unwrap_or(-1), out.stdout)
+    };
+    assert_eq!(ocode, 0, "oracle mixed pipe succeeds");
+}
