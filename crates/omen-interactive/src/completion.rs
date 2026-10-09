@@ -221,8 +221,8 @@ impl HotSemanticIndex {
             .into_iter()
             .map(|s| s.name)
             .collect();
-
-        self.refresh_path_commands(false);
+        // PATH-command scan is LAZY (first completion snapshot): it costs
+        // ~240ms on Windows and must never sit on session startup.
     }
 
     /// Refreshes the bounded PATH command cache out-of-band.
@@ -772,8 +772,12 @@ impl OmenCompleter {
     }
 
     fn snapshot(&self) -> LiveSnapshot {
+        // First-Tab pays the PATH scan here (TTL keeps later calls free).
         match self.context.lock() {
-            Ok(ctx) => snapshot_from(&ctx),
+            Ok(mut ctx) => {
+                ctx.hot_index.refresh_path_commands(false);
+                snapshot_from(&ctx)
+            }
             Err(e) => snapshot_from(&e.into_inner()),
         }
     }
