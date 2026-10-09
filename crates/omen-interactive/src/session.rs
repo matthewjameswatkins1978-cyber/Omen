@@ -33,6 +33,27 @@ pub struct InteractiveSession {
     next_standalone_job: u64,
 }
 
+/// Render bytes for the HUMAN terminal: control characters that could
+/// drive the terminal (ESC sequences, carriage returns, DEL, C1) become
+/// `?`, while newline/tab structure and all printable Unicode survive.
+///
+/// Process bytes are NEVER sanitized in flight — pipes, redirects, and
+/// captures keep exact bytes. This applies ONLY at terminal display
+/// sites, so a hostile filename containing ESC cannot clear the screen
+/// or forge prompt text when listed.
+pub fn sanitize_for_terminal(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .chars()
+        .map(|c| {
+            if c == '\n' || c == '\t' || !c.is_control() {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
 /// Lifecycle of one standalone (daemonless) background job.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StandaloneJobState {
@@ -679,10 +700,16 @@ impl InteractiveSession {
                             );
 
                             if !summary.stdout_preview.is_empty() {
-                                print!("{}", summary.stdout_preview);
+                                print!(
+                                    "{}",
+                                    sanitize_for_terminal(summary.stdout_preview.as_bytes())
+                                );
                             }
                             if !summary.stderr_preview.is_empty() {
-                                eprint!("{}", summary.stderr_preview);
+                                eprint!(
+                                    "{}",
+                                    sanitize_for_terminal(summary.stderr_preview.as_bytes())
+                                );
                             }
 
                             let exit = ProcessExit {
@@ -784,8 +811,8 @@ impl InteractiveSession {
                 }
 
                 // Print stdout / stderr to user
-                print!("{}", String::from_utf8_lossy(&output.stdout_all));
-                eprint!("{}", String::from_utf8_lossy(&output.stderr_all));
+                print!("{}", sanitize_for_terminal(&output.stdout_all));
+                eprint!("{}", sanitize_for_terminal(&output.stderr_all));
 
                 self.last_exit = Some(output.process_exit.clone());
                 self.update_prompt_state();
@@ -897,10 +924,16 @@ impl InteractiveSession {
                     summary.execution_id, summary.runtime_status
                 );
                 if !summary.stdout_preview.is_empty() {
-                    print!("{}", summary.stdout_preview);
+                    print!(
+                        "{}",
+                        sanitize_for_terminal(summary.stdout_preview.as_bytes())
+                    );
                 }
                 if !summary.stderr_preview.is_empty() {
-                    eprint!("{}", summary.stderr_preview);
+                    eprint!(
+                        "{}",
+                        sanitize_for_terminal(summary.stderr_preview.as_bytes())
+                    );
                 }
                 (consequential_request_id, summary.execution_id)
             }
@@ -1493,10 +1526,16 @@ impl InteractiveSession {
                 )
             );
             if !summary.stdout_preview.is_empty() {
-                print!("{}", summary.stdout_preview);
+                print!(
+                    "{}",
+                    sanitize_for_terminal(summary.stdout_preview.as_bytes())
+                );
             }
             if !summary.stderr_preview.is_empty() {
-                eprint!("{}", summary.stderr_preview);
+                eprint!(
+                    "{}",
+                    sanitize_for_terminal(summary.stderr_preview.as_bytes())
+                );
             }
             let exit = ProcessExit {
                 code: summary.exit_code,
@@ -1579,8 +1618,8 @@ impl InteractiveSession {
             let _ = omen_knowledge::ExecutionHistory::record_execution(db, &record, &[], &[], &[]);
         }
 
-        print!("{}", String::from_utf8_lossy(&output.execution.stdout_all));
-        eprint!("{}", String::from_utf8_lossy(&output.execution.stderr_all));
+        print!("{}", sanitize_for_terminal(&output.execution.stdout_all));
+        eprint!("{}", sanitize_for_terminal(&output.execution.stderr_all));
         let exit = output.execution.process_exit;
         self.last_exit = Some(exit.clone());
         self.update_prompt_state();
@@ -1950,10 +1989,16 @@ impl InteractiveSession {
             );
 
             if !summary_res.stdout_preview.is_empty() {
-                print!("{}", summary_res.stdout_preview);
+                print!(
+                    "{}",
+                    sanitize_for_terminal(summary_res.stdout_preview.as_bytes())
+                );
             }
             if !summary_res.stderr_preview.is_empty() {
-                eprint!("{}", summary_res.stderr_preview);
+                eprint!(
+                    "{}",
+                    sanitize_for_terminal(summary_res.stderr_preview.as_bytes())
+                );
             }
 
             let exit = ProcessExit {
@@ -2061,8 +2106,8 @@ impl InteractiveSession {
             );
         }
 
-        print!("{}", String::from_utf8_lossy(&output.stdout_all));
-        eprint!("{}", String::from_utf8_lossy(&output.stderr_all));
+        print!("{}", sanitize_for_terminal(&output.stdout_all));
+        eprint!("{}", sanitize_for_terminal(&output.stderr_all));
 
         self.last_exit = Some(output.process_exit.clone());
         self.update_prompt_state();
@@ -2188,6 +2233,26 @@ mod builtin_pipeline_dispatch_tests {
             message.contains("nosuchbin_xyz_omen"),
             "refusal names the missing binary, got {message}"
         );
+    }
+
+    /// A missing single command fails closed the same way.
+    #[test]
+    fn terminal_sanitizer_neutralizes_escape_injection() {
+        // ESC, CR, DEL, C1 become `?`; newline/tab/Unicode survive.
+        assert_eq!(
+            sanitize_for_terminal(b"\x1b[2J\x1b[Hclean\n"),
+            "?[2J?[Hclean\n"
+        );
+        assert_eq!(
+            sanitize_for_terminal("a\rb\u{7f}c\u{85}d".as_bytes()),
+            "a?b?c?d"
+        );
+        assert_eq!(
+            sanitize_for_terminal("tab\there\né\u{301}\n".as_bytes()),
+            "tab\there\né\u{301}\n"
+        );
+        // Invalid UTF-8 degrades to U+FFFD (terminal-inert), never panics.
+        assert!(sanitize_for_terminal(b"\xff\xfen").contains('\u{FFFD}'));
     }
 
     /// A missing single command fails closed the same way.
