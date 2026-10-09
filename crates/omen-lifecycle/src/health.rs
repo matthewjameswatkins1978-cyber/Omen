@@ -1049,6 +1049,25 @@ pub fn parse_identity(output: &[u8]) -> (Option<String>, Option<String>, Option<
 mod tests {
     use super::*;
 
+    /// Spawn a test fixture with bounded ETXTBSY tolerance: hosted
+    /// runners occasionally refuse exec of a just-materialized fixture
+    /// (os error 26). ETXTBSY is definitionally transient — retry 3x at
+    /// 50ms, then fail exactly as `.unwrap()` would. All other errors
+    /// fail immediately.
+    fn spawn_forgiving(cmd: &mut std::process::Command) -> std::process::Child {
+        let mut attempt = 0;
+        loop {
+            match cmd.spawn() {
+                Ok(child) => return child,
+                Err(e) if e.raw_os_error() == Some(26) && attempt < 3 => {
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => panic!("fixture spawn works: {e}"),
+            }
+        }
+    }
+
     #[test]
     fn identity_parse_rules() {
         let (v, c, s) = parse_identity(
@@ -1475,12 +1494,11 @@ fn main() {
     #[test]
     fn stalling_helper_is_bounded() {
         let (_dir, bin) = stall_fixture();
-        let helper = std::process::Command::new(&bin)
-            .stdin(Stdio::null())
+        let mut cmd = std::process::Command::new(&bin);
+        cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::null());
+        let helper = spawn_forgiving(&mut cmd);
         let t0 = Instant::now();
         let (end, _) = run_bounded_helper(helper, t0 + Duration::from_millis(500));
         let total = t0.elapsed();
@@ -1497,12 +1515,11 @@ fn main() {
     #[test]
     fn expired_deadline_helper_returns_bounded() {
         let (_dir, bin) = stall_fixture();
-        let helper = std::process::Command::new(&bin)
-            .stdin(Stdio::null())
+        let mut cmd = std::process::Command::new(&bin);
+        cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::null());
+        let helper = spawn_forgiving(&mut cmd);
         let t0 = Instant::now();
         let (end, _) = run_bounded_helper(helper, t0);
         assert!(
@@ -1518,12 +1535,11 @@ fn main() {
     #[test]
     fn live_child_classifies_cleanup_incomplete() {
         let (_dir, bin) = stall_fixture();
-        let mut helper = std::process::Command::new(&bin)
-            .stdin(Stdio::null())
+        let mut cmd = std::process::Command::new(&bin);
+        cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::null());
+        let mut helper = spawn_forgiving(&mut cmd);
         let err =
             reap_bounded(&mut helper, Instant::now() + Duration::from_millis(200)).unwrap_err();
         assert!(err.contains("would not confirm termination"));
@@ -1698,13 +1714,13 @@ fn main() {
         );
         // Negative control: the same binary, plain-spawned, is NOT a
         // member of our job (whatever ambient jobs exist).
-        let plain = std::process::Command::new(&helper)
+        let mut plain_cmd = std::process::Command::new(&helper);
+        plain_cmd
             .arg("--version")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("control spawn works");
+            .stderr(Stdio::null());
+        let plain = spawn_forgiving(&mut plain_cmd);
         assert!(
             !in_explicit_job(plain.as_raw_handle() as HANDLE, job.handle()),
             "plain-spawned child must NOT join our job — the query is vacuous"
