@@ -29,6 +29,8 @@ tokio = { workspace = true, features = [
 [dev-dependencies]
 omen-test-fixtures = { workspace = true }
 omen-builtins = { workspace = true }
+omen-interactive = { workspace = true }
+omen-core = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = [
     "process",
