@@ -785,6 +785,45 @@ That difference is almost the entire philosophy of Omen in miniature.
 
 ---
 
+# Pipelines, redirection, and background jobs
+
+Omen's own commands compose without spawning processes:
+
+```text
+cat server.log | grep ERROR | sort -u | head
+```
+
+Bytes flow unchanged between stages, including binary data. A stage
+that names an installed tool (for example `rg` or `git`) runs that
+real tool; mixed pipelines work the same way.
+
+`&&` and `||` chain on exit status, and `<` feeds a
+file as input:
+
+```text
+cargo test && echo green
+ls *.rs
+sort -u < names.txt
+```
+
+Writing to files with `>` or `>>` currently refuses with a clear
+error: file mutations wait on the admitted filesystem authority
+(see the Tethers boundary below), and Omen will not half-write.
+Reading with `<` works today.
+
+Long work goes to the background with `&`:
+
+```text
+python -m http.server &
+jobs
+stop job-1
+```
+
+Finished jobs keep a short output preview. `stop` names a job id;
+stopping an already-finished job simply says so.
+
+---
+
 # What makes it feel different?
 
 It is not supposed to feel alien.
