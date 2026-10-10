@@ -6,6 +6,7 @@ pub mod color;
 pub mod diagnostics;
 pub mod humanize;
 pub mod prompt;
+pub mod secret;
 pub mod terminal;
 
 pub use appearance::{AppearanceChooser, ChooserAction, HumanSettings, PromptDensity, Theme};

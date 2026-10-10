@@ -531,10 +531,19 @@ impl AiLaneDispatcher {
                         latency_ms: None,
                         usage: None,
                     });
+                    // Failed-key recovery route: authentication failures
+                    // name the fix (key or setup) instead of stranding the
+                    // user. No network validation runs without consent.
+                    let mut response_text = format!("Agent\n\nReasoning unavailable: {e}");
+                    if matches!(e, omen_agent::AgentError::AuthenticationRequired { .. }) {
+                        response_text.push_str(
+                            "\nSet the provider key in the environment or store it with `omen setup` (interactive), then ask again.",
+                        );
+                    }
                     return Ok(AiLaneOutput {
                         configured: false,
                         query: query.to_string(),
-                        response_text: format!("Agent\n\nReasoning unavailable: {e}"),
+                        response_text,
                         suggested_commands: suggestions,
                         proposed_actions: Vec::new(),
                         references: Vec::new(),

@@ -253,6 +253,22 @@ pub fn cmd_repair(apply: bool, json_mode: bool) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
+/// Later provider-key route for `omen setup`: the same offer flow as
+/// first run, sharing `offer_luna_setup`. TTY-gated by the caller.
+fn offer_luna_key_setup_cli() {
+    use omen_agent::credentials::{KeyringCredentialStore, SetupIo, offer_luna_setup};
+    let caps = omen_ui::TerminalCapabilities::detect();
+    let io = SetupIo {
+        ask_yes_no: |prompt| omen_ui::secret::ask_yes_no(prompt),
+        read_secret: || match omen_ui::secret::read_masked_line("Paste API key: ", &caps) {
+            Ok(omen_ui::secret::SecretRead::Submitted(key)) => Some(key),
+            _ => None,
+        },
+        say: |line| println!("{line}"),
+    };
+    offer_luna_setup(&io, &KeyringCredentialStore);
+}
+
 pub fn lifecycle_doctor_report() -> omen_lifecycle::doctor::DoctorReport {
     let b = base();
     omen_lifecycle::doctor::run_doctor(&omen_lifecycle::doctor::DoctorInput {
@@ -638,6 +654,13 @@ pub fn cmd_setup(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
         }
         println!("channel: {ch:?} (change with `omen channel stable|preview`)");
         println!("optional next: install a provider CLI (codex/luna), then `omen doctor`");
+        // Later provider-key route (same flow as first run). TTY only:
+        // piped/non-interactive setup never prompts, never blocks.
+        if std::io::IsTerminal::is_terminal(&std::io::stdin())
+            && std::io::IsTerminal::is_terminal(&std::io::stdout())
+        {
+            offer_luna_key_setup_cli();
+        }
     }
     Ok(())
 }
