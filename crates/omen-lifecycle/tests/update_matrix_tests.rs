@@ -723,6 +723,35 @@ fn check_is_readonly() {
     assert_eq!(walk(&fx.base), before);
 }
 
+/// Antigravity dogfood C: an older tagged release must never be offered
+/// as an upgrade candidate against a newer installed version. Repro:
+/// installed 0.9.0-preview.25, newest indexed release 0.9.0-preview.21.
+#[test]
+fn older_release_is_never_an_upgrade_candidate() {
+    let fx = setup();
+    make_release(
+        &fx.source,
+        "0.9.0-preview.21",
+        "cccccccccccccccccccccccccccccccccccccccc",
+        false,
+    );
+    let report = update::check_for_update(
+        "0.9.0-preview.25",
+        Channel::Preview,
+        Ownership::Omen,
+        &ReleaseSource::Directory(fx.source.clone()),
+    );
+    match report.outcome {
+        CheckOutcome::OlderCandidate {
+            current, candidate, ..
+        } => {
+            assert_eq!(current, "0.9.0-preview.25");
+            assert_eq!(candidate.version, "0.9.0-preview.21");
+        }
+        other => panic!("older release must not be an upgrade candidate: {other:?}"),
+    }
+}
+
 fn walk(dir: &Path) -> Vec<String> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];

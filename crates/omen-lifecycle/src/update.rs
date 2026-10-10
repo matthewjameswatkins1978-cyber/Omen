@@ -83,6 +83,15 @@ pub enum CheckOutcome {
         candidate: ReleaseMeta,
         reason: String,
     },
+    /// The newest indexed release is OLDER than the installed version.
+    /// Never an upgrade: a downgrade requires an explicit supported
+    /// decision (not offered here). `update apply` refuses this outcome
+    /// exactly like any other non-candidate.
+    OlderCandidate {
+        current: String,
+        candidate: ReleaseMeta,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,7 +252,32 @@ fn evaluate_candidate(current_version: &str, meta: &ReleaseMeta) -> CheckOutcome
         CheckOutcome::UpToDate {
             current: current_version.to_string(),
         }
-    } else if meta.package_sha256.is_empty() || meta.git_sha.is_empty() {
+    } else if let (Some(cur), Some(cand)) =
+        (preview_num(current_version), preview_num(&meta.version))
+    {
+        // Both sides parse as preview releases: enforce direction. An
+        // older tagged release is never a valid upgrade (nor a silent
+        // downgrade); it needs an explicit supported decision.
+        if cand < cur {
+            CheckOutcome::OlderCandidate {
+                current: current_version.to_string(),
+                candidate: meta.clone(),
+                reason: format!(
+                    "indexed release {} is older than installed {current_version}; refusing as upgrade",
+                    meta.version,
+                ),
+            }
+        } else {
+            evaluate_compatible(current_version, meta)
+        }
+    } else {
+        // Either side is not a parseable preview tag (dev builds, future
+        // stable lines): ordering is unknown, preserve prior behavior.
+        evaluate_compatible(current_version, meta)
+    }
+}
+fn evaluate_compatible(current_version: &str, meta: &ReleaseMeta) -> CheckOutcome {
+    if meta.package_sha256.is_empty() || meta.git_sha.is_empty() {
         CheckOutcome::MalformedMetadata {
             detail: format!("release {} lacks digest provenance", meta.version),
         }
