@@ -724,6 +724,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "filesystem": format!("{:?}", backend_caps.filesystem),
                         "network": format!("{:?}", backend_caps.network),
                         "descendants": format!("{:?}", backend_caps.descendants),
+                    },
+                    // Structural AI-egress evidence: whether this process
+                    // would be allowed to reach commercial model APIs, and
+                    // which providers are configured (ids only, never keys).
+                    // Additive machine shape; production values unchanged.
+                    "ai_egress": {
+                        "admitted": omen_agent::is_admitted(),
+                        "test_isolation": omen_agent::hermetic_denial_active(),
+                        "configured": omen_agent::ProviderRegistry::new()
+                            .list_providers()
+                            .iter()
+                            .map(|d| d.id.clone())
+                            .collect::<Vec<_>>(),
                     }
                 });
                 // H lifecycle findings: observational, stable machine shape.
@@ -738,6 +751,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Executable: {}", executable.as_deref().unwrap_or("unknown"));
                 println!("Git SHA: {}", env!("OMEN_GIT_SHA"));
                 println!("Machine Contract: {}", machine_contract::CONTRACT_VERSION);
+                // Test-isolation evidence on the human surface, printed ONLY
+                // when denial is active so normal production output is
+                // byte-identical to before.
+                if omen_agent::hermetic_denial_active() {
+                    println!(
+                        "AI egress: denied (test isolation OMEN_HERMETIC_TESTS=1; live commercial calls refused)"
+                    );
+                }
                 match installed
                     .as_ref()
                     .and_then(|value| value.get("provenance").and_then(|v| v.as_str()))

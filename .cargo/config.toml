@@ -1,0 +1,11 @@
+# Omen cargo configuration.
+#
+# [env] OMEN_HERMETIC_TESTS=1 denies commercial AI egress for every
+# process cargo launches — including all test binaries — and inherits
+# into any child process those tests spawn (real `omen` / MCP
+# executables). Production binaries started outside cargo never carry
+# it, so normal `omen` startup and Luna functionality are unchanged.
+# A developer running `cargo run -p omen-cli` observes a loud refusal
+# naming the remedy (unset the variable) instead of silent billing.
+[env]
+OMEN_HERMETIC_TESTS = "1"

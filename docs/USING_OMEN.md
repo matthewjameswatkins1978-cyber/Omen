@@ -762,9 +762,16 @@ Omen does not dump your terminal scrollback into a prompt or ask you to copy-pas
   touch commercial APIs, even with keys configured in the environment or
   OS credential store — the test process is simply not admitted for live
   egress, and any accidental live attempt fails loudly instead of
-  spending. Deliberate live validation is a separate human-approved
-  activity (`OMEN_LIVE_TESTS=1` plus an explicitly admitted smoke test).
-  A credential alone is never permission to bill.
+  spending. The denial (`OMEN_HERMETIC_TESTS=1`, set automatically for
+  every cargo-launched test process) inherits into spawned `omen`/MCP
+  child processes and takes precedence over production admission;
+  `doctor --json` reports the structural evidence under `ai_egress`
+  (admitted, test isolation, configured provider ids). Deliberate live
+  validation is a separate human-approved activity (`OMEN_LIVE_TESTS=1`
+  plus an explicitly admitted smoke test). A credential alone is never
+  permission to bill. External agent adapters that spawn their own
+  processes (e.g. the Codex route) are outside this HTTPS gate and stay
+  covered by test doubles, never live calls.
 
 The presentation format is always clean, structured, and distinct:
 
