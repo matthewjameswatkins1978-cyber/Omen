@@ -455,6 +455,8 @@ impl CodexAdapter {
                 }],
                 references: vec![],
                 uncertainty: None,
+                usage: None,
+                latency_ms: None,
             });
         }
         Ok(AgentResponse {
@@ -463,6 +465,8 @@ impl CodexAdapter {
             proposed_actions: vec![],
             references: vec![],
             uncertainty: None,
+            usage: None,
+            latency_ms: None,
         })
     }
 

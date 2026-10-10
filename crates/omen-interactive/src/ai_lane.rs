@@ -15,6 +15,28 @@ pub struct AiLaneDispatchStats {
     pub service_scans: usize,
     #[serde(default)]
     pub semantic_provider_calls: usize,
+    /// Diagnostic event for the provider round of this dispatch, when a
+    /// provider ran. Lives on stats so every `AiLaneOutput` construction
+    /// site stays untouched: stats is built once and moved by value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_event: Option<AiProviderEvent>,
+}
+
+/// One provider round as a diagnostic event: who answered, with which
+/// model and effort, how long it took, and the token usage the provider
+/// reported. Cost rates are unknown to Omen and never invented: counts
+/// are the available cost information. Secrets never appear here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AiProviderEvent {
+    pub provider_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<omen_agent::ProviderUsage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -383,8 +405,18 @@ impl AiLaneDispatcher {
 
             // Invoke provider (wrapped with bounded timeout)
             let result = crate::session::block_on_async(p.respond(request));
+            // Diagnostic event: identity always, usage/latency when the
+            // provider reported them. No secrets flow through here.
+            let identity = p.provider_identity();
             match result {
                 Ok(resp) => {
+                    stats.provider_event = Some(AiProviderEvent {
+                        provider_id: identity.id,
+                        model: identity.model,
+                        reasoning_effort: identity.effort,
+                        latency_ms: resp.latency_ms,
+                        usage: resp.usage.clone(),
+                    });
                     let mut formatted = format!("Agent\n\n{}", resp.message);
                     if !resp.proposed_actions.is_empty() {
                         formatted.push_str("\n\nProposed action:");
@@ -472,6 +504,13 @@ impl AiLaneDispatcher {
                     });
                 }
                 Err(AgentError::Timeout(d)) => {
+                    stats.provider_event = Some(AiProviderEvent {
+                        provider_id: identity.id,
+                        model: identity.model,
+                        reasoning_effort: identity.effort,
+                        latency_ms: None,
+                        usage: None,
+                    });
                     return Ok(AiLaneOutput {
                         configured: false,
                         query: query.to_string(),
@@ -485,6 +524,13 @@ impl AiLaneDispatcher {
                     });
                 }
                 Err(e) => {
+                    stats.provider_event = Some(AiProviderEvent {
+                        provider_id: identity.id,
+                        model: identity.model,
+                        reasoning_effort: identity.effort,
+                        latency_ms: None,
+                        usage: None,
+                    });
                     return Ok(AiLaneOutput {
                         configured: false,
                         query: query.to_string(),

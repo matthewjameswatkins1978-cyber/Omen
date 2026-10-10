@@ -727,6 +727,24 @@ Now you have explicitly entered the AI lane.
 
 Omen does not dump your terminal scrollback into a prompt or ask you to copy-paste error messages. It gathers a strongly typed, bounded `AgentContext` (current directory, git status, last command execution summary, bounded stderr excerpt, and active facts) and queries the configured `AgentProvider`.
 
+#### Reasoning providers
+
+- Default: GPT-6 Luna (`openai-luna`, Medium reasoning effort) whenever
+  `OPENAI_API_KEY` is configured; otherwise the deterministic built-in
+  diagnostic fallback answers and Omen remains fully usable without AI.
+- Switch at the prompt: `:agent providers` lists, `:agent use <id>`
+  selects (diagnostic, Luna when configured, Codex when its binary
+  resolves on PATH).
+- One attempt per query: Omen never retries a billable call itself. A
+  rate limit surfaces with its retry hint; you decide whether to ask again.
+- Bounded by design: bounded context in, small structured response out
+  (800 output tokens); a response cut short by the budget fails closed
+  with its reason instead of trailing off.
+- Each provider round records a diagnostic event (provider id, model,
+  reasoning effort, latency, provider-reported token counts — the
+  available cost information; rates are unknown to Omen). Secrets never
+  appear in outputs, errors, history, or diagnostic bundles.
+
 The presentation format is always clean, structured, and distinct:
 
 ```text

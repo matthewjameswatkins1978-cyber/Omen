@@ -101,6 +101,9 @@ async fn test_agent_lane_im_lost_proof_a() {
                 None,
             )
             .unwrap();
+            // Hermetic: pin the deterministic fallback so ambient
+            // credentials in the dev shell never route tests to the network.
+            session.use_agent_provider("diagnostic").unwrap();
 
             let exit = session.dispatch_input("? I'm lost").unwrap();
             assert!(exit.is_zero(), "AI lane dispatch must return exit code 0");
@@ -184,13 +187,16 @@ async fn test_agent_lane_why_did_that_fail_proof_b() {
             ExecutionHistory::record_execution(&mut db, &exec_fail, &[], &[], &[]).unwrap();
 
             ctx.phase("DISPATCH_WHY_DID_THAT_FAIL");
-            let session = InteractiveSession::new_with_client(
+            let mut session = InteractiveSession::new_with_client(
                 session_id.clone(),
                 ws_path.to_path_buf(),
                 Some(db),
                 None,
             )
             .unwrap();
+            // Hermetic: pin the deterministic fallback so ambient
+            // credentials in the dev shell never route tests to the network.
+            session.use_agent_provider("diagnostic").unwrap();
 
             let out = omen_interactive::ai_lane::AiLaneDispatcher::dispatch_with_session(
                 "why did that fail?",
@@ -284,6 +290,9 @@ async fn test_agent_lane_human_agent_build_proposal_proof_c() {
             .unwrap();
 
             ctx.phase("DISPATCH_BUILD_QUERY_AND_EXECUTE");
+            // Hermetic: pin the deterministic fallback so ambient
+            // credentials in the dev shell never route tests to the network.
+            session.use_agent_provider("diagnostic").unwrap();
             let exit = session
                 .dispatch_input("? check whether this project still builds")
                 .unwrap();
@@ -371,6 +380,9 @@ async fn real_human_agent_action_executes_through_daemon_once() {
             .unwrap();
 
             ctx.phase("DISPATCH_PERMITTED_ACTION");
+            // Hermetic: pin the deterministic fallback so ambient
+            // credentials in the dev shell never route tests to the network.
+            session.use_agent_provider("diagnostic").unwrap();
             let exit = session
                 .dispatch_input("? check whether this project still builds")
                 .unwrap();
@@ -460,6 +472,9 @@ async fn agent_execution_id_matches_history_and_receipt() {
             .unwrap();
 
             ctx.phase("EXECUTE_ACTION");
+            // Hermetic: pin the deterministic fallback so ambient
+            // credentials in the dev shell never route tests to the network.
+            session.use_agent_provider("diagnostic").unwrap();
             let exit = session
                 .dispatch_input("? check whether this project still builds")
                 .unwrap();
@@ -833,13 +848,16 @@ async fn test_agent_lane_ambiguous_directory_navigation() {
             fs::create_dir_all(ws_path.join("tests").join("components")).unwrap();
 
             let session_id = InteractiveSessionId::new("sess-ambig").unwrap();
-            let session = InteractiveSession::new_with_client(
+            let mut session = InteractiveSession::new_with_client(
                 session_id.clone(),
                 ws_path.to_path_buf(),
                 None,
                 None,
             )
             .unwrap();
+            // Hermetic: pin the deterministic fallback so ambient
+            // credentials in the dev shell never route tests to the network.
+            session.use_agent_provider("diagnostic").unwrap();
 
             let out = omen_interactive::ai_lane::AiLaneDispatcher::dispatch_with_session(
                 "switch to components",
@@ -897,6 +915,9 @@ async fn test_agent_lane_unambiguous_directory_navigation_executes() {
             .unwrap();
 
             let initial_cwd = session.cwd.clone();
+            // Hermetic: pin the deterministic fallback so ambient
+            // credentials in the dev shell never route tests to the network.
+            session.use_agent_provider("diagnostic").unwrap();
             let exit = session.dispatch_input("? switch to omen-engine").unwrap();
             assert!(exit.is_zero());
 
@@ -916,6 +937,14 @@ struct MockAgentProvider {
 }
 
 impl omen_agent::AgentProvider for MockAgentProvider {
+    fn provider_identity(&self) -> omen_agent::ProviderIdentity {
+        omen_agent::ProviderIdentity {
+            id: self.id.clone(),
+            model: Some("mock-model".into()),
+            effort: Some("low".into()),
+        }
+    }
+
     fn respond<'a>(
         &'a self,
         _request: omen_agent::AgentRequest,
@@ -935,6 +964,8 @@ impl omen_agent::AgentProvider for MockAgentProvider {
             proposed_actions: self.proposals.clone(),
             references: Vec::new(),
             uncertainty: None,
+            usage: None,
+            latency_ms: None,
         };
         Box::pin(async move { Ok(resp) })
     }
@@ -1234,6 +1265,44 @@ async fn test_hostile_agent_proposal_does_not_execute_in_session() {
                 last_exec.is_none(),
                 "Hostile action must NOT be executed or recorded"
             );
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn provider_round_records_diagnostic_event() {
+    run_with_test_timeout(
+        "provider_round_records_diagnostic_event",
+        UNIT_TIMEOUT,
+        |_ctx| async move {
+            let temp = tempdir().unwrap();
+            let ws_path = temp.path();
+            let session_id = InteractiveSessionId::new("sess-evt-1").unwrap();
+
+            let mock_prov = Arc::new(MockAgentProvider {
+                id: "mock".into(),
+                call_count: std::sync::atomic::AtomicUsize::new(0),
+                response_msg: "reasoned answer".into(),
+                proposals: vec![],
+            });
+
+            let out = omen_interactive::ai_lane::AiLaneDispatcher::dispatch_with_workspace(
+                "? explain why the build failed with exit code 2",
+                &session_id,
+                ws_path,
+                ws_path,
+                None,
+                Some(mock_prov.as_ref()),
+                None,
+            )
+            .unwrap();
+
+            assert_eq!(out.stats.provider_calls, 1);
+            let event = out.stats.provider_event.expect("provider round recorded");
+            assert_eq!(event.provider_id, "mock");
+            assert_eq!(event.model.as_deref(), Some("mock-model"));
+            assert_eq!(event.reasoning_effort.as_deref(), Some("low"));
         },
     )
     .await;

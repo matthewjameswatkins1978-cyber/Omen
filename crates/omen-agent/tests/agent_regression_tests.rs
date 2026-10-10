@@ -390,6 +390,11 @@ fn provider_registry_registers_openai_luna_when_credential_present() {
         );
         assert!(luna.is_available);
 
+        // Configured Luna is the default active provider (Medium effort
+        // preset); the diagnostic fallback stays default only when no
+        // credential is configured.
+        assert_eq!(registry.active_descriptor().id, "openai-luna");
+
         // Status and debug surfaces must never echo the key material.
         registry.set_active_provider("openai-luna").unwrap();
         let status = registry.status_text();

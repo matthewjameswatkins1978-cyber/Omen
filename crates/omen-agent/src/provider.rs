@@ -58,6 +58,39 @@ pub struct AgentRequest {
     pub conversation: Vec<AgentTurn>,
 }
 
+/// Token usage reported by a provider for one response. The only cost
+/// information Omen can state truthfully: token counts as reported.
+/// Rates and currency are unknown to Omen and never invented here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ProviderUsage {
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+}
+
+/// Static provider identity for diagnostic events: who answered, with
+/// which model and reasoning effort. Effort is `None` for providers
+/// without a reasoning-effort concept.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderIdentity {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+impl ProviderIdentity {
+    pub fn unknown() -> Self {
+        Self {
+            id: "unknown".to_string(),
+            model: None,
+            effort: None,
+        }
+    }
+}
+
 /// Structured response returned by an Agent provider.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentResponse {
@@ -66,6 +99,12 @@ pub struct AgentResponse {
     pub proposed_actions: Vec<ProposedAction>,
     pub references: Vec<String>,
     pub uncertainty: Option<String>,
+    /// Token usage as reported by the provider for this response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ProviderUsage>,
+    /// Client-measured round-trip milliseconds for this response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
 }
 
 impl AgentResponse {
@@ -76,6 +115,8 @@ impl AgentResponse {
             proposed_actions: Vec::new(),
             references: Vec::new(),
             uncertainty: None,
+            usage: None,
+            latency_ms: None,
         }
     }
 
@@ -86,6 +127,8 @@ impl AgentResponse {
             proposed_actions: actions,
             references: Vec::new(),
             uncertainty: None,
+            usage: None,
+            latency_ms: None,
         }
     }
 
@@ -96,6 +139,8 @@ impl AgentResponse {
             proposed_actions: Vec::new(),
             references: Vec::new(),
             uncertainty: None,
+            usage: None,
+            latency_ms: None,
         }
     }
 
@@ -106,6 +151,8 @@ impl AgentResponse {
             proposed_actions: Vec::new(),
             references: Vec::new(),
             uncertainty: None,
+            usage: None,
+            latency_ms: None,
         }
     }
 }
@@ -147,6 +194,11 @@ pub trait AgentProvider: Send + Sync {
         &'a self,
         request: AgentRequest,
     ) -> Pin<Box<dyn Future<Output = Result<AgentResponse, AgentError>> + Send + 'a>>;
+    /// Static identity for diagnostic events. Default is unknown: providers
+    /// override with their registry id, model and reasoning effort.
+    fn provider_identity(&self) -> ProviderIdentity {
+        ProviderIdentity::unknown()
+    }
 }
 
 /// Wraps any AgentProvider with an explicit execution ceiling to prevent hangs.
@@ -172,5 +224,9 @@ impl AgentProvider for TimeoutProvider {
                 Err(_) => Err(AgentError::Timeout(self.timeout)),
             }
         })
+    }
+
+    fn provider_identity(&self) -> ProviderIdentity {
+        self.inner.provider_identity()
     }
 }
