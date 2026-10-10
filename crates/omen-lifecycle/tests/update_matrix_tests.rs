@@ -752,6 +752,120 @@ fn older_release_is_never_an_upgrade_candidate() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Install-truth incident regressions (OMEN-INSTALL-TRUTH-01).
+// ---------------------------------------------------------------------------
+
+/// R3: second qualified promotion supersedes the first. A active, B
+/// active afterwards; A demoted to previous (rollback preserved, never
+/// an active alternative); exactly one active slot; pointer truthful.
+#[test]
+fn second_promotion_supersedes_first() {
+    let fx = setup();
+    let mut record = load_record(&fx);
+    for (version, sha) in [
+        (
+            "0.9.0-preview.16",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ),
+        (
+            "0.9.0-preview.17",
+            "cccccccccccccccccccccccccccccccccccccccc",
+        ),
+    ] {
+        let meta = make_release(&fx.source, version, sha, false);
+        let health = StubHealth {
+            ok: true,
+            version: meta.version.clone(),
+            sha: meta.git_sha.clone(),
+        };
+        let tx = update::run_update(
+            &fx.base,
+            &mut record,
+            meta,
+            &ReleaseSource::Directory(fx.source.clone()),
+            &good_hooks(),
+            &health,
+        )
+        .unwrap();
+        assert_eq!(tx.stage, update::TxStage::Activated);
+    }
+    // B active, A demoted to previous, original seed preserved on disk.
+    assert_eq!(record.version, "0.9.0-preview.17");
+    let active = record.active_slot.clone().unwrap();
+    assert!(active.starts_with("0.9.0-preview.17-"));
+    assert!(
+        record
+            .previous_slot
+            .as_deref()
+            .unwrap()
+            .starts_with("0.9.0-preview.16-"),
+        "first promotion demoted to previous, got {:?}",
+        record.previous_slot
+    );
+    let ptr = update::read_active_pointer(&fx.base).unwrap();
+    assert_eq!(ptr.active_slot, active);
+    // Exactly one active pointer; superseded slots remain as rollback
+    // history, never as active alternatives.
+    assert!(
+        fx.base
+            .join("versions")
+            .join(&active)
+            .join(exe_name())
+            .is_file()
+    );
+}
+
+/// R5: a competing lifecycle operation defers safely. With the lifecycle
+/// lock held, promotion refuses with LockUnavailable and changes nothing
+/// (no partial promotion, no record rewrite).
+#[test]
+fn promotion_defers_while_lock_held() {
+    let fx = setup();
+    let _holder = omen_lifecycle::lock::acquire(&fx.base).unwrap();
+    // Baseline AFTER lock scaffolding: the holder's lock file is test
+    // setup, not promotion fallout.
+    let before = walk(&fx.base);
+    let meta = make_release(
+        &fx.source,
+        "0.9.0-preview.16",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        false,
+    );
+    let mut record = load_record(&fx);
+    let health = StubHealth {
+        ok: true,
+        version: meta.version.clone(),
+        sha: meta.git_sha.clone(),
+    };
+    let err = update::run_update(
+        &fx.base,
+        &mut record,
+        meta,
+        &ReleaseSource::Directory(fx.source.clone()),
+        &good_hooks(),
+        &health,
+    )
+    .expect_err("locked promotion must defer, never proceed");
+    assert!(
+        matches!(err, omen_lifecycle::LifecycleError::LockUnavailable(_)),
+        "deferral must name the lock, got: {err:?}"
+    );
+    assert_eq!(record.version, "0.9.0-preview.15", "record untouched");
+    let ptr = update::read_active_pointer(&fx.base).unwrap();
+    assert_eq!(
+        ptr.active_slot, "0.9.0-preview.15-aaaaaaa",
+        "active pointer untouched"
+    );
+    // No new version slots: the only filesystem delta allowed is the
+    // lock-coordination file itself (created by the failed acquire).
+    let mut after = walk(&fx.base);
+    after.retain(|p| !p.ends_with("lifecycle.lock"));
+    let mut before = before;
+    before.retain(|p| !p.ends_with("lifecycle.lock"));
+    assert_eq!(after, before, "no partial promotion artifacts");
+}
+
 fn walk(dir: &Path) -> Vec<String> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];

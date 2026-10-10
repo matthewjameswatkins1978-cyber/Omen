@@ -18,6 +18,7 @@ pub mod health;
 pub mod install;
 pub mod lock;
 pub mod migrate;
+pub mod path_audit;
 pub mod pins;
 pub mod plan;
 pub mod release;
