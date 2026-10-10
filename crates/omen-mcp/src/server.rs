@@ -389,40 +389,21 @@ impl McpServer {
     }
 
     async fn tool_orient(&self) -> CallToolResult {
-        let contract = machine_contract::contract();
         let context = self.machine_context();
-        let groups: Vec<String> = contract
-            .capability_definitions
-            .iter()
-            .map(|definition| definition.group.clone())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        CallToolResult::text(serde_json::to_string_pretty(&json!({
-            "contract_version": machine_contract::CONTRACT_VERSION,
-            "omen_version": env!("CARGO_PKG_VERSION"),
-            "contract_digest": machine_contract::contract_digest(),
-            "context_generation": context.context_generation,
-            "generation_status": context.generation_status,
-            "workspace": {"name": self.workspace_path.file_name().and_then(|s| s.to_str()).unwrap_or("workspace"), "root": "."},
-            "platform": std::env::consts::OS,
-            "backend": "native",
-            "capability_groups": groups,
-            "surfaces": {
-                "cli": "omen command tree (a subset projection)",
-                "mcp": "this server: the complete agent/tool surface",
-                "interactive": "bare omen on a TTY (full shell with :verbs and @references)"
-            },
-            "references": ["@last", "@failed"],
-            "recipes": contract.recipe_definitions.iter().map(|recipe| &recipe.id).collect::<Vec<_>>(),
-            "next": ["capabilities", "history", "describe <capability>", "recipe <recipe>", "context"],
-            "next_actions": [
-                {"operation":"capabilities","cli":"capabilities [group] --machine","mcp_tool":"omen_capabilities","purpose":"select a relevant capability from the compact catalogue"},
-                {"operation":"describe","cli":"describe <capability> --machine","mcp_tool":"omen_describe","purpose":"load one capability's operational schema and constraints"},
-                {"operation":"recipe","cli":"how <recipe> --machine","mcp_tool":"omen_recipe","purpose":"follow a short advisory multi-step path"},
-                {"operation":"context","cli":"context --machine","mcp_tool":"omen_context","purpose":"refresh dynamic workspace/session state"}
-            ]
-        })).unwrap())
+        let ws_name = self
+            .workspace_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("workspace");
+        let doc = machine_contract::orient_document(
+            env!("CARGO_PKG_VERSION"),
+            ws_name,
+            "omen command tree (a subset projection)",
+            "this server: the complete agent/tool surface",
+            "bare omen on a TTY (full shell with :verbs and @references)",
+            &context,
+        );
+        CallToolResult::text(serde_json::to_string_pretty(&doc).unwrap())
     }
 
     async fn tool_capabilities(&self, args: &Value) -> CallToolResult {
@@ -665,6 +646,12 @@ impl McpServer {
         if argv.is_empty() {
             return CallToolResult::error("'argv' cannot be empty");
         }
+        // Wrong-interface refusal (self-teaching): shared shape check
+        // with the CLI — shell syntax pasted as argv refuses before
+        // spawn with the supported alternative.
+        if let Some(refusal) = omen_builtins::exec_syntax_refusal(&argv) {
+            return CallToolResult::error(refusal);
+        }
 
         let tool = args.get("tool").and_then(|v| v.as_str()).unwrap_or("exec");
         let operation = args.get("operation").and_then(|v| v.as_str()).unwrap_or("");
@@ -679,7 +666,7 @@ impl McpServer {
 
         if let Some(ref c) = self.client {
             match c
-                .submit_execution(tool, operation, argv, cwd, timeout_ms)
+                .submit_execution(tool, operation, argv.clone(), cwd, timeout_ms)
                 .await
             {
                 Ok(summary) => {
@@ -695,7 +682,14 @@ impl McpServer {
                     });
                     CallToolResult::text(serde_json::to_string_pretty(&out).unwrap())
                 }
-                Err(e) => CallToolResult::error(format!("Execution broker error: {e}")),
+                Err(e) => {
+                    let mut msg = format!("Execution broker error: {e}");
+                    if let Some(hint) = omen_builtins::spawn_failure_hint(&argv, &e) {
+                        msg.push_str("\nHint: ");
+                        msg.push_str(&hint);
+                    }
+                    CallToolResult::error(msg)
+                }
             }
         } else {
             let supervisor = omen_engine::ProcessSupervisor::new();
@@ -800,7 +794,14 @@ impl McpServer {
                     });
                     CallToolResult::text(serde_json::to_string_pretty(&out).unwrap())
                 }
-                Err(e) => CallToolResult::error(format!("Local execution error: {e}")),
+                Err(e) => {
+                    let mut msg = format!("Local execution error: {e}");
+                    if let Some(hint) = omen_builtins::spawn_failure_hint(&argv, &e) {
+                        msg.push_str("\nHint: ");
+                        msg.push_str(&hint);
+                    }
+                    CallToolResult::error(msg)
+                }
             }
         }
     }

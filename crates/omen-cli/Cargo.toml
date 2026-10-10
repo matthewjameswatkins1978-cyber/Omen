@@ -16,6 +16,7 @@ path = "src/main.rs"
 omen-core = { workspace = true }
 omen-schema = { workspace = true }
 omen-engine = { workspace = true }
+omen-builtins = { workspace = true }
 omen-knowledge = { workspace = true }
 omen-atlas = { workspace = true }
 omen-adapters = { workspace = true }

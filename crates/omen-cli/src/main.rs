@@ -648,31 +648,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect();
-            let doc = serde_json::json!({
-                "contract_version": machine_contract::CONTRACT_VERSION,
-                "omen_version": env!("CARGO_PKG_VERSION"),
-                "contract_digest": digest,
-                "context_generation": machine_context.context_generation,
-                "generation_status": machine_context.generation_status,
-                "workspace": {"name": ws_root.file_name().and_then(|s| s.to_str()).unwrap_or("workspace"), "root": "."},
-                "platform": std::env::consts::OS,
-                "backend": "native",
-                "capability_groups": capability_groups,
-                "surfaces": {
-                    "cli": "this command tree (a subset projection)",
-                    "mcp": "omen mcp --workspace <path> serves the complete agent/tool surface",
-                    "interactive": "bare omen on a TTY (full shell with :verbs and @references)"
-                },
-                "references": ["@last", "@failed"],
-                "recipes": machine_contract::contract().recipe_definitions.iter().map(|recipe| &recipe.id).collect::<Vec<_>>(),
-                "next": ["capabilities", "history", "describe <capability>", "how <recipe>", "context --since <generation>"],
-                "next_actions": [
-                    {"operation":"capabilities","cli":"capabilities [group] --machine","mcp_tool":"omen_capabilities","purpose":"select a relevant capability from the compact catalogue"},
-                    {"operation":"describe","cli":"describe <capability> --machine","mcp_tool":"omen_describe","purpose":"load one capability's operational schema and constraints"},
-                    {"operation":"recipe","cli":"how <recipe> --machine","mcp_tool":"omen_recipe","purpose":"follow a short advisory multi-step path"},
-                    {"operation":"context","cli":"context --machine","mcp_tool":"omen_context","purpose":"refresh dynamic workspace/session state"}
-                ]
-            });
+            let ws_name = ws_root
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("workspace");
+            let doc = machine_contract::orient_document(
+                env!("CARGO_PKG_VERSION"),
+                ws_name,
+                "this command tree (a subset projection)",
+                "omen mcp --workspace <path> serves the complete agent/tool surface",
+                "bare omen on a TTY (full shell with :verbs and @references)",
+                &machine_context,
+            );
             if json_mode {
                 println!("{}", serde_json::to_string_pretty(&doc)?);
             } else {
@@ -811,6 +798,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "Availability: {:?}, Admission: {:?}",
                                 entry.status.availability, entry.status.admission
                             );
+                            let invocation = &entry.definition.invocation;
+                            match (
+                                invocation.cli.as_deref(),
+                                invocation.mcp_tool.as_deref(),
+                                invocation.interactive.as_deref(),
+                            ) {
+                                (None, None, None) => println!(
+                                    "Routes: interactive-shell only — no CLI or MCP route (see summary for the agent equivalent)"
+                                ),
+                                _ => println!(
+                                    "Routes: cli={} mcp={} interactive={}",
+                                    invocation.cli.as_deref().unwrap_or("—"),
+                                    invocation.mcp_tool.as_deref().unwrap_or("—"),
+                                    invocation.interactive.as_deref().unwrap_or("—"),
+                                ),
+                            }
                         }
                     }
                     None => {
@@ -1477,6 +1480,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     std::process::exit(1);
                 }
+                // Wrong-interface refusal (self-teaching): shell syntax
+                // pasted as an argv never names an executable. Refused
+                // before spawn with the supported alternative — no new
+                // parser, no behavior change to plain argvs.
+                if let Some(refusal) = omen_builtins::exec_syntax_refusal(&exec_args.argv) {
+                    if json_mode {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&OmenError::from_code(
+                                ErrorCode::Refusal,
+                                refusal
+                            ))?
+                        );
+                    } else {
+                        eprintln!("Error: {refusal}");
+                    }
+                    std::process::exit(2);
+                }
 
                 let command = exec_args.argv.clone();
                 // Human one-shot execution inherits the caller's stdin so
@@ -1504,7 +1525,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     secrets: vec![],
                 };
 
-                let output = supervisor.execute(req).await?;
+                let output = supervisor.execute(req).await.map_err(|error| {
+                    // Self-teaching on spawn failure: when the missing
+                    // program is also an interactive builtin, say so — exec
+                    // never routes builtins. Success paths untouched.
+                    if let Some(hint) = omen_builtins::spawn_failure_hint(&command, &error) {
+                        CoreError::ExecutionFailed(format!("{error}\nHint: {hint}"))
+                    } else {
+                        error
+                    }
+                })?;
                 let execution_id = omen_core::ExecutionId::generate();
                 let stdout_artifact = cas.store(
                     &mut db,

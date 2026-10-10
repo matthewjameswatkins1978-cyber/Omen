@@ -56,3 +56,58 @@ fn orient_digest_match_is_a_bounded_no_delta_response() {
         serde_json::json!({"changed": false, "contract_digest": digest})
     );
 }
+
+#[test]
+fn orient_carries_agent_guidance_and_shell_truth() {
+    let value = run(&["orient", "--machine"]);
+    let guidance = value["guidance"].as_array().expect("guidance array");
+    assert!(!guidance.is_empty());
+    let text = serde_json::to_string(guidance).unwrap();
+    assert!(
+        text.contains("typed routes"),
+        "guidance prefers typed routes"
+    );
+    assert!(
+        text.contains("ONE external argv"),
+        "guidance states single-argv"
+    );
+    // shell.pipeline describe: no machine route, and the summary says so.
+    let described = run(&["describe", "shell.pipeline", "--machine"]);
+    let invocation = &described["definition"]["invocation"];
+    assert_eq!(invocation["cli"], serde_json::Value::Null);
+    assert_eq!(invocation["mcp_tool"], serde_json::Value::Null);
+    assert_eq!(invocation["interactive"], serde_json::Value::Null);
+    assert!(
+        described["definition"]["summary"]
+            .as_str()
+            .unwrap()
+            .starts_with("Interactive-shell"),
+        "summary states its surface truth"
+    );
+}
+
+#[test]
+fn exec_refuses_pasted_shell_syntax_with_refusal_code() {
+    let workspace = tempdir().expect("temporary workspace");
+    for argv in [["git --version | sort"], [":history"]] {
+        let mut args = vec!["exec", "--machine", "--workspace"];
+        let dir = workspace.path().to_string_lossy().to_string();
+        args.push(&dir);
+        args.push("--");
+        args.extend(argv);
+        let output = Command::new(env!("CARGO_BIN_EXE_omen"))
+            .args(&args)
+            .output()
+            .expect("run omen exec refusal");
+        assert_eq!(output.status.code(), Some(2), "refusal exit code");
+        let body: Value = serde_json::from_slice(&output.stdout).expect("refusal is JSON");
+        assert_eq!(body["code"], "REFUSAL");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("one external argv"),
+            "refusal names the supported alternative"
+        );
+    }
+}

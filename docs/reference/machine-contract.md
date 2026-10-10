@@ -28,6 +28,24 @@ Changing live status must not redefine the static contract.
     omen --machine how <recipe>
     omen --machine context --since <generation>
 
+`orient` also carries a `guidance` array: prefer advertised typed routes
+over imitated shell keystrokes. The CLI `orient` command and the MCP
+`omen_orient` tool render the same document from one shared builder.
+
+## Surfaces and invocation
+
+Every capability carries an `invocation` routing (`cli`, `mcp_tool`,
+`interactive`); `None` means that surface cannot invoke it directly.
+`describe` (human and machine) shows the actual routes.
+
+- `execution.run` is the only machine execution route, and it runs ONE
+external argv: no shell syntax, no interactive builtins, no `:verbs`.
+- `shell.pipeline`, `shell.redirect`, `shell.job`, `shell.builtin` are
+interactive-shell syntax only (all three routes `None`); their summaries
+state the agent equivalent (client-side composition via `execution.run`).
+- `filesystem.read` / `filesystem.write` have no machine route: agents
+inspect files with their own tools; writes stay under Tethers authority.
+
 ## Contract digest
 
 The digest fingerprints static semantics.
