@@ -420,6 +420,55 @@ fn provider_registry_omits_openai_luna_without_credential() {
 }
 
 #[test]
+fn provider_registry_sonnet_present_but_never_default() {
+    struct AnthropicGuard {
+        previous: Option<String>,
+    }
+    impl Drop for AnthropicGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(v) => std::env::set_var("ANTHROPIC_API_KEY", v),
+                    None => std::env::remove_var("ANTHROPIC_API_KEY"),
+                }
+            }
+        }
+    }
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let previous = std::env::var("ANTHROPIC_API_KEY").ok();
+    let _guard = AnthropicGuard { previous };
+    unsafe { std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-synthetic-not-real") };
+    let registry = ProviderRegistry::new();
+    let sonnet = registry
+        .list_providers()
+        .into_iter()
+        .find(|p| p.id == "anthropic-sonnet")
+        .expect("anthropic-sonnet listed when ANTHROPIC_API_KEY is set");
+    assert_eq!(sonnet.model.as_deref(), Some("claude-sonnet-5-5"));
+    assert_eq!(
+        sonnet.credential_source.as_deref(),
+        Some("environment:ANTHROPIC_API_KEY")
+    );
+    assert!(sonnet.is_available);
+    assert_ne!(
+        registry.active_descriptor().id,
+        "anthropic-sonnet",
+        "Claude stays inactive until explicitly selected"
+    );
+    let status = registry.status_text();
+    assert!(!status.contains("sk-ant-synthetic-not-real"));
+    unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
+    let registry = ProviderRegistry::new();
+    assert!(
+        !registry
+            .list_providers()
+            .iter()
+            .any(|p| p.id == "anthropic-sonnet"),
+        "no credential means no listing and no spend surface"
+    );
+}
+
+#[test]
 fn provider_failure_is_translated_to_omen_error() {
     let auth_err = AgentError::AuthenticationRequired {
         provider: "anthropic".into(),

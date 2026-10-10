@@ -1,3 +1,7 @@
+use crate::anthropic::{
+    ANTHROPIC_SONNET_PROVIDER_ID, anthropic_api_key_from_env, anthropic_sonnet_descriptor,
+    anthropic_sonnet_provider,
+};
 use crate::codex::{
     CODEX_PROVIDER_ID, CodexAdapter, CodexRouteConfig, codex_descriptor, resolve_codex_exe,
 };
@@ -123,6 +127,20 @@ impl ProviderRegistry {
                 Arc::new(TimeoutProvider::new(Arc::new(luna), DEFAULT_AGENT_TIMEOUT));
             map.insert(OPENAI_LUNA_ID.into(), (desc, luna_provider));
             active_id = OPENAI_LUNA_ID.to_string();
+        }
+
+        // Register the Sonnet preset whenever its credential is locally
+        // configured. Presence-gated like Luna, but NEVER the default:
+        // Claude stays inactive until explicitly selected (`:agent use
+        // anthropic-sonnet`). No credential, no listing, no spend.
+        if anthropic_api_key_from_env().is_some() {
+            let sonnet = anthropic_sonnet_provider();
+            let desc = anthropic_sonnet_descriptor(sonnet.model(), true);
+            let sonnet_provider: Arc<dyn AgentProvider> = Arc::new(TimeoutProvider::new(
+                Arc::new(sonnet),
+                DEFAULT_AGENT_TIMEOUT,
+            ));
+            map.insert(ANTHROPIC_SONNET_PROVIDER_ID.into(), (desc, sonnet_provider));
         }
 
         // Register the Codex external reference route whenever its binary is

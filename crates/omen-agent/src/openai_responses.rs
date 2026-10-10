@@ -883,7 +883,11 @@ fn malformed_action(message: &str) -> OpenAiFailure {
     }
 }
 
-fn map_wire_to_agent_response(wire: WireAgentResponse) -> Result<AgentResponse, OpenAiFailure> {
+/// Shared with the Anthropic adapter: validated wire payloads map through
+/// one function so both transports admit exactly the same shapes.
+pub(crate) fn map_wire_to_agent_response(
+    wire: WireAgentResponse,
+) -> Result<AgentResponse, OpenAiFailure> {
     let kind = map_kind(&wire.kind)?;
 
     if wire.proposed_actions.len() > MAX_ACTIONS {

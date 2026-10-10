@@ -5,6 +5,7 @@
 
 pub mod adapter_provider;
 pub mod adapter_spawn;
+pub mod anthropic;
 pub mod canary;
 pub mod codex;
 pub mod conformance;
@@ -17,6 +18,7 @@ pub mod registry;
 
 pub use adapter_provider::*;
 pub use adapter_spawn::*;
+pub use anthropic::*;
 pub use canary::*;
 pub use codex::*;
 pub use conformance::*;
