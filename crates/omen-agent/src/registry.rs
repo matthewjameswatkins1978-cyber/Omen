@@ -111,18 +111,27 @@ impl ProviderRegistry {
         ));
         map.insert("diagnostic".into(), (diag_desc, diag_provider));
 
-        // Register the Luna preset whenever a credential is locally configured.
-        // Credential presence means "configured enough to attempt use"; it does
-        // not prove remote key validity, model entitlement, or network reach.
-        // Runtime HTTP truth remains authoritative for those outcomes.
-        // The key itself is never stored on the descriptor.
+        // Register the Luna preset whenever a credential is resolvable
+        // through the chain (environment first, OS keyring second).
+        // Chain failures (no OS backend here) mean absent, never fatal.
+        // The key itself is never stored on the descriptor — only the
+        // source label that provided it.
         // When Luna is configured it becomes the default active provider
         // (Medium reasoning effort preset); otherwise the deterministic
         // diagnostic fallback stays active so Omen remains usable without AI.
         let mut active_id = "diagnostic".to_string();
-        if openai_api_key_from_env().is_some() {
-            let luna = openai_luna_provider();
-            let desc = openai_luna_descriptor(luna.model(), true);
+        if let Some((key, source)) = crate::credentials::CredentialChain::standard()
+            .get_with_source(OPENAI_LUNA_ID)
+            .ok()
+            .flatten()
+        {
+            let luna = OpenAiResponsesProvider::with_config(
+                openai_luna_config(),
+                Some(key),
+                OPENAI_LUNA_PROVIDER_ID.to_string(),
+            );
+            let mut desc = openai_luna_descriptor(luna.model(), true);
+            desc.credential_source = Some(source);
             let luna_provider: Arc<dyn AgentProvider> =
                 Arc::new(TimeoutProvider::new(Arc::new(luna), DEFAULT_AGENT_TIMEOUT));
             map.insert(OPENAI_LUNA_ID.into(), (desc, luna_provider));
