@@ -281,11 +281,33 @@ where
     pub say: S,
 }
 
-/// Offer Luna key setup once: no-op when a credential already resolves
-/// through `chain` (never re-asks). Otherwise asks, reads one masked
-/// secret, and stores it in `store`. Every path speaks its outcome;
-/// setup itself never fails the caller.
-pub fn offer_luna_setup_with<A, R, S>(
+/// Production Luna offer: standard chain (environment, then OS keyring).
+/// Other providers reuse [`offer_provider_setup`] with their own id and
+/// display name.
+///
+/// Production offer: standard chain (environment, then OS keyring).
+pub fn offer_luna_setup<A, R, S>(io: &SetupIo<A, R, S>, store: &dyn CredentialStore)
+where
+    A: Fn(&str) -> bool,
+    R: Fn() -> Option<String>,
+    S: Fn(&str),
+{
+    offer_provider_setup(
+        "GPT-6 Luna",
+        LUNA_PROVIDER_ID,
+        io,
+        store,
+        &CredentialChain::standard(),
+    );
+}
+
+/// Provider-generic setup offer: the same workflow for Luna, Sonnet, and
+/// any future provider (MiMo, DeepSeek, Gemini): never re-asks when the
+/// chain already resolves, otherwise asks, reads one masked secret, and
+/// stores it. `display_name` is the human provider name for messages.
+pub fn offer_provider_setup<A, R, S>(
+    display_name: &str,
+    provider_id: &str,
     io: &SetupIo<A, R, S>,
     store: &dyn CredentialStore,
     chain: &CredentialChain,
@@ -294,20 +316,38 @@ pub fn offer_luna_setup_with<A, R, S>(
     R: Fn() -> Option<String>,
     S: Fn(&str),
 {
-    if chain.get(LUNA_PROVIDER_ID).ok().flatten().is_some() {
+    offer_provider_setup_with(display_name, provider_id, io, store, chain);
+}
+
+fn offer_provider_setup_with<A, R, S>(
+    display_name: &str,
+    provider_id: &str,
+    io: &SetupIo<A, R, S>,
+    store: &dyn CredentialStore,
+    chain: &CredentialChain,
+) where
+    A: Fn(&str) -> bool,
+    R: Fn() -> Option<String>,
+    S: Fn(&str),
+{
+    if chain.get(provider_id).ok().flatten().is_some() {
         return;
     }
-    (io.say)("GPT-6 Luna is the default reasoning provider when a key is configured.");
+    (io.say)(&format!(
+        "{display_name} is available when a key is configured."
+    ));
     let outcome = run_key_setup(
-        LUNA_PROVIDER_ID,
-        (io.ask_yes_no)("Configure Luna now? The key stays in your OS credential store"),
+        provider_id,
+        (io.ask_yes_no)(&format!(
+            "Configure {display_name} now? The key stays in your OS credential store"
+        )),
         || (io.read_secret)(),
         store,
     );
     match outcome {
         KeySetupOutcome::Stored { source } => {
             (io.say)(&format!(
-                "[ok] Luna key stored ({source}). Verify with any `?` question."
+                "[ok] {display_name} key stored ({source}). Verify with any `?` question."
             ));
         }
         KeySetupOutcome::Skipped => {
@@ -315,20 +355,10 @@ pub fn offer_luna_setup_with<A, R, S>(
         }
         KeySetupOutcome::Failed { reason } => {
             (io.say)(&format!(
-                "[warn] Luna key not stored ({reason}). Deterministic fallback stays active."
+                "[warn] {display_name} key not stored ({reason}). Deterministic fallback stays active."
             ));
         }
     }
-}
-
-/// Production offer: standard chain (environment, then OS keyring).
-pub fn offer_luna_setup<A, R, S>(io: &SetupIo<A, R, S>, store: &dyn CredentialStore)
-where
-    A: Fn(&str) -> bool,
-    R: Fn() -> Option<String>,
-    S: Fn(&str),
-{
-    offer_luna_setup_with(io, store, &CredentialChain::standard());
 }
 
 /// Process-wide last-known-good source labels (for descriptors built
@@ -456,13 +486,13 @@ mod tests {
             read_secret: || Some("sk-offer-key-value".into()),
             say: |line| said.lock().unwrap().push(line.to_string()),
         };
-        offer_luna_setup_with(&io, &shared, &chain);
+        offer_provider_setup("GPT-6 Luna", LUNA_PROVIDER_ID, &io, &shared, &chain);
         assert_eq!(
             shared.get(LUNA_PROVIDER_ID).unwrap().as_deref(),
             Some("sk-offer-key-value")
         );
         let transcript = said.lock().unwrap().join("\n");
-        assert!(transcript.contains("[ok] Luna key stored"));
+        assert!(transcript.contains("[ok] GPT-6 Luna key stored"));
         // Second offer: credential now resolves through the chain, so the
         // flow stays silent (never re-asks).
         said.lock().unwrap().clear();
@@ -471,8 +501,28 @@ mod tests {
             read_secret: || panic!("must not read when configured"),
             say: |line| said.lock().unwrap().push(line.to_string()),
         };
-        offer_luna_setup_with(&io, &shared, &chain);
+        offer_provider_setup("GPT-6 Luna", LUNA_PROVIDER_ID, &io, &shared, &chain);
         assert!(said.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn same_workflow_serves_other_providers() {
+        use std::sync::Mutex;
+        let said: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let shared = MemoryCredentialStore::new();
+        let chain = CredentialChain::new(vec![Box::new(shared.clone())]);
+        let io = SetupIo {
+            ask_yes_no: |_| true,
+            read_secret: || Some("sk-ant-offer-key".into()),
+            say: |line| said.lock().unwrap().push(line.to_string()),
+        };
+        offer_provider_setup("Claude Sonnet", SONNET_PROVIDER_ID, &io, &shared, &chain);
+        assert_eq!(
+            shared.get(SONNET_PROVIDER_ID).unwrap().as_deref(),
+            Some("sk-ant-offer-key")
+        );
+        let transcript = said.lock().unwrap().join("\n");
+        assert!(transcript.contains("[ok] Claude Sonnet key stored"));
     }
 
     #[test]
