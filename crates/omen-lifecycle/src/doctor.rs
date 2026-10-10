@@ -101,6 +101,54 @@ fn unknown(id: &str, summary: &str) -> Finding {
     }
 }
 
+/// First 7 hex chars for human-readable identity details; full values
+/// stay in the underlying records, never truncated there.
+fn short_sha(sha: &str) -> &str {
+    sha.get(..7).unwrap_or(sha)
+}
+
+/// Conveyor `state/installed.json` active identity, when present.
+enum ConveyorActive {
+    Absent,
+    Present { version: String, git_sha: String },
+    Unreadable(String),
+}
+
+fn read_conveyor_active(base: &std::path::Path) -> ConveyorActive {
+    let path = base.join("state").join("installed.json");
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ConveyorActive::Absent,
+        Err(e) => return ConveyorActive::Unreadable(e.to_string()),
+    };
+    let state: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => return ConveyorActive::Unreadable(e.to_string()),
+    };
+    let Some(active) = state.get("active") else {
+        return ConveyorActive::Unreadable("conveyor state has no active entry".to_string());
+    };
+    if active.is_null() {
+        return ConveyorActive::Absent;
+    }
+    let version = active
+        .get("preview_version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let git_sha = active
+        .get("git_sha")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if version.is_empty() || git_sha.is_empty() {
+        return ConveyorActive::Unreadable(
+            "conveyor active entry lacks version identity".to_string(),
+        );
+    }
+    ConveyorActive::Present { version, git_sha }
+}
+
 /// Run all observational checks. Pure reads + bounded probes only.
 pub fn run_doctor(input: &DoctorInput) -> DoctorReport {
     let base = &input.base;
@@ -144,6 +192,32 @@ pub fn run_doctor(input: &DoctorInput) -> DoctorReport {
                 ));
                 let _ = detected;
             }
+            // Installation truth: the running binary's embedded identity
+            // must agree with the record it runs against. A manual
+            // overlay or dev binary over a recorded install disagrees
+            // here; doctor flags it observationally and never rewrites.
+            if record.version == input.version && record.git_sha == input.git_sha {
+                findings.push(ok(
+                    "install.identity",
+                    &format!(
+                        "running binary matches install record {} {}",
+                        record.version,
+                        short_sha(&record.git_sha),
+                    ),
+                ));
+            } else {
+                findings.push(warn(
+                    "install.identity",
+                    "running binary identity differs from install record",
+                    &format!(
+                        "binary {} {} vs record {} {}; manual overlay or dev binary over a recorded install — record left untouched",
+                        input.version,
+                        short_sha(&input.git_sha),
+                        record.version,
+                        short_sha(&record.git_sha),
+                    ),
+                ));
+            }
         }
         Ok(None) => findings.push(unknown(
             "install.record",
@@ -159,6 +233,44 @@ pub fn run_doctor(input: &DoctorInput) -> DoctorReport {
         "install.channel",
         &format!("channel: {:?}", crate::install::user_channel(base)),
     ));
+    // Conveyor truth: a preview-conveyor installed.json names the
+    // installer-placed binary. When the running binary disagrees, the
+    // install is manual/dev run against (or over) a conveyor install —
+    // explicit, observational, never rewritten.
+    match read_conveyor_active(base) {
+        ConveyorActive::Absent => {}
+        ConveyorActive::Present { version, git_sha } => {
+            if version == input.version && git_sha == input.git_sha {
+                findings.push(ok(
+                    "install.conveyor_identity",
+                    &format!(
+                        "running binary matches conveyor install {} {}",
+                        version,
+                        short_sha(&git_sha),
+                    ),
+                ));
+            } else {
+                findings.push(warn(
+                    "install.conveyor_identity",
+                    "running binary is not the conveyor-installed binary",
+                    &format!(
+                        "binary {} {} vs conveyor {} {}; manual or development binary — conveyor state left untouched",
+                        input.version,
+                        short_sha(&input.git_sha),
+                        version,
+                        short_sha(&git_sha),
+                    ),
+                ));
+            }
+        }
+        ConveyorActive::Unreadable(detail) => {
+            findings.push(warn(
+                "install.conveyor_identity",
+                "conveyor state unreadable",
+                &detail,
+            ));
+        }
+    }
 
     // Active slot.
     match crate::update::read_active_pointer(base) {
