@@ -263,6 +263,62 @@ fn synthetic_secrets_never_leak() {
     }
 }
 
+/// Antigravity dogfood B: when the executing binary's embedded identity
+/// disagrees with the install record, doctor must say so loudly — not
+/// report both side by side with no verdict.
+#[test]
+fn doctor_flags_binary_record_identity_mismatch() {
+    let (_tmp, base) = base_fixture();
+    let record = InstallRecord::new(
+        Ownership::Omen,
+        Channel::Preview,
+        "0.9.0-preview.15",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    omen_lifecycle::install::save_install_record(&base, &record).unwrap();
+    let exe = base.join(exe_name());
+    std::fs::write(&exe, b"bin").unwrap();
+    // Embedded identity (0.9.0-preview.16 / deadbeef) != record (15 / aaaa).
+    let report = doctor::run_doctor(&input(&base, &exe));
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.id == "install.identity")
+        .expect("install.identity finding present");
+    assert_eq!(finding.status, omen_lifecycle::doctor::Status::Warn);
+}
+
+/// Antigravity dogfood B (conveyor side): a conveyor installed.json whose
+/// active identity disagrees with the running binary must be flagged, so a
+/// dev/manual binary run against a conveyor install is explicit.
+#[test]
+fn doctor_flags_conveyor_identity_mismatch() {
+    let (_tmp, base) = base_fixture();
+    let exe = base.join(exe_name());
+    std::fs::write(&exe, b"bin").unwrap();
+    std::fs::create_dir_all(base.join("state")).unwrap();
+    std::fs::write(
+        base.join("state").join("installed.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "active_slot": "0.9.0-preview.21-ccccccc",
+            "active": {
+                "provenance": "omen-preview-conveyor",
+                "preview_version": "0.9.0-preview.21",
+                "git_sha": "cccccccccccccccccccccccccccccccccccccccc",
+            },
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let report = doctor::run_doctor(&input(&base, &exe));
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.id == "install.conveyor_identity")
+        .expect("install.conveyor_identity finding present");
+    assert_eq!(finding.status, omen_lifecycle::doctor::Status::Warn);
+}
+
 fn walk(dir: &std::path::Path) -> Vec<String> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
