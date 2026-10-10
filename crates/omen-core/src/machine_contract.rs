@@ -355,7 +355,7 @@ pub fn contract() -> MachineContract {
             id: "execution.run".into(),
             invocation: invocation_for("execution.run"),
             group: "execution".into(),
-            summary: "Run an explicitly supplied argv under an execution contract; Omen mints the physical execution_id.".into(),
+            summary: "Run one explicitly supplied external argv under an execution contract; Omen mints the physical execution_id. Single argv only: no shell syntax (no `|`, `<`, `>`, `&&`), no interactive builtins, no `:verbs`.".into(),
             input_schema: object_schema(
                 json!({"argv":{"type":"array","minItems":1,"maxItems":64,"items":{"type":"string"}}}),
                 &["argv"],
@@ -485,7 +485,7 @@ pub fn contract() -> MachineContract {
             id: "shell.pipeline".into(),
             invocation: invocation_for("shell.pipeline"),
             group: "composition".into(),
-            summary: "Compose commands with `|` (plus `&&` / `||`): bytes flow unchanged between stages; all-builtin chains run in-process, external stages spawn real tools.".into(),
+            summary: "Interactive-shell syntax only: no CLI or MCP route. Compose commands with `|` (plus `&&` / `||`): bytes flow unchanged between stages; all-builtin chains run in-process, external stages spawn real tools. Agents: run each stage with execution.run (`exec --machine -- <argv>` / `omen_execute`) and compose the bytes client-side.".into(),
             input_schema: object_schema(
                 json!({"pipeline":{"type":"string","minLength":1}}),
                 &["pipeline"],
@@ -504,7 +504,7 @@ pub fn contract() -> MachineContract {
             id: "shell.redirect".into(),
             invocation: invocation_for("shell.redirect"),
             group: "composition".into(),
-            summary: "`<` feeds a file as input. `>` / `>>` refuse closed until host-filesystem authority is admitted (no half-writes, ever).".into(),
+            summary: "Interactive-shell syntax only: no CLI or MCP route. `<` feeds a file as input. `>` / `>>` refuse closed until host-filesystem authority is admitted (no half-writes, ever). Agents: pass file bytes via execution.run stages composed client-side.".into(),
             input_schema: object_schema(
                 json!({"redirect":{"type":"string","minLength":1}}),
                 &["redirect"],
@@ -523,7 +523,7 @@ pub fn contract() -> MachineContract {
             id: "shell.job".into(),
             invocation: invocation_for("shell.job"),
             group: "execution".into(),
-            summary: "Run work in the background with `&`; list with `jobs`, stop with `stop <id>`; finished jobs keep a bounded output preview.".into(),
+            summary: "Interactive-shell syntax only: no CLI or MCP route. Run work in the background with `&`; list with `jobs`, stop with `stop <id>`; finished jobs keep a bounded output preview. Agents: track long work with execution.cancel (`cancel <execution-id>` / `omen_cancel_execution`) instead.".into(),
             input_schema: object_schema(
                 json!({"command":{"type":"string","minLength":1}}),
                 &["command"],
@@ -542,7 +542,7 @@ pub fn contract() -> MachineContract {
             id: "shell.builtin".into(),
             invocation: invocation_for("shell.builtin"),
             group: "composition".into(),
-            summary: "Read-only native commands (cat/grep/sort/ls/find/which/…): same trust class as reads; `help <name>` documents each; unknown options fail loudly.".into(),
+            summary: "Interactive-shell builtins only: no CLI or MCP route. Read-only native commands (cat/grep/sort/ls/find/which/…): same trust class as reads; `help <name>` documents each; unknown options fail loudly. Agents: invoke external equivalents with execution.run; there is no machine file-read route — inspect files with your own tools.".into(),
             input_schema: object_schema(
                 json!({"command":{"type":"string","minLength":1}}),
                 &["command"],
@@ -566,12 +566,12 @@ pub fn contract() -> MachineContract {
                 RecipeStep {
                     capability_id: "filesystem.read".into(),
                     invocation: invocation_for("filesystem.read"),
-                    purpose: "inspect @failed or its bounded artifact reference".into(),
+                    purpose: "read the failure evidence with your own file tools (no Omen file-read route), or through a bounded artifact reference (`artifact read`) when you hold one".into(),
                 },
                 RecipeStep {
                     capability_id: "semantic.diagnostics".into(),
                     invocation: invocation_for("semantic.diagnostics"),
-                    purpose: "resolve deterministic diagnostics when available".into(),
+                    purpose: "resolve deterministic diagnostics when available (no direct route): run the project's own checks via `execution.run`, or check tool health via `tool validate`".into(),
                 },
                 RecipeStep {
                     capability_id: "semantic.definition".into(),
@@ -776,6 +776,65 @@ pub fn catalogue(
         .collect()
 }
 
+/// Static deterministic agent guidance for orientation: prefer advertised
+/// typed routes over imitated shell keystrokes. Part of the discovery
+/// surface (not the versioned contract): clients must not pin its text,
+/// only its presence.
+pub const ORIENT_GUIDANCE: &[&str] = &[
+    "Prefer the advertised typed routes (each capability's `invocation`: CLI spelling / MCP tool) over imitating human shell keystrokes.",
+    "`exec --machine -- <argv>` / `omen_execute` runs ONE external argv: no `|`, `<`, `>`, `&&`, no interactive builtins (cat/ls/grep/...), no `:verbs`. Run stages separately and compose the bytes client-side.",
+    "Capabilities with all-null `invocation` have no machine route: `shell.*` is interactive-shell syntax (bare `omen` on a TTY); file reads have no Omen route -- inspect files with your own tools.",
+    "Mutations stay fail-closed without Tethers admission; `describe` shows each capability's authority, availability and limits before you act.",
+];
+
+/// Shared orientation document builder: the CLI `orient` command and the
+/// MCP `omen_orient` tool render the same discovery surface from this one
+/// source. Per-surface prose differs only in the caller-supplied surface
+/// descriptions; shape and guidance are identical.
+pub fn orient_document(
+    omen_version: &str,
+    workspace_name: &str,
+    cli_surface: &str,
+    mcp_surface: &str,
+    interactive_surface: &str,
+    context: &MachineContext,
+) -> Value {
+    let contract = contract();
+    let capability_groups: Vec<String> = contract
+        .capability_definitions
+        .iter()
+        .map(|definition| definition.group.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    json!({
+        "contract_version": CONTRACT_VERSION,
+        "omen_version": omen_version,
+        "contract_digest": contract_digest(),
+        "context_generation": context.context_generation,
+        "generation_status": context.generation_status,
+        "workspace": {"name": workspace_name, "root": "."},
+        "platform": std::env::consts::OS,
+        "backend": "native",
+        "capability_groups": capability_groups,
+        "surfaces": {
+            "cli": cli_surface,
+            "mcp": mcp_surface,
+            "interactive": interactive_surface
+        },
+        "guidance": ORIENT_GUIDANCE,
+        "references": ["@last", "@failed"],
+        "recipes": contract.recipe_definitions.iter().map(|recipe| &recipe.id).collect::<Vec<_>>(),
+        "next": ["capabilities", "history", "describe <capability>", "how <recipe>", "context --since <generation>"],
+        "next_actions": [
+            {"operation":"capabilities","cli":"capabilities [group] --machine","mcp_tool":"omen_capabilities","purpose":"select a relevant capability from the compact catalogue"},
+            {"operation":"describe","cli":"describe <capability> --machine","mcp_tool":"omen_describe","purpose":"load one capability's operational schema and constraints"},
+            {"operation":"recipe","cli":"how <recipe> --machine","mcp_tool":"omen_recipe","purpose":"follow a short advisory multi-step path"},
+            {"operation":"context","cli":"context --machine","mcp_tool":"omen_context","purpose":"refresh dynamic workspace/session state"}
+        ]
+    })
+}
+
 pub fn canonical_json<T: Serialize>(value: &T) -> String {
     serde_json::to_string(value).expect("machine contract is serializable")
 }
@@ -905,5 +964,26 @@ mod tests {
         assert_eq!(unknown.cli, None);
         assert_eq!(unknown.mcp_tool, None);
         assert_eq!(unknown.interactive, None);
+        // Interactive-only shell capabilities advertise no machine route
+        // AND say so in their summaries (self-teaching: an agent must be
+        // able to tell without guessing from all-None alone).
+        for id in [
+            "shell.pipeline",
+            "shell.redirect",
+            "shell.job",
+            "shell.builtin",
+        ] {
+            let routed = invocation_for(id);
+            assert_eq!(routed.cli, None, "{id}");
+            assert_eq!(routed.mcp_tool, None, "{id}");
+            assert_eq!(routed.interactive, None, "{id}");
+            let def = capability(id).expect("shell capability defined");
+            assert!(
+                def.summary.contains("no CLI or MCP route")
+                    || def.summary.contains("no CLI/MCP route")
+                    || def.summary.starts_with("Interactive-shell"),
+                "{id} summary states its surface truth"
+            );
+        }
     }
 }

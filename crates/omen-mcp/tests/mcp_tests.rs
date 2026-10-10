@@ -513,6 +513,31 @@ async fn test_mcp_execution_result_preserves_nonzero_and_spawn_failure_identity(
     assert!(failed.content[0].text.contains("Local execution error"));
 }
 
+#[tokio::test]
+async fn test_mcp_execute_refuses_shell_syntax_with_alternative() {
+    let temp = tempdir().unwrap();
+    let server = McpServer::new(temp.path().to_path_buf(), None);
+    let cwd = temp.path().to_string_lossy().to_string();
+    let response = server
+        .handle_request(JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(93)),
+            method: "tools/call".into(),
+            params: Some(json!({
+                "name": "omen_execute",
+                "arguments": {"argv": ["git --version | sort"], "cwd": cwd}
+            })),
+        })
+        .await;
+    let result = serde_json::from_value::<CallToolResult>(response.result.unwrap()).unwrap();
+    assert_eq!(result.is_error, Some(true));
+    assert!(
+        result.content[0].text.contains("one external argv"),
+        "refusal names the supported alternative: {}",
+        result.content[0].text
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_persistent_notification_does_not_emit_response() {
     run_with_test_timeout(

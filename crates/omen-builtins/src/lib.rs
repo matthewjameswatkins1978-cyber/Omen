@@ -127,6 +127,70 @@ pub fn is_builtin(name: &str) -> bool {
     BUILTIN_NAMES.contains(&name)
 }
 
+/// Post-failure hint: when spawning `argv[0]` fails at spawn phase and
+/// that name is also an Omen interactive builtin, explain that exec
+/// looked for an EXTERNAL program and never routes builtins. Call sites
+/// append this to the surfaced error; success paths are untouched, so an
+/// external program legitimately shadowing a builtin name keeps working.
+pub fn spawn_failure_hint(argv: &[String], error: &impl std::fmt::Display) -> Option<String> {
+    let first = argv.first()?;
+    if !error.to_string().contains("Process spawn failed for") {
+        return None;
+    }
+    if is_builtin(first) {
+        Some(format!(
+            "`{first}` is also an Omen interactive-shell builtin, which exec never routes: this spawn looked for an EXTERNAL `{first}` on PATH and found none. Run it at the interactive prompt (bare `omen` on a TTY), or invoke the external equivalent."
+        ))
+    } else {
+        None
+    }
+}
+/// Wrong-interface diagnosis for non-interactive execution (`exec -- <argv>`
+/// / `omen_execute`): those run ONE external argv with no shell syntax.
+/// Returns a refusal message naming the supported alternative when `argv`
+/// provably carries interactive-shell syntax; `None` when `argv` is shaped
+/// like a plain argv (the spawn itself may still fail, which surfaces
+/// normally). Pure string shapes only: no process, no filesystem, no new
+/// authority. Builtin names alone do NOT refuse — an external program may
+/// legitimately shadow them (e.g. `/bin/echo`); that case is taught by the
+/// contract text, not by refusal.
+pub fn exec_syntax_refusal(argv: &[String]) -> Option<String> {
+    const OPERATORS: &[&str] = &["|", ">", "<", ">>", "<<", "&&", "||"];
+    let first = argv.first()?;
+    if first.starts_with(':') {
+        return Some(format!(
+            "`{first}` is an interactive-shell verb, not an executable: exec runs one external argv. Run bare `omen` on a TTY for `:verbs`."
+        ));
+    }
+    if argv.iter().any(|word| OPERATORS.contains(&word.as_str())) {
+        return Some(
+            "exec runs one external argv, not shell syntax: bare `|`, `>`, `<`, `&&`, `||` words are never the executables you mean. Run each stage with exec and compose the bytes client-side, or use the interactive shell (bare `omen` on a TTY)."
+                .to_string(),
+        );
+    }
+    // A single argv string carrying pipe/redirect/chain syntax is a pasted
+    // shell line, not a program name (Windows forbids `|<>` in file names;
+    // elsewhere no executable is ever spelled this way).
+    if argv.len() == 1 {
+        if first.contains('|') {
+            return Some(format!(
+                "exec runs one external argv, not shell pipelines: `{first}` names no executable. Run each stage with exec and compose the bytes client-side, or use the interactive shell (bare `omen` on a TTY) for `|`."
+            ));
+        }
+        if first.contains('>') || first.contains('<') {
+            return Some(format!(
+                "exec runs one external argv, not shell redirection: `{first}` names no executable. Feed file bytes via separate exec stages, or use the interactive shell (bare `omen` on a TTY) for `<` (`>` output stays refused-closed pending host-filesystem authority)."
+            ));
+        }
+        if first.contains("&&") || first.contains("||") {
+            return Some(format!(
+                "exec runs one external argv, not shell chains: `{first}` names no executable. Run each command with exec and branch on exit codes client-side, or use the interactive shell (bare `omen` on a TTY) for `&&` / `||`."
+            ));
+        }
+    }
+    None
+}
+
 /// Runs `argv` as a builtin when `argv[0]` names one.
 ///
 /// Returns `None` when the command is not a builtin (the caller falls through
@@ -459,6 +523,35 @@ mod consistency_tests {
                 run_if_builtin(&argv, &ctx).is_none(),
                 "run_if_builtin claims unlisted command '{name}'"
             );
+        }
+    }
+
+    /// Wrong-interface diagnosis refuses shell syntax pasted as an argv
+    /// while leaving plain argvs (including builtin names that an
+    /// external program may shadow) strictly alone.
+    #[test]
+    fn exec_syntax_refusal_shapes() {
+        let words = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // Pasted shell lines refuse with a named alternative.
+        for argv in [
+            words(&["git --version | sort"]),
+            words(&["sort -u < names.txt"]),
+            words(&["make && make test"]),
+            words(&[":history"]),
+            words(&["git", "--version", "|", "sort"]),
+            words(&["echo", "hi", ">", "out.txt"]),
+        ] {
+            assert!(exec_syntax_refusal(&argv).is_some(), "refuses {argv:?}");
+        }
+        // Plain argvs pass through untouched — even builtin names, which
+        // an external program may legitimately shadow.
+        for argv in [
+            words(&["git", "--version"]),
+            words(&["cat", "Cargo.toml"]),
+            words(&["echo", "hi"]),
+            words(&["curl", "http://x/?a=1&b=2"]),
+        ] {
+            assert!(exec_syntax_refusal(&argv).is_none(), "passes {argv:?}");
         }
     }
 

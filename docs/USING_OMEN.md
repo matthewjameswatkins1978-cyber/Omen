@@ -769,6 +769,30 @@ External agents gain structured access to:
 
 Output from commands run by agents is captured into content-addressed storage (`artifact://sha256/...`), ensuring transcripts remain bounded while complete execution evidence is preserved.
 
+#### Agent interface boundary (self-discovery)
+
+Agents should discover Omen through its own machine surface, not by
+imitating human shell keystrokes:
+
+```text
+omen orient --machine            # contract digest, surfaces, guidance
+omen capabilities --machine      # compact catalogue with `invocation` routes
+omen describe execution.run --machine   # schema, authority, limits
+```
+
+The rules the tool teaches itself:
+
+- `exec --machine -- <argv>` / `omen_execute` runs ONE external argv:
+  no `|`, `<`, `>`, `&&`, no interactive builtins (`cat`, `ls`, `grep`,
+  …), no `:verbs`. Shell syntax pasted as an argv refuses with the
+  supported alternative. Run stages separately and compose the bytes
+  client-side.
+- `shell.pipeline`, `shell.redirect`, `shell.job`, `shell.builtin` are
+  interactive-shell syntax only (bare `omen` on a TTY) — they advertise
+  no CLI/MCP route, and `describe` says so.
+- File reads have no Omen machine route: inspect files with your own
+  tools. Mutations stay fail-closed without Tethers admission.
+
 ### What Omen adds
 
 Most “AI shells” begin with:
