@@ -7,7 +7,6 @@
 //! - Synthetic secrets never leak through doctor/diagnostics.
 use omen_lifecycle::doctor::{self, DoctorInput};
 use omen_lifecycle::install::{Channel, InstallRecord, Ownership};
-use omen_lifecycle::plan;
 use std::path::PathBuf;
 
 const SYNTH: &str = "sk-h-test-SYNTHETIC-0000";
