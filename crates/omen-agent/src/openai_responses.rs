@@ -1,7 +1,7 @@
 use crate::context::AgentContext;
 use crate::provider::{
     AgentError, AgentProvider, AgentRequest, AgentResponse, AgentResponseKind,
-    DEFAULT_AGENT_TIMEOUT, ProposedAction,
+    DEFAULT_AGENT_TIMEOUT, ProposedAction, ProviderIdentity, ProviderUsage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -180,6 +180,18 @@ struct ResponsesApiEnvelope {
     output: Option<Vec<Value>>,
     error: Option<Value>,
     incomplete_details: Option<IncompleteDetails>,
+    #[serde(default)]
+    usage: Option<ResponsesUsage>,
+}
+
+/// Token usage as reported by the Responses API. Absent on error bodies
+/// and older shapes; callers treat missing usage as unknown, never zero.
+#[derive(Debug, Deserialize)]
+struct ResponsesUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -563,6 +575,14 @@ question, prefer a short explanation over inventing actions.",
     ///
     /// Only `status == completed` may produce an AgentResponse.
     pub fn parse_responses_body(body: &str) -> Result<AgentResponse, OpenAiFailure> {
+        Self::parse_responses_body_full(body).map(|(response, _)| response)
+    }
+
+    /// Full parse: response plus provider-reported token usage (`None`
+    /// when the envelope carries none — unknown, never zero).
+    pub fn parse_responses_body_full(
+        body: &str,
+    ) -> Result<(AgentResponse, Option<ProviderUsage>), OpenAiFailure> {
         let envelope: ResponsesApiEnvelope =
             serde_json::from_str(body).map_err(|e| OpenAiFailure {
                 class: OpenAiFailureClass::MalformedResponse,
@@ -603,7 +623,11 @@ question, prefer a short explanation over inventing actions.",
                 retry_after_secs: None,
             })?;
 
-        map_wire_to_agent_response(wire)
+        let usage = envelope.usage.map(|u| ProviderUsage {
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+        });
+        map_wire_to_agent_response(wire).map(|response| (response, usage))
     }
 
     fn post(&self, body: &str) -> Result<HttpResponseSnapshot, OpenAiFailure> {
@@ -653,18 +677,34 @@ impl AgentProvider for OpenAiResponsesProvider {
                 .map_err(|e| AgentError::Rejected(format!("request serialization failed: {e}")))?;
 
             let provider = self.clone();
+            let started = std::time::Instant::now();
             let snap = tokio::task::spawn_blocking(move || provider.post(&body))
                 .await
                 .map_err(|e| AgentError::Provider(format!("provider worker failed: {e}")))?
                 .map_err(|f| self.safe_error(f))?;
+            let latency_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
 
             classify_http(snap.status, &snap.body, snap.retry_after_secs)
                 .map_err(|f| self.safe_error(f))?;
 
             let safe_body =
                 bounded_and_redacted(&snap.body, self.api_key.as_deref(), MAX_RESPONSE_BYTES);
-            Self::parse_responses_body(&safe_body).map_err(|f| self.safe_error(f))
+            Self::parse_responses_body_full(&safe_body)
+                .map(|(mut response, usage)| {
+                    response.usage = usage;
+                    response.latency_ms = Some(latency_ms);
+                    response
+                })
+                .map_err(|f| self.safe_error(f))
         })
+    }
+
+    fn provider_identity(&self) -> ProviderIdentity {
+        ProviderIdentity {
+            id: self.provider_id.clone(),
+            model: Some(self.config.model.clone()),
+            effort: self.config.reasoning_effort.clone(),
+        }
     }
 }
 
@@ -896,6 +936,8 @@ fn map_wire_to_agent_response(wire: WireAgentResponse) -> Result<AgentResponse, 
         proposed_actions: actions,
         references: wire.references,
         uncertainty: wire.uncertainty.filter(|s| !s.trim().is_empty()),
+        usage: None,
+        latency_ms: None,
     })
 }
 
@@ -1124,6 +1166,74 @@ mod tests {
         assert!(dbg.contains("<redacted>"));
         assert!(dbg.contains("gpt-6-luna"));
         assert!(dbg.contains("openai-luna"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn usage_latency_and_identity_attach_to_response() {
+        let mut envelope: Value = serde_json::from_str(&ok_body("hi", "explanation")).unwrap();
+        envelope["usage"] = json!({"input_tokens": 12, "output_tokens": 34});
+        let http = Arc::new(FixedHttp::new(200, &envelope.to_string(), None));
+        let provider = luna_provider(http, Some("k"));
+        let response = provider.respond(sample_request("x")).await.unwrap();
+        let usage = response.usage.expect("provider-reported usage attaches");
+        assert_eq!(usage.input_tokens, 12);
+        assert_eq!(usage.output_tokens, 34);
+        assert!(
+            response.latency_ms.is_some(),
+            "client-measured latency attaches"
+        );
+        let identity = provider.provider_identity();
+        assert_eq!(identity.id, crate::registry::OPENAI_LUNA_PROVIDER_ID);
+        assert_eq!(identity.model.as_deref(), Some("gpt-6-luna"));
+        assert_eq!(
+            identity.effort.as_deref(),
+            Some(OPENAI_DEFAULT_REASONING_EFFORT)
+        );
+
+        // Usage absent from the envelope stays unknown, never zero.
+        let plain = luna_provider(
+            Arc::new(FixedHttp::new(200, &ok_body("hi", "explanation"), None)),
+            Some("k"),
+        );
+        let response = plain.respond(sample_request("x")).await.unwrap();
+        assert_eq!(response.usage, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transport_makes_no_automatic_retries() {
+        // Success: exactly one POST.
+        let http = Arc::new(FixedHttp::new(200, &ok_body("hi", "explanation"), None));
+        let provider = luna_provider(http.clone(), Some("k"));
+        provider.respond(sample_request("x")).await.unwrap();
+        let posts = http
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(k, _)| k == "url")
+            .count();
+        assert_eq!(posts, 1, "success posts exactly once");
+        // Retryable failure (429): still exactly one POST. Omen surfaces
+        // RateLimited with the hint; it never spends a second call itself.
+        let http = Arc::new(FixedHttp::new(
+            429,
+            r#"{"error":{"message":"slow down"}}"#,
+            Some(7),
+        ));
+        let provider = luna_provider(http.clone(), Some("k"));
+        let err = provider.respond(sample_request("x")).await.unwrap_err();
+        assert!(matches!(err, AgentError::RateLimited { .. }));
+        let posts = http
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(k, _)| k == "url")
+            .count();
+        assert_eq!(
+            posts, 1,
+            "rate limit posts exactly once (no billable retry)"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -558,7 +558,7 @@ fn registry_construction_is_cheap_and_credential_gated() {
                 .any(|p| p.id == "openai-luna"),
             "credential presence registers luna"
         );
-        assert_eq!(registry.active_descriptor().id, "diagnostic");
+        assert_eq!(registry.active_descriptor().id, "openai-luna");
     });
     with_openai_env(None, || {
         let registry = ProviderRegistry::new();
@@ -568,6 +568,11 @@ fn registry_construction_is_cheap_and_credential_gated() {
                 .iter()
                 .any(|p| p.id == "openai-luna"),
             "luna must be absent without credential"
+        );
+        assert_eq!(
+            registry.active_descriptor().id,
+            "diagnostic",
+            "diagnostic fallback stays default without credential"
         );
     });
 }
@@ -616,7 +621,9 @@ fn registry_machine_output_never_carries_secrets() {
     with_openai_env(Some("sk-g1-synthetic-secret"), || {
         let registry = ProviderRegistry::new();
         let status = registry.status_text();
-        assert!(status.contains("diagnostic"));
+        // Configured Luna is the default active provider; the assertion
+        // targets secret absence, not which provider is active.
+        assert!(status.contains("openai-luna"));
         assert!(status.contains("Capabilities:"));
         assert!(!status.contains("sk-g1-synthetic-secret"));
         assert!(!status.to_lowercase().contains("bearer"));

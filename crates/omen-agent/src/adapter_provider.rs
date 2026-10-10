@@ -370,6 +370,8 @@ impl AdapterBackedProvider {
             proposed_actions: actions,
             references: payload.references.iter().take(16).cloned().collect(),
             uncertainty: payload.uncertainty.clone(),
+            usage: None,
+            latency_ms: None,
         })
     }
 }

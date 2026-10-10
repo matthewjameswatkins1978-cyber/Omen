@@ -119,6 +119,8 @@ impl ConformanceProvider {
             proposed_actions: Vec::new(),
             references: Vec::new(),
             uncertainty: None,
+            usage: None,
+            latency_ms: None,
         }
     }
 
@@ -135,6 +137,8 @@ impl ConformanceProvider {
             ],
             references: Vec::new(),
             uncertainty: None,
+            usage: None,
+            latency_ms: None,
         }
     }
 
@@ -150,6 +154,8 @@ impl ConformanceProvider {
             }],
             references: Vec::new(),
             uncertainty: None,
+            usage: None,
+            latency_ms: None,
         }
     }
 
@@ -160,6 +166,8 @@ impl ConformanceProvider {
             proposed_actions: Vec::new(),
             references: Vec::new(),
             uncertainty: Some("canary is deliberately uncertain".into()),
+            usage: None,
+            latency_ms: None,
         }
     }
 
@@ -170,6 +178,8 @@ impl ConformanceProvider {
             proposed_actions: Vec::new(),
             references: Vec::new(),
             uncertainty: None,
+            usage: None,
+            latency_ms: None,
         }
     }
 

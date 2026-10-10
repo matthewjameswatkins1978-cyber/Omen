@@ -112,12 +112,17 @@ impl ProviderRegistry {
         // not prove remote key validity, model entitlement, or network reach.
         // Runtime HTTP truth remains authoritative for those outcomes.
         // The key itself is never stored on the descriptor.
+        // When Luna is configured it becomes the default active provider
+        // (Medium reasoning effort preset); otherwise the deterministic
+        // diagnostic fallback stays active so Omen remains usable without AI.
+        let mut active_id = "diagnostic".to_string();
         if openai_api_key_from_env().is_some() {
             let luna = openai_luna_provider();
             let desc = openai_luna_descriptor(luna.model(), true);
             let luna_provider: Arc<dyn AgentProvider> =
                 Arc::new(TimeoutProvider::new(Arc::new(luna), DEFAULT_AGENT_TIMEOUT));
             map.insert(OPENAI_LUNA_ID.into(), (desc, luna_provider));
+            active_id = OPENAI_LUNA_ID.to_string();
         }
 
         // Register the Codex external reference route whenever its binary is
@@ -138,7 +143,7 @@ impl ProviderRegistry {
 
         Self {
             providers: RwLock::new(map),
-            active_id: RwLock::new("diagnostic".into()),
+            active_id: RwLock::new(active_id),
         }
     }
 

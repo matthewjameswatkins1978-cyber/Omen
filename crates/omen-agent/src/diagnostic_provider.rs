@@ -441,6 +441,8 @@ impl DiagnosticAgentProvider {
                 proposed_actions: Vec::new(),
                 references: Vec::new(),
                 uncertainty: Some("Multiple candidate directories found".into()),
+                usage: None,
+                latency_ms: None,
             };
         }
 
