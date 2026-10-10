@@ -335,3 +335,184 @@ fn walk(dir: &std::path::Path) -> Vec<String> {
     out.sort();
     out
 }
+
+// ---------------------------------------------------------------------------
+// Install-truth incident regressions (OMEN-INSTALL-TRUTH-01).
+// ---------------------------------------------------------------------------
+
+fn install_record_with_slot(base: &std::path::Path, slot: &str) {
+    let mut record = InstallRecord::new(
+        Ownership::Omen,
+        Channel::Preview,
+        "0.9.0-preview.25",
+        "dddddddddddddddddddddddddddddddddddddddd",
+    );
+    record.active_slot = Some(slot.to_string());
+    omen_lifecycle::install::save_install_record(base, &record).unwrap();
+}
+
+/// R1: a debug build earlier on PATH is detected, planned for removal,
+/// and the apply refuses anything that is not verified-stale. No test
+/// mutates the process PATH: detection runs over explicit entries, and
+/// planning reads the finding detail (machine list), so parallel tests
+/// cannot observe each other.
+#[test]
+fn path_shadowing_detected_planned_and_guarded() {
+    let (_tmp, base) = base_fixture();
+    let shadow = _tmp.path().join("shadow").join("target").join("debug");
+    std::fs::create_dir_all(&shadow).unwrap();
+    std::fs::write(shadow.join(exe_name()), b"fake-debug-omen").unwrap();
+    let entries = vec![
+        "C:/Windows/system32".to_string(),
+        shadow.to_string_lossy().to_string(),
+        base.join("bin").to_string_lossy().to_string(),
+    ];
+    // Pure detection over explicit entries.
+    let found = omen_lifecycle::path_audit::shadowing_omen_exe_dirs_in(&base, &entries);
+    assert_eq!(found, vec![shadow.to_string_lossy().to_string()]);
+    // Planning reads the doctor finding detail, never the live env.
+    let report = omen_lifecycle::doctor::DoctorReport {
+        schema_version: 1,
+        version: "0.9.0-preview.16".to_string(),
+        git_sha: "deadbeef".to_string(),
+        contract_version: "0.8".to_string(),
+        ownership: Ownership::Unknown,
+        channel: Channel::Preview,
+        findings: vec![omen_lifecycle::doctor::Finding {
+            id: "path.shadowed".to_string(),
+            status: omen_lifecycle::doctor::Status::Warn,
+            summary: "1 stale build dir(s) shadow omen on PATH (repair: path:clean)".to_string(),
+            detail: Some(found.join(";")),
+        }],
+    };
+    let (rplan, _) = omen_lifecycle::repair::repair_plan(&base, &report);
+    let identity = format!("path:clean:{}", shadow.to_string_lossy());
+    assert!(
+        rplan.items.iter().any(|i| i.identity == identity),
+        "shadowing entry must be planned for removal"
+    );
+    // Apply re-verifies staleness: the temp target/debug dir qualifies,
+    // and on Windows the absent-from-registry entry changes nothing.
+    #[cfg(windows)]
+    let reg_before = omen_lifecycle::path_audit::read_registry_user_path();
+    let item = rplan.items.iter().find(|i| i.identity == identity).unwrap();
+    let detail = omen_lifecycle::repair::apply_repair_item(&base, item).unwrap();
+    #[cfg(windows)]
+    assert_eq!(
+        omen_lifecycle::path_audit::read_registry_user_path(),
+        reg_before,
+        "cleaning an unregistered entry must not rewrite the registry"
+    );
+    assert!(!detail.is_empty());
+    // Anything not verified-stale is refused, even if hand-planned.
+    let hostile = omen_lifecycle::plan::PlannedItem {
+        identity: "path:clean:C:/Program Files/nodejs".to_string(),
+        role: "runtime".to_string(),
+        reason: "hostile".to_string(),
+        size_bytes: None,
+        consequence: "none".to_string(),
+        protected_at_plan: false,
+        fingerprint: None,
+    };
+    assert!(
+        omen_lifecycle::repair::apply_repair_item(&base, &hostile).is_err(),
+        "non-stale entries are never removed"
+    );
+}
+
+/// R2: record + pointer agree but the conveyor projection lags: repair
+/// re-projects from the authoritative slot manifest, preserving history.
+#[test]
+fn record_pointer_agreement_reprojects_lagging_projection() {
+    let (_tmp, base) = base_fixture();
+    let slot = "slot-new";
+    install_record_with_slot(&base, slot);
+    omen_lifecycle::update::write_active_pointer(&base, slot).unwrap();
+    let slot_dir = base.join("versions").join(slot);
+    std::fs::create_dir_all(&slot_dir).unwrap();
+    std::fs::write(slot_dir.join(exe_name()), b"bin").unwrap();
+    let manifest = serde_json::json!({
+        "schema_version": 2,
+        "provenance": "ci",
+        "preview_version": "0.9.0-preview.25",
+        "git_sha": "dddddddddddddddddddddddddddddddddddddddd",
+    });
+    std::fs::write(
+        slot_dir.join("manifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    // Lagging projection (the Preview 24/25 incident shape).
+    std::fs::create_dir_all(base.join("state")).unwrap();
+    std::fs::write(
+        base.join("state").join("installed.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "active_slot": "slot-old",
+            "previous_slot": "slot-older",
+            "active": {"preview_version": "0.9.0-preview.24"},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let exe = slot_dir.join(exe_name());
+    let report = doctor::run_doctor(&input(&base, &exe));
+    let (rplan, refused) = omen_lifecycle::repair::repair_plan(&base, &report);
+    assert!(refused.iter().all(|r| r.id != "state:reproject"));
+    let item = rplan
+        .items
+        .iter()
+        .find(|i| i.identity == format!("state:reproject:{slot}"))
+        .expect("reproject planned")
+        .clone();
+    omen_lifecycle::repair::apply_repair_item(&base, &item).unwrap();
+    let after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(base.join("state").join("installed.json")).unwrap())
+            .unwrap();
+    assert_eq!(after["active_slot"], slot);
+    assert_eq!(
+        after["active"]["git_sha"],
+        "dddddddddddddddddddddddddddddddddddddddd"
+    );
+    assert_eq!(after["previous_slot"], "slot-older", "history preserved");
+    // R8: second plan no longer proposes the reproject (idempotent).
+    let report2 = doctor::run_doctor(&input(&base, &exe));
+    let (rplan2, _) = omen_lifecycle::repair::repair_plan(&base, &report2);
+    assert!(
+        !rplan2
+            .items
+            .iter()
+            .any(|i| i.identity.starts_with("state:reproject")),
+        "repaired projection must not re-plan"
+    );
+}
+
+/// R2 refusal: record and pointer disagree — the mechanism must not guess.
+#[test]
+fn reproject_refuses_record_pointer_disagreement() {
+    let (_tmp, base) = base_fixture();
+    install_record_with_slot(&base, "slot-a");
+    omen_lifecycle::update::write_active_pointer(&base, "slot-b").unwrap();
+    let exe = base.join(exe_name());
+    std::fs::write(&exe, b"bin").unwrap();
+    let report = doctor::run_doctor(&input(&base, &exe));
+    let (_, refused) = omen_lifecycle::repair::repair_plan(&base, &report);
+    assert!(
+        refused.iter().any(|r| r.id == "state:reproject"),
+        "ambiguous record/pointer must refuse, got: {refused:?}"
+    );
+}
+
+/// R6: the registry User PATH is readable (Windows) and parse-covered;
+/// elsewhere the reader is honestly absent.
+#[test]
+fn registry_user_path_readable_where_it_exists() {
+    #[cfg(windows)]
+    {
+        let path = omen_lifecycle::path_audit::read_registry_user_path()
+            .expect("registry User PATH must be readable on Windows");
+        assert!(!path.is_empty());
+    }
+    #[cfg(not(windows))]
+    assert_eq!(omen_lifecycle::path_audit::read_registry_user_path(), None);
+}

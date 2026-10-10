@@ -373,6 +373,100 @@ pub fn run_doctor(input: &DoctorInput) -> DoctorReport {
         ));
     }
 
+    // PATH shadowing (observational, R1): verified-stale cargo build dirs
+    // on PATH that resolve an omen executable ahead of (or instead of)
+    // the managed install. The detail is the machine-parseable entry
+    // list (repair re-verifies each); the summary carries the human text.
+    {
+        let shadowed = crate::path_audit::shadowing_omen_exe_dirs(base);
+        if shadowed.is_empty() {
+            findings.push(ok(
+                "path.shadowed",
+                "no stale build dir shadows omen on PATH",
+            ));
+        } else {
+            findings.push(warn(
+                "path.shadowed",
+                &format!(
+                    "{} stale build dir(s) shadow omen on PATH (repair: path:clean)",
+                    shadowed.len()
+                ),
+                &shadowed.join(";"),
+            ));
+        }
+    }
+
+    // Registry-vs-process PATH divergence (observational, R6, Windows):
+    // a fresh shell resolves via registry PATH, not this process' copy.
+    #[cfg(windows)]
+    {
+        match crate::path_audit::read_registry_user_path() {
+            Some(reg) => {
+                let proc: Vec<String> = std::env::var_os("PATH")
+                    .map(|p| {
+                        std::env::split_paths(&p)
+                            .map(|d| d.to_string_lossy().to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let reg_norm: Vec<String> = reg
+                    .iter()
+                    .map(|e| e.replace('\\', "/").to_lowercase())
+                    .collect();
+                let proc_norm: Vec<String> = proc
+                    .iter()
+                    .map(|e| e.replace('\\', "/").to_lowercase())
+                    .collect();
+                let only_reg: Vec<&String> = reg
+                    .iter()
+                    .filter(|e| !proc_norm.contains(&e.replace('\\', "/").to_lowercase()))
+                    .collect();
+                let only_proc: Vec<&String> = proc
+                    .iter()
+                    .filter(|e| !reg_norm.contains(&e.replace('\\', "/").to_lowercase()))
+                    .collect();
+                // Only Omen-relevant divergence is reported; unrelated
+                // shell drift is the user's business.
+                let omenish = |e: &String| {
+                    let l = e.to_lowercase();
+                    l.contains("omen") || crate::path_audit::is_stale_build_dir(e)
+                };
+                let mut div: Vec<String> = only_reg
+                    .iter()
+                    .filter(|e| omenish(e))
+                    .map(|e| format!("registry-only:{e}"))
+                    .chain(
+                        only_proc
+                            .iter()
+                            .filter(|e| omenish(e))
+                            .map(|e| format!("process-only:{e}")),
+                    )
+                    .collect();
+                div.sort();
+                div.dedup();
+                if div.is_empty() {
+                    findings.push(ok(
+                        "path.registry_divergence",
+                        "registry and process PATH agree on Omen entries",
+                    ));
+                } else {
+                    findings.push(warn(
+                        "path.registry_divergence",
+                        "registry PATH and process PATH disagree on Omen entries",
+                        &format!(
+                            "fresh shells resolve via registry; restart the shell or re-apply: {}",
+                            div.join("; ")
+                        ),
+                    ));
+                }
+            }
+            None => findings.push(unknown(
+                "path.registry_divergence",
+                "registry PATH unreadable here",
+            )),
+        }
+    }
+
     // Terminal capabilities (observational).
     let dumb = std::env::var("TERM").map(|t| t == "dumb").unwrap_or(false);
     let no_color = std::env::var("NO_COLOR").is_ok();
