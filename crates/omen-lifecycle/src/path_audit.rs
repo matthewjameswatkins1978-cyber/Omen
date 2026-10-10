@@ -77,6 +77,9 @@ pub fn join_entries(entries: &[String]) -> String {
 /// Parse `reg query HKCU\Environment /v Path` output into entries.
 /// Pure for testability: takes captured stdout, returns PATH entries.
 /// Returns None when the output has no readable Path value.
+/// Compiled on Windows (used by the registry readers) and under test
+/// (unit tests run on all platforms).
+#[cfg(any(windows, test))]
 fn parse_reg_path_output(stdout: &str) -> Option<Vec<String>> {
     for line in stdout.lines() {
         let t = line.trim();
