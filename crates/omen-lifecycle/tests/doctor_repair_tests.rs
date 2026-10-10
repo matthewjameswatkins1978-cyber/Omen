@@ -65,16 +65,18 @@ fn doctor_observes_broken_pointer_and_repairs_when_safe() {
     // Repair plans the re-point (exactly one slot: unambiguous).
     let (rplan, refused) = omen_lifecycle::repair::repair_plan(&base, &report);
     assert!(refused.is_empty());
-    assert!(
-        rplan
-            .items
-            .iter()
-            .any(|i| i.identity == "repoint-active:only-slot")
-    );
-    let rep = plan::apply_plan(&rplan, &|_| Ok(plan::Revalidate::Proceed), &|item| {
-        omen_lifecycle::repair::apply_repair_item(&base, item)
-    });
-    assert!(rep.fully_applied());
+    let item = rplan
+        .items
+        .iter()
+        .find(|i| i.identity == "repoint-active:only-slot")
+        .expect("repoint planned")
+        .clone();
+    // Apply ONLY the re-point under test: applying the whole plan would
+    // execute path:register against the REAL registry User PATH (live
+    // side effect observed on dev machines). Plan coverage stays whole;
+    // apply coverage stays hermetic.
+    let detail = omen_lifecycle::repair::apply_repair_item(&base, &item).unwrap();
+    assert!(!detail.is_empty());
     // Re-run doctor: pointer healthy now.
     let after = doctor::run_doctor(&input(&base, &exe));
     assert!(
