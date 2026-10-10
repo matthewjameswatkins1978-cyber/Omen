@@ -555,6 +555,29 @@ mod consistency_tests {
         }
     }
 
+    /// Post-failure builtin hint fires only at spawn phase for builtin
+    /// names: the external program may legitimately shadow them, so
+    /// success paths and non-spawn failures stay silent.
+    #[test]
+    fn spawn_failure_hint_shapes() {
+        let words = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let spawn_err = "Process spawn failed for 'cat': program not found";
+        let hint = spawn_failure_hint(&words(&["cat"]), &spawn_err).expect("hint for builtin");
+        assert!(hint.contains("never routes"), "hint teaches the boundary");
+        assert!(
+            spawn_failure_hint(&words(&["git"]), &spawn_err).is_none(),
+            "no hint for external names"
+        );
+        assert!(
+            spawn_failure_hint(&words(&["cat"]), &"timed out").is_none(),
+            "no hint outside spawn phase"
+        );
+        assert!(
+            spawn_failure_hint(&[], &spawn_err).is_none(),
+            "no hint for empty argv"
+        );
+    }
+
     /// Registry names and session intrinsics must not claim the same word.
     #[test]
     fn builtins_do_not_shadow_session_intrinsics() {
