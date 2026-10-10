@@ -16,12 +16,20 @@ fn norm(entry: &str) -> String {
     entry.replace('\\', "/").to_lowercase()
 }
 
-/// True when `entry` is a cargo target build dir (debug/release tree).
-/// Matches the dir itself and any child (`deps`, `build/<hash>/out`, …).
+/// True when `entry` is a cargo target build dir (debug/release tree),
+/// matched on whole path components: `target/debugger` does NOT match,
+/// `target/debug` and any child (`deps`, `build/<hash>/out`, …) do.
 pub fn is_stale_build_dir(entry: &str) -> bool {
-    let n = norm(entry);
-    n.contains("/target/debug") || n.contains("/target/release")
+    norm(entry)
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|w| w[0] == "target" && (w[1] == "debug" || w[1] == "release"))
 }
+
+/// Executable names that resolve an Omen installation (both binaries).
+const OMEN_EXES: &[&str] = &["omen.exe", "omen", "omend.exe", "omend"];
 
 /// True when `entry` equals the canonical managed bin (case-insensitive).
 pub fn is_canonical_bin(entry: &str, canonical_bin: &str) -> bool {
@@ -122,6 +130,31 @@ pub fn read_registry_user_path() -> Option<Vec<String>> {
     None
 }
 
+/// Read the registry Machine PATH (HKLM, read-only; what every fresh
+/// shell inherits before the User value). Windows-only; None when
+/// unreadable. Observational: never writes.
+#[cfg(windows)]
+pub fn read_registry_machine_path() -> Option<Vec<String>> {
+    let out = std::process::Command::new("reg")
+        .args([
+            "query",
+            r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+            "/v",
+            "Path",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_reg_path_output(&String::from_utf8_lossy(&out.stdout))
+}
+
+#[cfg(not(windows))]
+pub fn read_registry_machine_path() -> Option<Vec<String>> {
+    None
+}
+
 /// Write the registry User PATH on Windows via reg.exe (no setx 1024-char
 /// truncation). Entries are joined verbatim. Returns Ok on success.
 #[cfg(windows)]
@@ -181,19 +214,126 @@ mod reg_tests {
 /// Shadowing omen executable dirs for EXPLICIT entries (pure, testable).
 /// `entries` are PATH entries in order; returns display paths that are
 /// verified-stale build dirs (never the canonical bin) containing an
-/// omen executable.
+/// omen OR omend executable.
 pub fn shadowing_omen_exe_dirs_in(base: &std::path::Path, entries: &[String]) -> Vec<String> {
-    let exe = if cfg!(windows) { "omen.exe" } else { "omen" };
     let canonical = base.join("bin").to_string_lossy().to_string();
     let mut out = Vec::new();
     for e in shadowing_entries(entries, &canonical) {
-        if std::path::Path::new(e).join(exe).is_file() && !out.contains(&e.to_string()) {
+        let dir = std::path::Path::new(e);
+        let has_exe = OMEN_EXES.iter().any(|x| dir.join(x).is_file());
+        if has_exe && !out.contains(&e.to_string()) {
             out.push(e.to_string());
         }
     }
     out
 }
 
+/// Omen executables found in DIRS THAT ARE NEITHER stale build trees NOR
+/// the canonical bin: unknown ownership. Reported for human review;
+/// never planned for automatic removal.
+pub fn unknown_omen_exe_dirs_in(base: &std::path::Path, entries: &[String]) -> Vec<String> {
+    let canonical = base.join("bin").to_string_lossy().to_string();
+    let mut out = Vec::new();
+    for e in entries {
+        if is_canonical_bin(e, &canonical) || is_stale_build_dir(e) {
+            continue;
+        }
+        let dir = std::path::Path::new(e);
+        let has_exe = OMEN_EXES.iter().any(|x| dir.join(x).is_file());
+        if has_exe && !out.contains(e) {
+            out.push(e.clone());
+        }
+    }
+    out
+}
+
+/// Canonical bin entries beyond the first occurrence (case-insensitive):
+/// duplicates that collapse safely.
+pub fn duplicate_canonical_entries(entries: &[String], canonical_bin: &str) -> Vec<String> {
+    let mut seen = false;
+    let mut dupes = Vec::new();
+    for e in entries {
+        if is_canonical_bin(e, canonical_bin) {
+            if seen && !dupes.iter().any(|d: &String| norm(d) == norm(e)) {
+                dupes.push(e.clone());
+            }
+            seen = true;
+        }
+    }
+    dupes
+}
+
+/// Collapse case-insensitive duplicate entries, keeping the first
+/// occurrence of each. Order preserved.
+pub fn entries_after_dedupe(entries: &[String]) -> Vec<String> {
+    let mut seen = Vec::new();
+    let mut out = Vec::new();
+    for e in entries {
+        let n = norm(e);
+        if !seen.contains(&n) {
+            seen.push(n);
+            out.push(e.clone());
+        }
+    }
+    out
+}
+
+/// Parse `--version` output: true only for genuine Omen binaries
+/// (`omen <version> … contract:<v> …`). Pure for testability.
+pub fn omen_version_output_owned(text: &str) -> bool {
+    let first = text.lines().next().unwrap_or("").trim();
+    first.starts_with("omen ") && text.contains("contract:")
+}
+
+/// Verify a shadowing dir resolves an OMEN-owned executable: runs
+/// `<dir>/omen(.exe) --version` bounded (10s, no shell) and checks the
+/// identity banner. Only the omen binary proves ownership (omend has no
+/// version banner contract); dirs whose omen binary is missing or
+/// foreign return false. Never deletes files.
+pub fn omen_owned_exe_dir(dir: &std::path::Path) -> bool {
+    let exe = dir.join(if cfg!(windows) { "omen.exe" } else { "omen" });
+    if !exe.is_file() {
+        return false;
+    }
+    let mut child = match std::process::Command::new(&exe)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return false;
+                }
+                let mut text = String::new();
+                if let Some(mut out) = child.stdout.take() {
+                    use std::io::Read;
+                    let _ = out.read_to_string(&mut text);
+                }
+                return omen_version_output_owned(&text);
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                return false;
+            }
+        }
+    }
+}
 /// Shadowing omen executable dirs on the PROCESS path: verified-stale
 /// build dirs (never the canonical managed bin) that contain an omen
 /// executable. Thin wrapper over [`shadowing_omen_exe_dirs_in`] for the
@@ -221,6 +361,7 @@ mod tests {
             "D:/repo/target/debug",
             "D:/repo/target/debug/deps",
             "D:/repo/target/release",
+            "D:/repo/target/release/deps",
             "D:/repo/target/debug/build/ring-abc/out",
             "/home/u/repo/target/debug",
         ] {
@@ -232,6 +373,8 @@ mod tests {
             "D:/repo/src",
             "D:/repo/target", // the bare target dir is not itself an exe dir
             "D:/my-target/debugger/bin",
+            "D:/target/debugger/bin", // substring trap: not a build tree
+            "D:/repo/targeted/release-notes",
         ] {
             assert!(!is_stale_build_dir(fresh), "{fresh}");
         }
@@ -262,6 +405,35 @@ mod tests {
         assert_eq!(once[0], CANON);
         let twice = entries_after_register(&once, "c:/users/u/appdata/local/omen/bin");
         assert_eq!(twice.len(), 2, "case-insensitive dedupe");
+    }
+
+    #[test]
+    fn version_banner_proves_omen_ownership() {
+        assert!(omen_version_output_owned(
+            "omen 0.9.0-preview.25 contract:0.8 commit:abc target:x86_64-pc-windows-msvc profile:release\n"
+        ));
+        for foreign in [
+            "",
+            "omen.exe: command not found\n",
+            "my-omen-tool 1.0\n",
+            "omen without a contract banner\n",
+            "Omen 0.9.0 contract:0.8\n", // capital O: not the banner
+        ] {
+            assert!(!omen_version_output_owned(foreign), "{foreign:?}");
+        }
+    }
+
+    #[test]
+    fn duplicate_canonical_detection_and_dedupe() {
+        let path = vec![
+            CANON.to_string(),
+            "C:/Windows".to_string(),
+            "c:/users/u/appdata/local/omen/bin".to_string(),
+        ];
+        assert_eq!(duplicate_canonical_entries(&path, CANON).len(), 1);
+        let deduped = entries_after_dedupe(&path);
+        assert_eq!(deduped.len(), 2);
+        assert_eq!(deduped[0], CANON);
     }
 
     #[test]

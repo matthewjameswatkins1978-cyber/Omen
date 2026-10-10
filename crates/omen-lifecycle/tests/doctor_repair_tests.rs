@@ -371,39 +371,20 @@ fn path_shadowing_detected_planned_and_guarded() {
     let found = omen_lifecycle::path_audit::shadowing_omen_exe_dirs_in(&base, &entries);
     assert_eq!(found, vec![shadow.to_string_lossy().to_string()]);
     // Planning reads the doctor finding detail, never the live env.
-    let report = omen_lifecycle::doctor::DoctorReport {
-        schema_version: 1,
-        version: "0.9.0-preview.16".to_string(),
-        git_sha: "deadbeef".to_string(),
-        contract_version: "0.8".to_string(),
-        ownership: Ownership::Unknown,
-        channel: Channel::Preview,
-        findings: vec![omen_lifecycle::doctor::Finding {
-            id: "path.shadowed".to_string(),
-            status: omen_lifecycle::doctor::Status::Warn,
-            summary: "1 stale build dir(s) shadow omen on PATH (repair: path:clean)".to_string(),
-            detail: Some(found.join(";")),
-        }],
-    };
+    let report = shadowed_report(&found);
     let (rplan, _) = omen_lifecycle::repair::repair_plan(&base, &report);
     let identity = format!("path:clean:{}", shadow.to_string_lossy());
     assert!(
         rplan.items.iter().any(|i| i.identity == identity),
         "shadowing entry must be planned for removal"
     );
-    // Apply re-verifies staleness: the temp target/debug dir qualifies,
-    // and on Windows the absent-from-registry entry changes nothing.
-    #[cfg(windows)]
-    let reg_before = omen_lifecycle::path_audit::read_registry_user_path();
+    // Apply proves ownership: the fake binary cannot answer --version.
     let item = rplan.items.iter().find(|i| i.identity == identity).unwrap();
-    let detail = omen_lifecycle::repair::apply_repair_item(&base, item).unwrap();
-    #[cfg(windows)]
-    assert_eq!(
-        omen_lifecycle::path_audit::read_registry_user_path(),
-        reg_before,
-        "cleaning an unregistered entry must not rewrite the registry"
+    let err = omen_lifecycle::repair::apply_repair_item(&base, item).unwrap_err();
+    assert!(
+        format!("{err:?}").contains("Omen-owned"),
+        "foreign binary must be refused, got: {err:?}"
     );
-    assert!(!detail.is_empty());
     // Anything not verified-stale is refused, even if hand-planned.
     let hostile = omen_lifecycle::plan::PlannedItem {
         identity: "path:clean:C:/Program Files/nodejs".to_string(),
@@ -418,6 +399,56 @@ fn path_shadowing_detected_planned_and_guarded() {
         omen_lifecycle::repair::apply_repair_item(&base, &hostile).is_err(),
         "non-stale entries are never removed"
     );
+}
+
+/// R1 positive ownership path (Unix): a script binary answering the Omen
+/// version banner passes the ownership proof and cleans without touching
+/// real registry state (Linux apply returns guidance; the proof is the
+/// Ok here plus the exact refusal behavior above on foreign binaries).
+#[test]
+#[cfg(unix)]
+fn owned_script_binary_passes_ownership_proof() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("t").join("target").join("debug");
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("omen");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\necho 'omen 0.9.0-preview.25 contract:0.8 commit:abc'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(omen_lifecycle::path_audit::omen_owned_exe_dir(&dir));
+    // And the full plan→apply chain accepts it (guidance Ok on Linux).
+    let (_tmp, base) = base_fixture();
+    let report = shadowed_report(&[dir.to_string_lossy().to_string()]);
+    let (rplan, _) = omen_lifecycle::repair::repair_plan(&base, &report);
+    let item = rplan
+        .items
+        .iter()
+        .find(|i| i.identity.starts_with("path:clean:"))
+        .expect("owned entry planned")
+        .clone();
+    let detail = omen_lifecycle::repair::apply_repair_item(&base, &item).unwrap();
+    assert!(!detail.is_empty());
+}
+
+fn shadowed_report(found: &[String]) -> omen_lifecycle::doctor::DoctorReport {
+    omen_lifecycle::doctor::DoctorReport {
+        schema_version: 1,
+        version: "0.9.0-preview.16".to_string(),
+        git_sha: "deadbeef".to_string(),
+        contract_version: "0.8".to_string(),
+        ownership: Ownership::Unknown,
+        channel: Channel::Preview,
+        findings: vec![omen_lifecycle::doctor::Finding {
+            id: "path.shadowed".to_string(),
+            status: omen_lifecycle::doctor::Status::Warn,
+            summary: "1 stale build dir(s) shadow omen on PATH (repair: path:clean)".to_string(),
+            detail: Some(found.join(";")),
+        }],
+    }
 }
 
 /// R2: record + pointer agree but the conveyor projection lags: repair
@@ -515,4 +546,213 @@ fn registry_user_path_readable_where_it_exists() {
     }
     #[cfg(not(windows))]
     assert_eq!(omen_lifecycle::path_audit::read_registry_user_path(), None);
+}
+
+fn finding(
+    id: &str,
+    status: omen_lifecycle::doctor::Status,
+    detail: Option<&str>,
+) -> omen_lifecycle::doctor::Finding {
+    omen_lifecycle::doctor::Finding {
+        id: id.to_string(),
+        status,
+        summary: id.to_string(),
+        detail: detail.map(str::to_string),
+    }
+}
+
+fn bare_report(
+    findings: Vec<omen_lifecycle::doctor::Finding>,
+) -> omen_lifecycle::doctor::DoctorReport {
+    omen_lifecycle::doctor::DoctorReport {
+        schema_version: 1,
+        version: "0.9.0-preview.16".to_string(),
+        git_sha: "deadbeef".to_string(),
+        contract_version: "0.8".to_string(),
+        ownership: Ownership::Unknown,
+        channel: Channel::Preview,
+        findings,
+    }
+}
+
+/// Review §2: full identity — a slot manifest that disagrees with the
+/// record on version/SHA refuses even when the slot string matches.
+#[test]
+fn reproject_refuses_authoritative_identity_mismatch() {
+    let (_tmp, base) = base_fixture();
+    let slot = "slot-new";
+    install_record_with_slot(&base, slot);
+    omen_lifecycle::update::write_active_pointer(&base, slot).unwrap();
+    let slot_dir = base.join("versions").join(slot);
+    std::fs::create_dir_all(&slot_dir).unwrap();
+    // Same slot string, DIFFERENT authoritative identity.
+    std::fs::write(
+        slot_dir.join("manifest.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 2,
+            "preview_version": "0.9.0-preview.99",
+            "git_sha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let exe = base.join(exe_name());
+    std::fs::write(&exe, b"bin").unwrap();
+    let report = doctor::run_doctor(&input(&base, &exe));
+    let (rplan, refused) = omen_lifecycle::repair::repair_plan(&base, &report);
+    assert!(
+        refused.iter().any(|r| r.id == "state:reproject"),
+        "record/manifest identity mismatch must refuse"
+    );
+    assert!(
+        !rplan
+            .items
+            .iter()
+            .any(|i| i.identity.starts_with("state:reproject")),
+        "no reproject may be planned on authoritative disagreement"
+    );
+}
+
+/// Review §3: one installed build — superseded slots retire, active +
+/// previous (rollback) and unmanaged dirs are preserved.
+#[test]
+fn retire_obsolete_slots_keeps_rollback_and_ignores_unmanaged() {
+    let (_tmp, base) = base_fixture();
+    let mut record = InstallRecord::new(
+        Ownership::Omen,
+        Channel::Preview,
+        "0.9.0-preview.25",
+        "dddddddddddddddddddddddddddddddddddddddd",
+    );
+    record.active_slot = Some("slot-active".to_string());
+    record.previous_slot = Some("slot-prev".to_string());
+    omen_lifecycle::install::save_install_record(&base, &record).unwrap();
+    for s in ["slot-active", "slot-prev", "slot-old"] {
+        let dir = base.join("versions").join(s);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(exe_name()), b"bin").unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "preview_version": "0.9.0-preview.25",
+                "git_sha": "dddddddddddddddddddddddddddddddddddddddd",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    // Unmanaged dir (no manifest): never planned, never touched.
+    let junk = base.join("versions").join("junk-dir");
+    std::fs::create_dir_all(&junk).unwrap();
+    std::fs::write(junk.join(exe_name()), b"bin").unwrap();
+
+    let exe = base.join(exe_name());
+    std::fs::write(&exe, b"bin").unwrap();
+    let report = doctor::run_doctor(&input(&base, &exe));
+    let (rplan, _) = omen_lifecycle::repair::repair_plan(&base, &report);
+    let retire: Vec<_> = rplan
+        .items
+        .iter()
+        .filter(|i| i.identity.starts_with("versions:retire:"))
+        .collect();
+    assert_eq!(retire.len(), 1);
+    assert_eq!(retire[0].identity, "versions:retire:slot-old");
+    omen_lifecycle::repair::apply_repair_item(&base, retire[0]).unwrap();
+    assert!(!base.join("versions").join("slot-old").exists());
+    assert!(
+        base.join("versions")
+            .join("slot-active")
+            .join(exe_name())
+            .is_file()
+    );
+    assert!(
+        base.join("versions")
+            .join("slot-prev")
+            .join(exe_name())
+            .is_file()
+    );
+    assert!(junk.join(exe_name()).is_file(), "unmanaged dir preserved");
+    // No obsolete Omen binary remains under versions/.
+    let report2 = doctor::run_doctor(&input(&base, &exe));
+    let (rplan2, _) = omen_lifecycle::repair::repair_plan(&base, &report2);
+    assert!(
+        !rplan2
+            .items
+            .iter()
+            .any(|i| i.identity.starts_with("versions:retire:")),
+        "finalized promotion leaves nothing retireable"
+    );
+}
+
+/// Review §4: duplicate canonical entries collapse; unknown-ownership
+/// Omen executables refuse automatic removal.
+#[test]
+fn dedupe_planned_and_unknown_ownership_refused() {
+    let (_tmp, base) = base_fixture();
+    let report = bare_report(vec![
+        finding(
+            "path.canonical_single",
+            omen_lifecycle::doctor::Status::Warn,
+            Some("C:/Omen/bin"),
+        ),
+        finding(
+            "path.unknown_omen",
+            omen_lifecycle::doctor::Status::Warn,
+            Some("D:/tools/omen-standalone"),
+        ),
+    ]);
+    let (rplan, refused) = omen_lifecycle::repair::repair_plan(&base, &report);
+    assert!(
+        rplan.items.iter().any(|i| i.identity == "path:dedupe"),
+        "duplicates must be planned for collapse"
+    );
+    assert!(
+        refused.iter().any(|r| r.id == "path:unknown-omen"),
+        "unknown ownership must refuse, got: {refused:?}"
+    );
+    assert!(
+        !rplan.items.iter().any(|i| i.identity.contains("unknown")),
+        "unknown entries are never planned"
+    );
+    // Dedupe apply is safe everywhere (no-op or guidance when clean).
+    let item = rplan
+        .items
+        .iter()
+        .find(|i| i.identity == "path:dedupe")
+        .unwrap();
+    let detail = omen_lifecycle::repair::apply_repair_item(&base, item).unwrap();
+    assert!(!detail.is_empty());
+}
+
+/// Review §1: plan detail with non-stale and exe-less entries plans
+/// only the qualifying dir.
+#[test]
+fn plan_detail_filters_nonqualifying_entries() {
+    let (_tmp, base) = base_fixture();
+    let good = _tmp.path().join("g").join("target").join("debug");
+    std::fs::create_dir_all(&good).unwrap();
+    std::fs::write(good.join(exe_name()), b"x").unwrap();
+    let ghost = _tmp.path().join("h").join("target").join("debug");
+    std::fs::create_dir_all(&ghost).unwrap(); // no exe inside
+    let detail = format!(
+        "C:/Program Files/nodejs;{};{}",
+        ghost.to_string_lossy(),
+        good.to_string_lossy()
+    );
+    let report = bare_report(vec![finding(
+        "path.shadowed",
+        omen_lifecycle::doctor::Status::Warn,
+        Some(&detail),
+    )]);
+    let (rplan, _) = omen_lifecycle::repair::repair_plan(&base, &report);
+    let cleans: Vec<_> = rplan
+        .items
+        .iter()
+        .filter(|i| i.identity.starts_with("path:clean:"))
+        .collect();
+    assert_eq!(cleans.len(), 1);
+    assert_eq!(
+        cleans[0].identity,
+        format!("path:clean:{}", good.to_string_lossy())
+    );
 }

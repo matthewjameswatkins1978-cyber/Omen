@@ -409,7 +409,11 @@ pub fn run_doctor(input: &DoctorInput) -> DoctorReport {
                             .collect()
                     })
                     .unwrap_or_default();
-                let reg_norm: Vec<String> = reg
+                let mut reg_all = reg.clone();
+                if let Some(machine) = crate::path_audit::read_registry_machine_path() {
+                    reg_all.extend(machine);
+                }
+                let reg_norm: Vec<String> = reg_all
                     .iter()
                     .map(|e| e.replace('\\', "/").to_lowercase())
                     .collect();
@@ -426,7 +430,8 @@ pub fn run_doctor(input: &DoctorInput) -> DoctorReport {
                     .filter(|e| !reg_norm.contains(&e.replace('\\', "/").to_lowercase()))
                     .collect();
                 // Only Omen-relevant divergence is reported; unrelated
-                // shell drift is the user's business.
+                // shell drift is the user's business. Scopes: registry
+                // (User + Machine, what fresh shells resolve) vs process.
                 let omenish = |e: &String| {
                     let l = e.to_lowercase();
                     l.contains("omen") || crate::path_audit::is_stale_build_dir(e)
@@ -464,6 +469,52 @@ pub fn run_doctor(input: &DoctorInput) -> DoctorReport {
                 "path.registry_divergence",
                 "registry PATH unreadable here",
             )),
+        }
+    }
+
+    // PATH completeness (observational, review §4): duplicate canonical
+    // entries and unknown-ownership Omen executables. Duplicates are
+    // safe to collapse; unknown ownership is reported, never removed.
+    {
+        let entries: Vec<String> = std::env::var_os("PATH")
+            .map(|p| {
+                std::env::split_paths(&p)
+                    .map(|d| d.to_string_lossy().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let canonical = base.join("bin").to_string_lossy().to_string();
+        let dupes = crate::path_audit::duplicate_canonical_entries(&entries, &canonical);
+        if dupes.is_empty() {
+            findings.push(ok(
+                "path.canonical_single",
+                "canonical bin present at most once",
+            ));
+        } else {
+            findings.push(warn(
+                "path.canonical_single",
+                &format!(
+                    "canonical bin listed {} time(s) (repair: path:dedupe)",
+                    dupes.len() + 1
+                ),
+                &dupes.join(";"),
+            ));
+        }
+        let unknown = crate::path_audit::unknown_omen_exe_dirs_in(base, &entries);
+        if unknown.is_empty() {
+            findings.push(ok(
+                "path.unknown_omen",
+                "no unknown-ownership Omen executables on PATH",
+            ));
+        } else {
+            findings.push(warn(
+                "path.unknown_omen",
+                &format!(
+                    "{} non-managed dir(s) resolve an omen executable (human review; never auto-removed)",
+                    unknown.len()
+                ),
+                &unknown.join(";"),
+            ));
         }
     }
 

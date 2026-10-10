@@ -65,24 +65,107 @@ fn state_reproject_plan(base: &Path) -> ReprojectPlan {
             pointer.active_slot
         ));
     }
-    let manifest_path = base.join("versions").join(&slot).join("manifest.json");
-    if !manifest_path.is_file() {
+    // Full authoritative identity: the slot manifest must confirm the
+    // record's version AND git SHA (not just the slot string). Any
+    // authoritative disagreement refuses; only a stale projection is
+    // safe to rewrite.
+    let manifest: serde_json::Value =
+        match std::fs::read(base.join("versions").join(&slot).join("manifest.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+        {
+            Some(m) => m,
+            None => {
+                return ReprojectPlan::Refused(format!(
+                    "slot {slot} manifest absent or unreadable; reinstall, not reproject"
+                ));
+            }
+        };
+    let m_version = manifest.get("preview_version").and_then(|v| v.as_str());
+    let m_sha = manifest.get("git_sha").and_then(|v| v.as_str());
+    if m_version != Some(record.version.as_str()) || m_sha != Some(record.git_sha.as_str()) {
         return ReprojectPlan::Refused(format!(
-            "slot {slot} manifest absent; reinstall, not reproject"
+            "record ({} {}) != slot manifest ({} {}); authoritative disagreement",
+            record.version,
+            record.git_sha.get(..7).unwrap_or(&record.git_sha),
+            m_version.unwrap_or("?"),
+            m_sha.and_then(|s| s.get(..7)).unwrap_or("?")
         ));
     }
-    let projected: Option<String> = std::fs::read(base.join("state").join("installed.json"))
-        .ok()
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .and_then(|v| {
-            v.get("active_slot")
+    let projected: Option<serde_json::Value> =
+        std::fs::read(base.join("state").join("installed.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok());
+    let agrees = projected.as_ref().is_some_and(|v| {
+        v.get("active_slot").and_then(|s| s.as_str()) == Some(slot.as_str())
+            && v.pointer("/active/preview_version")
                 .and_then(|s| s.as_str())
-                .map(str::to_string)
-        });
-    if projected.as_deref() == Some(slot.as_str()) {
+                == Some(record.version.as_str())
+            && v.pointer("/active/git_sha").and_then(|s| s.as_str())
+                == Some(record.git_sha.as_str())
+    });
+    if agrees {
         ReprojectPlan::Agreed
     } else {
         ReprojectPlan::Ready { slot }
+    }
+}
+
+/// Slots eligible for retirement: present under versions/, carrying a
+/// parseable Omen slot manifest, and neither the active nor the previous
+/// slot. Active + previous are rollback material and never retireable.
+fn retireable_slots(base: &Path) -> Vec<String> {
+    let record = match crate::install::load_install_record(base).ok().flatten() {
+        Some(r) => r,
+        None => return Vec::new(),
+    };
+    let keep: Vec<&str> = [
+        record.active_slot.as_deref(),
+        record.previous_slot.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(base.join("versions")) else {
+        return out;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if keep.contains(&name.as_str()) {
+            continue;
+        }
+        // Omen-managed proof: a parseable slot manifest. Anything else
+        // (foreign dirs, half-written staging) stays for human review.
+        let manifest_ok = std::fs::read(e.path().join("manifest.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .is_some_and(|v| {
+                v.get("preview_version").and_then(|s| s.as_str()).is_some()
+                    && v.get("git_sha").and_then(|s| s.as_str()).is_some()
+            });
+        if manifest_ok {
+            out.push(name);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Retire one superseded slot. Removes only the slot directory; a locked
+/// (running) slot fails loudly and stays for human review.
+fn apply_slot_retire(base: &Path, slot: &str) -> Result<String, LifecycleError> {
+    // Re-verify eligibility at apply time (plan never equals apply).
+    if !retireable_slots(base).iter().any(|s| s == slot) {
+        return Err(LifecycleError::Refused(format!(
+            "slot {slot} is not retireable now (became active/previous or unmanaged)"
+        )));
+    }
+    match std::fs::remove_dir_all(base.join("versions").join(slot)) {
+        Ok(()) => Ok(format!("retired superseded slot {slot}")),
+        Err(e) => Err(LifecycleError::Io(format!(
+            "slot {slot} could not be removed (active or locked? report, not delete): {e}"
+        ))),
     }
 }
 
@@ -140,6 +223,31 @@ fn clean_path_entry(entry: &str) -> Result<String, LifecycleError> {
     Ok(format!(
         "remove {entry} from PATH in your shell profile (automatic cleanup is Windows-only)"
     ))
+}
+
+/// Collapse duplicate registry PATH entries (case-insensitive), keeping
+/// first occurrences. Re-verified at apply: no-op when already single.
+#[cfg(windows)]
+fn dedupe_path() -> Result<String, LifecycleError> {
+    let current = crate::path_audit::read_registry_user_path()
+        .ok_or_else(|| LifecycleError::Io("registry User PATH unreadable".to_string()))?;
+    let next = crate::path_audit::entries_after_dedupe(&current);
+    if next.len() == current.len() {
+        return Ok("registry PATH already duplicate-free".to_string());
+    }
+    crate::path_audit::write_registry_user_path(&next).map_err(LifecycleError::Io)?;
+    Ok(format!(
+        "collapsed {} duplicate PATH entries (takes effect in new shells)",
+        current.len() - next.len()
+    ))
+}
+
+#[cfg(not(windows))]
+fn dedupe_path() -> Result<String, LifecycleError> {
+    Ok(
+        "collapse duplicate PATH entries in your shell profile (automatic cleanup is Windows-only)"
+            .to_string(),
+    )
 }
 
 /// Inspect a doctor report + live state and propose repairs. Returns
@@ -259,6 +367,29 @@ pub fn repair_plan(base: &Path, report: &DoctorReport) -> (ActionPlan, Vec<Refus
         }
     }
 
+    // Canonical-bin duplicates: collapse to a single entry (safe:
+    // identical value, first occurrence kept).
+    if has("path.canonical_single") == Some(Status::Warn) {
+        items.push(PlannedItem {
+            identity: "path:dedupe".to_string(),
+            role: "runtime".to_string(),
+            reason: "canonical bin listed more than once".to_string(),
+            size_bytes: None,
+            consequence: "collapses duplicate canonical entries; order preserved".to_string(),
+            protected_at_plan: false,
+            fingerprint: None,
+        });
+    }
+    // Unknown-ownership Omen executables: reported for human review only.
+    // Unknown ownership means refusal, never automatic deletion.
+    if has("path.unknown_omen") == Some(Status::Warn) {
+        refused.push(RefusedRepair {
+            id: "path:unknown-omen".to_string(),
+            reason: "non-managed dir resolves an omen executable; human review required"
+                .to_string(),
+        });
+    }
+
     // Record/projection agreement (R2): when the install record and the
     // active pointer agree on slot S, the slot manifest exists, but the
     // conveyor projection (state/installed.json) disagrees, re-project
@@ -280,6 +411,22 @@ pub fn repair_plan(base: &Path, report: &DoctorReport) -> (ActionPlan, Vec<Refus
             id: "state:reproject".to_string(),
             reason,
         }),
+    }
+
+    // One installed build (review §3): retire version slots that are
+    // neither active nor previous. Only Omen-managed slots (parseable
+    // manifest.json) are planned; anything else stays for human review.
+    // Rollback material (active + previous) is always preserved.
+    for slot in retireable_slots(base) {
+        items.push(PlannedItem {
+            identity: format!("versions:retire:{slot}"),
+            role: "runtime".to_string(),
+            reason: "superseded install slot; single-build policy".to_string(),
+            size_bytes: None,
+            consequence: format!("removes versions/{slot} (rollback keeps active + previous)"),
+            protected_at_plan: false,
+            fingerprint: None,
+        });
     }
 
     // Interrupted staging state: recoverable only when the transaction
@@ -366,15 +513,38 @@ pub fn apply_repair_item(base: &Path, item: &PlannedItem) -> Result<String, Life
         return register_path(base);
     }
     if let Some(entry) = item.identity.strip_prefix("path:clean:") {
-        // Refuse anything that is not a verified-stale build dir: the
-        // plan only emits matches, but apply re-verifies (defense in
-        // depth against hand-written plans).
+        // Ownership proof at apply time: verified-stale pattern AND an
+        // omen executable present AND the binary proves Omen identity
+        // via its version banner AND the entry is currently registered.
+        // Hand-written plans for anything else are refused. Files are
+        // never deleted — only the PATH value changes.
         if !crate::path_audit::is_stale_build_dir(entry) {
             return Err(LifecycleError::Refused(format!(
                 "path:clean refused for non-stale entry: {entry}"
             )));
         }
+        let dir = std::path::Path::new(entry);
+        let exe = dir.join(if cfg!(windows) { "omen.exe" } else { "omen" });
+        if !exe.is_file() {
+            return Err(LifecycleError::Refused(format!(
+                "path:clean refused: no omen executable in {entry}"
+            )));
+        }
+        if !crate::path_audit::omen_owned_exe_dir(dir) {
+            return Err(LifecycleError::Refused(format!(
+                "path:clean refused: {entry} does not resolve an Omen-owned executable"
+            )));
+        }
         return clean_path_entry(entry);
+    }
+    if item.identity == "path:dedupe" {
+        return dedupe_path();
+    }
+    if let Some(slot) = item.identity.strip_prefix("versions:retire:") {
+        if slot.contains('/') || slot.contains('\\') || slot.contains("..") {
+            return Err(LifecycleError::Refused("repair slot escape".to_string()));
+        }
+        return apply_slot_retire(base, slot);
     }
     if let Some(slot) = item.identity.strip_prefix("state:reproject:") {
         if slot.contains('/') || slot.contains('\\') || slot.contains("..") {
