@@ -23,9 +23,12 @@ pub struct AiLaneDispatchStats {
 }
 
 /// One provider round as a diagnostic event: who answered, with which
-/// model and effort, how long it took, and the token usage the provider
-/// reported. Cost rates are unknown to Omen and never invented: counts
-/// are the available cost information. Secrets never appear here.
+/// model and effort, over which native transport, how long it took, and
+/// the token usage the provider reported. Cost rates are unknown to Omen
+/// and never invented: counts are the available cost information.
+/// Transport names the provider's own channel (`live-https`, `local`,
+/// `mock`); whether packets actually moved is proven by the live gate
+/// together with usage/latency. Secrets never appear here.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AiProviderEvent {
     pub provider_id: String,
@@ -33,6 +36,8 @@ pub struct AiProviderEvent {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -414,6 +419,7 @@ impl AiLaneDispatcher {
                         provider_id: identity.id,
                         model: identity.model,
                         reasoning_effort: identity.effort,
+                        transport: identity.transport,
                         latency_ms: resp.latency_ms,
                         usage: resp.usage.clone(),
                     });
@@ -508,6 +514,7 @@ impl AiLaneDispatcher {
                         provider_id: identity.id,
                         model: identity.model,
                         reasoning_effort: identity.effort,
+                        transport: identity.transport,
                         latency_ms: None,
                         usage: None,
                     });
@@ -528,6 +535,7 @@ impl AiLaneDispatcher {
                         provider_id: identity.id,
                         model: identity.model,
                         reasoning_effort: identity.effort,
+                        transport: identity.transport,
                         latency_ms: None,
                         usage: None,
                     });

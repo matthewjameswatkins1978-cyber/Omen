@@ -741,8 +741,9 @@ Omen does not dump your terminal scrollback into a prompt or ask you to copy-pas
   (800 output tokens); a response cut short by the budget fails closed
   with its reason instead of trailing off.
 - Each provider round records a diagnostic event (provider id, model,
-  reasoning effort, latency, provider-reported token counts — the
-  available cost information; rates are unknown to Omen). Secrets never
+  reasoning effort, native transport — `live-https`, `local`, or `mock`
+  — latency, provider-reported token counts — the available cost
+  information; rates are unknown to Omen). Secrets never
   appear in outputs, errors, history, or diagnostic bundles.
 - Anthropic Claude Sonnet (`anthropic-sonnet`, model `claude-sonnet-5-5`)
   is prepared but inactive: it appears in `:agent providers` only when
@@ -757,6 +758,13 @@ Omen does not dump your terminal scrollback into a prompt or ask you to copy-pas
   never asked again; `omen setup` on a terminal re-offers it any time.
   Updates never touch settings, so an existing key is never requested
   again.
+- Hermetic tests, explicit live gate: ordinary `cargo test` runs never
+  touch commercial APIs, even with keys configured in the environment or
+  OS credential store — the test process is simply not admitted for live
+  egress, and any accidental live attempt fails loudly instead of
+  spending. Deliberate live validation is a separate human-approved
+  activity (`OMEN_LIVE_TESTS=1` plus an explicitly admitted smoke test).
+  A credential alone is never permission to bill.
 
 The presentation format is always clean, structured, and distinct:
 

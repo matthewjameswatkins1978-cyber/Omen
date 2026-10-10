@@ -89,6 +89,12 @@ impl HttpPost for UreqHttpPost {
         headers: &[(String, String)],
         body: &str,
     ) -> Result<HttpResponseSnapshot, String> {
+        // Hermetic egress gate: the single choke point for commercial AI
+        // traffic (Luna and Sonnet share this transport). Production
+        // admits at startup; ordinary tests never admit, so even a
+        // fully-configured provider with a real ambient credential fails
+        // closed here with no packet built and nothing sent.
+        crate::live_gate::check()?;
         let mut req = self
             .agent()
             .post(url)
@@ -704,6 +710,7 @@ impl AgentProvider for OpenAiResponsesProvider {
             id: self.provider_id.clone(),
             model: Some(self.config.model.clone()),
             effort: self.config.reasoning_effort.clone(),
+            transport: Some("live-https".to_string()),
         }
     }
 }

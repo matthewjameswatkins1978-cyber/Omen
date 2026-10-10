@@ -598,6 +598,11 @@ mod lifecycle_cmds;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Production admission for commercial AI egress. This is the user-facing
+    // `omen` binary: a configured Luna/Sonnet provider may reach its API
+    // from here. Ordinary tests never run this entry, so they stay
+    // hermetic even with ambient credentials present.
+    omen_agent::admit_production();
     let cli = Cli::parse();
     let json_mode = cli.json || cli.machine;
 

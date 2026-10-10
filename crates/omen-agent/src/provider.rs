@@ -70,8 +70,13 @@ pub struct ProviderUsage {
 }
 
 /// Static provider identity for diagnostic events: who answered, with
-/// which model and reasoning effort. Effort is `None` for providers
-/// without a reasoning-effort concept.
+/// which model and reasoning effort, and over which native transport.
+/// Transport names the provider struct's own channel (`live-https` for
+/// the commercial HTTPS providers, `local` for the deterministic
+/// builtin, test doubles report their own): it is design truth, not a
+/// packet trace. Whether packets actually moved is proven by the live
+/// gate (refusal vs admission) together with usage/latency evidence.
+/// Effort is `None` for providers without a reasoning-effort concept.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderIdentity {
     pub id: String,
@@ -79,6 +84,10 @@ pub struct ProviderIdentity {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// Native transport of this provider struct (`live-https`, `local`,
+    /// or a test-double label). `None` preserves older surfaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
 }
 
 impl ProviderIdentity {
@@ -87,6 +96,7 @@ impl ProviderIdentity {
             id: "unknown".to_string(),
             model: None,
             effort: None,
+            transport: None,
         }
     }
 }

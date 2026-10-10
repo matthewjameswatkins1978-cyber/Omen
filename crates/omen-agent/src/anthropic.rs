@@ -538,6 +538,7 @@ impl AgentProvider for AnthropicSonnetProvider {
             id: self.provider_id.clone(),
             model: Some(self.config.model.clone()),
             effort: None,
+            transport: Some("live-https".to_string()),
         }
     }
 }

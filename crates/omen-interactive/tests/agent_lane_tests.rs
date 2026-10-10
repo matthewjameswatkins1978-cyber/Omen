@@ -942,6 +942,7 @@ impl omen_agent::AgentProvider for MockAgentProvider {
             id: self.id.clone(),
             model: Some("mock-model".into()),
             effort: Some("low".into()),
+            transport: Some("mock".into()),
         }
     }
 
