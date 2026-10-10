@@ -13,6 +13,7 @@ pub mod context;
 pub mod credentials;
 pub mod deterministic;
 pub mod diagnostic_provider;
+pub mod live_gate;
 pub mod openai_responses;
 pub mod provider;
 pub mod registry;
@@ -27,6 +28,10 @@ pub use context::*;
 pub use credentials::*;
 pub use deterministic::*;
 pub use diagnostic_provider::*;
+pub use live_gate::{
+    HERMETIC_REFUSED_MESSAGE, HERMETIC_TESTS_ENV_VAR, LIVE_REFUSED_MESSAGE, LIVE_TESTS_ENV_VAR,
+    admit_for_explicit_live_test, admit_production, hermetic_denial_active, is_admitted,
+};
 pub use openai_responses::*;
 pub use provider::*;
 pub use registry::*;

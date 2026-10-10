@@ -633,10 +633,14 @@ fn registry_machine_output_never_carries_secrets() {
             // environment variable is allowed and expected.
             assert!(!json.contains("sk-g1-synthetic-secret"));
             // Allowed credential shapes: none (diagnostic), environment label
-            // (Luna), or external-manager label (Codex reference route, G2).
-            // Labels name a source; values never appear (asserted above).
+            // (Luna or Sonnet), or external-manager label (Codex reference
+            // route, G2). Labels name a source; values never appear
+            // (asserted above). Sonnet's env label is an approved shape:
+            // presence-gated listing is designed behavior, and the suite
+            // must stay robust when a developer shell carries ambient keys.
             assert!(
                 json.contains("environment:OPENAI_API_KEY")
+                    || json.contains("environment:ANTHROPIC_API_KEY")
                     || json.contains("codex-auth")
                     || desc.id == "diagnostic",
                 "unexpected credential shape for {}: {json}",

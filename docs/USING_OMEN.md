@@ -741,8 +741,9 @@ Omen does not dump your terminal scrollback into a prompt or ask you to copy-pas
   (800 output tokens); a response cut short by the budget fails closed
   with its reason instead of trailing off.
 - Each provider round records a diagnostic event (provider id, model,
-  reasoning effort, latency, provider-reported token counts — the
-  available cost information; rates are unknown to Omen). Secrets never
+  reasoning effort, native transport — `live-https`, `local`, or `mock`
+  — latency, provider-reported token counts — the available cost
+  information; rates are unknown to Omen). Secrets never
   appear in outputs, errors, history, or diagnostic bundles.
 - Anthropic Claude Sonnet (`anthropic-sonnet`, model `claude-sonnet-5-5`)
   is prepared but inactive: it appears in `:agent providers` only when
@@ -757,6 +758,28 @@ Omen does not dump your terminal scrollback into a prompt or ask you to copy-pas
   never asked again; `omen setup` on a terminal re-offers it any time.
   Updates never touch settings, so an existing key is never requested
   again.
+- Hermetic tests, explicit live gate: ordinary `cargo test` runs never
+  touch commercial APIs, even with keys configured in the environment or
+  OS credential store — the test process is simply not admitted for live
+  egress, and any accidental live attempt fails loudly instead of
+  spending. The denial (`OMEN_HERMETIC_TESTS=1`, set automatically for
+  every cargo-launched test process) inherits into spawned `omen`/MCP
+  child processes and takes precedence over production admission;
+  `doctor --json` reports the structural evidence under `ai_egress`
+  (admitted, test isolation, configured provider ids). Unit tests prove
+  the gate decision as a pure truth table, never by briefly lifting
+  protection in a running test process. Deliberate live validation is a
+  separate human-approved activity requiring BOTH `OMEN_LIVE_TESTS=1`
+  AND `OMEN_HERMETIC_TESTS=0` (cargo never overrides variables already
+  present in the approving shell, so the explicit `0` survives); the
+  smoke test refuses loudly otherwise, and `OMEN_LIVE_TESTS=1` alone
+  never enables it. A credential alone is never permission to bill.
+  Note: `cargo run` inherits test isolation, but a normally installed
+  executable does not — unsetting the variable is insufficient while
+  cargo supplies it again, so use the installed binary or an explicit
+  per-command override. External agent adapters that spawn their own
+  processes (e.g. the Codex route) are outside this HTTPS gate and stay
+  covered by test doubles, never live calls.
 
 The presentation format is always clean, structured, and distinct:
 

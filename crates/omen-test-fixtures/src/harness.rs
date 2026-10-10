@@ -100,6 +100,23 @@ impl TestContext {
     }
 }
 
+/// Denies commercial AI egress for this test process and every child it
+/// spawns, via the inherited `OMEN_HERMETIC_TESTS=1` flag (see
+/// `omen-agent::live_gate`). Called by [`run_with_test_timeout`] so every
+/// harness-driven test enforces isolation with zero per-test setup.
+///
+/// Parallel-test safety: the set is monotonic and idempotent — every
+/// caller writes the same deny value, no test reads-then-decides, and no
+/// test API clears it. Parallel tests can only observe MORE refusal,
+/// never less. (Cargo's `[env]` in `.cargo/config.toml` provides the
+/// same flag for test binaries cargo launches directly; this covers
+/// runners that bypass that config.)
+pub fn ensure_hermetic_ai_egress() {
+    // SAFETY: idempotent write of a single sentinel value at a point
+    // where no test logic has branched on the previous value.
+    unsafe { std::env::set_var("OMEN_HERMETIC_TESTS", "1") };
+}
+
 /// Executes a test future with an explicit outer deadline and structured diagnostic failure reporting.
 pub async fn run_with_test_timeout<F, Fut, T>(
     test_name: &str,
@@ -110,6 +127,7 @@ where
     F: FnOnce(TestContext) -> Fut,
     Fut: Future<Output = T>,
 {
+    ensure_hermetic_ai_egress();
     let ctx = TestContext::new(test_name);
     let ctx_clone = ctx.clone();
     let fut = test_fn(ctx);

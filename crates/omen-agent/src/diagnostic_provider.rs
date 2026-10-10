@@ -1,6 +1,7 @@
 use crate::context::AgentContext;
 use crate::provider::{
     AgentError, AgentProvider, AgentRequest, AgentResponse, AgentResponseKind, ProposedAction,
+    ProviderIdentity,
 };
 use std::future::Future;
 use std::path::PathBuf;
@@ -470,6 +471,15 @@ impl AgentProvider for DiagnosticAgentProvider {
         request: AgentRequest,
     ) -> Pin<Box<dyn Future<Output = Result<AgentResponse, AgentError>> + Send + 'a>> {
         Box::pin(async move { Ok(self.evaluate(&request)) })
+    }
+
+    fn provider_identity(&self) -> ProviderIdentity {
+        ProviderIdentity {
+            id: "diagnostic".to_string(),
+            model: Some("deterministic".to_string()),
+            effort: None,
+            transport: Some("local".to_string()),
+        }
     }
 }
 
