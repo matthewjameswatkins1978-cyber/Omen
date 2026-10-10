@@ -143,9 +143,10 @@ impl CredentialStore for KeyringCredentialStore {
 }
 
 /// In-memory store for tests. Never touches the OS or the environment.
-#[derive(Debug, Default)]
+/// Cheaply cloneable: clones share the same backing map.
+#[derive(Debug, Default, Clone)]
 pub struct MemoryCredentialStore {
-    inner: Mutex<HashMap<String, String>>,
+    inner: std::sync::Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl MemoryCredentialStore {
@@ -267,6 +268,69 @@ pub fn run_key_setup(
     }
 }
 
+/// Terminal I/O for the setup offer, supplied by the caller (first-run
+/// session, `omen setup`, tests). Keeps TTY handling out of this module.
+pub struct SetupIo<A, R, S>
+where
+    A: Fn(&str) -> bool,
+    R: Fn() -> Option<String>,
+    S: Fn(&str),
+{
+    pub ask_yes_no: A,
+    pub read_secret: R,
+    pub say: S,
+}
+
+/// Offer Luna key setup once: no-op when a credential already resolves
+/// through `chain` (never re-asks). Otherwise asks, reads one masked
+/// secret, and stores it in `store`. Every path speaks its outcome;
+/// setup itself never fails the caller.
+pub fn offer_luna_setup_with<A, R, S>(
+    io: &SetupIo<A, R, S>,
+    store: &dyn CredentialStore,
+    chain: &CredentialChain,
+) where
+    A: Fn(&str) -> bool,
+    R: Fn() -> Option<String>,
+    S: Fn(&str),
+{
+    if chain.get(LUNA_PROVIDER_ID).ok().flatten().is_some() {
+        return;
+    }
+    (io.say)("GPT-6 Luna is the default reasoning provider when a key is configured.");
+    let outcome = run_key_setup(
+        LUNA_PROVIDER_ID,
+        (io.ask_yes_no)("Configure Luna now? The key stays in your OS credential store"),
+        || (io.read_secret)(),
+        store,
+    );
+    match outcome {
+        KeySetupOutcome::Stored { source } => {
+            (io.say)(&format!(
+                "[ok] Luna key stored ({source}). Verify with any `?` question."
+            ));
+        }
+        KeySetupOutcome::Skipped => {
+            (io.say)("Skipped: deterministic fallback stays active. Later route: `omen setup`.");
+        }
+        KeySetupOutcome::Failed { reason } => {
+            (io.say)(&format!(
+                "[warn] Luna key not stored ({reason}). Deterministic fallback stays active."
+            ));
+        }
+    }
+}
+
+/// Production offer: standard chain (environment, then OS keyring).
+pub fn offer_luna_setup<A, R, S>(io: &SetupIo<A, R, S>, store: &dyn CredentialStore)
+where
+    A: Fn(&str) -> bool,
+    R: Fn() -> Option<String>,
+    S: Fn(&str),
+{
+    offer_luna_setup_with(io, store, &CredentialChain::standard());
+}
+
 /// Process-wide last-known-good source labels (for descriptors built
 /// without a chain handy). Empty by default; the setup flows record here.
 static SOURCE_HINTS: std::sync::LazyLock<RwLock<HashMap<String, String>>> =
@@ -377,6 +441,38 @@ mod tests {
             store.get("openai-luna").unwrap().as_deref(),
             Some("sk-test-key-value")
         );
+    }
+
+    #[test]
+    fn offer_flow_speaks_every_outcome() {
+        use std::sync::Mutex;
+        let said: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        // Memory-only chain over a shared store: hermetic regardless of
+        // ambient env/keychain, and the second offer goes silent.
+        let shared = MemoryCredentialStore::new();
+        let chain = CredentialChain::new(vec![Box::new(shared.clone())]);
+        let io = SetupIo {
+            ask_yes_no: |_| true,
+            read_secret: || Some("sk-offer-key-value".into()),
+            say: |line| said.lock().unwrap().push(line.to_string()),
+        };
+        offer_luna_setup_with(&io, &shared, &chain);
+        assert_eq!(
+            shared.get(LUNA_PROVIDER_ID).unwrap().as_deref(),
+            Some("sk-offer-key-value")
+        );
+        let transcript = said.lock().unwrap().join("\n");
+        assert!(transcript.contains("[ok] Luna key stored"));
+        // Second offer: credential now resolves through the chain, so the
+        // flow stays silent (never re-asks).
+        said.lock().unwrap().clear();
+        let io = SetupIo {
+            ask_yes_no: |_| panic!("must not prompt when configured"),
+            read_secret: || panic!("must not read when configured"),
+            say: |line| said.lock().unwrap().push(line.to_string()),
+        };
+        offer_luna_setup_with(&io, &shared, &chain);
+        assert!(said.lock().unwrap().is_empty());
     }
 
     #[test]

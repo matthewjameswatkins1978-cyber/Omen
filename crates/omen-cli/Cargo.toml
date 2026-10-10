@@ -28,6 +28,7 @@ omen-daemon = { workspace = true }
 omen-mcp = { workspace = true }
 omen-lifecycle = { workspace = true }
 omen-authority = { workspace = true }
+omen-agent = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 serde = { workspace = true }
@@ -43,5 +44,4 @@ tracing-subscriber = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 omen-semantic = { workspace = true }
-omen-agent = { workspace = true }
 omen-test-fixtures = { workspace = true }

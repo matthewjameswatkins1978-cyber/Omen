@@ -1309,6 +1309,57 @@ async fn provider_round_records_diagnostic_event() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn auth_failure_names_recovery_route() {
+    struct DeniedProvider;
+    impl omen_agent::AgentProvider for DeniedProvider {
+        fn respond<'a>(
+            &'a self,
+            _request: omen_agent::AgentRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<omen_agent::AgentResponse, omen_agent::AgentError>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                Err(omen_agent::AgentError::AuthenticationRequired {
+                    provider: "openai-luna".into(),
+                    message: "missing credential OPENAI_API_KEY".into(),
+                })
+            })
+        }
+    }
+    run_with_test_timeout(
+        "auth_failure_names_recovery_route",
+        UNIT_TIMEOUT,
+        |_ctx| async move {
+            let temp = tempdir().unwrap();
+            let ws_path = temp.path();
+            let session_id = InteractiveSessionId::new("sess-auth-hint").unwrap();
+            let denied = Arc::new(DeniedProvider);
+            let out = omen_interactive::ai_lane::AiLaneDispatcher::dispatch_with_workspace(
+                "? explain the failure in depth with full reasoning",
+                &session_id,
+                ws_path,
+                ws_path,
+                None,
+                Some(denied.as_ref()),
+                None,
+            )
+            .unwrap();
+            assert!(!out.configured);
+            assert!(
+                out.response_text.contains("omen setup"),
+                "auth failure must name the recovery route"
+            );
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn trivial_question_uses_zero_provider_calls() {
     run_with_test_timeout(
         "trivial_question_uses_zero_provider_calls",

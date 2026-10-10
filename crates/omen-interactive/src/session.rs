@@ -382,8 +382,28 @@ impl InteractiveSession {
         self.human_settings
             .save(&path)
             .map_err(|error| CoreError::Internal(format!("human settings save failed: {error}")))?;
+        self.offer_luna_key_setup();
         self.prompt.apply_settings(self.human_settings.clone());
         Ok(())
+    }
+
+    /// First-run Luna key offer. Runs at most once ever: settings now
+    /// exist, so declined/skipped is never re-asked, and updates never
+    /// touch settings. Never blocks non-interactive sessions (the caller
+    /// already returned for those). All failure paths fall back to the
+    /// deterministic provider with a spoken reason; first run itself
+    /// never fails over key setup.
+    fn offer_luna_key_setup(&self) {
+        use omen_agent::credentials::{KeyringCredentialStore, SetupIo, offer_luna_setup};
+        let io = SetupIo {
+            ask_yes_no: |prompt| omen_ui::secret::ask_yes_no(prompt),
+            read_secret: || match omen_ui::secret::read_masked_line("Paste API key: ", &self.caps) {
+                Ok(omen_ui::secret::SecretRead::Submitted(key)) => Some(key),
+                _ => None,
+            },
+            say: |line| println!("{line}"),
+        };
+        offer_luna_setup(&io, &KeyringCredentialStore);
     }
 
     /// Dispatches entered input: ordinary executable, semantic action (:), or AI lane (?).

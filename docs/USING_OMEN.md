@@ -750,6 +750,13 @@ Omen does not dump your terminal scrollback into a prompt or ask you to copy-pas
   spends nothing until explicitly selected. Later activation: set the
   key, run an explicitly approved connection check (any small `?`
   query), then `:agent use anthropic-sonnet`.
+- Key onboarding: first launch offers Luna setup on an interactive
+  terminal (masked paste; the key stays in your OS credential store and
+  is never logged, never passed as an argument, and never validated over
+  the network without your explicit consent). Decline once and you are
+  never asked again; `omen setup` on a terminal re-offers it any time.
+  Updates never touch settings, so an existing key is never requested
+  again.
 
 The presentation format is always clean, structured, and distinct:
 
