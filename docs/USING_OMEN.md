@@ -744,6 +744,12 @@ Omen does not dump your terminal scrollback into a prompt or ask you to copy-pas
   reasoning effort, latency, provider-reported token counts — the
   available cost information; rates are unknown to Omen). Secrets never
   appear in outputs, errors, history, or diagnostic bundles.
+- Anthropic Claude Sonnet (`anthropic-sonnet`, model `claude-sonnet-5-5`)
+  is prepared but inactive: it appears in `:agent providers` only when
+  `ANTHROPIC_API_KEY` is configured, never becomes the default, and
+  spends nothing until explicitly selected. Later activation: set the
+  key, run an explicitly approved connection check (any small `?`
+  query), then `:agent use anthropic-sonnet`.
 
 The presentation format is always clean, structured, and distinct:
 
