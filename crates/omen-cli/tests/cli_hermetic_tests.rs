@@ -119,6 +119,56 @@ fn spawned_omen_reports_test_isolation_over_admission() {
 }
 
 #[test]
+fn explicit_override_reaches_production_equivalent_state() {
+    // The approver's explicit OMEN_HERMETIC_TESTS=0 (set in the shell
+    // before cargo runs; cargo [env] never overrides a present variable)
+    // is modeled here as a child-only override: no process-global
+    // mutation, no spending, doctor emits no packets either way.
+    let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let mut saved = Vec::new();
+    set_var(
+        "OPENAI_API_KEY",
+        "sk-luna-child-fixture-not-real",
+        &mut saved,
+    );
+    let _restore = EnvGuard { saved };
+
+    let workspace = tempdir().expect("temporary workspace");
+    let state = tempdir().expect("temporary state root");
+    let output = Command::new(env!("CARGO_BIN_EXE_omen"))
+        .args(["doctor", "--json"])
+        .arg("--workspace")
+        .arg(workspace.path())
+        .env("OMEN_STATE_HOME", state.path())
+        .env("OMEN_HERMETIC_TESTS", "0")
+        .output()
+        .expect("run real omen doctor");
+    assert!(output.status.success());
+    let doctor: Value = serde_json::from_slice(&output.stdout).expect("doctor JSON");
+    let egress = &doctor["ai_egress"];
+    assert_eq!(
+        egress["test_isolation"], false,
+        "explicit override must switch isolation off in the child"
+    );
+    assert_eq!(
+        egress["admitted"], true,
+        "production admission still applies once isolation is off"
+    );
+    let ids: Vec<&str> = egress["configured"]
+        .as_array()
+        .expect("configured list")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        ids.contains(&"openai-luna"),
+        "override state still resolves configured providers, got: {ids:?}"
+    );
+    let raw = serde_json::to_string(&doctor).unwrap();
+    assert!(!raw.contains("sk-luna-child-fixture-not-real"));
+}
+
+#[test]
 fn human_doctor_names_denial_only_when_active() {
     let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let mut saved = Vec::new();

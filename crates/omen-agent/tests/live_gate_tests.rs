@@ -170,16 +170,33 @@ fn ambient_lock() -> std::sync::MutexGuard<'static, ()> {
     AMBIENT_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Explicit live smoke test: ignored by default, requires
-/// `OMEN_LIVE_TESTS=1` AND this deliberate admission. Bounds spend to a
-/// single attempt with the standard 800-token cap and asserts observable
-/// usage. Run by a human approver only; CI never runs it.
+/// Explicit live smoke test: ignored by default and doubly gated. The
+/// harness sets `OMEN_HERMETIC_TESTS=1` for every cargo-launched test
+/// process (`.cargo/config.toml [env]`), and cargo's `[env]` does NOT
+/// override a variable already present in the approving shell — so a
+/// deliberate live run sets BOTH variables explicitly before invoking
+/// cargo, and this test refuses loudly otherwise. A credential alone is
+/// never permission.
 ///
-/// Example: `OMEN_LIVE_TESTS=1 cargo test -p omen-agent --test
-/// live_gate_tests -- --ignored live_smoke_bounded_request`
+/// Windows PowerShell (approver only, spends bounded live credit):
+/// ```powershell
+/// $env:OMEN_LIVE_TESTS = "1"
+/// $env:OMEN_HERMETIC_TESTS = "0"
+/// cargo test -p omen-agent --test live_gate_tests -- --ignored live_smoke_bounded_request
+/// ```
+/// Linux:
+/// ```sh
+/// OMEN_LIVE_TESTS=1 OMEN_HERMETIC_TESTS=0 cargo test -p omen-agent --test live_gate_tests -- --ignored live_smoke_bounded_request
+/// ```
+/// CI never sets these; ordinary `cargo test` stays denied.
 #[test]
 #[ignore]
 fn live_smoke_bounded_request() {
+    if omen_agent::hermetic_denial_active() {
+        panic!(
+            "live smoke refused: test isolation is active; a deliberate live run requires OMEN_LIVE_TESTS=1 AND OMEN_HERMETIC_TESTS=0 in the approving shell (see test docs)"
+        );
+    }
     omen_agent::admit_for_explicit_live_test();
     let provider = omen_agent::openai_luna_provider();
     if !provider.has_credential() {

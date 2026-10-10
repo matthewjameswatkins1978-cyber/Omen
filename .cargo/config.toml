@@ -5,7 +5,28 @@
 # into any child process those tests spawn (real `omen` / MCP
 # executables). Production binaries started outside cargo never carry
 # it, so normal `omen` startup and Luna functionality are unchanged.
-# A developer running `cargo run -p omen-cli` observes a loud refusal
-# naming the remedy (unset the variable) instead of silent billing.
+#
+# Developer note: `cargo run -p omen-cli` inherits this isolation, so an
+# AI query from a cargo-launched binary is refused with a message naming
+# the remedy. Unsetting the variable inside a shell where cargo supplies
+# it does not help — cargo sets it again for each launched process.
+# Either run the normally installed executable (no isolation), or
+# override explicitly for that command:
+#   Windows PowerShell: $env:OMEN_HERMETIC_TESTS = "0"; cargo run -p omen-cli -- doctor
+#   Linux:              OMEN_HERMETIC_TESTS=0 cargo run -p omen-cli -- doctor
+#
+# Deliberate live validation (human approver only, spends bounded live
+# credit) requires BOTH variables, because cargo [env] never overrides a
+# variable already present in the approving shell — the explicit 0 below
+# survives cargo and reaches the test process:
+#   Windows PowerShell:
+#     $env:OMEN_LIVE_TESTS = "1"
+#     $env:OMEN_HERMETIC_TESTS = "0"
+#     cargo test -p omen-agent --test live_gate_tests -- --ignored live_smoke_bounded_request
+#   Linux:
+#     OMEN_LIVE_TESTS=1 OMEN_HERMETIC_TESTS=0 cargo test -p omen-agent --test live_gate_tests -- --ignored live_smoke_bounded_request
+# `OMEN_LIVE_TESTS=1` alone never enables a live test: without the
+# explicit `OMEN_HERMETIC_TESTS=0`, the smoke test refuses loudly. CI
+# sets neither; ordinary `cargo test` stays denied.
 [env]
 OMEN_HERMETIC_TESTS = "1"

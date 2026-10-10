@@ -77,14 +77,19 @@ pub fn is_admitted() -> bool {
     ADMITTED.load(Ordering::SeqCst)
 }
 
-/// Test-only latch reset toward deny. This can only make a test process
-/// MORE hermetic, never less: it clears admission. Gate tests call it
-/// first so they are deterministic even if the ambient environment
-/// carries `OMEN_LIVE_TESTS=1`. There is deliberately no test-only
-/// admit: the only admission path in tests is the explicit live gate.
-#[cfg(test)]
-pub fn deny_for_test() {
-    ADMITTED.store(false, Ordering::SeqCst);
+/// Pure gate decision over already-read inputs: denial first, then
+/// admission. Kept pure so the full truth table is provable without
+/// touching process env or the admission latch (no unprotected windows
+/// in test processes). [`check`] reads the live inputs and delegates.
+fn decide(denied: bool, admitted: bool) -> Result<(), &'static str> {
+    if denied {
+        return Err(HERMETIC_REFUSED_MESSAGE);
+    }
+    if admitted {
+        Ok(())
+    } else {
+        Err(LIVE_REFUSED_MESSAGE)
+    }
 }
 
 /// Choke-point check run by the production HTTPS transport before any
@@ -92,14 +97,7 @@ pub fn deny_for_test() {
 /// refuses even an admitted process. Then admission. `Ok` admits; `Err`
 /// carries the exact refusal signal.
 pub(crate) fn check() -> Result<(), String> {
-    if hermetic_denial_active() {
-        return Err(HERMETIC_REFUSED_MESSAGE.to_string());
-    }
-    if is_admitted() {
-        Ok(())
-    } else {
-        Err(LIVE_REFUSED_MESSAGE.to_string())
-    }
+    decide(hermetic_denial_active(), is_admitted()).map_err(str::to_string)
 }
 
 #[cfg(test)]
@@ -107,49 +105,31 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// Serializes tests that mutate process env. Denial itself is
-    /// monotonic and idempotent (nothing in tests clears the latch),
-    /// so the lock only keeps save/restore pairs deterministic.
+    /// Serializes the tests that write process env. Writes are always
+    /// toward MORE protection (setting the denial flag, or removing the
+    /// live opt-in flag); no test removes the denial flag or touches
+    /// the admission latch, so no unprotected window can exist.
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn gate_denies_by_default_with_exact_signal() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        // Deterministic even if the ambient environment carries either
-        // flag (cargo config sets OMEN_HERMETIC_TESTS=1 for test runs).
-        let prev_hermetic = std::env::var(HERMETIC_TESTS_ENV_VAR).ok();
-        unsafe { std::env::remove_var(HERMETIC_TESTS_ENV_VAR) };
-        deny_for_test();
-        assert!(!is_admitted());
-        assert_eq!(
-            check().unwrap_err(),
-            LIVE_REFUSED_MESSAGE,
-            "refusal must carry the exact fail-closed signal"
-        );
-        unsafe {
-            match prev_hermetic {
-                Some(v) => std::env::set_var(HERMETIC_TESTS_ENV_VAR, v),
-                None => std::env::remove_var(HERMETIC_TESTS_ENV_VAR),
-            }
-        }
+    fn decision_truth_table_is_pure() {
+        // No env reads, no latch, no lock: pure state transitions.
+        assert_eq!(decide(false, false), Err(LIVE_REFUSED_MESSAGE));
+        assert_eq!(decide(false, true), Ok(()));
+        assert_eq!(decide(true, false), Err(HERMETIC_REFUSED_MESSAGE));
+        // Denial takes precedence over admission.
+        assert_eq!(decide(true, true), Err(HERMETIC_REFUSED_MESSAGE));
     }
 
     #[test]
-    fn inherited_denial_refuses_without_admission() {
-        // Serial guard: this test mutates process env. Denial is
-        // monotonic and idempotent, and nothing in tests clears the latch,
-        // so parallel tests can only observe MORE refusal, never less.
-        // Still, the guard keeps the env restore deterministic.
+    fn inherited_denial_signal_names_flag() {
         let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var(HERMETIC_TESTS_ENV_VAR).ok();
         unsafe { std::env::set_var(HERMETIC_TESTS_ENV_VAR, "1") };
-        deny_for_test();
         assert!(hermetic_denial_active());
-        let err = check().unwrap_err();
-        assert!(
-            err.contains("live network refused") && err.contains(HERMETIC_TESTS_ENV_VAR),
-            "denial refusal must name the inherited flag, got: {err}"
-        );
+        // Latch untouched by any test: a fresh test process starts
+        // unadmitted, and denial decides first regardless.
+        assert_eq!(check().unwrap_err(), HERMETIC_REFUSED_MESSAGE);
         unsafe {
             match prev {
                 Some(v) => std::env::set_var(HERMETIC_TESTS_ENV_VAR, v),
@@ -159,17 +139,20 @@ mod tests {
     }
 
     #[test]
-    fn explicit_admission_without_env_flag_panics() {
-        deny_for_test();
-        if std::env::var(LIVE_TESTS_ENV_VAR).as_deref() == Ok("1") {
-            admit_for_explicit_live_test();
-            assert!(is_admitted(), "explicit opt-in plus flag admits");
-            deny_for_test();
-            assert!(!is_admitted(), "hermetic default restored");
-            return;
-        }
+    fn explicit_admission_requires_flag() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        // Removing the LIVE opt-in flag only reduces admission; it can
+        // never weaken hermetic denial (separate flag, separate latch).
+        let prev = std::env::var(LIVE_TESTS_ENV_VAR).ok();
+        unsafe { std::env::remove_var(LIVE_TESTS_ENV_VAR) };
         let caught = std::panic::catch_unwind(admit_for_explicit_live_test);
         assert!(caught.is_err(), "credential/config alone must not admit");
         assert!(!is_admitted(), "failed admission leaves the latch denied");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(LIVE_TESTS_ENV_VAR, v),
+                None => std::env::remove_var(LIVE_TESTS_ENV_VAR),
+            }
+        }
     }
 }

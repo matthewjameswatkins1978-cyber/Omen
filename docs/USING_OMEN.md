@@ -766,10 +766,18 @@ Omen does not dump your terminal scrollback into a prompt or ask you to copy-pas
   every cargo-launched test process) inherits into spawned `omen`/MCP
   child processes and takes precedence over production admission;
   `doctor --json` reports the structural evidence under `ai_egress`
-  (admitted, test isolation, configured provider ids). Deliberate live
-  validation is a separate human-approved activity (`OMEN_LIVE_TESTS=1`
-  plus an explicitly admitted smoke test). A credential alone is never
-  permission to bill. External agent adapters that spawn their own
+  (admitted, test isolation, configured provider ids). Unit tests prove
+  the gate decision as a pure truth table, never by briefly lifting
+  protection in a running test process. Deliberate live validation is a
+  separate human-approved activity requiring BOTH `OMEN_LIVE_TESTS=1`
+  AND `OMEN_HERMETIC_TESTS=0` (cargo never overrides variables already
+  present in the approving shell, so the explicit `0` survives); the
+  smoke test refuses loudly otherwise, and `OMEN_LIVE_TESTS=1` alone
+  never enables it. A credential alone is never permission to bill.
+  Note: `cargo run` inherits test isolation, but a normally installed
+  executable does not — unsetting the variable is insufficient while
+  cargo supplies it again, so use the installed binary or an explicit
+  per-command override. External agent adapters that spawn their own
   processes (e.g. the Codex route) are outside this HTTPS gate and stay
   covered by test doubles, never live calls.
 
