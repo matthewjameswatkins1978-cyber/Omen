@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from omen_shell.errors import OmenRequestTimeout
+from omen_shell.errors import OmenProtocolError, OmenRequestTimeout
 from omen_shell.transport import AsyncStdioTransport
 
 FAKE = str(Path(__file__).resolve().parent.parent / "support" / "fake_mcp_server.py")
@@ -108,6 +108,42 @@ class TransportDeadlineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(blocked.pending_count(), 0)
         await asyncio.wait_for(blocked.aclose(), 3)
         self.assertFalse(blocked.is_alive)
+
+    async def start_small_transport(self, mode: str) -> AsyncStdioTransport:
+        transport = AsyncStdioTransport(
+            sys.executable,
+            ".",
+            request_timeout=2,
+            shutdown_grace=0.2,
+            shutdown_hard=0.5,
+            max_message_bytes=1024,
+            env={"FAKE_MCP_MODE": mode},
+        )
+        self.addAsyncCleanup(transport.aclose)
+        with patch("omen_shell.transport.start_command", return_value=[sys.executable, FAKE]):
+            await asyncio.wait_for(transport.start(), 3)
+        return transport
+
+    async def test_stderr_flood_without_newline_does_not_block_rpc(self) -> None:
+        transport = await self.start_small_transport("stderr-flood")
+        reply = await asyncio.wait_for(transport.request("ping"), 3)
+        self.assertEqual(reply["result"], {})
+        # stdout and stderr have independent scheduling. Wait for real EOF
+        # before checking the final diagnostic tail, not for a guessed sleep.
+        proc = transport._process
+        assert proc is not None and proc.stdin is not None
+        proc.stdin.close()
+        await asyncio.wait_for(proc.wait(), 2)
+        assert transport._stderr_task is not None
+        await asyncio.wait_for(transport._stderr_task, 2)
+        self.assertTrue(transport.stderr_excerpt().endswith("END-OF-STDERR"))
+        self.assertLessEqual(len(transport._stderr_tail), 8192)
+
+    async def test_configured_stdout_limit_reports_protocol_error(self) -> None:
+        transport = await self.start_small_transport("large")
+        with self.assertRaisesRegex(OmenProtocolError, "message exceeds 1024 bytes"):
+            await asyncio.wait_for(transport.request("tools/call", {"name": "x"}), 3)
+        self.assertEqual(transport.pending_count(), 0)
 
 
 if __name__ == "__main__":

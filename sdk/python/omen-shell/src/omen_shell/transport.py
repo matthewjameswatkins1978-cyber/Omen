@@ -161,11 +161,14 @@ class AsyncStdioTransport:
     async def _stderr_loop(self) -> None:
         assert self._process is not None and self._process.stderr is not None
         try:
-            async for chunk in self._process.stderr:
+            # stderr is raw diagnostic bytes, not a line protocol. Reading
+            # by line can stop the drain on an overlong unterminated line,
+            # eventually blocking the child on its full stderr pipe.
+            while chunk := await self._process.stderr.read(4096):
                 self._stderr_tail += chunk
                 if len(self._stderr_tail) > 8192:
                     del self._stderr_tail[: len(self._stderr_tail) - 8192]
-        except (asyncio.CancelledError, ValueError):
+        except asyncio.CancelledError:
             pass
         except Exception:  # noqa: BLE001 — stderr drain must never kill the client
             _log.debug("omen_shell: stderr drain ended", exc_info=True)
@@ -179,7 +182,10 @@ class AsyncStdioTransport:
             while True:
                 try:
                     line = await self._process.stdout.readline()
-                except asyncio.LimitOverrunError as exc:
+                # StreamReader.readline converts LimitOverrunError to
+                # ValueError; both paths mean the configured frame cap
+                # has been exceeded, not an ordinary process exit.
+                except (asyncio.LimitOverrunError, ValueError) as exc:
                     self._fail_all(
                         OmenProtocolError(
                             f"message exceeds {self._max_message_bytes} bytes; "
@@ -188,7 +194,7 @@ class AsyncStdioTransport:
                     )
                     _log.debug("omen_shell: reader overrun: %s", exc)
                     break
-                except (asyncio.CancelledError, ValueError):
+                except asyncio.CancelledError:
                     break
                 if not line:
                     break
