@@ -39,6 +39,10 @@ pip install omen-shell
   `PARTIAL` is not `COMPLETE`.
 - Cancelling your `await` does not cancel Omen's execution. `close()`
   does not roll anything back.
+- The Python transport deadline covers waiting for the write lock, pipe
+  backpressure, and the response together. The timeout names the phase;
+  once a request has been written, a timeout does not establish whether
+  Omen executed it. Requests are never automatically replayed.
 - One `Omen` holds one persistent `omen mcp` process. If it dies, the
   client fails closed — reconnect explicitly.
 

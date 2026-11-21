@@ -161,11 +161,14 @@ class AsyncStdioTransport:
     async def _stderr_loop(self) -> None:
         assert self._process is not None and self._process.stderr is not None
         try:
-            async for chunk in self._process.stderr:
+            # stderr is raw diagnostic bytes, not a line protocol. Reading
+            # by line can stop the drain on an overlong unterminated line,
+            # eventually blocking the child on its full stderr pipe.
+            while chunk := await self._process.stderr.read(4096):
                 self._stderr_tail += chunk
                 if len(self._stderr_tail) > 8192:
                     del self._stderr_tail[: len(self._stderr_tail) - 8192]
-        except (asyncio.CancelledError, ValueError):
+        except asyncio.CancelledError:
             pass
         except Exception:  # noqa: BLE001 — stderr drain must never kill the client
             _log.debug("omen_shell: stderr drain ended", exc_info=True)
@@ -179,7 +182,10 @@ class AsyncStdioTransport:
             while True:
                 try:
                     line = await self._process.stdout.readline()
-                except asyncio.LimitOverrunError as exc:
+                # StreamReader.readline converts LimitOverrunError to
+                # ValueError; both paths mean the configured frame cap
+                # has been exceeded, not an ordinary process exit.
+                except (asyncio.LimitOverrunError, ValueError) as exc:
                     self._fail_all(
                         OmenProtocolError(
                             f"message exceeds {self._max_message_bytes} bytes; "
@@ -188,7 +194,7 @@ class AsyncStdioTransport:
                     )
                     _log.debug("omen_shell: reader overrun: %s", exc)
                     break
-                except (asyncio.CancelledError, ValueError):
+                except asyncio.CancelledError:
                     break
                 if not line:
                     break
@@ -279,37 +285,46 @@ class AsyncStdioTransport:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[JsonObject] = loop.create_future()
         self._pending[call_id] = future
-        self.stats.requests_sent += 1
         if _TRACE_PAYLOADS:
             _log.warning("omen_shell UNSAFE trace: --> %s", envelope)
         else:
             _log.debug("omen_shell: --> id=%s method=%s", call_id, method)
         started = time.monotonic()
-        try:
-            async with self._write_lock:
-                self._process.stdin.write(encoded)
-                await self._process.stdin.drain()
-        except (OSError, ValueError, ConnectionError) as exc:
-            self._pending.pop(call_id, None)
-            error = OmenConnectionClosedError(f"failed writing to omen mcp: {exc}")
-            self._fail_all(error)
-            raise error from exc
         timeout = self._request_timeout if request_timeout is None else request_timeout
+        phase = "write-lock"
         try:
+            # One deadline covers queueing, pipe backpressure, and response.
+            # A deadline reached after write() makes the remote outcome unknown,
+            # just like a response timeout; never replay the request.
             async with asyncio.timeout(timeout):
+                async with self._write_lock:
+                    self._check_usable()
+                    phase = "write-drain"
+                    self._process.stdin.write(encoded)
+                    self.stats.requests_sent += 1
+                    await self._process.stdin.drain()
+                phase = "receive"
                 message = await asyncio.shield(future)
         except TimeoutError as exc:
-            self._pending.pop(call_id, None)
             raise OmenRequestTimeout(
-                f"request {method!r} (id={call_id}) exceeded {timeout}s transport deadline"
+                f"request {method!r} (id={call_id}) exceeded {timeout}s "
+                f"transport deadline during {phase}"
             ) from exc
-        except asyncio.CancelledError:
-            # Python-side cancellation only: drop our waiter. A late Omen
-            # response is discarded by id; NO claim about Omen-side state.
+        except (OSError, ValueError, ConnectionError) as exc:
+            error = OmenConnectionClosedError(f"failed {phase} to omen mcp: {exc}")
+            self._fail_all(error)
+            raise error from exc
+        finally:
+            # Cancellation and failure can occur during ANY phase, including
+            # before acquiring the write lock. Discard late responses by id.
             self._pending.pop(call_id, None)
             if not future.done():
                 future.cancel()
-            raise
+            elif not future.cancelled():
+                # A reader/close failure may have completed this future while
+                # we were still writing. Retrieve it to avoid an orphaned
+                # Future exception when the write path itself failed.
+                future.exception()
         elapsed_ms = (time.monotonic() - started) * 1000.0
         if _TRACE_PAYLOADS:
             _log.warning("omen_shell UNSAFE trace: <-- %s", message)
@@ -333,12 +348,23 @@ class AsyncStdioTransport:
         envelope: JsonObject = {"jsonrpc": "2.0", "method": method}
         if params is not None:
             envelope["params"] = params
+        phase = "write-lock"
         try:
-            async with self._write_lock:
-                proc.stdin.write((json.dumps(envelope) + "\n").encode("utf-8"))
-                await proc.stdin.drain()
-        except (OSError, ValueError, ConnectionError):
-            pass
+            async with asyncio.timeout(self._request_timeout):
+                async with self._write_lock:
+                    self._check_usable()
+                    phase = "write-drain"
+                    proc.stdin.write((json.dumps(envelope) + "\n").encode("utf-8"))
+                    await proc.stdin.drain()
+        except TimeoutError as exc:
+            raise OmenRequestTimeout(
+                f"notification {method!r} exceeded {self._request_timeout}s "
+                f"transport deadline during {phase}"
+            ) from exc
+        except (OSError, ValueError, ConnectionError) as exc:
+            error = OmenConnectionClosedError(f"failed notification {phase} to omen mcp: {exc}")
+            self._fail_all(error)
+            raise error from exc
 
     async def aclose(self) -> None:
         """Deterministic shutdown: stdin EOF → grace → terminate → kill."""

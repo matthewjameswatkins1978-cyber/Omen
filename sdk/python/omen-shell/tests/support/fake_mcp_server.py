@@ -10,6 +10,7 @@ behavior selected by the ``FAKE_MCP_MODE`` environment variable:
 * ``unknown-id`` — emit a response for an id nobody asked about.
 * ``exit-early`` — exit(0) after reading the first line.
 * ``stderr-noise`` — write junk to stderr, behave as normal.
+* ``stderr-flood`` — write >8 MiB without a newline before reading stdin.
 * ``large`` — answer tools/call with a ~2 MiB text payload.
 * ``slow`` — sleep 30s before answering tools/call (tests use short
   deadlines to observe the timeout, then kill).
@@ -177,6 +178,9 @@ def _handle(message: dict[str, object], pending: list[dict[str, object]]) -> Non
 def main() -> int:
     if MODE == "stderr-noise":
         sys.stderr.write("fake setup noise line\n")
+        sys.stderr.flush()
+    if MODE == "stderr-flood":
+        sys.stderr.write("x" * (8 << 20) + "END-OF-STDERR")
         sys.stderr.flush()
     if MODE == "malformed":
         sys.stdout.write("this is not json\n")
